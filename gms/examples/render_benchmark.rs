@@ -529,7 +529,12 @@ impl BenchmarkRuntime {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| self.renderer.adapter_info.name.clone());
 
-        let score = compute_render_benchmark_score(&computed, gms_score);
+        let score = compute_render_benchmark_score(
+            &computed,
+            gms_score,
+            self.pacing_mode,
+            &self.renderer.runtime_tuning,
+        );
         let multi_gpu_summary = self.multi_gpu.as_ref().map(|multi_gpu| multi_gpu.summary());
 
         BenchmarkSummary {
@@ -547,6 +552,10 @@ impl BenchmarkRuntime {
             p99_frame_ms: computed.p99_frame_ms,
             low_1_percent_fps: computed.low_1_percent_fps,
             frame_time_stddev_ms: computed.frame_time_stddev_ms,
+            avg_work_ms: computed.avg_work_ms,
+            p95_work_ms: computed.p95_work_ms,
+            p99_work_ms: computed.p99_work_ms,
+            work_time_stddev_ms: computed.work_time_stddev_ms,
             gms_hardware_score: gms_score,
             total_discovered_gpus: self.gms_inventory.adapters.len(),
             render_score: score.score,
@@ -1007,7 +1016,7 @@ fn title_update_interval(tuning: &GmsRuntimeTuningProfile) -> Duration {
     Duration::from_millis(tuning.benchmark_title_update_interval_ms.max(100))
 }
 
-fn match_inventory_profile (
+fn match_inventory_profile(
     inventory: &GpuInventory,
     adapter_info: &wgpu::AdapterInfo,
 ) -> Option<gms::GpuAdapterProfile> {
@@ -1163,6 +1172,10 @@ impl FrameStats {
             0.0
         };
         let frame_time_stddev_ms = stddev(&self.frame_intervals_ms).unwrap_or(0.0);
+        let avg_work_ms = average(&self.render_durations_ms).unwrap_or(0.0);
+        let p95_work_ms = percentile_ms(&self.render_durations_ms, 95.0).unwrap_or(avg_work_ms);
+        let p99_work_ms = percentile_ms(&self.render_durations_ms, 99.0).unwrap_or(p95_work_ms);
+        let work_time_stddev_ms = stddev(&self.render_durations_ms).unwrap_or(0.0);
 
         ComputedFrameStats {
             total_frames: self.frames,
@@ -1174,6 +1187,10 @@ impl FrameStats {
             p99_frame_ms,
             low_1_percent_fps,
             frame_time_stddev_ms,
+            avg_work_ms,
+            p95_work_ms,
+            p99_work_ms,
+            work_time_stddev_ms,
             resolution: self.resolution,
         }
     }
@@ -1207,6 +1224,10 @@ struct ComputedFrameStats {
     p99_frame_ms: f64,
     low_1_percent_fps: f64,
     frame_time_stddev_ms: f64,
+    avg_work_ms: f64,
+    p95_work_ms: f64,
+    p99_work_ms: f64,
+    work_time_stddev_ms: f64,
     resolution: PhysicalSize<u32>,
 }
 
@@ -1217,6 +1238,11 @@ struct RenderScore {
     fps_term: f64,
     stability_factor: f64,
     tail_factor: f64,
+    present_stability_factor: f64,
+    present_tail_factor: f64,
+    work_stability_factor: f64,
+    work_tail_factor: f64,
+    work_stability_blend: f64,
     resolution_factor: f64,
     gms_factor: f64,
 }
@@ -1224,6 +1250,8 @@ struct RenderScore {
 fn compute_render_benchmark_score(
     stats: &ComputedFrameStats,
     gms_hardware_score: u64,
+    pacing_mode: BenchmarkPacingMode,
+    runtime_tuning: &GmsRuntimeTuningProfile,
 ) -> RenderScore {
     let pixels = (stats.resolution.width.max(1) as f64) * (stats.resolution.height.max(1) as f64);
     let resolution_factor = (pixels / (1280.0 * 720.0)).sqrt().clamp(0.75, 3.0);
@@ -1231,9 +1259,33 @@ fn compute_render_benchmark_score(
     let avg_ms = stats.avg_frame_ms.max(0.001);
     let p95_ms = stats.p95_frame_ms.max(avg_ms);
     let p99_ms = stats.p99_frame_ms.max(p95_ms);
+    let avg_work_ms = stats.avg_work_ms.max(0.001);
+    let p95_work_ms = stats.p95_work_ms.max(avg_work_ms);
+    let p99_work_ms = stats.p99_work_ms.max(p95_work_ms);
 
-    let stability_factor = (avg_ms / p95_ms).clamp(0.35, 1.0);
-    let tail_factor = (avg_ms / p99_ms).clamp(0.25, 1.0);
+    let present_stability_factor = (avg_ms / p95_ms).clamp(0.35, 1.0);
+    let present_tail_factor = (avg_ms / p99_ms).clamp(0.25, 1.0);
+    let work_stability_factor = (avg_work_ms / p95_work_ms).clamp(0.35, 1.0);
+    let work_tail_factor = (avg_work_ms / p99_work_ms).clamp(0.25, 1.0);
+
+    // In max-throughput mode on unified-memory adapters (especially Apple Silicon), present-time
+    // intervals include compositor scheduling noise that does not reflect actual GPU work pacing.
+    // Blend in per-work-unit render durations so the score tracks engine-side throughput stability
+    // while still retaining some penalty for visible present jitter.
+    let work_stability_blend = if matches!(pacing_mode, BenchmarkPacingMode::MaxThroughput) {
+        runtime_tuning
+            .throughput_work_stability_blend
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let stability_factor = lerp(
+        present_stability_factor,
+        work_stability_factor,
+        work_stability_blend,
+    );
+    let tail_factor = lerp(present_tail_factor, work_tail_factor, work_stability_blend);
 
     // Small hardware-score boost so a stronger adapter helps, but FPS still dominates.
     let gms_factor = (1.0 + (gms_hardware_score as f64).ln_1p() / 12.0).clamp(1.0, 2.0);
@@ -1249,6 +1301,11 @@ fn compute_render_benchmark_score(
         fps_term,
         stability_factor,
         tail_factor,
+        present_stability_factor,
+        present_tail_factor,
+        work_stability_factor,
+        work_tail_factor,
+        work_stability_blend,
         resolution_factor,
         gms_factor,
     }
@@ -1279,6 +1336,10 @@ struct BenchmarkSummary {
     p99_frame_ms: f64,
     low_1_percent_fps: f64,
     frame_time_stddev_ms: f64,
+    avg_work_ms: f64,
+    p95_work_ms: f64,
+    p99_work_ms: f64,
+    work_time_stddev_ms: f64,
     gms_hardware_score: u64,
     total_discovered_gpus: usize,
     render_score: u64,
@@ -1339,6 +1400,10 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.frame_time_stddev_ms
     );
     println!(
+        "Work time / unit(ms): avg {:.3} | p95 {:.3} | p99 {:.3} | stddev {:.3}",
+        summary.avg_work_ms, summary.p95_work_ms, summary.p99_work_ms, summary.work_time_stddev_ms
+    );
+    println!(
         "GMS hardware score: {} | discovered adapters: {}",
         summary.gms_hardware_score, summary.total_discovered_gpus
     );
@@ -1354,6 +1419,16 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.score_breakdown.tail_factor,
         summary.score_breakdown.gms_factor
     );
+    if summary.score_breakdown.work_stability_blend > 0.0 {
+        println!(
+            "Stability blend => present {:.3}/{:.3}, work {:.3}/{:.3}, work_weight {:.2}",
+            summary.score_breakdown.present_stability_factor,
+            summary.score_breakdown.present_tail_factor,
+            summary.score_breakdown.work_stability_factor,
+            summary.score_breakdown.work_tail_factor,
+            summary.score_breakdown.work_stability_blend
+        );
+    }
     if let Some(multi_gpu) = summary.multi_gpu.as_ref() {
         println!(
             "Multi-GPU: {} -> {} ({:?}) | secondary WU/present: {} | total secondary WU: {}",
@@ -1397,6 +1472,11 @@ fn average(values: &[f64]) -> Option<f64> {
         return None;
     }
     Some(values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    a + (b - a) * t
 }
 
 fn stddev(values: &[f64]) -> Option<f64> {

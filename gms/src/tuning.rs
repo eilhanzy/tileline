@@ -23,6 +23,11 @@ pub struct GmsRuntimeTuningProfile {
     pub benchmark_timing_capacity: usize,
     /// Suggested UI title refresh interval to reduce host/compositor noise in benchmarks.
     pub benchmark_title_update_interval_ms: u64,
+    /// Throughput benchmark score weighting for work-time stability vs present-time stability.
+    ///
+    /// `0.0` means score stability uses only present/compositor intervals.
+    /// `1.0` means score stability uses only per-work-unit render durations.
+    pub throughput_work_stability_blend: f64,
 }
 
 impl GmsRuntimeTuningProfile {
@@ -48,7 +53,8 @@ impl GmsRuntimeTuningProfile {
                 is_apple_silicon_like: true,
                 recommended_surface_frame_latency: 4,
                 throughput_offscreen_target_ring_len: 6,
-                integrated_throughput_burst_work_units: 4,
+                integrated_throughput_burst_work_units: 3,
+                throughput_work_stability_blend: 0.85,
                 benchmark_timing_capacity: 131_072,
                 benchmark_title_update_interval_ms: 500,
             };
@@ -61,6 +67,7 @@ impl GmsRuntimeTuningProfile {
                 recommended_surface_frame_latency: 3,
                 throughput_offscreen_target_ring_len: 4,
                 integrated_throughput_burst_work_units: 6,
+                throughput_work_stability_blend: 0.65,
                 benchmark_timing_capacity: 98_304,
                 benchmark_title_update_interval_ms: 500,
             };
@@ -72,6 +79,7 @@ impl GmsRuntimeTuningProfile {
             recommended_surface_frame_latency: 2,
             throughput_offscreen_target_ring_len: 2,
             integrated_throughput_burst_work_units: 8,
+            throughput_work_stability_blend: 0.0,
             benchmark_timing_capacity: 131_072,
             benchmark_title_update_interval_ms: 500,
         }
