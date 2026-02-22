@@ -1,0 +1,11 @@
+[package]
+name = "mps"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam.workspace = true
+num_cpus.workspace = true
+raw-cpuid.workspace = true
+rayon.workspace = true
+wasmer.workspace = true

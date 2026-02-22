@@ -1,0 +1,23 @@
+[workspace]
+members = ["mps", "runtime", "graphics", "tl-core"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+bevy_ecs = "0.18.0"
+crossbeam = "0.8.4"
+egui = "0.33.3"
+egui-wgpu = "0.33.3"
+hecs = "0.11.0"
+nalgebra = "0.34.1"
+num_cpus = "1.17.0"
+raw-cpuid = "11.6.0"
+rayon = "1.11.0"
+tokio = "1.49.0"
+wasmer = "7.0.1"
+wgpu = "28.0.0"
+winit = "0.30.12"
+wit-bindgen = "0.53.1"
