@@ -487,6 +487,11 @@ impl BenchmarkRuntime {
 
     fn update_title(&mut self, instant_fps: f64, avg_fps: f64) {
         let gms_score = self.adapter_profile.as_ref().map(|p| p.score).unwrap_or(0);
+        let compute_unit_suffix = self
+            .adapter_profile
+            .as_ref()
+            .map(compact_compute_unit_title_suffix)
+            .unwrap_or_default();
         let phase = self.phase_label();
         let burst = self.renderer.work_units_per_present();
         let secondary_burst = self
@@ -507,13 +512,14 @@ impl BenchmarkRuntime {
             String::new()
         };
         let title = format!(
-            "GMS Render Benchmark [{}] | {} {:.1} | Avg {:.1} | Frames {} | GMS {}{}{} | Close/Esc to finish",
+            "GMS Render Benchmark [{}] | {} {:.1} | Avg {:.1} | Frames {} | GMS {}{}{}{} | Close/Esc to finish",
             phase,
             fps_label,
             instant_fps,
             avg_fps,
             self.stats.frames,
             gms_score,
+            compute_unit_suffix,
             burst_suffix,
             multi_gpu_suffix
         );
@@ -536,11 +542,31 @@ impl BenchmarkRuntime {
             &self.renderer.runtime_tuning,
         );
         let multi_gpu_summary = self.multi_gpu.as_ref().map(|multi_gpu| multi_gpu.summary());
+        let (estimated_compute_units, compute_unit_short_label, compute_unit_display_label) = self
+            .adapter_profile
+            .as_ref()
+            .map(|profile| {
+                let (short_label, count) = profile.compute_unit_summary();
+                (
+                    Some(count),
+                    Some(short_label),
+                    Some(profile.compute_unit_kind.display_label()),
+                )
+            })
+            .unwrap_or((None, None, None));
+        let compute_unit_source = self
+            .adapter_profile
+            .as_ref()
+            .map(|profile| profile.compute_unit_source.short_label());
 
         BenchmarkSummary {
             adapter_name,
             backend: format!("{:?}", self.renderer.adapter_info.backend),
             device_type: format!("{:?}", self.renderer.adapter_info.device_type),
+            estimated_compute_units,
+            compute_unit_short_label,
+            compute_unit_display_label,
+            compute_unit_source,
             resolution: self.renderer.size,
             present_mode: self.renderer.present_mode,
             total_frames: computed.total_frames,
@@ -841,22 +867,10 @@ impl Renderer {
     }
 
     fn effective_work_units_per_present(&self) -> u32 {
-        let target = self.work_units_per_present();
-        if target <= 1 {
-            return target;
-        }
-
-        let ramp_frames = self.runtime_tuning.throughput_startup_ramp_frames;
-        if ramp_frames == 0 {
-            return target;
-        }
-
-        let progress =
-            ((self.presented_frames.saturating_add(1)) as f64 / ramp_frames as f64).clamp(0.0, 1.0);
-        // Smoothstep ramp reduces startup spikes better than a linear step on UMA systems.
-        let eased = progress * progress * (3.0 - 2.0 * progress);
-        let scaled = 1.0 + (target.saturating_sub(1) as f64) * eased;
-        scaled.round().clamp(1.0, target as f64) as u32
+        self.runtime_tuning.effective_throughput_work_units_per_present(
+            self.work_units_per_present(),
+            self.presented_frames,
+        )
     }
 
     fn current_throughput_target(&mut self) -> Option<&wgpu::Texture> {
@@ -932,10 +946,10 @@ impl Renderer {
             return;
         }
 
-        let prewarm_submits = self
-            .runtime_tuning
-            .throughput_startup_prewarm_submits
-            .min(self.throughput_targets.len() as u32);
+        let prewarm_submits = self.runtime_tuning.startup_prewarm_submits_for_ring(
+            self.work_units_per_present(),
+            self.throughput_targets.len(),
+        );
 
         for _ in 0..prewarm_submits {
             let Some(target) = self.current_throughput_target() else {
@@ -1390,6 +1404,10 @@ struct BenchmarkSummary {
     adapter_name: String,
     backend: String,
     device_type: String,
+    estimated_compute_units: Option<u32>,
+    compute_unit_short_label: Option<&'static str>,
+    compute_unit_display_label: Option<&'static str>,
+    compute_unit_source: Option<&'static str>,
     resolution: PhysicalSize<u32>,
     present_mode: PresentMode,
     total_frames: u64,
@@ -1427,6 +1445,17 @@ fn print_summary(summary: &BenchmarkSummary) {
         "Adapter: {} | Backend: {} | Type: {}",
         summary.adapter_name, summary.backend, summary.device_type
     );
+    if let (Some(units), Some(short_label), Some(display_label), Some(source)) = (
+        summary.estimated_compute_units,
+        summary.compute_unit_short_label,
+        summary.compute_unit_display_label,
+        summary.compute_unit_source,
+    ) {
+        println!(
+            "Estimated {}: {} {} (source: {})",
+            display_label, units, short_label, source
+        );
+    }
     println!(
         "Resolution: {}x{} | Present mode: {:?}",
         summary.resolution.width, summary.resolution.height, summary.present_mode
@@ -1601,6 +1630,15 @@ fn choose_pacing_mode(
     } else {
         BenchmarkPacingMode::MaxThroughput
     }
+}
+
+fn compact_compute_unit_title_suffix(profile: &gms::GpuAdapterProfile) -> String {
+    if profile.estimated_compute_units == 0 {
+        return String::new();
+    }
+
+    let (label, count) = profile.compute_unit_summary();
+    format!(" | {} {}", label, count)
 }
 
 #[derive(Debug, Clone)]

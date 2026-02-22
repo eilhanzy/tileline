@@ -8,6 +8,8 @@
 //! - memory-topology penalties/bonuses
 
 use std::cmp::Ordering;
+use std::process::Command;
+use std::sync::OnceLock;
 
 use wgpu::{Adapter, AdapterInfo, Backends, DeviceType, Features, Instance, Limits};
 
@@ -27,6 +29,50 @@ pub enum ComputeUnitKind {
     CoreCluster,
     /// Unknown, fallback heuristic only.
     Unknown,
+}
+
+/// Where the CU/SM estimate came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeUnitEstimateSource {
+    /// Vendor/OS native tooling probe (best available path when present).
+    NativeProbe,
+    /// Device-name lookup table maintained by GMS.
+    DeviceNameTable,
+    /// Coarse fallback derived from `wgpu` limits only.
+    DriverLimitsHeuristic,
+}
+
+impl ComputeUnitEstimateSource {
+    /// Compact source label for summaries.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::NativeProbe => "native",
+            Self::DeviceNameTable => "table",
+            Self::DriverLimitsHeuristic => "heuristic",
+        }
+    }
+}
+
+impl ComputeUnitKind {
+    /// Short label suitable for benchmark headers and compact summaries.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Cu => "CU",
+            Self::Sm => "SM",
+            Self::CoreCluster => "CoreCluster",
+            Self::Unknown => "Units",
+        }
+    }
+
+    /// Human-readable description for logs and detailed summaries.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::Cu => "Compute Units (CU)",
+            Self::Sm => "Streaming Multiprocessors (SM, CUDA scheduler clusters)",
+            Self::CoreCluster => "GPU Core Clusters",
+            Self::Unknown => "GPU Compute Units",
+        }
+    }
 }
 
 /// Memory topology that affects latency and transfer behavior.
@@ -90,6 +136,7 @@ pub struct GpuAdapterProfile {
     pub memory_topology: MemoryTopology,
     pub compute_unit_kind: ComputeUnitKind,
     pub estimated_compute_units: u32,
+    pub compute_unit_source: ComputeUnitEstimateSource,
     pub estimated_vram_mb: u64,
     pub estimated_bandwidth_gbps: f64,
     pub supports_mappable_primary_buffers: bool,
@@ -113,6 +160,11 @@ impl GpuAdapterProfile {
         } else {
             self.score as f64 / other_score as f64
         }
+    }
+
+    /// Compact `(label, count)` pair for benchmark UIs.
+    pub fn compute_unit_summary(&self) -> (&'static str, u32) {
+        (self.compute_unit_kind.short_label(), self.estimated_compute_units)
     }
 }
 
@@ -179,7 +231,7 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
     let device_type = info.device_type;
     let memory_topology = classify_memory_topology(device_type);
 
-    let estimated_compute_units =
+    let (estimated_compute_units, compute_unit_source) =
         estimate_compute_units(&info, &limits, &name_lower, vendor_family);
     let compute_unit_kind = estimate_compute_unit_kind(vendor_family);
     let estimated_vram_mb = estimate_vram_mb(&info, &limits, &name_lower, memory_topology);
@@ -212,6 +264,7 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
         memory_topology,
         compute_unit_kind,
         estimated_compute_units,
+        compute_unit_source,
         estimated_vram_mb,
         estimated_bandwidth_gbps,
         supports_mappable_primary_buffers,
@@ -290,9 +343,13 @@ fn estimate_compute_units(
     limits: &Limits,
     name_lower: &str,
     vendor: VendorFamily,
-) -> u32 {
+) -> (u32, ComputeUnitEstimateSource) {
+    if let Some(native) = probe_native_compute_units(info, vendor, name_lower) {
+        return (native.max(1), ComputeUnitEstimateSource::NativeProbe);
+    }
+
     if let Some(parsed) = parse_known_compute_units(name_lower, vendor) {
-        return parsed.max(1);
+        return (parsed.max(1), ComputeUnitEstimateSource::DeviceNameTable);
     }
 
     // Fallback heuristic from compute limits.
@@ -317,7 +374,189 @@ fn estimate_compute_units(
         + (buffer_gb.sqrt() * 6.0))
         * device_bias;
 
-    estimate.round().clamp(1.0, 256.0) as u32
+    (
+        estimate.round().clamp(1.0, 256.0) as u32,
+        ComputeUnitEstimateSource::DriverLimitsHeuristic,
+    )
+}
+
+fn probe_native_compute_units(
+    info: &AdapterInfo,
+    vendor: VendorFamily,
+    name_lower: &str,
+) -> Option<u32> {
+    match vendor {
+        VendorFamily::Nvidia => probe_nvidia_smi_compute_units(name_lower),
+        VendorFamily::Amd => probe_rocminfo_compute_units(name_lower),
+        VendorFamily::Apple => probe_macos_gpu_core_count(info, name_lower),
+        VendorFamily::Intel | VendorFamily::Other => None,
+    }
+}
+
+fn probe_nvidia_smi_compute_units(name_lower: &str) -> Option<u32> {
+    static CACHE: OnceLock<Vec<(String, u32)>> = OnceLock::new();
+    let entries = CACHE.get_or_init(load_nvidia_smi_sm_cache);
+    match_probe_entries_by_name(entries, name_lower)
+}
+
+fn load_nvidia_smi_sm_cache() -> Vec<(String, u32)> {
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,multiprocessor_count",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(',')?;
+            let units = value.trim().parse::<u32>().ok()?;
+            Some((normalize_gpu_name(name), units))
+        })
+        .collect()
+}
+
+fn probe_rocminfo_compute_units(name_lower: &str) -> Option<u32> {
+    static CACHE: OnceLock<Vec<(String, u32)>> = OnceLock::new();
+    let entries = CACHE.get_or_init(load_rocminfo_cu_cache);
+    match_probe_entries_by_name(entries, name_lower)
+}
+
+fn load_rocminfo_cu_cache() -> Vec<(String, u32)> {
+    let output = Command::new("rocminfo").output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_cu: Option<u32> = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            if let (Some(name), Some(cu)) = (current_name.take(), current_cu.take()) {
+                entries.push((normalize_gpu_name(&name), cu));
+            }
+            continue;
+        }
+
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+            if key == "marketing name" || key == "name" {
+                // `rocminfo` includes CPU agents too; we keep the latest name and rely on CU parse
+                // + name matching to filter out non-GPU entries.
+                current_name = Some(value.to_owned());
+            } else if key == "compute unit" {
+                current_cu = value.parse::<u32>().ok();
+            }
+        }
+    }
+
+    if let (Some(name), Some(cu)) = (current_name.take(), current_cu.take()) {
+        entries.push((normalize_gpu_name(&name), cu));
+    }
+
+    entries
+}
+
+#[cfg(target_os = "macos")]
+fn probe_macos_gpu_core_count(info: &AdapterInfo, name_lower: &str) -> Option<u32> {
+    let _ = info;
+    static CACHE: OnceLock<Vec<(String, u32)>> = OnceLock::new();
+    let entries = CACHE.get_or_init(load_system_profiler_gpu_cores_cache);
+    match_probe_entries_by_name(entries, name_lower)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probe_macos_gpu_core_count(_info: &AdapterInfo, _name_lower: &str) -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn load_system_profiler_gpu_cores_cache() -> Vec<(String, u32)> {
+    let output = Command::new("system_profiler")
+        .args(["SPDisplaysDataType"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_cores: Option<u32> = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("Chipset Model:") {
+            if let (Some(name), Some(cores)) = (current_name.take(), current_cores.take()) {
+                entries.push((normalize_gpu_name(&name), cores));
+            }
+            current_name = Some(rest.trim().to_owned());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Total Number of Cores:") {
+            current_cores = rest.trim().parse::<u32>().ok();
+        }
+    }
+
+    if let (Some(name), Some(cores)) = (current_name.take(), current_cores.take()) {
+        entries.push((normalize_gpu_name(&name), cores));
+    }
+
+    entries
+}
+
+fn match_probe_entries_by_name(entries: &[(String, u32)], name_lower: &str) -> Option<u32> {
+    let normalized_target = normalize_gpu_name(name_lower);
+    if normalized_target.is_empty() {
+        return None;
+    }
+
+    // Prefer the longest matching probe name to avoid generic substring collisions.
+    entries
+        .iter()
+        .filter(|(probe_name, units)| {
+            *units > 0
+                && !probe_name.is_empty()
+                && (normalized_target.contains(probe_name)
+                    || probe_name.contains(&normalized_target))
+        })
+        .max_by_key(|(probe_name, _)| probe_name.len())
+        .map(|(_, units)| *units)
+}
+
+fn normalize_gpu_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_space = false;
+    for ch in name.chars().flat_map(|c| c.to_lowercase()) {
+        let keep = ch.is_ascii_alphanumeric();
+        if keep {
+            out.push(ch);
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_owned()
 }
 
 fn parse_known_compute_units(name_lower: &str, vendor: VendorFamily) -> Option<u32> {
@@ -331,21 +570,56 @@ fn parse_known_compute_units(name_lower: &str, vendor: VendorFamily) -> Option<u
 }
 
 fn parse_nvidia_sm(name: &str) -> Option<u32> {
-    // Common, approximate SM counts (sufficient for scheduling ratios).
+    // GeForce RTX (desktop-focused) SM coverage from RTX 2000 onward.
+    //
+    // Ordering matters because we use substring matching:
+    // - longer / more specific patterns must appear before base models
+    // - e.g. "rtx 4070 ti super" before "rtx 4070 ti" before "rtx 4070"
+    //
+    // Laptop/OEM variants that report distinct names may still fall back unless explicitly listed.
     const TABLE: &[(&str, u32)] = &[
+        // RTX 50 series (validated entries first; add more as device names are verified)
+        ("rtx 5060 ti", 36),
+
+        // RTX 40 series
+        ("rtx 4090 d", 114),
         ("rtx 4090", 128),
+        ("rtx 4080 super", 80),
         ("rtx 4080", 76),
+        ("rtx 4070 ti super", 66),
         ("rtx 4070 ti", 60),
+        ("rtx 4070 super", 56),
         ("rtx 4070", 46),
         ("rtx 4060 ti", 34),
         ("rtx 4060", 24),
+        ("rtx 4050", 20),
+
+        // RTX 30 series
+        ("rtx 3090 ti", 84),
         ("rtx 3090", 82),
+        ("rtx 3080 ti", 80),
+        ("rtx 3080 12gb", 70),
         ("rtx 3080", 68),
+        ("rtx 3070 ti", 48),
         ("rtx 3070", 46),
+        ("rtx 3060 ti", 38),
         ("rtx 3060", 28),
+        ("rtx 3050 6gb", 18),
+        ("rtx 3050 ti", 20),
+        ("rtx 3050", 20),
+
+        // RTX 20 series / Turing refresh
+        ("titan rtx", 72),
+        ("rtx 2080 ti", 68),
+        ("rtx 2080 super", 48),
         ("rtx 2080", 46),
+        ("rtx 2070 super", 40),
         ("rtx 2070", 36),
+        ("rtx 2060 super", 34),
         ("rtx 2060", 30),
+        ("rtx 2050", 16),
+
+        // Pre-RTX fallback entries kept for older benchmark machines
         ("gtx 1660", 22),
         ("gtx 1650", 14),
     ];
@@ -353,20 +627,35 @@ fn parse_nvidia_sm(name: &str) -> Option<u32> {
 }
 
 fn parse_amd_cu(name: &str) -> Option<u32> {
-    // Common RDNA/RDNA2/RDNA3 CU counts (approximate but directionally correct for weighting).
+    // Radeon RX desktop-focused CU coverage from RX 6000 onward.
+    //
+    // We keep this table explicit because many drivers/backends expose only the marketing name,
+    // and CU count is the primary weighting factor in GMS scheduling.
     const TABLE: &[(&str, u32)] = &[
+        // RX 7000 series (RDNA3)
         ("rx 7900 xtx", 96),
         ("rx 7900 xt", 84),
         ("rx 7900 gre", 80),
+        ("rx 7900m", 72),
         ("rx 7800 xt", 60),
         ("rx 7700 xt", 54),
+        ("rx 7600 xt", 32),
         ("rx 7600", 32),
+
+        // RX 6000 series (RDNA2 + refresh)
+        ("rx 6950 xt", 80),
         ("rx 6900 xt", 80),
         ("rx 6800 xt", 72),
         ("rx 6800", 60),
+        ("rx 6750 xt", 40),
         ("rx 6700 xt", 40),
+        ("rx 6700", 36),
+        ("rx 6650 xt", 32),
         ("rx 6600 xt", 32),
         ("rx 6600", 28),
+        ("rx 6500 xt", 16),
+        ("rx 6400", 12),
+        ("rx 6300", 8),
     ];
     lookup_table_contains(name, TABLE)
 }
@@ -427,6 +716,34 @@ fn lookup_table_contains(name: &str, table: &[(&str, u32)]) -> Option<u32> {
         .iter()
         .find(|(pattern, _)| name.contains(*pattern))
         .map(|(_, value)| *value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_amd_cu, parse_nvidia_sm};
+
+    #[test]
+    fn parses_nvidia_rtx_5060_ti_sm() {
+        assert_eq!(parse_nvidia_sm("nvidia geforce rtx 5060 ti"), Some(36));
+    }
+
+    #[test]
+    fn parses_nvidia_specific_variants_before_base_model() {
+        assert_eq!(
+            parse_nvidia_sm("nvidia geforce rtx 4070 ti super"),
+            Some(66)
+        );
+        assert_eq!(parse_nvidia_sm("nvidia geforce rtx 4080 super"), Some(80));
+        assert_eq!(parse_nvidia_sm("nvidia geforce rtx 3080 12gb"), Some(70));
+    }
+
+    #[test]
+    fn parses_amd_rx_6000_and_7000_cu_counts() {
+        assert_eq!(parse_amd_cu("amd radeon rx 6950 xt"), Some(80));
+        assert_eq!(parse_amd_cu("amd radeon rx 6700"), Some(36));
+        assert_eq!(parse_amd_cu("amd radeon rx 6400"), Some(12));
+        assert_eq!(parse_amd_cu("amd radeon rx 7900 gre"), Some(80));
+    }
 }
 
 fn estimate_vram_mb(

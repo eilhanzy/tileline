@@ -94,4 +94,49 @@ impl GmsRuntimeTuningProfile {
             benchmark_title_update_interval_ms: 500,
         }
     }
+
+    /// Compute the effective throughput work-unit burst for a given present index.
+    ///
+    /// This centralizes the startup ramp patch so renderers can reuse the same behavior:
+    /// - low initial burst to avoid UMA startup spikes/stutters
+    /// - smooth ramp to full burst over a small number of presents
+    pub fn effective_throughput_work_units_per_present(
+        &self,
+        target_work_units_per_present: u32,
+        presented_frames: u64,
+    ) -> u32 {
+        if target_work_units_per_present <= 1 {
+            return target_work_units_per_present;
+        }
+
+        let ramp_frames = self.throughput_startup_ramp_frames;
+        if ramp_frames == 0 {
+            return target_work_units_per_present;
+        }
+
+        let progress =
+            ((presented_frames.saturating_add(1)) as f64 / ramp_frames as f64).clamp(0.0, 1.0);
+        // Smoothstep is intentionally used instead of a linear ramp because it reduces visible
+        // startup spikes on UMA systems without delaying full throughput too long.
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        let scaled = 1.0 + (target_work_units_per_present.saturating_sub(1) as f64) * eased;
+        scaled.round().clamp(1.0, target_work_units_per_present as f64) as u32
+    }
+
+    /// Decide how many offscreen prewarm submits should run before the first visible frame.
+    ///
+    /// This returns a bounded count that respects both the configured prewarm budget and the
+    /// available offscreen ring length.
+    pub fn startup_prewarm_submits_for_ring(
+        &self,
+        target_work_units_per_present: u32,
+        offscreen_ring_len: usize,
+    ) -> u32 {
+        if target_work_units_per_present <= 1 || offscreen_ring_len == 0 {
+            return 0;
+        }
+
+        self.throughput_startup_prewarm_submits
+            .min(offscreen_ring_len as u32)
+    }
 }
