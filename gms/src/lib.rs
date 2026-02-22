@@ -4,6 +4,7 @@
 pub mod bridge;
 pub mod hardware;
 pub mod multi_gpu_runtime;
+pub mod tuning;
 
 pub use bridge::{
     DispatchPlan, GmsDispatcher, GpuWorkAssignment, MultiGpuDispatchPlan, MultiGpuDispatcher,
@@ -17,3 +18,4 @@ pub use hardware::{
 pub use multi_gpu_runtime::{
     MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary, MultiGpuInitPolicy,
 };
+pub use tuning::GmsRuntimeTuningProfile;
