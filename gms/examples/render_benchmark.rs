@@ -1,3 +1,4 @@
+use std::env;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -13,17 +14,200 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let options = CliOptions::parse_from_env()?;
     let event_loop = EventLoop::new()?;
-    let mut app = RenderBenchmarkApp::default();
+    let mut app = RenderBenchmarkApp::new(options);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy)]
+struct CliOptions {
+    mode_override: ModeOverride,
+    vsync_override: VsyncOverride,
+    warmup_duration: Duration,
+    sample_duration: Duration,
+    resolution: PhysicalSize<u32>,
+}
+
+impl Default for CliOptions {
+    fn default() -> Self {
+        Self {
+            mode_override: ModeOverride::Auto,
+            vsync_override: VsyncOverride::Auto,
+            warmup_duration: Duration::from_secs(2),
+            sample_duration: Duration::from_secs(10),
+            resolution: PhysicalSize::new(1280, 720),
+        }
+    }
+}
+
+impl CliOptions {
+    fn parse_from_env() -> Result<Self, Box<dyn Error>> {
+        let mut options = Self::default();
+        let mut args = env::args().skip(1);
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--help" | "-h" => {
+                    print_usage();
+                    std::process::exit(0);
+                }
+                "--mode" => {
+                    let value = next_arg(&mut args, "--mode")?;
+                    options.mode_override = ModeOverride::parse(&value)?;
+                }
+                "--vsync" => {
+                    let value = next_arg(&mut args, "--vsync")?;
+                    options.vsync_override = VsyncOverride::parse(&value)?;
+                }
+                "--duration" => {
+                    let value = next_arg(&mut args, "--duration")?;
+                    options.sample_duration = parse_seconds_arg(&value, "--duration")?;
+                }
+                "--warmup" => {
+                    let value = next_arg(&mut args, "--warmup")?;
+                    options.warmup_duration = parse_seconds_arg(&value, "--warmup")?;
+                }
+                "--resolution" => {
+                    let value = next_arg(&mut args, "--resolution")?;
+                    options.resolution = parse_resolution_arg(&value)?;
+                }
+                other => {
+                    return Err(Box::new(SimpleError(format!(
+                        "unknown argument: {other} (use --help)"
+                    ))));
+                }
+            }
+        }
+
+        if options.sample_duration.is_zero() {
+            return Err(Box::new(SimpleError(
+                "--duration must be greater than 0".to_owned(),
+            )));
+        }
+
+        Ok(options)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeOverride {
+    Auto,
+    Stable,
+    Max,
+}
+
+impl ModeOverride {
+    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "stable" => Ok(Self::Stable),
+            "max" | "throughput" => Ok(Self::Max),
+            _ => Err(Box::new(SimpleError(format!(
+                "invalid --mode value: {value} (expected auto|stable|max)"
+            )))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsyncOverride {
+    Auto,
+    On,
+    Off,
+}
+
+impl VsyncOverride {
+    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "on" | "true" | "1" => Ok(Self::On),
+            "off" | "false" | "0" => Ok(Self::Off),
+            _ => Err(Box::new(SimpleError(format!(
+                "invalid --vsync value: {value} (expected auto|on|off)"
+            )))),
+        }
+    }
+}
+
+fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Box<dyn Error>> {
+    args.next()
+        .ok_or_else(|| Box::new(SimpleError(format!("missing value for {flag}"))) as Box<dyn Error>)
+}
+
+fn parse_seconds_arg(value: &str, flag: &str) -> Result<Duration, Box<dyn Error>> {
+    let seconds = value.parse::<f64>().map_err(|_| {
+        Box::new(SimpleError(format!(
+            "invalid {flag} value: {value} (expected seconds, e.g. 10 or 2.5)"
+        ))) as Box<dyn Error>
+    })?;
+
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(Box::new(SimpleError(format!(
+            "invalid {flag} value: {value} (must be >= 0)"
+        ))));
+    }
+
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_resolution_arg(value: &str) -> Result<PhysicalSize<u32>, Box<dyn Error>> {
+    let normalized = value.to_ascii_lowercase();
+    let (w, h) = normalized.split_once('x').ok_or_else(|| {
+        Box::new(SimpleError(format!(
+            "invalid --resolution value: {value} (expected WxH, e.g. 1280x720)"
+        ))) as Box<dyn Error>
+    })?;
+
+    let width = w.parse::<u32>().map_err(|_| {
+        Box::new(SimpleError(format!(
+            "invalid --resolution width: {w} (from {value})"
+        ))) as Box<dyn Error>
+    })?;
+    let height = h.parse::<u32>().map_err(|_| {
+        Box::new(SimpleError(format!(
+            "invalid --resolution height: {h} (from {value})"
+        ))) as Box<dyn Error>
+    })?;
+
+    if width == 0 || height == 0 {
+        return Err(Box::new(SimpleError(
+            "--resolution dimensions must be non-zero".to_owned(),
+        )));
+    }
+
+    Ok(PhysicalSize::new(width, height))
+}
+
+fn print_usage() {
+    println!("GMS Render Benchmark");
+    println!("Usage: cargo run -p gms --example render_benchmark -- [options]");
+    println!("Options:");
+    println!("  --mode auto|stable|max      Frame pacing mode (default: auto)");
+    println!("  --vsync auto|on|off         Present mode preference (default: auto)");
+    println!("  --warmup <sec>              Warmup duration before sampling (default: 2)");
+    println!("  --duration <sec>            Sampling duration before auto-exit (default: 10)");
+    println!("  --resolution <WxH>          Window resolution (default: 1280x720)");
+    println!("  -h, --help                  Show this help");
+}
+
 struct RenderBenchmarkApp {
+    options: CliOptions,
     runtime: Option<BenchmarkRuntime>,
     exit_requested: bool,
     summary_printed: bool,
+}
+
+impl RenderBenchmarkApp {
+    fn new(options: CliOptions) -> Self {
+        Self {
+            options,
+            runtime: None,
+            exit_requested: false,
+            summary_printed: false,
+        }
+    }
 }
 
 impl ApplicationHandler for RenderBenchmarkApp {
@@ -32,10 +216,11 @@ impl ApplicationHandler for RenderBenchmarkApp {
             return;
         }
 
-        match BenchmarkRuntime::new(event_loop) {
+        match BenchmarkRuntime::new(event_loop, self.options) {
             Ok(runtime) => {
+                let control_flow = runtime.preferred_control_flow();
                 self.runtime = Some(runtime);
-                event_loop.set_control_flow(ControlFlow::Poll);
+                event_loop.set_control_flow(control_flow);
             }
             Err(err) => {
                 eprintln!("Failed to start GMS render benchmark: {err}");
@@ -98,16 +283,35 @@ impl ApplicationHandler for RenderBenchmarkApp {
                         }
                     }
                 }
+
+                if runtime.use_redraw_chaining() {
+                    runtime.window.request_redraw();
+                }
             }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::Poll);
+        if let Some(runtime) = self.runtime.as_ref() {
+            event_loop.set_control_flow(runtime.preferred_control_flow());
+
+            if runtime.use_redraw_chaining() {
+                if runtime.stats.frames == 0 {
+                    runtime.window.request_redraw();
+                }
+            } else {
+                runtime.window.request_redraw();
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
 
         if let Some(runtime) = self.runtime.as_ref() {
-            runtime.window.request_redraw();
+            if runtime.should_auto_exit() {
+                self.exit_requested = true;
+                event_loop.exit();
+            }
         }
 
         if self.exit_requested {
@@ -134,24 +338,37 @@ struct BenchmarkRuntime {
     stats: FrameStats,
     adapter_profile: Option<gms::GpuAdapterProfile>,
     gms_inventory: GpuInventory,
+    pacing_mode: BenchmarkPacingMode,
+    options: CliOptions,
+    session_start: Instant,
+    sample_started_at: Option<Instant>,
+    sample_finished: bool,
 }
 
 impl BenchmarkRuntime {
-    fn new(event_loop: &ActiveEventLoop) -> Result<Self, Box<dyn Error>> {
+    fn new(event_loop: &ActiveEventLoop, options: CliOptions) -> Result<Self, Box<dyn Error>> {
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
                     .with_title("GMS Render Benchmark | Initializing...")
-                    .with_inner_size(PhysicalSize::new(1280, 720)),
+                    .with_inner_size(options.resolution),
             )?,
         );
 
-        let renderer = Renderer::new(Arc::clone(&window))?;
+        let renderer = Renderer::new(Arc::clone(&window), options)?;
         let gms_inventory = GpuInventory::discover();
         let adapter_profile = match_inventory_profile(&gms_inventory, &renderer.adapter_info);
+        let pacing_mode =
+            choose_pacing_mode(adapter_profile.as_ref(), &renderer.adapter_info, options);
 
         let mut stats = FrameStats::new(renderer.size, renderer.present_mode);
         stats.last_title_update = Instant::now();
+        let session_start = Instant::now();
+        let sample_started_at = if options.warmup_duration.is_zero() {
+            Some(session_start)
+        } else {
+            None
+        };
 
         let mut runtime = Self {
             window,
@@ -159,6 +376,11 @@ impl BenchmarkRuntime {
             stats,
             adapter_profile,
             gms_inventory,
+            pacing_mode,
+            options,
+            session_start,
+            sample_started_at,
+            sample_finished: false,
         };
 
         runtime.update_title(0.0, 0.0);
@@ -175,12 +397,17 @@ impl BenchmarkRuntime {
     }
 
     fn render_frame(&mut self) -> Result<(), RenderOutcome> {
-        let frame_start = Instant::now();
-        self.renderer.render()?;
+        self.update_benchmark_phase_before_frame(Instant::now());
 
-        let timing = self.stats.record_frame(frame_start, Instant::now());
+        let frame_start = Instant::now();
+        let work_units = self.renderer.render(&self.window)?;
+
+        let frame_end = Instant::now();
+        let timing = self.stats.record_frame(frame_start, frame_end, work_units);
+        self.update_benchmark_phase_after_frame(frame_end);
+
         if timing.should_update_title {
-            self.update_title(timing.instant_fps, timing.avg_fps);
+            self.update_title(timing.display_fps, timing.avg_fps);
         }
 
         Ok(())
@@ -188,12 +415,23 @@ impl BenchmarkRuntime {
 
     fn update_title(&mut self, instant_fps: f64, avg_fps: f64) {
         let gms_score = self.adapter_profile.as_ref().map(|p| p.score).unwrap_or(0);
+        let phase = self.phase_label();
+        let burst = self.renderer.work_units_per_present();
+        let fps_label = if burst > 1 { "WFPS" } else { "FPS" };
+        let burst_suffix = if burst > 1 {
+            format!(" | Burst x{}", burst)
+        } else {
+            String::new()
+        };
         let title = format!(
-            "GMS Render Benchmark | FPS {:.1} | Avg {:.1} | Frames {} | GMS {} | Close/Esc to finish",
+            "GMS Render Benchmark [{}] | {} {:.1} | Avg {:.1} | Frames {} | GMS {}{} | Close/Esc to finish",
+            phase,
+            fps_label,
             instant_fps,
             avg_fps,
             self.stats.frames,
-            gms_score
+            gms_score,
+            burst_suffix
         );
         self.window.set_title(&title);
     }
@@ -229,6 +467,60 @@ impl BenchmarkRuntime {
             render_score: score.score,
             render_tier: score.tier,
             score_breakdown: score,
+            work_units_per_present: self.renderer.work_units_per_present(),
+            pacing_mode: self.pacing_mode,
+            warmup_duration: self.options.warmup_duration,
+            sample_duration: self.options.sample_duration,
+            mode_override: self.options.mode_override,
+            vsync_override: self.options.vsync_override,
+        }
+    }
+
+    fn preferred_control_flow(&self) -> ControlFlow {
+        match self.pacing_mode {
+            BenchmarkPacingMode::Stable => ControlFlow::Wait,
+            BenchmarkPacingMode::MaxThroughput => ControlFlow::Poll,
+        }
+    }
+
+    fn use_redraw_chaining(&self) -> bool {
+        matches!(self.pacing_mode, BenchmarkPacingMode::Stable)
+    }
+
+    fn should_auto_exit(&self) -> bool {
+        self.sample_finished
+    }
+
+    fn update_benchmark_phase_before_frame(&mut self, now: Instant) {
+        if self.sample_finished || self.sample_started_at.is_some() {
+            return;
+        }
+
+        if now.duration_since(self.session_start) >= self.options.warmup_duration {
+            self.sample_started_at = Some(now);
+            self.stats.reset_measurement(now);
+        }
+    }
+
+    fn update_benchmark_phase_after_frame(&mut self, now: Instant) {
+        if self.sample_finished {
+            return;
+        }
+
+        if let Some(sample_started_at) = self.sample_started_at {
+            if now.duration_since(sample_started_at) >= self.options.sample_duration {
+                self.sample_finished = true;
+            }
+        }
+    }
+
+    fn phase_label(&self) -> &'static str {
+        if self.sample_finished {
+            "Done"
+        } else if self.sample_started_at.is_some() {
+            "Sample"
+        } else {
+            "Warmup"
         }
     }
 }
@@ -243,10 +535,17 @@ struct Renderer {
     size: PhysicalSize<u32>,
     present_mode: PresentMode,
     clear_phase: f64,
+    throughput_burst: Option<ThroughputBurst>,
+    throughput_target: Option<wgpu::Texture>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThroughputBurst {
+    work_units_per_present: u32,
 }
 
 impl Renderer {
-    fn new(window: Arc<Window>) -> Result<Self, Box<dyn Error>> {
+    fn new(window: Arc<Window>, options: CliOptions) -> Result<Self, Box<dyn Error>> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(Arc::clone(&window))?;
@@ -277,7 +576,18 @@ impl Renderer {
         {
             config.format = srgb;
         }
-        config.present_mode = select_present_mode(&capabilities.present_modes);
+        let prefer_stable_present = match options.vsync_override {
+            VsyncOverride::On => true,
+            VsyncOverride::Off => false,
+            VsyncOverride::Auto => {
+                matches!(adapter_info.device_type, wgpu::DeviceType::IntegratedGpu)
+            }
+        };
+        config.present_mode = select_present_mode(
+            &capabilities.present_modes,
+            prefer_stable_present,
+            options.vsync_override,
+        );
         config.alpha_mode = capabilities
             .alpha_modes
             .iter()
@@ -286,6 +596,8 @@ impl Renderer {
             .unwrap_or(config.alpha_mode);
         config.desired_maximum_frame_latency = 2;
         surface.configure(&device, &config);
+
+        let throughput_burst = select_throughput_burst(&adapter_info, options, config.present_mode);
 
         Ok(Self {
             _instance: instance,
@@ -297,18 +609,22 @@ impl Renderer {
             size,
             present_mode: config.present_mode,
             clear_phase: 0.0,
+            throughput_burst,
+            throughput_target: None,
         })
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             self.size = size;
+            self.throughput_target = None;
             return;
         }
 
         self.size = size;
         self.config.width = size.width;
         self.config.height = size.height;
+        self.throughput_target = None;
         self.surface.configure(&self.device, &self.config);
     }
 
@@ -319,9 +635,9 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn render(&mut self) -> Result<(), RenderOutcome> {
+    fn render(&mut self, window: &Window) -> Result<u32, RenderOutcome> {
         if self.size.width == 0 || self.size.height == 0 {
-            return Ok(());
+            return Ok(1);
         }
 
         let frame = self
@@ -341,28 +657,74 @@ impl Renderer {
                 label: Some("gms-render-benchmark-encoder"),
             });
 
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("gms-render-benchmark-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+        let work_units_per_present = self.work_units_per_present();
+        if work_units_per_present > 1 {
+            // Windowed presentation may still be throttled by the compositor (often ~60/120 Hz),
+            // even when a non-vsync present mode is selected. Run extra offscreen work in the
+            // same present interval so the benchmark tracks GPU throughput instead of display Hz.
+            self.ensure_throughput_target();
+            if let Some(target) = self.throughput_target.as_ref() {
+                let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+                for _ in 0..(work_units_per_present - 1) {
+                    self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
+                    encode_clear_pass(
+                        &mut encoder,
+                        &target_view,
+                        animated_clear_color(self.clear_phase),
+                    );
+                }
+            }
         }
 
+        encode_clear_pass(&mut encoder, &view, clear_color);
+
         self.queue.submit(Some(encoder.finish()));
+        window.pre_present_notify();
         frame.present();
-        Ok(())
+        Ok(work_units_per_present)
+    }
+
+    fn work_units_per_present(&self) -> u32 {
+        self.throughput_burst
+            .map(|mode| mode.work_units_per_present)
+            .unwrap_or(1)
+    }
+
+    fn ensure_throughput_target(&mut self) {
+        if self.size.width == 0 || self.size.height == 0 {
+            self.throughput_target = None;
+            return;
+        }
+
+        let needs_recreate = self
+            .throughput_target
+            .as_ref()
+            .map(|texture| {
+                let extent = texture.size();
+                extent.width != self.size.width
+                    || extent.height != self.size.height
+                    || texture.format() != self.config.format
+            })
+            .unwrap_or(true);
+
+        if !needs_recreate {
+            return;
+        }
+
+        self.throughput_target = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gms-render-benchmark-throughput-target"),
+            size: wgpu::Extent3d {
+                width: self.size.width.max(1),
+                height: self.size.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        }));
     }
 }
 
@@ -373,19 +735,108 @@ fn animated_clear_color(phase: f64) -> Color {
     Color { r, g, b, a: 1.0 }
 }
 
-fn select_present_mode(modes: &[PresentMode]) -> PresentMode {
-    for preferred in [
+fn encode_clear_pass(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, color: Color) {
+    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("gms-render-benchmark-pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(color),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+}
+
+fn select_present_mode(
+    modes: &[PresentMode],
+    prefer_stable: bool,
+    vsync_override: VsyncOverride,
+) -> PresentMode {
+    if matches!(vsync_override, VsyncOverride::On) {
+        for preferred in [
+            PresentMode::AutoVsync,
+            PresentMode::Fifo,
+            PresentMode::Mailbox,
+        ] {
+            if modes.contains(&preferred) {
+                return preferred;
+            }
+        }
+    }
+
+    if matches!(vsync_override, VsyncOverride::Off) {
+        for preferred in [
+            PresentMode::AutoNoVsync,
+            PresentMode::Immediate,
+            PresentMode::Mailbox,
+        ] {
+            if modes.contains(&preferred) {
+                return preferred;
+            }
+        }
+    }
+
+    let stable_order = [
+        PresentMode::AutoVsync,
+        PresentMode::Fifo,
+        PresentMode::Mailbox,
+        PresentMode::AutoNoVsync,
+        PresentMode::Immediate,
+    ];
+    let throughput_order = [
         PresentMode::AutoNoVsync,
         PresentMode::Immediate,
         PresentMode::Mailbox,
         PresentMode::AutoVsync,
         PresentMode::Fifo,
-    ] {
+    ];
+
+    for preferred in if prefer_stable {
+        stable_order
+    } else {
+        throughput_order
+    } {
         if modes.contains(&preferred) {
             return preferred;
         }
     }
     PresentMode::Fifo
+}
+
+fn select_throughput_burst(
+    adapter_info: &wgpu::AdapterInfo,
+    options: CliOptions,
+    _present_mode: PresentMode,
+) -> Option<ThroughputBurst> {
+    let mode_allows_burst = match options.mode_override {
+        ModeOverride::Stable => false,
+        ModeOverride::Max => true,
+        ModeOverride::Auto => !matches!(
+            adapter_info.device_type,
+            wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu
+        ),
+    };
+
+    if !mode_allows_burst || matches!(options.vsync_override, VsyncOverride::On) {
+        return None;
+    }
+
+    let work_units_per_present = match adapter_info.device_type {
+        wgpu::DeviceType::DiscreteGpu => 64,
+        wgpu::DeviceType::VirtualGpu => 16,
+        _ => 8,
+    };
+
+    Some(ThroughputBurst {
+        work_units_per_present,
+    })
 }
 
 fn match_inventory_profile(
@@ -448,7 +899,7 @@ struct FrameStats {
 }
 
 struct FrameTiming {
-    instant_fps: f64,
+    display_fps: f64,
     avg_fps: f64,
     should_update_title: bool,
 }
@@ -472,17 +923,34 @@ impl FrameStats {
         self.resolution = resolution;
     }
 
-    fn record_frame(&mut self, frame_start: Instant, frame_end: Instant) -> FrameTiming {
-        self.frames = self.frames.saturating_add(1);
+    fn reset_measurement(&mut self, now: Instant) {
+        self.benchmark_start = now;
+        self.last_frame_presented_at = None;
+        self.last_title_update = now;
+        self.frames = 0;
+        self.render_durations_ms.clear();
+        self.frame_intervals_ms.clear();
+        self.peak_fps = 0.0;
+    }
+
+    fn record_frame(
+        &mut self,
+        frame_start: Instant,
+        frame_end: Instant,
+        work_units: u32,
+    ) -> FrameTiming {
+        let work_units = work_units.max(1) as u64;
+        self.frames = self.frames.saturating_add(work_units);
         let render_ms = (frame_end - frame_start).as_secs_f64() * 1000.0;
-        self.render_durations_ms.push(render_ms);
+        self.render_durations_ms.push(render_ms / work_units as f64);
 
         let mut instant_fps = 0.0;
         if let Some(last) = self.last_frame_presented_at {
             let interval_ms = (frame_end - last).as_secs_f64() * 1000.0;
             if interval_ms.is_finite() && interval_ms > 0.0 {
-                self.frame_intervals_ms.push(interval_ms);
-                instant_fps = 1000.0 / interval_ms;
+                let normalized_interval_ms = interval_ms / work_units as f64;
+                self.frame_intervals_ms.push(normalized_interval_ms);
+                instant_fps = 1000.0 / normalized_interval_ms;
                 self.peak_fps = self.peak_fps.max(instant_fps);
             }
         }
@@ -490,6 +958,7 @@ impl FrameStats {
 
         let elapsed = (frame_end - self.benchmark_start).as_secs_f64().max(1e-9);
         let avg_fps = self.frames as f64 / elapsed;
+        let display_fps = self.smoothed_fps_recent(30).unwrap_or(instant_fps);
 
         let should_update_title =
             frame_end.duration_since(self.last_title_update) >= Duration::from_millis(250);
@@ -498,7 +967,7 @@ impl FrameStats {
         }
 
         FrameTiming {
-            instant_fps,
+            display_fps,
             avg_fps,
             should_update_title,
         }
@@ -529,6 +998,23 @@ impl FrameStats {
             low_1_percent_fps,
             frame_time_stddev_ms,
             resolution: self.resolution,
+        }
+    }
+
+    fn smoothed_fps_recent(&self, sample_count: usize) -> Option<f64> {
+        if sample_count == 0 || self.frame_intervals_ms.is_empty() {
+            return None;
+        }
+
+        let len = self.frame_intervals_ms.len();
+        let start = len.saturating_sub(sample_count);
+        let slice = &self.frame_intervals_ms[start..];
+        let avg_interval_ms = slice.iter().sum::<f64>() / slice.len() as f64;
+
+        if avg_interval_ms > 0.0 {
+            Some(1000.0 / avg_interval_ms)
+        } else {
+            None
         }
     }
 }
@@ -621,6 +1107,12 @@ struct BenchmarkSummary {
     render_score: u64,
     render_tier: &'static str,
     score_breakdown: RenderScore,
+    work_units_per_present: u32,
+    pacing_mode: BenchmarkPacingMode,
+    warmup_duration: Duration,
+    sample_duration: Duration,
+    mode_override: ModeOverride,
+    vsync_override: VsyncOverride,
 }
 
 fn print_summary(summary: &BenchmarkSummary) {
@@ -634,8 +1126,23 @@ fn print_summary(summary: &BenchmarkSummary) {
         "Resolution: {}x{} | Present mode: {:?}",
         summary.resolution.width, summary.resolution.height, summary.present_mode
     );
+    if summary.work_units_per_present > 1 {
+        println!(
+            "Throughput burst: x{} work units / present (WFPS may exceed display refresh)",
+            summary.work_units_per_present
+        );
+    }
     println!(
-        "Frames: {} | Elapsed: {:.3}s | Avg FPS: {:.2} | Peak FPS: {:.2}",
+        "Pacing mode: {:?} | CLI mode: {:?} | CLI vsync: {:?}",
+        summary.pacing_mode, summary.mode_override, summary.vsync_override
+    );
+    println!(
+        "Warmup: {:.2}s | Sample: {:.2}s",
+        summary.warmup_duration.as_secs_f64(),
+        summary.sample_duration.as_secs_f64()
+    );
+    println!(
+        "Frames (work units): {} | Elapsed: {:.3}s | Avg FPS/WFPS: {:.2} | Peak FPS/WFPS: {:.2}",
         summary.total_frames,
         summary.elapsed.as_secs_f64(),
         summary.avg_fps,
@@ -701,6 +1208,36 @@ fn percentile_ms(values: &[f64], percentile: f64) -> Option<f64> {
     let p = percentile.clamp(0.0, 100.0) / 100.0;
     let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
     sorted.get(idx).copied()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BenchmarkPacingMode {
+    Stable,
+    MaxThroughput,
+}
+
+fn choose_pacing_mode(
+    profile: Option<&gms::GpuAdapterProfile>,
+    adapter_info: &wgpu::AdapterInfo,
+    options: CliOptions,
+) -> BenchmarkPacingMode {
+    match options.mode_override {
+        ModeOverride::Stable => return BenchmarkPacingMode::Stable,
+        ModeOverride::Max => return BenchmarkPacingMode::MaxThroughput,
+        ModeOverride::Auto => {}
+    }
+
+    if let Some(profile) = profile {
+        if matches!(profile.memory_topology, gms::MemoryTopology::Unified) {
+            return BenchmarkPacingMode::Stable;
+        }
+    }
+
+    if matches!(adapter_info.device_type, wgpu::DeviceType::IntegratedGpu) {
+        BenchmarkPacingMode::Stable
+    } else {
+        BenchmarkPacingMode::MaxThroughput
+    }
 }
 
 #[derive(Debug, Clone)]
