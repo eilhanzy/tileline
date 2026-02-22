@@ -654,12 +654,15 @@ struct Renderer {
     present_mode: PresentMode,
     clear_phase: f64,
     throughput_burst: Option<ThroughputBurst>,
-    throughput_target: Option<wgpu::Texture>,
+    throughput_targets: Vec<wgpu::Texture>,
+    throughput_target_cursor: usize,
+    prefer_unified_tuning: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ThroughputBurst {
     work_units_per_present: u32,
+    offscreen_target_ring_len: usize,
 }
 
 impl Renderer {
@@ -675,6 +678,7 @@ impl Renderer {
         }))?;
 
         let adapter_info = adapter.get_info();
+        let prefer_unified_tuning = prefers_unified_memory_tuning(&adapter_info);
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("gms-render-benchmark-device"),
@@ -712,7 +716,9 @@ impl Renderer {
             .copied()
             .find(|mode| *mode == CompositeAlphaMode::Opaque)
             .unwrap_or(config.alpha_mode);
-        config.desired_maximum_frame_latency = 2;
+        // Unified-memory systems benefit from a little more frame buffering to reduce
+        // transient compositor/present jitter showing up in the benchmark.
+        config.desired_maximum_frame_latency = if prefer_unified_tuning { 3 } else { 2 };
         surface.configure(&device, &config);
 
         let throughput_burst = select_throughput_burst(&adapter_info, options, config.present_mode);
@@ -728,21 +734,25 @@ impl Renderer {
             present_mode: config.present_mode,
             clear_phase: 0.0,
             throughput_burst,
-            throughput_target: None,
+            throughput_targets: Vec::new(),
+            throughput_target_cursor: 0,
+            prefer_unified_tuning,
         })
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             self.size = size;
-            self.throughput_target = None;
+            self.throughput_targets.clear();
+            self.throughput_target_cursor = 0;
             return;
         }
 
         self.size = size;
         self.config.width = size.width;
         self.config.height = size.height;
-        self.throughput_target = None;
+        self.throughput_targets.clear();
+        self.throughput_target_cursor = 0;
         self.surface.configure(&self.device, &self.config);
     }
 
@@ -780,8 +790,8 @@ impl Renderer {
             // Windowed presentation may still be throttled by the compositor (often ~60/120 Hz),
             // even when a non-vsync present mode is selected. Run extra offscreen work in the
             // same present interval so the benchmark tracks GPU throughput instead of display Hz.
-            self.ensure_throughput_target();
-            if let Some(target) = self.throughput_target.as_ref() {
+            self.ensure_throughput_target_ring();
+            if let Some(target) = self.current_throughput_target() {
                 let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
                 for _ in 0..(work_units_per_present - 1) {
                     self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
@@ -808,41 +818,65 @@ impl Renderer {
             .unwrap_or(1)
     }
 
-    fn ensure_throughput_target(&mut self) {
+    fn current_throughput_target(&mut self) -> Option<&wgpu::Texture> {
+        if self.throughput_targets.is_empty() {
+            return None;
+        }
+
+        let index = self.throughput_target_cursor % self.throughput_targets.len();
+        self.throughput_target_cursor =
+            (self.throughput_target_cursor + 1) % self.throughput_targets.len();
+        self.throughput_targets.get(index)
+    }
+
+    fn ensure_throughput_target_ring(&mut self) {
         if self.size.width == 0 || self.size.height == 0 {
-            self.throughput_target = None;
+            self.throughput_targets.clear();
+            self.throughput_target_cursor = 0;
             return;
         }
 
-        let needs_recreate = self
-            .throughput_target
-            .as_ref()
-            .map(|texture| {
+        let desired_ring_len = self
+            .throughput_burst
+            .map(|mode| mode.offscreen_target_ring_len.max(1))
+            .unwrap_or(1);
+
+        let needs_recreate = self.throughput_targets.len() != desired_ring_len
+            || self.throughput_targets.iter().any(|texture| {
                 let extent = texture.size();
                 extent.width != self.size.width
                     || extent.height != self.size.height
                     || texture.format() != self.config.format
-            })
-            .unwrap_or(true);
+            });
 
         if !needs_recreate {
             return;
         }
 
-        self.throughput_target = Some(self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("gms-render-benchmark-throughput-target"),
-            size: wgpu::Extent3d {
-                width: self.size.width.max(1),
-                height: self.size.height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        }));
+        self.throughput_targets.clear();
+        self.throughput_targets.reserve(desired_ring_len);
+        for slot in 0..desired_ring_len {
+            self.throughput_targets
+                .push(self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(match self.prefer_unified_tuning {
+                        true => "gms-render-benchmark-throughput-target-uma",
+                        false => "gms-render-benchmark-throughput-target",
+                    }),
+                    size: wgpu::Extent3d {
+                        width: self.size.width.max(1),
+                        height: self.size.height.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                }));
+            let _ = slot;
+        }
+        self.throughput_target_cursor = 0;
     }
 }
 
@@ -954,7 +988,25 @@ fn select_throughput_burst(
 
     Some(ThroughputBurst {
         work_units_per_present,
+        offscreen_target_ring_len: if prefers_unified_memory_tuning(adapter_info) {
+            4
+        } else {
+            2
+        },
     })
+}
+
+fn prefers_unified_memory_tuning(adapter_info: &wgpu::AdapterInfo) -> bool {
+    if matches!(adapter_info.device_type, wgpu::DeviceType::IntegratedGpu) {
+        return true;
+    }
+
+    let name = adapter_info.name.to_ascii_lowercase();
+    name.contains("apple")
+        || name.contains("m1")
+        || name.contains("m2")
+        || name.contains("m3")
+        || name.contains("m4")
 }
 
 fn match_inventory_profile(
@@ -1030,8 +1082,10 @@ impl FrameStats {
             last_frame_presented_at: None,
             last_title_update: now,
             frames: 0,
-            render_durations_ms: Vec::with_capacity(16_384),
-            frame_intervals_ms: Vec::with_capacity(16_384),
+            // Avoid vector growth during short benchmarks (especially high-WFPS throughput mode)
+            // because realloc spikes can poison p95/p99 stability metrics on unified-memory systems.
+            render_durations_ms: Vec::with_capacity(131_072),
+            frame_intervals_ms: Vec::with_capacity(131_072),
             peak_fps: 0.0,
             resolution,
         }
@@ -1079,7 +1133,7 @@ impl FrameStats {
         let display_fps = self.smoothed_fps_recent(30).unwrap_or(instant_fps);
 
         let should_update_title =
-            frame_end.duration_since(self.last_title_update) >= Duration::from_millis(250);
+            frame_end.duration_since(self.last_title_update) >= Duration::from_millis(500);
         if should_update_title {
             self.last_title_update = frame_end;
         }
