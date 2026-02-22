@@ -1,14 +1,23 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Tileline core orchestration crate.
+//!
+//! `tl-core` is the integration boundary between:
+//! - `mps` (CPU scheduling / WASM execution)
+//! - `gms` (GPU discovery, planning, and multi-GPU heuristics)
+//! - runtime/render-loop code that records real `wgpu` submissions and present synchronization
+//!
+//! The crate exposes:
+//! - [`core::bridge`] for MPS<->GMS frame planning
+//! - [`graphics::multigpu::sync`] for portable explicit multi-GPU synchronization and UMA hooks
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod core;
+pub mod graphics;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use core::bridge::{
+    BridgeFrameId, BridgeFramePlan, BridgeGpuTaskKind, BridgeMpsSubmission, BridgeSubmitReceipt,
+    BridgeTaskDescriptor, BridgeTaskRouting, MpsGmsBridge, MpsGmsBridgeConfig, MpsGmsBridgeMetrics,
+};
+pub use gms::{AdaptiveBufferDecision, AdaptiveFrameTelemetry};
+pub use graphics::multigpu::sync::{
+    ComposeBarrierState, GpuQueueLane, MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer,
+    MultiGpuSyncSnapshot, SharedPlacementPolicy, SyncBackendHint,
+};

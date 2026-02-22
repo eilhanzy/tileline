@@ -120,7 +120,9 @@ impl GmsRuntimeTuningProfile {
         // startup spikes on UMA systems without delaying full throughput too long.
         let eased = progress * progress * (3.0 - 2.0 * progress);
         let scaled = 1.0 + (target_work_units_per_present.saturating_sub(1) as f64) * eased;
-        scaled.round().clamp(1.0, target_work_units_per_present as f64) as u32
+        scaled
+            .round()
+            .clamp(1.0, target_work_units_per_present as f64) as u32
     }
 
     /// Decide how many offscreen prewarm submits should run before the first visible frame.

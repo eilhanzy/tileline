@@ -1,5 +1,12 @@
 //! Graphics Multi Scaler (GMS)
 //! GPU-side workload discovery, scoring, and proportional dispatch planning.
+//!
+//! This crate provides the GPU-side half of Tileline's scaling stack:
+//! - adapter inventory and heuristic/native hardware profiling
+//! - single- and multi-GPU workload planning
+//! - portable helper runtime for explicit secondary-GPU bring-up
+//! - UMA/Apple Silicon adaptive buffer regulation
+//! - runtime tuning profiles shared by benchmarks and engine runtime code
 
 pub mod adaptive_buffer;
 pub mod bridge;
@@ -23,6 +30,7 @@ pub use hardware::{
     MemoryTopology,
 };
 pub use multi_gpu_runtime::{
-    MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary, MultiGpuInitPolicy,
+    MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary, MultiGpuFrameSubmitResult,
+    MultiGpuInitPolicy,
 };
 pub use tuning::GmsRuntimeTuningProfile;

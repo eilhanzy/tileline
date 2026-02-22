@@ -1,14 +1,20 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Tileline runtime integration crate.
+//!
+//! This crate hosts engine-level orchestration code that wires `tl-core` bridge primitives into a
+//! render loop without pushing integration logic into benchmarks/examples.
+//!
+//! Modules:
+//! - `frame_loop`: bridge pumping and frame-plan queue management
+//! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod frame_loop;
+mod wgpu_render_loop;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use frame_loop::{
+    FrameLoopRuntime, FrameLoopRuntimeConfig, FrameLoopRuntimeMetrics, FrameSubmissionRecordResult,
+    RuntimeTickResult,
+};
+pub use wgpu_render_loop::{
+    FrameExecutionTelemetry, SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator,
+    WgpuRenderLoopMetrics,
+};

@@ -73,6 +73,15 @@ pub struct MultiGpuExecutorSummary {
     pub integrated_ring_segments: u32,
 }
 
+/// Result of one secondary helper-lane frame submission.
+#[derive(Debug, Clone)]
+pub struct MultiGpuFrameSubmitResult {
+    /// Number of synthetic secondary work units submitted this present interval.
+    pub work_units: u32,
+    /// Submission index returned by `wgpu::Queue::submit` for sync registration.
+    pub submission_index: Option<wgpu::SubmissionIndex>,
+}
+
 /// Portable explicit multi-GPU helper runtime.
 ///
 /// This executor opens a secondary adapter/device and submits synthetic GPU work to it using the
@@ -305,8 +314,16 @@ impl MultiGpuExecutor {
 
     /// Submit a synthetic secondary workload frame and return completed work units.
     pub fn submit_frame(&mut self) -> u32 {
+        self.submit_frame_recording_submission().work_units
+    }
+
+    /// Submit a synthetic secondary workload frame and return work units + submission index.
+    pub fn submit_frame_recording_submission(&mut self) -> MultiGpuFrameSubmitResult {
         if self.frame_width == 0 || self.frame_height == 0 {
-            return 0;
+            return MultiGpuFrameSubmitResult {
+                work_units: 0,
+                submission_index: None,
+            };
         }
 
         let frames_in_flight_limit = self.plan.sync.frames_in_flight.max(1) as usize;
@@ -350,7 +367,7 @@ impl MultiGpuExecutor {
         let submission = self.secondary_queue.submit(Some(encoder.finish()));
         self.sync_state
             .pending_secondary_submissions
-            .push_back(submission);
+            .push_back(submission.clone());
         let _ = self.secondary_device.poll(wgpu::PollType::Poll);
         self.sync_state.poll_count = self.sync_state.poll_count.saturating_add(1);
 
@@ -359,7 +376,10 @@ impl MultiGpuExecutor {
             .saturating_add(self.secondary_work_units_per_present as u64);
         self.total_secondary_submissions = self.total_secondary_submissions.saturating_add(1);
 
-        self.secondary_work_units_per_present
+        MultiGpuFrameSubmitResult {
+            work_units: self.secondary_work_units_per_present,
+            submission_index: Some(submission),
+        }
     }
 
     /// Secondary work units submitted per present interval.
@@ -418,6 +438,16 @@ impl MultiGpuExecutor {
             integrated_encoder_pool: self.plan.sync.integrated_encoder_pool,
             integrated_ring_segments: self.plan.sync.integrated_ring_segments,
         }
+    }
+
+    /// Access the secondary device handle for explicit sync reconciliation.
+    pub fn secondary_device(&self) -> &wgpu::Device {
+        &self.secondary_device
+    }
+
+    /// Access the secondary adapter profile used by the helper lane.
+    pub fn secondary_profile(&self) -> &GpuAdapterProfile {
+        &self.secondary_profile
     }
 }
 

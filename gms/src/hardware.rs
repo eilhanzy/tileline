@@ -137,6 +137,8 @@ pub struct GpuAdapterProfile {
     pub compute_unit_kind: ComputeUnitKind,
     pub estimated_compute_units: u32,
     pub compute_unit_source: ComputeUnitEstimateSource,
+    /// Optional note describing native-probe success/failure and fallback reason.
+    pub compute_unit_probe_note: Option<String>,
     pub estimated_vram_mb: u64,
     pub estimated_bandwidth_gbps: f64,
     pub supports_mappable_primary_buffers: bool,
@@ -164,7 +166,10 @@ impl GpuAdapterProfile {
 
     /// Compact `(label, count)` pair for benchmark UIs.
     pub fn compute_unit_summary(&self) -> (&'static str, u32) {
-        (self.compute_unit_kind.short_label(), self.estimated_compute_units)
+        (
+            self.compute_unit_kind.short_label(),
+            self.estimated_compute_units,
+        )
     }
 }
 
@@ -231,7 +236,7 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
     let device_type = info.device_type;
     let memory_topology = classify_memory_topology(device_type);
 
-    let (estimated_compute_units, compute_unit_source) =
+    let (estimated_compute_units, compute_unit_source, compute_unit_probe_note) =
         estimate_compute_units(&info, &limits, &name_lower, vendor_family);
     let compute_unit_kind = estimate_compute_unit_kind(vendor_family);
     let estimated_vram_mb = estimate_vram_mb(&info, &limits, &name_lower, memory_topology);
@@ -265,6 +270,7 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
         compute_unit_kind,
         estimated_compute_units,
         compute_unit_source,
+        compute_unit_probe_note,
         estimated_vram_mb,
         estimated_bandwidth_gbps,
         supports_mappable_primary_buffers,
@@ -343,13 +349,22 @@ fn estimate_compute_units(
     limits: &Limits,
     name_lower: &str,
     vendor: VendorFamily,
-) -> (u32, ComputeUnitEstimateSource) {
-    if let Some(native) = probe_native_compute_units(info, vendor, name_lower) {
-        return (native.max(1), ComputeUnitEstimateSource::NativeProbe);
+) -> (u32, ComputeUnitEstimateSource, Option<String>) {
+    let native_probe = probe_native_compute_units(info, vendor, name_lower);
+    if let Some(native) = native_probe.units {
+        return (
+            native.max(1),
+            ComputeUnitEstimateSource::NativeProbe,
+            native_probe.note,
+        );
     }
 
     if let Some(parsed) = parse_known_compute_units(name_lower, vendor) {
-        return (parsed.max(1), ComputeUnitEstimateSource::DeviceNameTable);
+        return (
+            parsed.max(1),
+            ComputeUnitEstimateSource::DeviceNameTable,
+            native_probe.note,
+        );
     }
 
     // Fallback heuristic from compute limits.
@@ -377,66 +392,143 @@ fn estimate_compute_units(
     (
         estimate.round().clamp(1.0, 256.0) as u32,
         ComputeUnitEstimateSource::DriverLimitsHeuristic,
+        native_probe
+            .note
+            .or_else(|| Some("device-name table had no match".to_owned())),
     )
+}
+
+#[derive(Debug, Clone, Default)]
+struct NativeProbeOutcome {
+    units: Option<u32>,
+    note: Option<String>,
+}
+
+impl NativeProbeOutcome {
+    fn found(units: u32, provider: &'static str) -> Self {
+        Self {
+            units: Some(units),
+            note: Some(format!("native probe via {provider}")),
+        }
+    }
+
+    fn failed(note: String) -> Self {
+        Self {
+            units: None,
+            note: Some(note),
+        }
+    }
+
+    fn none() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NativeProbeCache {
+    tool: &'static str,
+    entries: Vec<(String, u32)>,
+    load_error: Option<String>,
+}
+
+impl NativeProbeCache {
+    fn ok(tool: &'static str, entries: Vec<(String, u32)>) -> Self {
+        Self {
+            tool,
+            entries,
+            load_error: None,
+        }
+    }
+
+    fn error(tool: &'static str, load_error: String) -> Self {
+        Self {
+            tool,
+            entries: Vec::new(),
+            load_error: Some(load_error),
+        }
+    }
 }
 
 fn probe_native_compute_units(
     info: &AdapterInfo,
     vendor: VendorFamily,
     name_lower: &str,
-) -> Option<u32> {
+) -> NativeProbeOutcome {
     match vendor {
         VendorFamily::Nvidia => probe_nvidia_smi_compute_units(name_lower),
         VendorFamily::Amd => probe_rocminfo_compute_units(name_lower),
         VendorFamily::Apple => probe_macos_gpu_core_count(info, name_lower),
-        VendorFamily::Intel | VendorFamily::Other => None,
+        VendorFamily::Intel | VendorFamily::Other => NativeProbeOutcome::none(),
     }
 }
 
-fn probe_nvidia_smi_compute_units(name_lower: &str) -> Option<u32> {
-    static CACHE: OnceLock<Vec<(String, u32)>> = OnceLock::new();
+fn probe_nvidia_smi_compute_units(name_lower: &str) -> NativeProbeOutcome {
+    static CACHE: OnceLock<NativeProbeCache> = OnceLock::new();
     let entries = CACHE.get_or_init(load_nvidia_smi_sm_cache);
-    match_probe_entries_by_name(entries, name_lower)
+    match_command_probe(entries, name_lower)
 }
 
-fn load_nvidia_smi_sm_cache() -> Vec<(String, u32)> {
-    let output = Command::new("nvidia-smi")
+fn load_nvidia_smi_sm_cache() -> NativeProbeCache {
+    let output = match Command::new("nvidia-smi")
         .args([
             "--query-gpu=name,multiprocessor_count",
             "--format=csv,noheader,nounits",
         ])
-        .output();
-
-    let Ok(output) = output else {
-        return Vec::new();
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => return NativeProbeCache::error("nvidia-smi", err.to_string()),
     };
     if !output.status.success() {
-        return Vec::new();
+        return NativeProbeCache::error(
+            "nvidia-smi",
+            format!(
+                "query failed (exit {:?}): {}",
+                output.status.code(),
+                compact_command_stderr(&output.stderr)
+            ),
+        );
     }
 
-    String::from_utf8_lossy(&output.stdout)
+    let entries = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let (name, value) = line.split_once(',')?;
             let units = value.trim().parse::<u32>().ok()?;
             Some((normalize_gpu_name(name), units))
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    if entries.is_empty() {
+        NativeProbeCache::error(
+            "nvidia-smi",
+            "query returned no parseable `multiprocessor_count` rows".to_owned(),
+        )
+    } else {
+        NativeProbeCache::ok("nvidia-smi", entries)
+    }
 }
 
-fn probe_rocminfo_compute_units(name_lower: &str) -> Option<u32> {
-    static CACHE: OnceLock<Vec<(String, u32)>> = OnceLock::new();
+fn probe_rocminfo_compute_units(name_lower: &str) -> NativeProbeOutcome {
+    static CACHE: OnceLock<NativeProbeCache> = OnceLock::new();
     let entries = CACHE.get_or_init(load_rocminfo_cu_cache);
-    match_probe_entries_by_name(entries, name_lower)
+    match_command_probe(entries, name_lower)
 }
 
-fn load_rocminfo_cu_cache() -> Vec<(String, u32)> {
-    let output = Command::new("rocminfo").output();
-    let Ok(output) = output else {
-        return Vec::new();
+fn load_rocminfo_cu_cache() -> NativeProbeCache {
+    let output = match Command::new("rocminfo").output() {
+        Ok(output) => output,
+        Err(err) => return NativeProbeCache::error("rocminfo", err.to_string()),
     };
     if !output.status.success() {
-        return Vec::new();
+        return NativeProbeCache::error(
+            "rocminfo",
+            format!(
+                "command failed (exit {:?}): {}",
+                output.status.code(),
+                compact_command_stderr(&output.stderr)
+            ),
+        );
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
@@ -470,32 +562,47 @@ fn load_rocminfo_cu_cache() -> Vec<(String, u32)> {
         entries.push((normalize_gpu_name(&name), cu));
     }
 
-    entries
+    if entries.is_empty() {
+        NativeProbeCache::error(
+            "rocminfo",
+            "no parseable GPU compute-unit entries".to_owned(),
+        )
+    } else {
+        NativeProbeCache::ok("rocminfo", entries)
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn probe_macos_gpu_core_count(info: &AdapterInfo, name_lower: &str) -> Option<u32> {
+fn probe_macos_gpu_core_count(info: &AdapterInfo, name_lower: &str) -> NativeProbeOutcome {
     let _ = info;
-    static CACHE: OnceLock<Vec<(String, u32)>> = OnceLock::new();
+    static CACHE: OnceLock<NativeProbeCache> = OnceLock::new();
     let entries = CACHE.get_or_init(load_system_profiler_gpu_cores_cache);
-    match_probe_entries_by_name(entries, name_lower)
+    match_command_probe(entries, name_lower)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn probe_macos_gpu_core_count(_info: &AdapterInfo, _name_lower: &str) -> Option<u32> {
-    None
+fn probe_macos_gpu_core_count(_info: &AdapterInfo, _name_lower: &str) -> NativeProbeOutcome {
+    NativeProbeOutcome::none()
 }
 
 #[cfg(target_os = "macos")]
-fn load_system_profiler_gpu_cores_cache() -> Vec<(String, u32)> {
-    let output = Command::new("system_profiler")
+fn load_system_profiler_gpu_cores_cache() -> NativeProbeCache {
+    let output = match Command::new("system_profiler")
         .args(["SPDisplaysDataType"])
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => return NativeProbeCache::error("system_profiler", err.to_string()),
     };
     if !output.status.success() {
-        return Vec::new();
+        return NativeProbeCache::error(
+            "system_profiler",
+            format!(
+                "command failed (exit {:?}): {}",
+                output.status.code(),
+                compact_command_stderr(&output.stderr)
+            ),
+        );
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
@@ -521,7 +628,43 @@ fn load_system_profiler_gpu_cores_cache() -> Vec<(String, u32)> {
         entries.push((normalize_gpu_name(&name), cores));
     }
 
-    entries
+    if entries.is_empty() {
+        NativeProbeCache::error(
+            "system_profiler",
+            "no parseable `Total Number of Cores` entries".to_owned(),
+        )
+    } else {
+        NativeProbeCache::ok("system_profiler", entries)
+    }
+}
+
+fn match_command_probe(cache: &NativeProbeCache, name_lower: &str) -> NativeProbeOutcome {
+    if let Some(units) = match_probe_entries_by_name(&cache.entries, name_lower) {
+        return NativeProbeOutcome::found(units, cache.tool);
+    }
+
+    if let Some(error) = cache.load_error.as_ref() {
+        return NativeProbeOutcome::failed(format!("{} unavailable: {}", cache.tool, error));
+    }
+
+    let normalized_target = normalize_gpu_name(name_lower);
+    NativeProbeOutcome::failed(format!(
+        "{} returned {} adapter entr{} but no name match for '{}'",
+        cache.tool,
+        cache.entries.len(),
+        if cache.entries.len() == 1 { "y" } else { "ies" },
+        normalized_target
+    ))
+}
+
+fn compact_command_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        "no stderr output".to_owned()
+    } else {
+        line.chars().take(220).collect()
+    }
 }
 
 fn match_probe_entries_by_name(entries: &[(String, u32)], name_lower: &str) -> Option<u32> {
@@ -580,7 +723,6 @@ fn parse_nvidia_sm(name: &str) -> Option<u32> {
     const TABLE: &[(&str, u32)] = &[
         // RTX 50 series (validated entries first; add more as device names are verified)
         ("rtx 5060 ti", 36),
-
         // RTX 40 series
         ("rtx 4090 d", 114),
         ("rtx 4090", 128),
@@ -593,7 +735,6 @@ fn parse_nvidia_sm(name: &str) -> Option<u32> {
         ("rtx 4060 ti", 34),
         ("rtx 4060", 24),
         ("rtx 4050", 20),
-
         // RTX 30 series
         ("rtx 3090 ti", 84),
         ("rtx 3090", 82),
@@ -607,7 +748,6 @@ fn parse_nvidia_sm(name: &str) -> Option<u32> {
         ("rtx 3050 6gb", 18),
         ("rtx 3050 ti", 20),
         ("rtx 3050", 20),
-
         // RTX 20 series / Turing refresh
         ("titan rtx", 72),
         ("rtx 2080 ti", 68),
@@ -618,7 +758,6 @@ fn parse_nvidia_sm(name: &str) -> Option<u32> {
         ("rtx 2060 super", 34),
         ("rtx 2060", 30),
         ("rtx 2050", 16),
-
         // Pre-RTX fallback entries kept for older benchmark machines
         ("gtx 1660", 22),
         ("gtx 1650", 14),
@@ -641,7 +780,6 @@ fn parse_amd_cu(name: &str) -> Option<u32> {
         ("rx 7700 xt", 54),
         ("rx 7600 xt", 32),
         ("rx 7600", 32),
-
         // RX 6000 series (RDNA2 + refresh)
         ("rx 6950 xt", 80),
         ("rx 6900 xt", 80),

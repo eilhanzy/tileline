@@ -1,0 +1,145 @@
+# Tileline Engine (Prototype Workspace)
+
+Tileline is a parallel-first game engine architecture prototype focused on explicit CPU/GPU scaling:
+
+- `MPS` (Multi Processing Scaler): CPU-side task scheduling and WASM execution
+- `GMS` (Graphics Multi Scaler): GPU discovery, scoring, and asymmetric multi-GPU planning
+- `tl-core`: engine bridge layer that synchronizes MPS and GMS
+- `runtime`: render-loop integration glue for `wgpu` submit/present flows
+
+This workspace is currently in engine-foundation phase. The main goals are:
+
+- lock-free task flow between CPU and GPU planning stages
+- explicit multi-GPU orchestration (primary throughput GPU + secondary latency/helper GPU)
+- Apple Silicon / UMA-aware stability controls
+- WASM-based scripting/runtime integration path (MPS-targeted)
+
+## Workspace Layout
+
+- `mps/`: CPU topology detection, priority balancer, lock-free scheduler, WASM dispatch (Wasmer)
+- `gms/`: GPU inventory/scoring, multi-GPU planner, adaptive UMA buffer control, benchmark tooling
+- `tl-core/`: `MpsGmsBridge` and portable multi-GPU sync abstractions
+- `runtime/`: frame-loop coordinators that bind real `wgpu` queue submits to the bridge
+
+## Current Architecture
+
+### 1. CPU Production (MPS)
+
+CPU-side preprocessing / simulation tasks are submitted to `mps::MpsScheduler` with:
+
+- priority (`Critical`, `High`, `Normal`, `Background`)
+- core preference (`Performance`, `Efficient`, `Auto`)
+- native Rust closures or WASM tasks
+
+The scheduler is topology-aware and designed to saturate logical cores in a `make -j$(nproc)` style.
+
+### 2. CPU -> GPU Bridge (`tl-core`)
+
+`tl_core::MpsGmsBridge` converts completed MPS tasks into frame-scoped GPU workload plans:
+
+- lock-free completion queue (`crossbeam::queue::SegQueue`)
+- frame sealing (`seal_frame`) to avoid partial planning
+- data-oriented mapping from bridge tasks to GMS workload classes
+- single-GPU and explicit multi-GPU plans produced per frame
+
+### 3. GPU Planning and Sync (GMS + `tl-core::graphics::multigpu::sync`)
+
+GMS provides:
+
+- adapter discovery and scoring
+- SM/CU/CoreCluster-aware distribution heuristics (with native-probe -> table -> heuristic fallback)
+- asymmetric multi-GPU planning (heavy lanes to primary, UI/Post-FX to secondary)
+- portable sync plan metadata (queue timelines + bounded waits)
+
+`tl-core` adds a portable runtime synchronizer:
+
+- `SubmissionIndex` as timeline markers
+- bounded `Device::poll(PollType::Wait { .. })` compose waits (default `0.8ms`)
+- Apple UMA integration via `gms::AdaptiveBuffer`
+
+### 4. Render Loop Integration (`runtime`)
+
+`runtime` contains canonical non-benchmark integration glue:
+
+- bridge pumping and frame-plan draining
+- queue submission recording (primary / secondary / transfer)
+- present reconcile calls before `SurfaceTexture::present`
+- optional Apple UMA telemetry feedback
+
+## Quick Start
+
+### Build / Check
+
+```bash
+cargo check
+```
+
+### Run GMS Render Benchmark
+
+```bash
+cargo run -p gms --example render_benchmark -- --mode max --vsync off --warmup 2 --duration 10 --resolution 1280x720
+```
+
+Stable mode (recommended for Apple Silicon UMA tests):
+
+```bash
+cargo run -p gms --example render_benchmark -- --mode stable --vsync on --warmup 2 --duration 10 --resolution 1920x1080
+```
+
+### Test Core Runtime Integration
+
+```bash
+cargo test -p tl-core
+cargo test -p runtime
+```
+
+## Canonical Runtime Flow (Non-Benchmark)
+
+The intended engine-side `wgpu` frame flow is:
+
+1. `runtime::WgpuRenderLoopCoordinator::tick_bridge()`
+2. `begin_next_frame_plan()`
+3. Submit primary GPU work and call `record_primary_submission(...)`
+4. Optionally submit secondary helper work with `submit_secondary_helper_for_frame(...)`
+5. Optionally submit transfer work and call `record_transfer_submission(...)`
+6. Call `reconcile_present(...)` before `frame.present()`
+7. Call `report_frame_telemetry(...)` (especially for Apple UMA paths)
+
+This keeps synchronization policy inside `src/` crates instead of benchmark/example code.
+
+## Platform Notes
+
+### NVIDIA / AMD / Apple GPU Unit Counts
+
+GMS uses a layered detection strategy for SM/CU/CoreCluster counts:
+
+1. Native probe (best effort):
+   - NVIDIA: `nvidia-smi`
+   - AMD: `rocminfo`
+   - Apple: `system_profiler`
+2. Device-name lookup table
+3. `wgpu`-limits-based heuristic fallback
+
+The benchmark and planner diagnostics show the active source (`native`, `table`, or `heuristic`).
+
+### Apple Silicon (Metal / UMA)
+
+UMA-specific tuning and adaptive buffer controls are implemented in `gms` and wired into
+`tl-core`/`runtime` for stability recovery and encoder-window management.
+
+## Next Planned Milestone
+
+`.tlscript` (Python-like syntax) frontend targeting WASM, executed through MPS.
+
+Planned pipeline:
+
+- lexer/parser (indentation-aware)
+- typed AST / semantic pass
+- WASM codegen
+- MPS submission + runtime host bindings (`wit-bindgen`)
+
+## License
+
+This repository is structured to be MIT-license ready (code comments and docs use FOSS-friendly
+terminology and style). Add/update the root `LICENSE` file as the project license source of truth.
+

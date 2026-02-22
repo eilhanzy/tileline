@@ -4,7 +4,9 @@
 //! can be consumed by the later render/compute runtime. The plan is weighted by the GPU
 //! scores discovered in `hardware.rs`.
 
-use crate::hardware::{GpuAdapterProfile, GpuInventory, MemoryTopology};
+use crate::hardware::{
+    ComputeUnitEstimateSource, ComputeUnitKind, GpuAdapterProfile, GpuInventory, MemoryTopology,
+};
 use wgpu::{BufferUsages, TextureUsages};
 
 /// Input workload description for a frame or simulation step.
@@ -57,6 +59,9 @@ pub struct GpuWorkAssignment {
     pub adapter_index: usize,
     pub adapter_name: String,
     pub score: u64,
+    pub compute_unit_kind: ComputeUnitKind,
+    pub compute_units: u32,
+    pub compute_unit_source: ComputeUnitEstimateSource,
     pub score_share_pct: f64,
     pub object_updates: u32,
     pub physics_jobs: u32,
@@ -134,6 +139,9 @@ pub struct MultiGpuLaneAssignment {
     pub adapter_name: String,
     pub role: MultiGpuRole,
     pub score: u64,
+    pub compute_unit_kind: ComputeUnitKind,
+    pub compute_units: u32,
+    pub compute_unit_source: ComputeUnitEstimateSource,
     pub score_share_pct: f64,
     pub sampled_processing_jobs: u32,
     pub object_updates: u32,
@@ -465,6 +473,9 @@ impl MultiGpuDispatcher {
                 adapter_name: gpu.name.clone(),
                 role,
                 score: gpu.score,
+                compute_unit_kind: gpu.compute_unit_kind,
+                compute_units: gpu.estimated_compute_units,
+                compute_unit_source: gpu.compute_unit_source,
                 score_share_pct,
                 sampled_processing_jobs,
                 object_updates,
@@ -651,7 +662,7 @@ fn heavy_weight_for(gpu: &GpuAdapterProfile, class: TaskClass) -> f64 {
         TaskClass::ObjectUpdate => 1.05,
         TaskClass::Ui | TaskClass::PostFx => 1.0,
     };
-    score.powf(exponent) * topology_factor
+    score.powf(exponent) * topology_factor * unit_parallelism_factor(gpu, class)
 }
 
 fn secondary_latency_budget_ms(target_frame_budget_ms: f64) -> f64 {
@@ -703,8 +714,13 @@ fn estimate_lane_ms(
         MemoryTopology::Unknown => 1.15,
     };
 
+    // Score already includes CU+bandwidth terms; this is a bounded correction so per-lane
+    // estimates reflect SM/CU/CoreCluster parallelism without overfitting the heuristic.
+    let unit_parallelism_boost = average_unit_parallelism_factor(gpu).clamp(0.75, 1.65);
     let per_score_scale = 6.0; // Tuned to keep planner estimates in a practical frame-time range.
-    ((weighted_job_units + byte_units) * per_score_scale / score) * 1000.0 * topology_penalty
+    ((weighted_job_units + byte_units) * per_score_scale / (score * unit_parallelism_boost))
+        * 1000.0
+        * topology_penalty
 }
 
 fn estimate_multi_gpu_assigned_bytes(
@@ -883,23 +899,14 @@ impl GmsDispatcher {
 
         let object_weights = usable
             .iter()
-            .map(|gpu| gpu.score as f64)
+            .map(|gpu| heavy_weight_for(gpu, TaskClass::ObjectUpdate))
             .collect::<Vec<_>>();
 
         // Physics is typically the heavier lane. We bias distribution to stronger adapters so
         // the fastest discrete GPU absorbs a larger share of expensive work.
         let physics_weights = usable
             .iter()
-            .map(|gpu| {
-                let topology_bias = match gpu.memory_topology {
-                    MemoryTopology::DiscreteVram => 1.10,
-                    MemoryTopology::Unified => 0.95,
-                    MemoryTopology::Virtualized => 0.70,
-                    MemoryTopology::System => 0.30,
-                    MemoryTopology::Unknown => 0.85,
-                };
-                (gpu.score.max(1) as f64).powf(1.15) * topology_bias
-            })
+            .map(|gpu| heavy_weight_for(gpu, TaskClass::Physics))
             .collect::<Vec<_>>();
 
         let object_distribution = allocate_weighted_counts(request.object_updates, &object_weights);
@@ -926,6 +933,9 @@ impl GmsDispatcher {
                     adapter_index: gpu.index,
                     adapter_name: gpu.name.clone(),
                     score: gpu.score,
+                    compute_unit_kind: gpu.compute_unit_kind,
+                    compute_units: gpu.estimated_compute_units,
+                    compute_unit_source: gpu.compute_unit_source,
                     score_share_pct,
                     object_updates,
                     physics_jobs,
@@ -985,10 +995,11 @@ fn select_workgroup_size(
 ) -> u32 {
     let base = clamp_pow2(base_workgroup_size.max(32), 32, 1024);
     let score_ratio = gpu.score_ratio_against(best_score.max(1)).clamp(0.1, 1.0);
-    let cu_factor = (gpu.estimated_compute_units.max(1) as f64 / 16.0)
+    let unit_factor = average_unit_parallelism_factor(gpu)
+        .mul_add(0.75, 0.25)
         .sqrt()
         .clamp(0.5, 2.5);
-    let scaled = (base as f64) * score_ratio.sqrt() * cu_factor;
+    let scaled = (base as f64) * score_ratio.sqrt() * unit_factor;
 
     let device_cap = gpu
         .limits
@@ -1071,6 +1082,60 @@ fn clamp_pow2(value: u32, min_value: u32, max_value: u32) -> u32 {
     } else {
         pow2.max(min_value)
     }
+}
+
+fn average_unit_parallelism_factor(gpu: &GpuAdapterProfile) -> f64 {
+    (unit_parallelism_factor(gpu, TaskClass::SampledProcessing)
+        + unit_parallelism_factor(gpu, TaskClass::ObjectUpdate)
+        + unit_parallelism_factor(gpu, TaskClass::Physics))
+        / 3.0
+}
+
+fn unit_parallelism_factor(gpu: &GpuAdapterProfile, class: TaskClass) -> f64 {
+    let units = gpu.estimated_compute_units.max(1) as f64;
+    let baseline_units = match gpu.compute_unit_kind {
+        ComputeUnitKind::Sm => 32.0,
+        ComputeUnitKind::Cu => 24.0,
+        ComputeUnitKind::CoreCluster => 10.0,
+        ComputeUnitKind::Unknown => 16.0,
+    };
+
+    let class_exponent = match class {
+        TaskClass::SampledProcessing => 0.60,
+        TaskClass::Physics => 0.55,
+        TaskClass::ObjectUpdate => 0.35,
+        TaskClass::Ui | TaskClass::PostFx => 0.20,
+    };
+
+    let kind_bias = match gpu.compute_unit_kind {
+        ComputeUnitKind::Sm => match class {
+            TaskClass::SampledProcessing => 1.08,
+            TaskClass::Physics => 1.03,
+            TaskClass::ObjectUpdate => 1.00,
+            TaskClass::Ui | TaskClass::PostFx => 0.98,
+        },
+        ComputeUnitKind::Cu => match class {
+            TaskClass::SampledProcessing => 1.02,
+            TaskClass::Physics => 1.08,
+            TaskClass::ObjectUpdate => 1.00,
+            TaskClass::Ui | TaskClass::PostFx => 0.98,
+        },
+        ComputeUnitKind::CoreCluster => match class {
+            TaskClass::SampledProcessing | TaskClass::Physics => 0.97,
+            TaskClass::ObjectUpdate | TaskClass::Ui | TaskClass::PostFx => 1.03,
+        },
+        ComputeUnitKind::Unknown => 1.0,
+    };
+
+    let source_confidence = match gpu.compute_unit_source {
+        ComputeUnitEstimateSource::NativeProbe => 1.00,
+        ComputeUnitEstimateSource::DeviceNameTable => 0.92,
+        ComputeUnitEstimateSource::DriverLimitsHeuristic => 0.55,
+    };
+
+    let raw = (units / baseline_units).powf(class_exponent) * kind_bias;
+    let blended = 1.0 + (raw - 1.0) * source_confidence;
+    blended.clamp(0.70, 2.40)
 }
 
 fn prev_power_of_two(value: u32) -> u32 {
