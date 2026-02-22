@@ -4,7 +4,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gms::GpuInventory;
+use gms::{
+    GpuInventory, MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary,
+    MultiGpuInitPolicy, MultiGpuWorkloadRequest,
+};
 use wgpu::{Color, CompositeAlphaMode, PresentMode, SurfaceError, TextureFormat};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -25,6 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 struct CliOptions {
     mode_override: ModeOverride,
     vsync_override: VsyncOverride,
+    multi_gpu_override: MultiGpuOverride,
     warmup_duration: Duration,
     sample_duration: Duration,
     resolution: PhysicalSize<u32>,
@@ -35,6 +39,7 @@ impl Default for CliOptions {
         Self {
             mode_override: ModeOverride::Auto,
             vsync_override: VsyncOverride::Auto,
+            multi_gpu_override: MultiGpuOverride::Off,
             warmup_duration: Duration::from_secs(2),
             sample_duration: Duration::from_secs(10),
             resolution: PhysicalSize::new(1280, 720),
@@ -60,6 +65,10 @@ impl CliOptions {
                 "--vsync" => {
                     let value = next_arg(&mut args, "--vsync")?;
                     options.vsync_override = VsyncOverride::parse(&value)?;
+                }
+                "--multi-gpu" => {
+                    let value = next_arg(&mut args, "--multi-gpu")?;
+                    options.multi_gpu_override = MultiGpuOverride::parse(&value)?;
                 }
                 "--duration" => {
                     let value = next_arg(&mut args, "--duration")?;
@@ -131,6 +140,26 @@ impl VsyncOverride {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiGpuOverride {
+    Auto,
+    On,
+    Off,
+}
+
+impl MultiGpuOverride {
+    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "on" | "true" | "1" => Ok(Self::On),
+            "off" | "false" | "0" => Ok(Self::Off),
+            _ => Err(Box::new(SimpleError(format!(
+                "invalid --multi-gpu value: {value} (expected auto|on|off)"
+            )))),
+        }
+    }
+}
+
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Box<dyn Error>> {
     args.next()
         .ok_or_else(|| Box::new(SimpleError(format!("missing value for {flag}"))) as Box<dyn Error>)
@@ -186,6 +215,7 @@ fn print_usage() {
     println!("Options:");
     println!("  --mode auto|stable|max      Frame pacing mode (default: auto)");
     println!("  --vsync auto|on|off         Present mode preference (default: auto)");
+    println!("  --multi-gpu auto|on|off     Enable explicit multi-GPU helper lane (default: off)");
     println!("  --warmup <sec>              Warmup duration before sampling (default: 2)");
     println!("  --duration <sec>            Sampling duration before auto-exit (default: 10)");
     println!("  --resolution <WxH>          Window resolution (default: 1280x720)");
@@ -335,6 +365,7 @@ impl ApplicationHandler for RenderBenchmarkApp {
 struct BenchmarkRuntime {
     window: Arc<Window>,
     renderer: Renderer,
+    multi_gpu: Option<MultiGpuExecutor>,
     stats: FrameStats,
     adapter_profile: Option<gms::GpuAdapterProfile>,
     gms_inventory: GpuInventory,
@@ -360,6 +391,32 @@ impl BenchmarkRuntime {
         let adapter_profile = match_inventory_profile(&gms_inventory, &renderer.adapter_info);
         let pacing_mode =
             choose_pacing_mode(adapter_profile.as_ref(), &renderer.adapter_info, options);
+        let multi_gpu = if matches!(options.multi_gpu_override, MultiGpuOverride::Off)
+            || (matches!(options.multi_gpu_override, MultiGpuOverride::Auto)
+                && matches!(options.mode_override, ModeOverride::Stable))
+        {
+            None
+        } else {
+            let workload_request = build_multi_gpu_workload_request(&renderer, options);
+            let policy = match options.multi_gpu_override {
+                MultiGpuOverride::Auto => MultiGpuInitPolicy::Auto,
+                MultiGpuOverride::On => MultiGpuInitPolicy::Force,
+                MultiGpuOverride::Off => unreachable!(),
+            };
+
+            MultiGpuExecutor::try_new(MultiGpuExecutorConfig {
+                policy,
+                primary_adapter_info: renderer.adapter_info.clone(),
+                inventory: gms_inventory.clone(),
+                primary_device: renderer.device.clone(),
+                frame_width: renderer.size.width,
+                frame_height: renderer.size.height,
+                secondary_offscreen_format: TextureFormat::Rgba8Unorm,
+                primary_work_units_per_present: renderer.work_units_per_present(),
+                workload_request,
+                auto_min_projected_gain_pct: 5.0,
+            })?
+        };
 
         let mut stats = FrameStats::new(renderer.size, renderer.present_mode);
         stats.last_title_update = Instant::now();
@@ -373,6 +430,7 @@ impl BenchmarkRuntime {
         let mut runtime = Self {
             window,
             renderer,
+            multi_gpu,
             stats,
             adapter_profile,
             gms_inventory,
@@ -389,6 +447,9 @@ impl BenchmarkRuntime {
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.renderer.resize(size);
+        if let Some(multi_gpu) = self.multi_gpu.as_mut() {
+            multi_gpu.resize(size.width, size.height);
+        }
         self.stats.set_resolution(self.renderer.size);
     }
 
@@ -400,7 +461,13 @@ impl BenchmarkRuntime {
         self.update_benchmark_phase_before_frame(Instant::now());
 
         let frame_start = Instant::now();
-        let work_units = self.renderer.render(&self.window)?;
+        let primary_work_units = self.renderer.render(&self.window)?;
+        let secondary_work_units = self
+            .multi_gpu
+            .as_mut()
+            .map(|multi_gpu| multi_gpu.submit_frame())
+            .unwrap_or(0);
+        let work_units = primary_work_units.saturating_add(secondary_work_units);
 
         let frame_end = Instant::now();
         let timing = self.stats.record_frame(frame_start, frame_end, work_units);
@@ -417,21 +484,33 @@ impl BenchmarkRuntime {
         let gms_score = self.adapter_profile.as_ref().map(|p| p.score).unwrap_or(0);
         let phase = self.phase_label();
         let burst = self.renderer.work_units_per_present();
-        let fps_label = if burst > 1 { "WFPS" } else { "FPS" };
+        let secondary_burst = self
+            .multi_gpu
+            .as_ref()
+            .map(|multi_gpu| multi_gpu.secondary_work_units_per_present())
+            .unwrap_or(0);
+        let total_burst = burst.saturating_add(secondary_burst);
+        let fps_label = if total_burst > 1 { "WFPS" } else { "FPS" };
         let burst_suffix = if burst > 1 {
             format!(" | Burst x{}", burst)
         } else {
             String::new()
         };
+        let multi_gpu_suffix = if secondary_burst > 0 {
+            format!(" | MGPU +{}", secondary_burst)
+        } else {
+            String::new()
+        };
         let title = format!(
-            "GMS Render Benchmark [{}] | {} {:.1} | Avg {:.1} | Frames {} | GMS {}{} | Close/Esc to finish",
+            "GMS Render Benchmark [{}] | {} {:.1} | Avg {:.1} | Frames {} | GMS {}{}{} | Close/Esc to finish",
             phase,
             fps_label,
             instant_fps,
             avg_fps,
             self.stats.frames,
             gms_score,
-            burst_suffix
+            burst_suffix,
+            multi_gpu_suffix
         );
         self.window.set_title(&title);
     }
@@ -446,6 +525,7 @@ impl BenchmarkRuntime {
             .unwrap_or_else(|| self.renderer.adapter_info.name.clone());
 
         let score = compute_render_benchmark_score(&computed, gms_score);
+        let multi_gpu_summary = self.multi_gpu.as_ref().map(|multi_gpu| multi_gpu.summary());
 
         BenchmarkSummary {
             adapter_name,
@@ -468,11 +548,13 @@ impl BenchmarkRuntime {
             render_tier: score.tier,
             score_breakdown: score,
             work_units_per_present: self.renderer.work_units_per_present(),
+            multi_gpu: multi_gpu_summary,
             pacing_mode: self.pacing_mode,
             warmup_duration: self.options.warmup_duration,
             sample_duration: self.options.sample_duration,
             mode_override: self.options.mode_override,
             vsync_override: self.options.vsync_override,
+            multi_gpu_override: self.options.multi_gpu_override,
         }
     }
 
@@ -522,6 +604,42 @@ impl BenchmarkRuntime {
         } else {
             "Warmup"
         }
+    }
+}
+
+fn build_multi_gpu_workload_request(
+    renderer: &Renderer,
+    options: CliOptions,
+) -> MultiGpuWorkloadRequest {
+    let pixels = (renderer.size.width.max(1) as u64) * (renderer.size.height.max(1) as u64);
+    let target_frame_budget_ms = match options.mode_override {
+        ModeOverride::Stable => 16.67,
+        ModeOverride::Max => 0.26,
+        ModeOverride::Auto => {
+            if renderer.work_units_per_present() > 1 {
+                0.50
+            } else {
+                8.33
+            }
+        }
+    };
+
+    MultiGpuWorkloadRequest {
+        sampled_processing_jobs: (pixels / 2048).clamp(128, 8192) as u32,
+        object_updates: (pixels / 1024).clamp(256, 16384) as u32,
+        physics_jobs: (pixels / 3072).clamp(64, 4096) as u32,
+        ui_jobs: (pixels / 8192).clamp(16, 1024) as u32,
+        post_fx_jobs: (pixels / 6144).clamp(32, 2048) as u32,
+        bytes_per_sampled_job: 4096,
+        bytes_per_object: 256,
+        bytes_per_physics_job: 1024,
+        bytes_per_ui_job: 512,
+        bytes_per_post_fx_job: 1024,
+        processed_texture_bytes_per_frame: pixels
+            .saturating_mul(4)
+            .clamp(512 * 1024, 64 * 1024 * 1024),
+        base_workgroup_size: 64,
+        target_frame_budget_ms,
     }
 }
 
@@ -1108,11 +1226,13 @@ struct BenchmarkSummary {
     render_tier: &'static str,
     score_breakdown: RenderScore,
     work_units_per_present: u32,
+    multi_gpu: Option<MultiGpuExecutorSummary>,
     pacing_mode: BenchmarkPacingMode,
     warmup_duration: Duration,
     sample_duration: Duration,
     mode_override: ModeOverride,
     vsync_override: VsyncOverride,
+    multi_gpu_override: MultiGpuOverride,
 }
 
 fn print_summary(summary: &BenchmarkSummary) {
@@ -1133,8 +1253,11 @@ fn print_summary(summary: &BenchmarkSummary) {
         );
     }
     println!(
-        "Pacing mode: {:?} | CLI mode: {:?} | CLI vsync: {:?}",
-        summary.pacing_mode, summary.mode_override, summary.vsync_override
+        "Pacing mode: {:?} | CLI mode: {:?} | CLI vsync: {:?} | CLI multi-gpu: {:?}",
+        summary.pacing_mode,
+        summary.mode_override,
+        summary.vsync_override,
+        summary.multi_gpu_override
     );
     println!(
         "Warmup: {:.2}s | Sample: {:.2}s",
@@ -1172,6 +1295,42 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.score_breakdown.tail_factor,
         summary.score_breakdown.gms_factor
     );
+    if let Some(multi_gpu) = summary.multi_gpu.as_ref() {
+        println!(
+            "Multi-GPU: {} -> {} ({:?}) | secondary WU/present: {} | total secondary WU: {}",
+            multi_gpu.primary_adapter_name,
+            multi_gpu.secondary_adapter_name,
+            multi_gpu.secondary_memory_topology,
+            multi_gpu.secondary_work_units_per_present,
+            multi_gpu.total_secondary_work_units
+        );
+        println!(
+            "Multi-GPU submissions: {}",
+            multi_gpu.total_secondary_submissions
+        );
+        println!(
+            "Multi-GPU planner: single {:.3}ms -> multi {:.3}ms | projected gain: {:.2}% | target>=20%: {}",
+            multi_gpu.estimated_single_gpu_frame_ms,
+            multi_gpu.estimated_multi_gpu_frame_ms,
+            multi_gpu.projected_score_gain_pct,
+            multi_gpu.meets_target_gain_20pct
+        );
+        println!(
+            "Bridge: {:?} | bytes/frame: {} | chunk: {} | sync frames_in_flight: {} | queue waits/polls: {}/{}",
+            multi_gpu.bridge_kind,
+            multi_gpu.bridge_bytes_per_frame,
+            multi_gpu.bridge_chunk_bytes,
+            multi_gpu.sync_frames_in_flight,
+            multi_gpu.sync_queue_waits,
+            multi_gpu.sync_queue_polls
+        );
+        if multi_gpu.aggressive_integrated_preallocation {
+            println!(
+                "iGPU stability preallocation: enabled | encoder pool: {} | ring segments: {}",
+                multi_gpu.integrated_encoder_pool, multi_gpu.integrated_ring_segments
+            );
+        }
+    }
 }
 
 fn average(values: &[f64]) -> Option<f64> {
