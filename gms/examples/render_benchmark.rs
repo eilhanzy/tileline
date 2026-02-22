@@ -418,7 +418,12 @@ impl BenchmarkRuntime {
             })?
         };
 
-        let mut stats = FrameStats::new(renderer.size, renderer.present_mode);
+        let mut stats = FrameStats::new(
+            renderer.size,
+            renderer.present_mode,
+            frame_stats_timing_capacity(&renderer.runtime_tuning),
+            title_update_interval(&renderer.runtime_tuning),
+        );
         stats.last_title_update = Instant::now();
         let session_start = Instant::now();
         let sample_started_at = if options.warmup_duration.is_zero() {
@@ -859,7 +864,7 @@ impl Renderer {
         for slot in 0..desired_ring_len {
             self.throughput_targets
                 .push(self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(match self.prefer_unified_tuning {
+                    label: Some(match self.runtime_tuning.prefer_unified_memory_tuning {
                         true => "gms-render-benchmark-throughput-target-uma",
                         false => "gms-render-benchmark-throughput-target",
                     }),
@@ -1002,160 +1007,7 @@ fn title_update_interval(tuning: &GmsRuntimeTuningProfile) -> Duration {
     Duration::from_millis(tuning.benchmark_title_update_interval_ms.max(100))
 }
 
-fn prefers_unified_memory_tuning(adapter_info: &wgpu::AdapterInfo) -> bool {
-    GmsRuntimeTuningProfile::from_adapter_info(adapter_info).prefer_unified_memory_tuning
-}
-                        true => "gms-render-benchmark-throughput-target-uma",
-                        false => "gms-render-benchmark-throughput-target",
-                    }),
-                    size: wgpu::Extent3d {
-                        width: self.size.width.max(1),
-                        height: self.size.height.max(1),
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: self.config.format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                }));
-            let _ = slot;
-        }
-        self.throughput_target_cursor = 0;
-    }
-}
-
-fn animated_clear_color(phase: f64) -> Color {
-    let r = 0.15 + 0.25 * (phase).sin().abs();
-    let g = 0.12 + 0.28 * (phase * 1.37).sin().abs();
-    let b = 0.18 + 0.30 * (phase * 0.73).cos().abs();
-    Color { r, g, b, a: 1.0 }
-}
-
-fn encode_clear_pass(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, color: Color) {
-    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("gms-render-benchmark-pass"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(color),
-                store: wgpu::StoreOp::Store,
-            },
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
-}
-
-fn select_present_mode(
-    modes: &[PresentMode],
-    prefer_stable: bool,
-    vsync_override: VsyncOverride,
-) -> PresentMode {
-    if matches!(vsync_override, VsyncOverride::On) {
-        for preferred in [
-            PresentMode::AutoVsync,
-            PresentMode::Fifo,
-            PresentMode::Mailbox,
-        ] {
-            if modes.contains(&preferred) {
-                return preferred;
-            }
-        }
-    }
-
-    if matches!(vsync_override, VsyncOverride::Off) {
-        for preferred in [
-            PresentMode::AutoNoVsync,
-            PresentMode::Immediate,
-            PresentMode::Mailbox,
-        ] {
-            if modes.contains(&preferred) {
-                return preferred;
-            }
-        }
-    }
-
-    let stable_order = [
-        PresentMode::AutoVsync,
-        PresentMode::Fifo,
-        PresentMode::Mailbox,
-        PresentMode::AutoNoVsync,
-        PresentMode::Immediate,
-    ];
-    let throughput_order = [
-        PresentMode::AutoNoVsync,
-        PresentMode::Immediate,
-        PresentMode::Mailbox,
-        PresentMode::AutoVsync,
-        PresentMode::Fifo,
-    ];
-
-    for preferred in if prefer_stable {
-        stable_order
-    } else {
-        throughput_order
-    } {
-        if modes.contains(&preferred) {
-            return preferred;
-        }
-    }
-    PresentMode::Fifo
-}
-
-fn select_throughput_burst(
-    adapter_info: &wgpu::AdapterInfo,
-    options: CliOptions,
-    _present_mode: PresentMode,
-) -> Option<ThroughputBurst> {
-    let mode_allows_burst = match options.mode_override {
-        ModeOverride::Stable => false,
-        ModeOverride::Max => true,
-        ModeOverride::Auto => !matches!(
-            adapter_info.device_type,
-            wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu
-        ),
-    };
-
-    if !mode_allows_burst || matches!(options.vsync_override, VsyncOverride::On) {
-        return None;
-    }
-
-    let work_units_per_present = match adapter_info.device_type {
-        wgpu::DeviceType::DiscreteGpu => 64,
-        wgpu::DeviceType::VirtualGpu => 16,
-        _ => 8,
-    };
-
-    Some(ThroughputBurst {
-        work_units_per_present,
-        offscreen_target_ring_len: if prefers_unified_memory_tuning(adapter_info) {
-            4
-        } else {
-            2
-        },
-    })
-}
-
-fn prefers_unified_memory_tuning(adapter_info: &wgpu::AdapterInfo) -> bool {
-    if matches!(adapter_info.device_type, wgpu::DeviceType::IntegratedGpu) {
-        return true;
-    }
-
-    let name = adapter_info.name.to_ascii_lowercase();
-    name.contains("apple")
-        || name.contains("m1")
-        || name.contains("m2")
-        || name.contains("m3")
-        || name.contains("m4")
-}
-
-fn match_inventory_profile(
+fn match_inventory_profile (
     inventory: &GpuInventory,
     adapter_info: &wgpu::AdapterInfo,
 ) -> Option<gms::GpuAdapterProfile> {
@@ -1207,6 +1059,7 @@ struct FrameStats {
     benchmark_start: Instant,
     last_frame_presented_at: Option<Instant>,
     last_title_update: Instant,
+    title_update_interval: Duration,
     frames: u64,
     render_durations_ms: Vec<f64>,
     frame_intervals_ms: Vec<f64>,
@@ -1221,17 +1074,23 @@ struct FrameTiming {
 }
 
 impl FrameStats {
-    fn new(resolution: PhysicalSize<u32>, _present_mode: PresentMode) -> Self {
+    fn new(
+        resolution: PhysicalSize<u32>,
+        _present_mode: PresentMode,
+        timing_capacity: usize,
+        title_update_interval: Duration,
+    ) -> Self {
         let now = Instant::now();
         Self {
             benchmark_start: now,
             last_frame_presented_at: None,
             last_title_update: now,
+            title_update_interval,
             frames: 0,
             // Avoid vector growth during short benchmarks (especially high-WFPS throughput mode)
             // because realloc spikes can poison p95/p99 stability metrics on unified-memory systems.
-            render_durations_ms: Vec::with_capacity(131_072),
-            frame_intervals_ms: Vec::with_capacity(131_072),
+            render_durations_ms: Vec::with_capacity(timing_capacity),
+            frame_intervals_ms: Vec::with_capacity(timing_capacity),
             peak_fps: 0.0,
             resolution,
         }
@@ -1279,7 +1138,7 @@ impl FrameStats {
         let display_fps = self.smoothed_fps_recent(30).unwrap_or(instant_fps);
 
         let should_update_title =
-            frame_end.duration_since(self.last_title_update) >= Duration::from_millis(500);
+            frame_end.duration_since(self.last_title_update) >= self.title_update_interval;
         if should_update_title {
             self.last_title_update = frame_end;
         }
