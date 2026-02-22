@@ -7,6 +7,8 @@
 use std::cmp::Ordering;
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 /// Execution profile of a logical CPU core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +60,8 @@ impl CpuTopology {
         let vendor = detect_vendor();
 
         let frequency_map = detect_linux_frequencies(logical_cores);
-        let classes = classify_cores(logical_cores, frequency_map.as_deref());
+        let classes = detect_macos_core_classes(logical_cores)
+            .unwrap_or_else(|| classify_cores(logical_cores, frequency_map.as_deref()));
 
         let mut cores = Vec::with_capacity(logical_cores);
         for core_id in 0..logical_cores {
@@ -135,9 +138,91 @@ fn detect_vendor() -> Option<String> {
         .map(|vendor_info| vendor_info.as_str().to_owned())
 }
 
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn detect_vendor() -> Option<String> {
+    Some("Apple".to_owned())
+}
+
+#[cfg(all(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
 fn detect_vendor() -> Option<String> {
     None
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_core_classes(logical_cores: usize) -> Option<Vec<CpuClass>> {
+    // `hw.nperflevels` is typically 2 on Apple Silicon (performance + efficient).
+    let perf_levels = read_sysctl_usize("hw.nperflevels")?;
+    if perf_levels < 2 {
+        return None;
+    }
+
+    // On Apple Silicon, perflevel0 is high-performance and perflevel1 is efficient.
+    let perf_count = read_sysctl_usize("hw.perflevel0.logicalcpu")
+        .or_else(|| read_sysctl_usize("hw.perflevel0.logicalcpu_max"));
+    let efficient_count = read_sysctl_usize("hw.perflevel1.logicalcpu")
+        .or_else(|| read_sysctl_usize("hw.perflevel1.logicalcpu_max"));
+
+    let (mut perf_count, mut efficient_count) = match (perf_count, efficient_count) {
+        (Some(perf), Some(efficient)) => (perf, efficient),
+        (Some(perf), None) if perf < logical_cores => (perf, logical_cores - perf),
+        (None, Some(efficient)) if efficient < logical_cores => {
+            (logical_cores - efficient, efficient)
+        }
+        _ => return None,
+    };
+
+    if perf_count == 0 || efficient_count == 0 {
+        return None;
+    }
+
+    let total = perf_count + efficient_count;
+    if total > logical_cores {
+        let overflow = total - logical_cores;
+        if efficient_count >= overflow {
+            efficient_count -= overflow;
+        } else {
+            let remaining = overflow - efficient_count;
+            efficient_count = 0;
+            perf_count = perf_count.saturating_sub(remaining);
+        }
+    } else if total < logical_cores {
+        // Assign any unresolved logical cores to the performance lane by default.
+        perf_count += logical_cores - total;
+    }
+
+    if perf_count == 0 || efficient_count == 0 {
+        return None;
+    }
+
+    let mut classes = Vec::with_capacity(logical_cores);
+    classes.extend(std::iter::repeat(CpuClass::Performance).take(perf_count));
+    classes.extend(std::iter::repeat(CpuClass::Efficient).take(efficient_count));
+    classes.truncate(logical_cores);
+
+    while classes.len() < logical_cores {
+        classes.push(CpuClass::Unknown);
+    }
+
+    Some(classes)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_macos_core_classes(_logical_cores: usize) -> Option<Vec<CpuClass>> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_sysctl_usize(key: &str) -> Option<usize> {
+    let output = Command::new("sysctl").arg("-n").arg(key).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let parsed = String::from_utf8(output.stdout).ok()?;
+    parsed.trim().parse::<usize>().ok()
 }
 
 fn classify_cores(logical_cores: usize, frequencies: Option<&[Option<u64>]>) -> Vec<CpuClass> {
