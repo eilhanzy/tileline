@@ -28,6 +28,10 @@ pub struct GmsRuntimeTuningProfile {
     /// `0.0` means score stability uses only present/compositor intervals.
     /// `1.0` means score stability uses only per-work-unit render durations.
     pub throughput_work_stability_blend: f64,
+    /// Number of presents used to smoothly ramp into full throughput burst mode.
+    pub throughput_startup_ramp_frames: u32,
+    /// Number of offscreen prewarm submissions to issue during startup (before first visible frame).
+    pub throughput_startup_prewarm_submits: u32,
 }
 
 impl GmsRuntimeTuningProfile {
@@ -55,6 +59,8 @@ impl GmsRuntimeTuningProfile {
                 throughput_offscreen_target_ring_len: 6,
                 integrated_throughput_burst_work_units: 3,
                 throughput_work_stability_blend: 0.85,
+                throughput_startup_ramp_frames: 90,
+                throughput_startup_prewarm_submits: 2,
                 benchmark_timing_capacity: 131_072,
                 benchmark_title_update_interval_ms: 500,
             };
@@ -68,6 +74,8 @@ impl GmsRuntimeTuningProfile {
                 throughput_offscreen_target_ring_len: 4,
                 integrated_throughput_burst_work_units: 6,
                 throughput_work_stability_blend: 0.65,
+                throughput_startup_ramp_frames: 45,
+                throughput_startup_prewarm_submits: 1,
                 benchmark_timing_capacity: 98_304,
                 benchmark_title_update_interval_ms: 500,
             };
@@ -80,6 +88,8 @@ impl GmsRuntimeTuningProfile {
             throughput_offscreen_target_ring_len: 2,
             integrated_throughput_burst_work_units: 8,
             throughput_work_stability_blend: 0.0,
+            throughput_startup_ramp_frames: 0,
+            throughput_startup_prewarm_submits: 0,
             benchmark_timing_capacity: 131_072,
             benchmark_title_update_interval_ms: 500,
         }

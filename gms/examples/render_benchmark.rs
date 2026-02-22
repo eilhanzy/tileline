@@ -671,6 +671,7 @@ struct Renderer {
     throughput_targets: Vec<wgpu::Texture>,
     throughput_target_cursor: usize,
     runtime_tuning: GmsRuntimeTuningProfile,
+    presented_frames: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -738,7 +739,7 @@ impl Renderer {
         let throughput_burst =
             select_throughput_burst(&adapter_info, &runtime_tuning, options, config.present_mode);
 
-        Ok(Self {
+        let mut renderer = Self {
             _instance: instance,
             surface,
             adapter_info,
@@ -752,7 +753,11 @@ impl Renderer {
             throughput_targets: Vec::new(),
             throughput_target_cursor: 0,
             runtime_tuning,
-        })
+            presented_frames: 0,
+        };
+
+        renderer.prewarm_throughput_resources();
+        Ok(renderer)
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -768,6 +773,7 @@ impl Renderer {
         self.config.height = size.height;
         self.throughput_targets.clear();
         self.throughput_target_cursor = 0;
+        self.presented_frames = 0;
         self.surface.configure(&self.device, &self.config);
     }
 
@@ -800,7 +806,7 @@ impl Renderer {
                 label: Some("gms-render-benchmark-encoder"),
             });
 
-        let work_units_per_present = self.work_units_per_present();
+        let work_units_per_present = self.effective_work_units_per_present();
         if work_units_per_present > 1 {
             // Windowed presentation may still be throttled by the compositor (often ~60/120 Hz),
             // even when a non-vsync present mode is selected. Run extra offscreen work in the
@@ -824,6 +830,7 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
         frame.present();
+        self.presented_frames = self.presented_frames.saturating_add(1);
         Ok(work_units_per_present)
     }
 
@@ -831,6 +838,25 @@ impl Renderer {
         self.throughput_burst
             .map(|mode| mode.work_units_per_present)
             .unwrap_or(1)
+    }
+
+    fn effective_work_units_per_present(&self) -> u32 {
+        let target = self.work_units_per_present();
+        if target <= 1 {
+            return target;
+        }
+
+        let ramp_frames = self.runtime_tuning.throughput_startup_ramp_frames;
+        if ramp_frames == 0 {
+            return target;
+        }
+
+        let progress =
+            ((self.presented_frames.saturating_add(1)) as f64 / ramp_frames as f64).clamp(0.0, 1.0);
+        // Smoothstep ramp reduces startup spikes better than a linear step on UMA systems.
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        let scaled = 1.0 + (target.saturating_sub(1) as f64) * eased;
+        scaled.round().clamp(1.0, target as f64) as u32
     }
 
     fn current_throughput_target(&mut self) -> Option<&wgpu::Texture> {
@@ -892,6 +918,45 @@ impl Renderer {
             let _ = slot;
         }
         self.throughput_target_cursor = 0;
+    }
+
+    fn prewarm_throughput_resources(&mut self) {
+        if self.work_units_per_present() <= 1
+            || self.runtime_tuning.throughput_startup_prewarm_submits == 0
+        {
+            return;
+        }
+
+        self.ensure_throughput_target_ring();
+        if self.throughput_targets.is_empty() {
+            return;
+        }
+
+        let prewarm_submits = self
+            .runtime_tuning
+            .throughput_startup_prewarm_submits
+            .min(self.throughput_targets.len() as u32);
+
+        for _ in 0..prewarm_submits {
+            let Some(target) = self.current_throughput_target() else {
+                break;
+            };
+            let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("gms-render-benchmark-throughput-prewarm-encoder"),
+                });
+            self.clear_phase = (self.clear_phase + 0.00625) % std::f64::consts::TAU;
+            encode_clear_pass(
+                &mut encoder,
+                &target_view,
+                animated_clear_color(self.clear_phase),
+            );
+            self.queue.submit(Some(encoder.finish()));
+        }
+
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 }
 
