@@ -11,6 +11,7 @@
 
 pub mod core;
 pub mod graphics;
+pub mod tlscript;
 
 pub use core::bridge::{
     BridgeFrameId, BridgeFramePlan, BridgeGpuTaskKind, BridgeMpsSubmission, BridgeSubmitReceipt,
@@ -21,3 +22,4 @@ pub use graphics::multigpu::sync::{
     ComposeBarrierState, GpuQueueLane, MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer,
     MultiGpuSyncSnapshot, SharedPlacementPolicy, SyncBackendHint,
 };
+pub use tlscript::{LexError, LexErrorKind, Lexer, Span, Token, TokenKind};
