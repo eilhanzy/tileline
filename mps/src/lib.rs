@@ -10,7 +10,7 @@ pub mod topology;
 
 pub use balancer::{CorePreference, LoadBalancer, RoutingDecision, TaskPriority};
 pub use scheduler::{
-    DispatchError, DispatchResult, Dispatcher, MpsScheduler, NativeTask, SchedulerMetrics,
-    TaskEnvelope, TaskId, TaskPayload, WasmTask,
+    ClassExecutionMetrics, DispatchError, DispatchResult, Dispatcher, MpsScheduler, NativeTask,
+    SchedulerMetrics, TaskEnvelope, TaskId, TaskPayload, WasmTask,
 };
 pub use topology::{CpuClass, CpuCore, CpuTopology};

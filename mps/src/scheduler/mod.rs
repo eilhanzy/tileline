@@ -90,6 +90,31 @@ impl TaskEnvelope {
     }
 }
 
+/// Per-worker-class execution statistics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClassExecutionMetrics {
+    /// Number of tasks executed by this worker class.
+    pub executed_tasks: u64,
+    /// Sum of execution time in nanoseconds.
+    pub execution_time_ns: u64,
+}
+
+impl ClassExecutionMetrics {
+    /// Total execution time in milliseconds.
+    pub fn execution_ms(&self) -> f64 {
+        self.execution_time_ns as f64 / 1_000_000.0
+    }
+
+    /// Average per-task execution time in milliseconds.
+    pub fn avg_task_ms(&self) -> f64 {
+        if self.executed_tasks == 0 {
+            0.0
+        } else {
+            self.execution_ms() / self.executed_tasks as f64
+        }
+    }
+}
+
 /// Runtime counters for scheduler health checks.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SchedulerMetrics {
@@ -97,6 +122,9 @@ pub struct SchedulerMetrics {
     pub completed: u64,
     pub failed: u64,
     pub queue_depth: QueueDepth,
+    pub performance: ClassExecutionMetrics,
+    pub efficient: ClassExecutionMetrics,
+    pub unknown: ClassExecutionMetrics,
 }
 
 /// Lock-free, topology-aware scheduler for MPS phase 1.
@@ -108,6 +136,7 @@ pub struct MpsScheduler {
     submitted: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
+    class_counters: Arc<ClassCounters>,
     next_task_id: AtomicU64,
     workers: Vec<JoinHandle<()>>,
 }
@@ -127,6 +156,7 @@ impl MpsScheduler {
         let submitted = Arc::new(AtomicU64::new(0));
         let completed = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicU64::new(0));
+        let class_counters = Arc::new(ClassCounters::default());
 
         let workers = spawn_workers(
             &topology,
@@ -135,6 +165,7 @@ impl MpsScheduler {
             Arc::clone(&shutdown),
             Arc::clone(&completed),
             Arc::clone(&failed),
+            Arc::clone(&class_counters),
         );
 
         Self {
@@ -145,6 +176,7 @@ impl MpsScheduler {
             submitted,
             completed,
             failed,
+            class_counters,
             next_task_id: AtomicU64::new(1),
             workers,
         }
@@ -267,11 +299,15 @@ impl MpsScheduler {
 
     /// Return runtime counters.
     pub fn metrics(&self) -> SchedulerMetrics {
+        let (performance, efficient, unknown) = self.class_counters.snapshot();
         SchedulerMetrics {
             submitted: self.submitted.load(Ordering::Acquire),
             completed: self.completed.load(Ordering::Acquire),
             failed: self.failed.load(Ordering::Acquire),
             queue_depth: self.queue.depth_snapshot(),
+            performance,
+            efficient,
+            unknown,
         }
     }
 
@@ -325,6 +361,7 @@ fn spawn_workers(
     shutdown: Arc<AtomicBool>,
     completed: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
+    class_counters: Arc<ClassCounters>,
 ) -> Vec<JoinHandle<()>> {
     let core_ids = topology.preferred_core_ids();
     let mut handles = Vec::with_capacity(core_ids.len());
@@ -335,6 +372,7 @@ fn spawn_workers(
         let worker_shutdown = Arc::clone(&shutdown);
         let worker_completed = Arc::clone(&completed);
         let worker_failed = Arc::clone(&failed);
+        let worker_class_counters = Arc::clone(&class_counters);
         let worker_class = topology.class_for_core(core_id);
         let worker_name = format!(
             "mps-worker-{worker_index}-core-{core_id}-{:?}",
@@ -351,6 +389,7 @@ fn spawn_workers(
                     worker_shutdown,
                     worker_completed,
                     worker_failed,
+                    worker_class_counters,
                 );
             })
             .expect("failed to spawn MPS worker thread");
@@ -368,13 +407,18 @@ fn worker_loop(
     shutdown: Arc<AtomicBool>,
     completed: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
+    class_counters: Arc<ClassCounters>,
 ) {
     let backoff = Backoff::new();
 
     loop {
         if let Some(task) = queue.pop_for_worker(worker_class) {
             backoff.reset();
-            match dispatcher.execute(task.payload) {
+            let started = Instant::now();
+            let result = dispatcher.execute(task.payload);
+            class_counters.record(worker_class, elapsed_nanos_u64(started.elapsed()));
+
+            match result {
                 Ok(_) => {
                     completed.fetch_add(1, Ordering::Release);
                 }
@@ -395,4 +439,63 @@ fn worker_loop(
             backoff.snooze();
         }
     }
+}
+
+#[derive(Default)]
+struct ClassCounters {
+    performance_tasks: AtomicU64,
+    performance_time_ns: AtomicU64,
+    efficient_tasks: AtomicU64,
+    efficient_time_ns: AtomicU64,
+    unknown_tasks: AtomicU64,
+    unknown_time_ns: AtomicU64,
+}
+
+impl ClassCounters {
+    fn record(&self, worker_class: CpuClass, elapsed_ns: u64) {
+        match worker_class {
+            CpuClass::Performance => {
+                self.performance_tasks.fetch_add(1, Ordering::Relaxed);
+                self.performance_time_ns
+                    .fetch_add(elapsed_ns, Ordering::Relaxed);
+            }
+            CpuClass::Efficient => {
+                self.efficient_tasks.fetch_add(1, Ordering::Relaxed);
+                self.efficient_time_ns
+                    .fetch_add(elapsed_ns, Ordering::Relaxed);
+            }
+            CpuClass::Unknown => {
+                self.unknown_tasks.fetch_add(1, Ordering::Relaxed);
+                self.unknown_time_ns
+                    .fetch_add(elapsed_ns, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(
+        &self,
+    ) -> (
+        ClassExecutionMetrics,
+        ClassExecutionMetrics,
+        ClassExecutionMetrics,
+    ) {
+        (
+            ClassExecutionMetrics {
+                executed_tasks: self.performance_tasks.load(Ordering::Acquire),
+                execution_time_ns: self.performance_time_ns.load(Ordering::Acquire),
+            },
+            ClassExecutionMetrics {
+                executed_tasks: self.efficient_tasks.load(Ordering::Acquire),
+                execution_time_ns: self.efficient_time_ns.load(Ordering::Acquire),
+            },
+            ClassExecutionMetrics {
+                executed_tasks: self.unknown_tasks.load(Ordering::Acquire),
+                execution_time_ns: self.unknown_time_ns.load(Ordering::Acquire),
+            },
+        )
+    }
+}
+
+fn elapsed_nanos_u64(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }

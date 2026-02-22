@@ -35,6 +35,15 @@ fn main() {
         metrics.submitted, metrics.completed, metrics.failed
     );
     println!(
+        "Class runtime(ms) => P: total={:.3}, avg={:.6}; E: total={:.3}, avg={:.6}; U: total={:.3}, avg={:.6}",
+        metrics.performance.execution_ms(),
+        metrics.performance.avg_task_ms(),
+        metrics.efficient.execution_ms(),
+        metrics.efficient.avg_task_ms(),
+        metrics.unknown.execution_ms(),
+        metrics.unknown.avg_task_ms()
+    );
+    println!(
         "Queue depth => performance: {}, efficient: {}, shared: {}, total: {}",
         metrics.queue_depth.performance,
         metrics.queue_depth.efficient,
