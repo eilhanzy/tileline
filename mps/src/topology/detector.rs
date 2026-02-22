@@ -4,8 +4,8 @@
 //! - vendor information from `raw_cpuid`
 //! - Linux frequency probing for big.LITTLE classification
 
-use raw_cpuid::CpuId;
 use std::cmp::Ordering;
+#[cfg(target_os = "linux")]
 use std::fs;
 
 /// Execution profile of a logical CPU core.
@@ -55,9 +55,7 @@ impl CpuTopology {
         let logical_cores = num_cpus::get().max(1);
         let physical_cores = num_cpus::get_physical().max(1).min(logical_cores);
 
-        let vendor = CpuId::new()
-            .get_vendor_info()
-            .map(|vendor_info| vendor_info.as_str().to_owned());
+        let vendor = detect_vendor();
 
         let frequency_map = detect_linux_frequencies(logical_cores);
         let classes = classify_cores(logical_cores, frequency_map.as_deref());
@@ -128,6 +126,18 @@ fn core_rank(class: CpuClass) -> u8 {
         CpuClass::Unknown => 1,
         CpuClass::Efficient => 2,
     }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn detect_vendor() -> Option<String> {
+    raw_cpuid::CpuId::new()
+        .get_vendor_info()
+        .map(|vendor_info| vendor_info.as_str().to_owned())
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn detect_vendor() -> Option<String> {
+    None
 }
 
 fn classify_cores(logical_cores: usize, frequencies: Option<&[Option<u64>]>) -> Vec<CpuClass> {
