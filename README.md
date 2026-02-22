@@ -18,8 +18,18 @@ This workspace is currently in engine-foundation phase. The main goals are:
 
 - `mps/`: CPU topology detection, priority balancer, lock-free scheduler, WASM dispatch (Wasmer)
 - `gms/`: GPU inventory/scoring, multi-GPU planner, adaptive UMA buffer control, benchmark tooling
-- `tl-core/`: `MpsGmsBridge` and portable multi-GPU sync abstractions
+- `tl-core/`: `MpsGmsBridge`, portable multi-GPU sync abstractions, and `.tlscript` frontend (lexer/token)
 - `runtime/`: frame-loop coordinators that bind real `wgpu` queue submits to the bridge
+
+## Documentation
+
+- `README.md`: workspace overview and quick start
+- `docs/README.md`: documentation index
+- `docs/tlscript-lexer.md`: `.tlscript` zero-copy lexer/token design
+- `docs/tlscript-parser-plan.md`: `.tlscript` parser/AST roadmap and V1 grammar
+- `docs/tlscript-semantic.md`: `.tlscript` semantic analyzer (types, handles, WASM sandboxing)
+- `docs/gms-dispatch-planner.md`: GMS workload planning and multi-GPU dispatch notes
+- `docs/runtime-bridge-flow.md`: canonical MPS -> GMS -> runtime synchronization flow
 
 ## Current Architecture
 
@@ -129,11 +139,15 @@ UMA-specific tuning and adaptive buffer controls are implemented in `gms` and wi
 
 ## Next Planned Milestone
 
-`.tlscript` (Python-like syntax) frontend targeting WASM, executed through MPS.
+`.tlscript` frontend is now started:
 
-Planned pipeline:
+- zero-copy token model (`&str` slices)
+- indentation-aware lexer (`Indent` / `Dedent`)
+- `@export` decorator tokenization
 
-- lexer/parser (indentation-aware)
+Next pipeline steps:
+
+- parser (indentation-aware AST builder)
 - typed AST / semantic pass
 - WASM codegen
 - MPS submission + runtime host bindings (`wit-bindgen`)
@@ -142,4 +156,3 @@ Planned pipeline:
 
 This repository is structured to be MIT-license ready (code comments and docs use FOSS-friendly
 terminology and style). Add/update the root `LICENSE` file as the project license source of truth.
-
