@@ -127,6 +127,43 @@ pub struct SchedulerMetrics {
     pub unknown: ClassExecutionMetrics,
 }
 
+impl SchedulerMetrics {
+    /// Aggregate execution time in nanoseconds across all worker classes.
+    pub fn aggregate_execution_ns(&self) -> u64 {
+        self.performance
+            .execution_time_ns
+            .saturating_add(self.efficient.execution_time_ns)
+            .saturating_add(self.unknown.execution_time_ns)
+    }
+
+    /// Aggregate execution time in milliseconds across all worker classes.
+    pub fn aggregate_execution_ms(&self) -> f64 {
+        self.aggregate_execution_ns() as f64 / 1_000_000.0
+    }
+
+    /// Parallel efficiency percentage relative to elapsed wall time and core count.
+    pub fn parallel_efficiency_pct(&self, elapsed: Duration, logical_cores: usize) -> f64 {
+        let elapsed_ns = elapsed.as_nanos() as f64;
+        if elapsed_ns <= 0.0 || logical_cores == 0 {
+            return 0.0;
+        }
+
+        let theoretical_ns = elapsed_ns * logical_cores as f64;
+        let actual_ns = self.aggregate_execution_ns() as f64;
+        (actual_ns / theoretical_ns).clamp(0.0, 1.0) * 100.0
+    }
+
+    /// Share of execution time handled by efficient cores.
+    pub fn e_core_share_pct(&self) -> f64 {
+        let total_ns = self.aggregate_execution_ns();
+        if total_ns == 0 {
+            0.0
+        } else {
+            (self.efficient.execution_time_ns as f64 / total_ns as f64) * 100.0
+        }
+    }
+}
+
 /// Lock-free, topology-aware scheduler for MPS phase 1.
 pub struct MpsScheduler {
     topology: CpuTopology,
