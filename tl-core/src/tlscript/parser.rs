@@ -26,6 +26,10 @@ pub enum ParseErrorKind {
     ExpectedExpression,
     /// Decorator placement or syntax is invalid for the current grammar.
     InvalidDecorator,
+    /// Decorator arguments are malformed.
+    InvalidDecoratorArgument,
+    /// Decorators may only be attached to supported items/statements.
+    InvalidDecoratorTarget,
     /// Assignment target is not a supported lvalue in V1.
     InvalidAssignmentTarget,
     /// `for` loop does not use the supported `range(...)` form.
@@ -118,10 +122,12 @@ where
             let decorator = match tok.kind {
                 TokenKind::ExportDecorator => Decorator {
                     kind: DecoratorKind::Export,
+                    args: Vec::new(),
                     span: tok.span,
                 },
                 TokenKind::Decorator(name) => Decorator {
                     kind: DecoratorKind::Named(name),
+                    args: Vec::new(),
                     span: tok.span,
                 },
                 TokenKind::At => {
@@ -130,6 +136,11 @@ where
                 _ => break,
             };
             self.next_token()?; // consume decorator token
+            let mut decorator = decorator;
+            if matches!(self.peek_kind()?, Some(TokenKind::LParen)) {
+                let args_end = self.parse_decorator_args_into(&mut decorator.args)?;
+                decorator.span = join_spans(decorator.span, args_end);
+            }
             self.expect_newline()?;
             decorators.push(decorator);
             self.skip_newlines()?;
@@ -229,8 +240,19 @@ where
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt<'src>, ParseError> {
+        let decorators = if matches!(
+            self.peek_kind()?,
+            Some(TokenKind::ExportDecorator | TokenKind::Decorator(_) | TokenKind::At)
+        ) {
+            self.parse_decorators()?
+        } else {
+            Vec::new()
+        };
+
         match self.peek_kind()? {
-            Some(TokenKind::Let) => self.parse_let_stmt().map(Stmt::Let),
+            Some(TokenKind::Let) => self
+                .parse_let_stmt_with_decorators(decorators)
+                .map(Stmt::Let),
             Some(TokenKind::If) => self.parse_if_stmt().map(Stmt::If),
             Some(TokenKind::While) => self.parse_while_stmt().map(Stmt::While),
             Some(TokenKind::For) => self.parse_for_range_stmt().map(Stmt::ForRange),
@@ -239,11 +261,15 @@ where
                     expected: "statement",
                 }))
             }
-            _ => self.parse_assignment_or_expr_stmt(),
+            _ if decorators.is_empty() => self.parse_assignment_or_expr_stmt(),
+            _ => Err(self.error_here(ParseErrorKind::InvalidDecoratorTarget)),
         }
     }
 
-    fn parse_let_stmt(&mut self) -> Result<LetStmt<'src>, ParseError> {
+    fn parse_let_stmt_with_decorators(
+        &mut self,
+        decorators: Vec<Decorator<'src>>,
+    ) -> Result<LetStmt<'src>, ParseError> {
         let let_tok = self.expect_token(|k| matches!(k, TokenKind::Let), "let")?;
         let (name, name_span) = self.expect_identifier()?;
         let ty = if matches!(self.peek_kind()?, Some(TokenKind::Colon)) {
@@ -257,12 +283,88 @@ where
         let end_span = self.consume_statement_terminator_span()?;
 
         Ok(LetStmt {
+            decorators,
             name,
             name_span,
             ty,
             value,
             span: join_spans(let_tok.span, end_span),
         })
+    }
+
+    fn parse_decorator_args_into(
+        &mut self,
+        args: &mut Vec<DecoratorArg<'src>>,
+    ) -> Result<Span, ParseError> {
+        self.expect_token(|k| matches!(k, TokenKind::LParen), "(")?;
+        let mut last_span;
+        if matches!(self.peek_kind()?, Some(TokenKind::RParen)) {
+            let rparen = self.next_token()?;
+            return Ok(rparen.span);
+        }
+
+        loop {
+            let arg = self.parse_decorator_arg()?;
+            last_span = arg.span();
+            args.push(arg);
+            if matches!(self.peek_kind()?, Some(TokenKind::Comma)) {
+                self.next_token()?;
+                if matches!(self.peek_kind()?, Some(TokenKind::RParen)) {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        let rparen = self.expect_token(|k| matches!(k, TokenKind::RParen), ")")?;
+        Ok(join_spans(last_span, rparen.span))
+    }
+
+    fn parse_decorator_arg(&mut self) -> Result<DecoratorArg<'src>, ParseError> {
+        let key_tok = self.next_token()?;
+        let key = match key_tok.kind {
+            TokenKind::Identifier(v) => v,
+            _ => {
+                return Err(ParseError::new(
+                    ParseErrorKind::InvalidDecoratorArgument,
+                    key_tok.span,
+                ))
+            }
+        };
+
+        if matches!(self.peek_kind()?, Some(TokenKind::Assign)) {
+            self.next_token()?;
+            let (value, value_span) = self.parse_decorator_value()?;
+            Ok(DecoratorArg::KeyValue {
+                key,
+                value,
+                span: join_spans(key_tok.span, value_span),
+            })
+        } else {
+            Ok(DecoratorArg::Flag {
+                name: key,
+                span: key_tok.span,
+            })
+        }
+    }
+
+    fn parse_decorator_value(&mut self) -> Result<(DecoratorValue<'src>, Span), ParseError> {
+        let tok = self.next_token()?;
+        let value = match tok.kind {
+            TokenKind::Identifier(v) => DecoratorValue::Identifier(v),
+            TokenKind::String(v) => DecoratorValue::String(v),
+            TokenKind::True => DecoratorValue::Bool(true),
+            TokenKind::False => DecoratorValue::Bool(false),
+            TokenKind::Integer(v) => DecoratorValue::Integer(v),
+            TokenKind::Float(v) => DecoratorValue::Float(v),
+            _ => {
+                return Err(ParseError::new(
+                    ParseErrorKind::InvalidDecoratorArgument,
+                    tok.span,
+                ))
+            }
+        };
+        Ok((value, tok.span))
     }
 
     fn parse_if_stmt(&mut self) -> Result<IfStmt<'src>, ParseError> {
@@ -739,6 +841,34 @@ mod tests {
                 ));
             }
             other => panic!("unexpected expr shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_net_decorators_for_function_and_let() {
+        let module = parse_ok(concat!(
+            "@export\n",
+            "@net(sync=\"on_change\")\n",
+            "def tick():\n",
+            "    @net(unreliable)\n",
+            "    let pos: int = 1\n",
+        ));
+
+        let Item::Function(func) = &module.items[0];
+        assert_eq!(func.decorators.len(), 2);
+        let net_dec = &func.decorators[1];
+        assert!(matches!(net_dec.kind, DecoratorKind::Named("net")));
+        assert_eq!(net_dec.args.len(), 1);
+        match &func.body.statements[0] {
+            Stmt::Let(let_stmt) => {
+                assert_eq!(let_stmt.decorators.len(), 1);
+                assert!(matches!(
+                    let_stmt.decorators[0].kind,
+                    DecoratorKind::Named("net")
+                ));
+                assert_eq!(let_stmt.decorators[0].args.len(), 1);
+            }
+            other => panic!("expected let stmt, got {other:?}"),
         }
     }
 }

@@ -107,12 +107,77 @@ impl<'src> TypedIrModule<'src> {
 }
 
 /// Per-function IR optimization metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrExecutionPolicy {
+    /// Default execution mode: callable, but no verified parallel safety contract.
+    Serial,
+    /// Function has a validated parallel contract and may be partitioned across MPS tasks.
+    ParallelSafe,
+    /// Function must run on the main/game thread (UI, renderer state, etc).
+    MainThreadOnly,
+}
+
+impl Default for IrExecutionPolicy {
+    fn default() -> Self {
+        Self::Serial
+    }
+}
+
+/// Core scheduling hint for MPS task placement generated from script decorators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrScheduleHint {
+    /// Let runtime/MPS choose based on phase and pressure.
+    Auto,
+    /// Prefer performance cores.
+    Performance,
+    /// Prefer efficient cores.
+    Efficient,
+}
+
+impl Default for IrScheduleHint {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Deterministic merge/reduction strategy hint for parallel functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrReduceKind {
+    Sum,
+    Min,
+    Max,
+    BitOr,
+    BitAnd,
+}
+
+/// Execution/scheduling metadata attached to a lowered function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TypedIrExecutionMeta {
+    /// Execution policy derived from script decorators or defaults.
+    pub policy: IrExecutionPolicy,
+    /// Whether the function contract requests deterministic behavior across parallel partitions.
+    pub deterministic: bool,
+    /// MPS scheduling preference hint.
+    pub schedule_hint: IrScheduleHint,
+    /// Optional partition chunk hint (`None` -> runtime heuristic).
+    pub chunk_hint: Option<u16>,
+    /// Optional deterministic reduction kind for merged outputs.
+    pub reduce: Option<IrReduceKind>,
+    /// Number of declared read-effect domains in the parallel contract (for planner heuristics).
+    pub read_effect_count: u16,
+    /// Number of declared write-effect domains in the parallel contract (for planner heuristics).
+    pub write_effect_count: u16,
+}
+
+/// Per-function IR optimization + execution metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TypedIrFunctionMeta {
     /// Number of instructions that are candidates for constant folding.
     pub const_fold_candidate_insts: u32,
     /// Number of instructions marked as SIMD-friendly scalar arithmetic sites.
     pub simd_candidate_insts: u32,
+    /// Execution/scheduling metadata used by runtime/MPS planning.
+    pub execution: TypedIrExecutionMeta,
 }
 
 /// A single lowered function in block form.

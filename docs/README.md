@@ -8,6 +8,8 @@ in `src/` crates (not benchmark-only code).
 - `tlscript-lexer.md`: zero-copy `.tlscript` token/lexer design and constraints
 - `tlscript-parser-plan.md`: parser architecture, AST shape, and V1 grammar plan
 - `tlscript-semantic.md`: semantic rules, soft diagnostics, handles, and WASM sandbox policy
+- `tlscript-parallel-runtime.md`: parallel contracts, advisor suggestions, and runtime dispatch planning
+- `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
 - `gms-dispatch-planner.md`: GPU scoring, workload assignment, and multi-GPU planning behavior
 - `runtime-bridge-flow.md`: canonical MPS -> `tl-core` -> GMS -> runtime submit/present flow
 

@@ -8,11 +8,16 @@
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
 mod frame_loop;
+mod tlscript_parallel;
 mod wgpu_render_loop;
 
 pub use frame_loop::{
     FrameLoopRuntime, FrameLoopRuntimeConfig, FrameLoopRuntimeMetrics, FrameSubmissionRecordResult,
     RuntimeTickResult,
+};
+pub use tlscript_parallel::{
+    TlscriptDispatchSubmission, TlscriptMpsDispatchConfig, TlscriptParallelRuntimeCoordinator,
+    TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,
 };
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator,

@@ -36,6 +36,8 @@ impl<'src> Item<'src> {
 pub struct Decorator<'src> {
     /// Decorator kind (`@export` or generic named decorator).
     pub kind: DecoratorKind<'src>,
+    /// Optional decorator arguments (`@net(sync=\"on_change\", unreliable)`).
+    pub args: Vec<DecoratorArg<'src>>,
     /// Decorator token span.
     pub span: Span,
 }
@@ -47,6 +49,46 @@ pub enum DecoratorKind<'src> {
     Export,
     /// Other named decorator (validated later by semantic pass).
     Named(&'src str),
+}
+
+/// Decorator argument (`flag` or `key=value`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecoratorArg<'src> {
+    /// Positional flag (`@net(unreliable)`).
+    Flag {
+        /// Flag name.
+        name: &'src str,
+        /// Source span.
+        span: Span,
+    },
+    /// Key-value pair (`@net(sync=\"on_change\")`).
+    KeyValue {
+        /// Key name.
+        key: &'src str,
+        /// Parsed literal/identifier value.
+        value: DecoratorValue<'src>,
+        /// Source span of the full argument.
+        span: Span,
+    },
+}
+
+impl<'src> DecoratorArg<'src> {
+    /// Argument span.
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Flag { span, .. } | Self::KeyValue { span, .. } => *span,
+        }
+    }
+}
+
+/// Decorator argument value (zero-copy where possible).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecoratorValue<'src> {
+    Identifier(&'src str),
+    String(&'src str),
+    Bool(bool),
+    Integer(&'src str),
+    Float(&'src str),
 }
 
 /// Function definition.
@@ -118,6 +160,8 @@ impl<'src> Stmt<'src> {
 /// `let` declaration statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LetStmt<'src> {
+    /// Statement decorators (currently used for `@net(...)` replication hooks).
+    pub decorators: Vec<Decorator<'src>>,
     /// Binding name.
     pub name: &'src str,
     /// Binding name span.

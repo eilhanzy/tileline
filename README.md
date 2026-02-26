@@ -4,6 +4,7 @@ Tileline is a parallel-first game engine architecture prototype focused on expli
 
 - `MPS` (Multi Processing Scaler): CPU-side task scheduling and WASM execution
 - `GMS` (Graphics Multi Scaler): GPU discovery, scoring, and asymmetric multi-GPU planning
+- `NPS` (Network Packet Scaler): bit-packed UDP protocol, reliability, and MPS-offloaded packet processing
 - `tl-core`: engine bridge layer that synchronizes MPS and GMS
 - `runtime`: render-loop integration glue for `wgpu` submit/present flows
 
@@ -18,8 +19,9 @@ This workspace is currently in engine-foundation phase. The main goals are:
 
 - `mps/`: CPU topology detection, priority balancer, lock-free scheduler, WASM dispatch (Wasmer)
 - `gms/`: GPU inventory/scoring, multi-GPU planner, adaptive UMA buffer control, benchmark tooling
-- `tl-core/`: `MpsGmsBridge`, portable multi-GPU sync abstractions, and `.tlscript` frontend (lexer/token)
-- `runtime/`: frame-loop coordinators that bind real `wgpu` queue submits to the bridge
+- `nps/`: low-level UDP packet protocol, bit packing, reliability, authority handoff, MPS-integrated packet manager
+- `tl-core/`: `MpsGmsBridge`, portable multi-GPU sync abstractions, and `.tlscript` compiler/runtime metadata layers
+- `runtime/`: frame-loop coordinators and `.tlscript` parallel planning glue for engine-side integration
 
 ## Documentation
 
@@ -28,6 +30,8 @@ This workspace is currently in engine-foundation phase. The main goals are:
 - `docs/tlscript-lexer.md`: `.tlscript` zero-copy lexer/token design
 - `docs/tlscript-parser-plan.md`: `.tlscript` parser/AST roadmap and V1 grammar
 - `docs/tlscript-semantic.md`: `.tlscript` semantic analyzer (types, handles, WASM sandboxing)
+- `docs/tlscript-parallel-runtime.md`: `.tlscript` parallel contracts, advisor, and runtime dispatch planning
+- `docs/nps-protocol.md`: NPS packet format, reliability, authority handoff, and MPS integration
 - `docs/gms-dispatch-planner.md`: GMS workload planning and multi-GPU dispatch notes
 - `docs/runtime-bridge-flow.md`: canonical MPS -> GMS -> runtime synchronization flow
 
@@ -137,20 +141,25 @@ The benchmark and planner diagnostics show the active source (`native`, `table`,
 UMA-specific tuning and adaptive buffer controls are implemented in `gms` and wired into
 `tl-core`/`runtime` for stability recovery and encoder-window management.
 
-## Next Planned Milestone
+## Current `.tlscript` Status
 
-`.tlscript` frontend is now started:
+`.tlscript` now includes a substantial compiler/runtime planning pipeline:
 
-- zero-copy token model (`&str` slices)
-- indentation-aware lexer (`Indent` / `Dedent`)
-- `@export` decorator tokenization
+- zero-copy lexer/token model (`&str` slices)
+- indentation-aware parser + AST
+- semantic analysis (types, handles, WASM sandbox policy)
+- typed IR + lowering
+- WASM codegen (MVP-oriented)
+- `@net(...)` compiler hook for sync metadata extraction
+- `@parallel(...)` / `@main_thread` / `@reduce(...)` contract validation
+- parallel advisor + runtime dispatch planner/fallback metrics
 
 Next pipeline steps:
 
-- parser (indentation-aware AST builder)
-- typed AST / semantic pass
-- WASM codegen
-- MPS submission + runtime host bindings (`wit-bindgen`)
+- typed IR-driven WASM codegen refactor (replace remaining AST-direct paths)
+- `.tlscript` -> MPS compile/cache/submit runtime path
+- host ABI for gameplay systems (ParadoxPE physics, networking, engine handles)
+- runtime profiling/diagnostics surfaces for script parallel dispatch decisions
 
 ## License
 

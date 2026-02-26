@@ -9,6 +9,7 @@ stack into a `wgpu` render loop.
 - `tl-core/src/graphics/multigpu/sync.rs` (`MultiGpuFrameSynchronizer`)
 - `runtime/src/frame_loop.rs` (`FrameLoopRuntime`)
 - `runtime/src/wgpu_render_loop.rs` (`WgpuRenderLoopCoordinator`)
+- `runtime/src/tlscript_parallel.rs` (`TlscriptParallelRuntimeCoordinator`)
 
 ## Design Constraints
 
@@ -29,6 +30,9 @@ stack into a `wgpu` render loop.
 8. Present reconcile checks queue completion state with bounded waits
 9. Present proceeds when ready, or times out/spillback policy applies
 10. Apple UMA telemetry feeds adaptive buffer decisions (when active)
+11. Script-side workloads (when present) can be planned/routed through
+    `TlscriptParallelRuntimeCoordinator` before MPS submission so `.tlscript` parallel contracts
+    and fallback telemetry are preserved in the runtime path
 
 ## Why This Is Split Across Crates
 
@@ -38,4 +42,3 @@ stack into a `wgpu` render loop.
 - `runtime`: actual frame-loop glue to real `wgpu::Queue::submit` and `present`
 
 This keeps the engine runtime path reusable and avoids benchmark-only logic leaking into the core.
-

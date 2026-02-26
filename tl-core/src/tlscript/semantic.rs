@@ -459,7 +459,7 @@ impl SemanticAnalyzer {
             let mut saw_export = false;
             let mut signature_valid = true;
             for dec in &func.decorators {
-                match dec.kind {
+                match &dec.kind {
                     DecoratorKind::Export => {
                         if saw_export {
                             errors.push(SemanticError::new(
@@ -470,12 +470,16 @@ impl SemanticAnalyzer {
                         }
                         saw_export = true;
                     }
-                    DecoratorKind::Named(_) => {
-                        errors.push(SemanticError::new(
-                            SemanticErrorKind::UnknownDecorator,
-                            dec.span,
-                        ));
-                        signature_valid = false;
+                    DecoratorKind::Named(name) => {
+                        if is_compiler_hook_decorator(name) {
+                            // `@net(...)` is validated by the dedicated compiler hook pass.
+                        } else {
+                            errors.push(SemanticError::new(
+                                SemanticErrorKind::UnknownDecorator,
+                                dec.span,
+                            ));
+                            signature_valid = false;
+                        }
                     }
                 }
             }
@@ -1090,6 +1094,14 @@ fn is_pointer_like_intrinsic(name: &str) -> bool {
             | "ptr_write"
             | "unchecked_index"
     ) || name.starts_with("ptr_")
+}
+
+#[inline]
+fn is_compiler_hook_decorator(name: &str) -> bool {
+    matches!(
+        name,
+        "net" | "parallel" | "main_thread" | "deterministic" | "reduce"
+    )
 }
 
 fn is_raw_memory_intrinsic(name: &str) -> bool {
