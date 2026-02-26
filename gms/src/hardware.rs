@@ -618,6 +618,21 @@ fn probe_vulkaninfo_arm_shader_core_count(name_lower: &str) -> NativeProbeOutcom
 
     static CACHE: OnceLock<NativeProbeCache> = OnceLock::new();
     let entries = CACHE.get_or_init(load_vulkaninfo_arm_shader_core_cache);
+    if entries.entries.is_empty() {
+        if let Some(err) = entries.load_error.as_ref() {
+            // Distinguish command/tool absence from valid output that simply does not expose ARM
+            // shader-core properties on this driver stack.
+            if err.contains("No such file") || err.contains("not found") {
+                return NativeProbeOutcome::failed(format!("vulkaninfo unavailable: {err}"));
+            }
+            if err.contains("no parseable ARM shader core count entries") {
+                return NativeProbeOutcome::failed(
+                    "vulkaninfo available but no ARM shaderCoreCount properties were exposed"
+                        .to_owned(),
+                );
+            }
+        }
+    }
     match_command_probe(entries, name_lower)
 }
 
@@ -1050,7 +1065,22 @@ fn parse_known_compute_units(name_lower: &str, vendor: VendorFamily) -> Option<u
 fn parse_arm_gpu_clusters(name: &str) -> Option<u32> {
     // ARM Mali/Immortalis adapters often encode shader core-cluster count as `MC<n>` / `MP<n>`.
     // Examples: `Immortalis-G720 MC12`, `Mali-G78 MP14`.
-    parse_arm_cluster_suffix(name, "mc").or_else(|| parse_arm_cluster_suffix(name, "mp"))
+    parse_arm_cluster_suffix(name, "mc")
+        .or_else(|| parse_arm_cluster_suffix(name, "mp"))
+        .or_else(|| parse_arm_known_model_clusters(name))
+}
+
+fn parse_arm_known_model_clusters(name: &str) -> Option<u32> {
+    // Conservative fallback table for common ARM GPU names that are often exposed without MP/MC
+    // suffixes on embedded Linux stacks. These values are intentionally limited to well-known
+    // boards/SoCs to avoid overestimating unknown devices.
+    if name.contains("rk3588") || name.contains("rk3588s") {
+        return Some(4); // Mali-G610 MP4 on RK3588/RK3588S
+    }
+    if name.contains("mali-g610") {
+        return Some(4); // conservative default when MP suffix is omitted
+    }
+    None
 }
 
 fn parse_arm_cluster_suffix(name: &str, prefix: &str) -> Option<u32> {
@@ -1268,6 +1298,8 @@ mod tests {
         assert_eq!(parse_arm_gpu_clusters("arm immortalis-g720 mc12"), Some(12));
         assert_eq!(parse_arm_gpu_clusters("mali-g78 mp14"), Some(14));
         assert_eq!(parse_arm_gpu_clusters("mali g715 mc-10"), Some(10));
+        assert_eq!(parse_arm_gpu_clusters("mali-g610"), Some(4));
+        assert_eq!(parse_arm_gpu_clusters("rk3588s mali-g610"), Some(4));
     }
 
     #[test]
