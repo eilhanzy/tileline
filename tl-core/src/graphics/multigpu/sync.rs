@@ -723,6 +723,7 @@ mod tests {
             estimated_compute_units: 8,
             compute_unit_source: gms::ComputeUnitEstimateSource::DeviceNameTable,
             compute_unit_probe_note: None,
+            arm_shader_core_count: None,
             estimated_vram_mb: 4096,
             estimated_bandwidth_gbps: 50.0,
             supports_mappable_primary_buffers: true,

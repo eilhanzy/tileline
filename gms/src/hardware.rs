@@ -203,6 +203,11 @@ pub struct GpuAdapterProfile {
     pub compute_unit_source: ComputeUnitEstimateSource,
     /// Optional note describing native-probe success/failure and fallback reason.
     pub compute_unit_probe_note: Option<String>,
+    /// ARM vendor auxiliary shader-core count (for example `shaderCoreCountARM` from `vulkaninfo`).
+    ///
+    /// This is intentionally stored separately from `estimated_compute_units` because ARM shader
+    /// cores are not equivalent to Mali/Immortalis cluster (`MP`/`MC`) counts used by GMS dispatch.
+    pub arm_shader_core_count: Option<u32>,
     pub estimated_vram_mb: u64,
     pub estimated_bandwidth_gbps: f64,
     pub supports_mappable_primary_buffers: bool,
@@ -302,6 +307,11 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
 
     let (estimated_compute_units, compute_unit_source, compute_unit_probe_note) =
         estimate_compute_units(&info, &limits, &name_lower, vendor_family);
+    let arm_shader_core_count = if matches!(vendor_family, VendorFamily::Arm) {
+        probe_vulkaninfo_arm_shader_core_count(&name_lower).units
+    } else {
+        None
+    };
     let compute_unit_kind = estimate_compute_unit_kind(vendor_family);
     let estimated_vram_mb = estimate_vram_mb(&info, &limits, &name_lower, memory_topology);
     let estimated_bandwidth_gbps = estimate_bandwidth_gbps(
@@ -315,7 +325,9 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
 
     let limits_summary = GpuLimitsSummary::from(limits.clone());
     let score_breakdown = score_adapter(
+        vendor_family,
         estimated_compute_units,
+        arm_shader_core_count,
         estimated_bandwidth_gbps,
         estimated_vram_mb,
         memory_topology,
@@ -335,6 +347,7 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
         estimated_compute_units,
         compute_unit_source,
         compute_unit_probe_note,
+        arm_shader_core_count,
         estimated_vram_mb,
         estimated_bandwidth_gbps,
         supports_mappable_primary_buffers,
@@ -553,12 +566,19 @@ fn probe_native_compute_units(
 
 fn probe_arm_compute_units(info: &AdapterInfo, name_lower: &str) -> NativeProbeOutcome {
     let _ = info;
-    let vk = probe_vulkaninfo_arm_compute_units(name_lower);
-    if vk.units.is_some() {
-        return vk;
-    }
+    let vk_shader = probe_vulkaninfo_arm_shader_core_count(name_lower);
+    let vk_note = if let Some(shader_cores) = vk_shader.units {
+        NativeProbeOutcome::failed(format!(
+            "vulkaninfo reports shaderCoreCountARM={shader_cores} (stored as aux ARM shader-core count, not cluster count)"
+        ))
+    } else {
+        NativeProbeOutcome {
+            units: None,
+            note: vk_shader.note,
+        }
+    };
     let driver = probe_linux_arm_gpu_driver_note(name_lower);
-    merge_native_probe_outcomes(vk, driver)
+    merge_native_probe_outcomes(vk_note, driver)
 }
 
 #[cfg(target_os = "linux")]
@@ -591,17 +611,17 @@ fn probe_linux_arm_gpu_driver_note(_name_lower: &str) -> NativeProbeOutcome {
     NativeProbeOutcome::none()
 }
 
-fn probe_vulkaninfo_arm_compute_units(name_lower: &str) -> NativeProbeOutcome {
+fn probe_vulkaninfo_arm_shader_core_count(name_lower: &str) -> NativeProbeOutcome {
     if !name_lower.contains("mali") && !name_lower.contains("immortalis") {
         return NativeProbeOutcome::none();
     }
 
     static CACHE: OnceLock<NativeProbeCache> = OnceLock::new();
-    let entries = CACHE.get_or_init(load_vulkaninfo_arm_cluster_cache);
+    let entries = CACHE.get_or_init(load_vulkaninfo_arm_shader_core_cache);
     match_command_probe(entries, name_lower)
 }
 
-fn load_vulkaninfo_arm_cluster_cache() -> NativeProbeCache {
+fn load_vulkaninfo_arm_shader_core_cache() -> NativeProbeCache {
     let output = match Command::new("vulkaninfo").output() {
         Ok(output) => output,
         Err(err) => return NativeProbeCache::error("vulkaninfo", err.to_string()),
@@ -618,7 +638,7 @@ fn load_vulkaninfo_arm_cluster_cache() -> NativeProbeCache {
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let entries = parse_vulkaninfo_arm_cluster_entries(&text);
+    let entries = parse_vulkaninfo_arm_shader_core_entries(&text);
     if entries.is_empty() {
         NativeProbeCache::error(
             "vulkaninfo",
@@ -897,7 +917,7 @@ fn normalize_gpu_name(name: &str) -> String {
     out.trim().to_owned()
 }
 
-fn parse_vulkaninfo_arm_cluster_entries(text: &str) -> Vec<(String, u32)> {
+fn parse_vulkaninfo_arm_shader_core_entries(text: &str) -> Vec<(String, u32)> {
     let mut entries = Vec::<(String, u32)>::new();
     let mut current_name: Option<String> = None;
     let mut current_units: Option<u32> = None;
@@ -951,6 +971,7 @@ fn parse_vulkaninfo_arm_cluster_entries(text: &str) -> Vec<(String, u32)> {
         // - `shaderCoreCountARM`
         // - `shaderCoreCount`
         // We keep this parser tolerant because `vulkaninfo` formatting varies by version.
+        // Returned values are shader-core counts, not Mali/Immortalis MP/MC cluster counts.
         let is_arm_shader_core_count = key_compact.contains("shadercorecount")
             && !key_compact.contains("mask")
             && (!current_name
@@ -1213,8 +1234,9 @@ fn lookup_table_contains(name: &str, table: &[(&str, u32)]) -> Option<u32> {
 mod tests {
     use super::{
         clamp_required_limits_to_supported, classify_memory_topology, merge_native_probe_outcomes,
-        parse_amd_cu, parse_arm_gpu_clusters, parse_nvidia_sm, parse_vulkaninfo_arm_cluster_entries,
-        vendor_family, MemoryTopology, NativeProbeOutcome, VendorFamily,
+        parse_amd_cu, parse_arm_gpu_clusters, parse_nvidia_sm,
+        parse_vulkaninfo_arm_shader_core_entries, vendor_family, MemoryTopology,
+        NativeProbeOutcome, VendorFamily,
     };
     use wgpu::DeviceType;
 
@@ -1281,7 +1303,7 @@ VkPhysicalDeviceProperties:
 VkPhysicalDeviceShaderCorePropertiesARM:
     shaderCoreCountARM: 12
 "#;
-        let entries = parse_vulkaninfo_arm_cluster_entries(text);
+        let entries = parse_vulkaninfo_arm_shader_core_entries(text);
         assert!(entries
             .iter()
             .any(|(name, units)| name.contains("mali g715") && *units == 10));
@@ -1417,7 +1439,9 @@ fn estimate_bandwidth_gbps(
 }
 
 fn score_adapter(
+    vendor: VendorFamily,
     estimated_compute_units: u32,
+    arm_shader_core_count: Option<u32>,
     estimated_bandwidth_gbps: f64,
     estimated_vram_mb: u64,
     memory_topology: MemoryTopology,
@@ -1450,11 +1474,23 @@ fn score_adapter(
 
     // 5) Mapping support improves our zero-copy pipeline options. This is a small bonus
     //    because it affects data path quality, not raw shader throughput.
-    let feature_term = if supports_mappable_primary_buffers {
+    let map_feature_term = if supports_mappable_primary_buffers {
         12.0
     } else {
         0.0
     };
+    // ARM/Mali/Immortalis note:
+    // `shaderCoreCountARM` is *not* a cluster/MP count, so it must not replace `estimated_compute_units`.
+    // We use it only as a bounded auxiliary capability signal to slightly refine ranking.
+    let arm_shader_core_aux_term = if matches!(vendor, VendorFamily::Arm) {
+        arm_shader_core_count
+            .map(|v| (v.max(1) as f64).sqrt() * 2.0)
+            .unwrap_or(0.0)
+            .clamp(0.0, 20.0)
+    } else {
+        0.0
+    };
+    let feature_term = map_feature_term + arm_shader_core_aux_term;
 
     // 6) Memory topology multiplier captures latency and transfer penalties.
     //    Discrete GPUs usually win raw throughput. Integrated GPUs get a smaller penalty to

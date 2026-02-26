@@ -563,6 +563,10 @@ impl BenchmarkRuntime {
             .adapter_profile
             .as_ref()
             .and_then(|profile| profile.compute_unit_probe_note.clone());
+        let arm_shader_core_count = self
+            .adapter_profile
+            .as_ref()
+            .and_then(|profile| profile.arm_shader_core_count);
 
         BenchmarkSummary {
             adapter_name,
@@ -573,6 +577,7 @@ impl BenchmarkRuntime {
             compute_unit_display_label,
             compute_unit_source,
             compute_unit_probe_note,
+            arm_shader_core_count,
             resolution: self.renderer.size,
             present_mode: self.renderer.present_mode,
             total_frames: computed.total_frames,
@@ -726,7 +731,8 @@ impl Renderer {
 
         let adapter_info = adapter.get_info();
         let runtime_tuning = GmsRuntimeTuningProfile::from_adapter_info(&adapter_info);
-        let (required_limits, limit_clamp_report) = safe_default_required_limits_for_adapter(&adapter);
+        let (required_limits, limit_clamp_report) =
+            safe_default_required_limits_for_adapter(&adapter);
         if limit_clamp_report.any_clamped() {
             eprintln!(
                 "GMS: clamped requested device limits to adapter support (1D={} 2D={} 3D={} layers={})",
@@ -1427,6 +1433,7 @@ struct BenchmarkSummary {
     compute_unit_display_label: Option<&'static str>,
     compute_unit_source: Option<&'static str>,
     compute_unit_probe_note: Option<String>,
+    arm_shader_core_count: Option<u32>,
     resolution: PhysicalSize<u32>,
     present_mode: PresentMode,
     total_frames: u64,
@@ -1474,6 +1481,9 @@ fn print_summary(summary: &BenchmarkSummary) {
             "Estimated {}: {} {} (source: {})",
             display_label, units, short_label, source
         );
+        if let Some(arm_shader_cores) = summary.arm_shader_core_count {
+            println!("ARM shader cores (aux, not cluster count): {arm_shader_cores}");
+        }
         if let Some(note) = summary.compute_unit_probe_note.as_deref() {
             println!("Compute-unit probe note: {note}");
         }
