@@ -115,6 +115,67 @@ pub struct GpuLimitsSummary {
     pub max_compute_workgroups_per_dimension: u32,
 }
 
+/// Summary of texture-limit fields clamped during `request_device` limit negotiation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceLimitClampReport {
+    pub max_texture_dimension_1d: bool,
+    pub max_texture_dimension_2d: bool,
+    pub max_texture_dimension_3d: bool,
+    pub max_texture_array_layers: bool,
+}
+
+impl DeviceLimitClampReport {
+    /// True if any tracked limit was reduced to fit the adapter.
+    pub fn any_clamped(self) -> bool {
+        self.max_texture_dimension_1d
+            || self.max_texture_dimension_2d
+            || self.max_texture_dimension_3d
+            || self.max_texture_array_layers
+    }
+}
+
+/// Clamp a requested `wgpu::Limits` set to the adapter's supported limits.
+///
+/// This primarily protects device creation on mobile/embedded stacks (including some Panthor-based
+/// Mali/Immortalis systems) where `wgpu::Limits::default()` can request a larger
+/// `max_texture_dimension_3d` than the driver advertises.
+pub fn clamp_required_limits_to_supported(
+    mut requested: Limits,
+    supported: &Limits,
+) -> (Limits, DeviceLimitClampReport) {
+    let mut report = DeviceLimitClampReport::default();
+
+    if requested.max_texture_dimension_1d > supported.max_texture_dimension_1d {
+        requested.max_texture_dimension_1d = supported.max_texture_dimension_1d;
+        report.max_texture_dimension_1d = true;
+    }
+    if requested.max_texture_dimension_2d > supported.max_texture_dimension_2d {
+        requested.max_texture_dimension_2d = supported.max_texture_dimension_2d;
+        report.max_texture_dimension_2d = true;
+    }
+    if requested.max_texture_dimension_3d > supported.max_texture_dimension_3d {
+        requested.max_texture_dimension_3d = supported.max_texture_dimension_3d;
+        report.max_texture_dimension_3d = true;
+    }
+    if requested.max_texture_array_layers > supported.max_texture_array_layers {
+        requested.max_texture_array_layers = supported.max_texture_array_layers;
+        report.max_texture_array_layers = true;
+    }
+
+    (requested, report)
+}
+
+/// Conservative, adapter-safe replacement for `wgpu::Limits::default()` device requests.
+///
+/// It starts from `Limits::default()` and clamps problematic texture dimensions to the adapter's
+/// supported values, preserving compatibility while avoiding accidental over-requests on mobile GPUs.
+pub fn safe_default_required_limits_for_adapter(
+    adapter: &Adapter,
+) -> (Limits, DeviceLimitClampReport) {
+    let supported = adapter.limits();
+    clamp_required_limits_to_supported(Limits::default(), &supported)
+}
+
 impl From<Limits> for GpuLimitsSummary {
     fn from(limits: Limits) -> Self {
         Self {
@@ -1151,8 +1212,8 @@ fn lookup_table_contains(name: &str, table: &[(&str, u32)]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_memory_topology, merge_native_probe_outcomes, parse_amd_cu,
-        parse_arm_gpu_clusters, parse_nvidia_sm, parse_vulkaninfo_arm_cluster_entries,
+        clamp_required_limits_to_supported, classify_memory_topology, merge_native_probe_outcomes,
+        parse_amd_cu, parse_arm_gpu_clusters, parse_nvidia_sm, parse_vulkaninfo_arm_cluster_entries,
         vendor_family, MemoryTopology, NativeProbeOutcome, VendorFamily,
     };
     use wgpu::DeviceType;
@@ -1239,6 +1300,22 @@ VkPhysicalDeviceShaderCorePropertiesARM:
         let note = out.note.expect("merged note");
         assert!(note.contains("vulkaninfo unavailable"));
         assert!(note.contains("panthor driver detected"));
+    }
+
+    #[test]
+    fn clamps_default_texture_limits_to_supported_adapter_limits() {
+        let requested = wgpu::Limits::default();
+        let mut supported = wgpu::Limits::default();
+        supported.max_texture_dimension_1d = 4096;
+        supported.max_texture_dimension_2d = 4096;
+        supported.max_texture_dimension_3d = 512;
+        supported.max_texture_array_layers = 128;
+
+        let (clamped, report) = clamp_required_limits_to_supported(requested, &supported);
+        assert!(report.any_clamped());
+        assert!(report.max_texture_dimension_3d);
+        assert_eq!(clamped.max_texture_dimension_3d, 512);
+        assert_eq!(clamped.max_texture_array_layers, 128);
     }
 }
 

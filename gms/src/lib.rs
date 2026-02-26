@@ -26,8 +26,9 @@ pub use bridge::{
     ZeroCopyBufferPlan,
 };
 pub use hardware::{
-    ComputeUnitEstimateSource, ComputeUnitKind, GpuAdapterProfile, GpuInventory, GpuScoreBreakdown,
-    MemoryTopology,
+    clamp_required_limits_to_supported, safe_default_required_limits_for_adapter,
+    ComputeUnitEstimateSource, ComputeUnitKind, DeviceLimitClampReport, GpuAdapterProfile,
+    GpuInventory, GpuScoreBreakdown, MemoryTopology,
 };
 pub use multi_gpu_runtime::{
     MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary, MultiGpuFrameSubmitResult,

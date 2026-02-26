@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gms::{
-    GmsRuntimeTuningProfile, GpuInventory, MultiGpuExecutor, MultiGpuExecutorConfig,
-    MultiGpuExecutorSummary, MultiGpuInitPolicy, MultiGpuWorkloadRequest,
+    safe_default_required_limits_for_adapter, GmsRuntimeTuningProfile, GpuInventory,
+    MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary, MultiGpuInitPolicy,
+    MultiGpuWorkloadRequest,
 };
 use wgpu::{Color, CompositeAlphaMode, PresentMode, SurfaceError, TextureFormat};
 use winit::application::ApplicationHandler;
@@ -725,9 +726,20 @@ impl Renderer {
 
         let adapter_info = adapter.get_info();
         let runtime_tuning = GmsRuntimeTuningProfile::from_adapter_info(&adapter_info);
+        let (required_limits, limit_clamp_report) = safe_default_required_limits_for_adapter(&adapter);
+        if limit_clamp_report.any_clamped() {
+            eprintln!(
+                "GMS: clamped requested device limits to adapter support (1D={} 2D={} 3D={} layers={})",
+                required_limits.max_texture_dimension_1d,
+                required_limits.max_texture_dimension_2d,
+                required_limits.max_texture_dimension_3d,
+                required_limits.max_texture_array_layers,
+            );
+        }
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("gms-render-benchmark-device"),
+                required_limits,
                 ..Default::default()
             }))?;
 

@@ -12,7 +12,9 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::bridge::{MultiGpuDispatchPlan, MultiGpuDispatcher, MultiGpuWorkloadRequest};
-use crate::hardware::{GpuAdapterProfile, GpuInventory, MemoryTopology};
+use crate::hardware::{
+    safe_default_required_limits_for_adapter, GpuAdapterProfile, GpuInventory, MemoryTopology,
+};
 use crate::SharedTransferKind;
 use wgpu::{Color, TextureFormat};
 
@@ -214,9 +216,11 @@ impl MultiGpuExecutor {
                 ))) as Box<dyn Error>
             })?;
 
-        // `wgpu` 28 can reject `DeviceDescriptor::default()` on some adapters due to limit
-        // negotiation quirks. Request the adapter's advertised limits explicitly.
-        let secondary_required_limits = secondary_adapter.limits();
+        // Some mobile/embedded stacks (including Panthor-class ARM drivers) can reject the
+        // default requested texture limits (notably `max_texture_dimension_3d = 2048`) even when
+        // the adapter is otherwise usable. Use a conservative default profile clamped to support.
+        let (secondary_required_limits, _secondary_limit_clamp_report) =
+            safe_default_required_limits_for_adapter(&secondary_adapter);
         let (secondary_device, secondary_queue) =
             pollster::block_on(secondary_adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("gms-multi-gpu-secondary-device"),
