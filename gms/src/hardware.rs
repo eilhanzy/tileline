@@ -8,6 +8,8 @@
 //! - memory-topology penalties/bonuses
 
 use std::cmp::Ordering;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -17,6 +19,7 @@ const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 const AMD_VENDOR_ID: u32 = 0x1002;
 const INTEL_VENDOR_ID: u32 = 0x8086;
 const APPLE_VENDOR_ID: u32 = 0x106B;
+const ARM_VENDOR_ID: u32 = 0x13B5;
 
 /// GPU compute unit type used for display/debugging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,7 +237,7 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
     let name_lower = info.name.to_ascii_lowercase();
     let vendor_family = vendor_family(info.vendor, &name_lower);
     let device_type = info.device_type;
-    let memory_topology = classify_memory_topology(device_type);
+    let memory_topology = classify_memory_topology(device_type, vendor_family, &name_lower);
 
     let (estimated_compute_units, compute_unit_source, compute_unit_probe_note) =
         estimate_compute_units(&info, &limits, &name_lower, vendor_family);
@@ -286,6 +289,7 @@ enum VendorFamily {
     Amd,
     Intel,
     Apple,
+    Arm,
     Other,
 }
 
@@ -295,6 +299,7 @@ fn vendor_family(vendor_id: u32, name_lower: &str) -> VendorFamily {
         AMD_VENDOR_ID => VendorFamily::Amd,
         INTEL_VENDOR_ID => VendorFamily::Intel,
         APPLE_VENDOR_ID => VendorFamily::Apple,
+        ARM_VENDOR_ID => VendorFamily::Arm,
         _ => {
             if name_lower.contains("nvidia")
                 || name_lower.contains("rtx")
@@ -318,6 +323,11 @@ fn vendor_family(vendor_id: u32, name_lower: &str) -> VendorFamily {
                 || name_lower.contains("m4")
             {
                 VendorFamily::Apple
+            } else if name_lower.contains("immortalis")
+                || name_lower.contains("mali")
+                || name_lower.contains("arm mali")
+            {
+                VendorFamily::Arm
             } else {
                 VendorFamily::Other
             }
@@ -325,13 +335,28 @@ fn vendor_family(vendor_id: u32, name_lower: &str) -> VendorFamily {
     }
 }
 
-fn classify_memory_topology(device_type: DeviceType) -> MemoryTopology {
+fn classify_memory_topology(
+    device_type: DeviceType,
+    vendor: VendorFamily,
+    name_lower: &str,
+) -> MemoryTopology {
     match device_type {
         DeviceType::DiscreteGpu => MemoryTopology::DiscreteVram,
         DeviceType::IntegratedGpu => MemoryTopology::Unified,
         DeviceType::VirtualGpu => MemoryTopology::Virtualized,
         DeviceType::Cpu => MemoryTopology::System,
-        _ => MemoryTopology::Unknown,
+        _ => {
+            // Some mobile Vulkan stacks report ARM Mali/Immortalis adapters as `Other`.
+            // Treat them as unified-memory GPUs so dispatch/zero-copy heuristics remain sane.
+            if matches!(vendor, VendorFamily::Arm)
+                || name_lower.contains("immortalis")
+                || name_lower.contains("mali")
+            {
+                MemoryTopology::Unified
+            } else {
+                MemoryTopology::Unknown
+            }
+        }
     }
 }
 
@@ -339,7 +364,9 @@ fn estimate_compute_unit_kind(vendor: VendorFamily) -> ComputeUnitKind {
     match vendor {
         VendorFamily::Amd => ComputeUnitKind::Cu,
         VendorFamily::Nvidia => ComputeUnitKind::Sm,
-        VendorFamily::Intel | VendorFamily::Apple => ComputeUnitKind::CoreCluster,
+        VendorFamily::Intel | VendorFamily::Apple | VendorFamily::Arm => {
+            ComputeUnitKind::CoreCluster
+        }
         VendorFamily::Other => ComputeUnitKind::Unknown,
     }
 }
@@ -458,7 +485,114 @@ fn probe_native_compute_units(
         VendorFamily::Nvidia => probe_nvidia_smi_compute_units(name_lower),
         VendorFamily::Amd => probe_rocminfo_compute_units(name_lower),
         VendorFamily::Apple => probe_macos_gpu_core_count(info, name_lower),
+        VendorFamily::Arm => probe_arm_compute_units(info, name_lower),
         VendorFamily::Intel | VendorFamily::Other => NativeProbeOutcome::none(),
+    }
+}
+
+fn probe_arm_compute_units(info: &AdapterInfo, name_lower: &str) -> NativeProbeOutcome {
+    let _ = info;
+    let vk = probe_vulkaninfo_arm_compute_units(name_lower);
+    if vk.units.is_some() {
+        return vk;
+    }
+    let driver = probe_linux_arm_gpu_driver_note(name_lower);
+    merge_native_probe_outcomes(vk, driver)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_linux_arm_gpu_driver_note(name_lower: &str) -> NativeProbeOutcome {
+    if !name_lower.contains("mali") && !name_lower.contains("immortalis") {
+        return NativeProbeOutcome::none();
+    }
+
+    static DRIVER_HINT: OnceLock<Option<&'static str>> = OnceLock::new();
+    let hint = DRIVER_HINT.get_or_init(|| {
+        if Path::new("/sys/module/panthor").exists() {
+            Some("panthor")
+        } else if Path::new("/sys/module/panfrost").exists() {
+            Some("panfrost")
+        } else {
+            None
+        }
+    });
+
+    match hint {
+        Some(driver) => NativeProbeOutcome::failed(format!(
+            "{driver} driver detected; CU/core-cluster count not exposed via portable probe"
+        )),
+        None => NativeProbeOutcome::none(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_linux_arm_gpu_driver_note(_name_lower: &str) -> NativeProbeOutcome {
+    NativeProbeOutcome::none()
+}
+
+fn probe_vulkaninfo_arm_compute_units(name_lower: &str) -> NativeProbeOutcome {
+    if !name_lower.contains("mali") && !name_lower.contains("immortalis") {
+        return NativeProbeOutcome::none();
+    }
+
+    static CACHE: OnceLock<NativeProbeCache> = OnceLock::new();
+    let entries = CACHE.get_or_init(load_vulkaninfo_arm_cluster_cache);
+    match_command_probe(entries, name_lower)
+}
+
+fn load_vulkaninfo_arm_cluster_cache() -> NativeProbeCache {
+    let output = match Command::new("vulkaninfo").output() {
+        Ok(output) => output,
+        Err(err) => return NativeProbeCache::error("vulkaninfo", err.to_string()),
+    };
+    if !output.status.success() {
+        return NativeProbeCache::error(
+            "vulkaninfo",
+            format!(
+                "command failed (exit {:?}): {}",
+                output.status.code(),
+                compact_command_stderr(&output.stderr)
+            ),
+        );
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let entries = parse_vulkaninfo_arm_cluster_entries(&text);
+    if entries.is_empty() {
+        NativeProbeCache::error(
+            "vulkaninfo",
+            "no parseable ARM shader core count entries (e.g. `shaderCoreCountARM`)".to_owned(),
+        )
+    } else {
+        NativeProbeCache::ok("vulkaninfo", entries)
+    }
+}
+
+fn merge_native_probe_outcomes(
+    primary: NativeProbeOutcome,
+    secondary: NativeProbeOutcome,
+) -> NativeProbeOutcome {
+    if primary.units.is_some() {
+        return primary;
+    }
+    if secondary.units.is_some() {
+        return secondary;
+    }
+
+    let mut notes = Vec::new();
+    if let Some(note) = primary.note {
+        notes.push(note);
+    }
+    if let Some(note) = secondary.note {
+        notes.push(note);
+    }
+    NativeProbeOutcome {
+        units: None,
+        note: if notes.is_empty() {
+            None
+        } else {
+            Some(notes.join("; "))
+        },
     }
 }
 
@@ -702,14 +836,172 @@ fn normalize_gpu_name(name: &str) -> String {
     out.trim().to_owned()
 }
 
+fn parse_vulkaninfo_arm_cluster_entries(text: &str) -> Vec<(String, u32)> {
+    let mut entries = Vec::<(String, u32)>::new();
+    let mut current_name: Option<String> = None;
+    let mut current_units: Option<u32> = None;
+
+    let flush = |entries: &mut Vec<(String, u32)>,
+                 current_name: &mut Option<String>,
+                 current_units: &mut Option<u32>| {
+        let Some(name) = current_name.take() else {
+            *current_units = None;
+            return;
+        };
+        let Some(units) = current_units.take() else {
+            return;
+        };
+        if units == 0 {
+            return;
+        }
+        let normalized = normalize_gpu_name(&name);
+        if normalized.contains("mali") || normalized.contains("immortalis") {
+            entries.push((normalized, units));
+        }
+    };
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            flush(&mut entries, &mut current_name, &mut current_units);
+            continue;
+        }
+
+        if let Some(name) = parse_vulkaninfo_gpu_name_line(line) {
+            flush(&mut entries, &mut current_name, &mut current_units);
+            current_name = Some(name);
+            continue;
+        }
+
+        let Some((key, value)) = split_kv_line(line) else {
+            continue;
+        };
+
+        let key_normalized = normalize_gpu_name(key);
+        let key_compact = key_normalized.replace(' ', "");
+
+        if key_compact == "devicename" {
+            flush(&mut entries, &mut current_name, &mut current_units);
+            current_name = Some(value.trim().to_owned());
+            continue;
+        }
+
+        // ARM Vulkan property names observed/expected variants:
+        // - `shaderCoreCountARM`
+        // - `shaderCoreCount`
+        // We keep this parser tolerant because `vulkaninfo` formatting varies by version.
+        let is_arm_shader_core_count = key_compact.contains("shadercorecount")
+            && !key_compact.contains("mask")
+            && (!current_name
+                .as_deref()
+                .map(normalize_gpu_name)
+                .unwrap_or_default()
+                .is_empty()
+                || key_compact.contains("arm"));
+
+        if is_arm_shader_core_count {
+            if let Some(units) = parse_first_u32(value) {
+                current_units = Some(units);
+            }
+        }
+    }
+
+    flush(&mut entries, &mut current_name, &mut current_units);
+    entries
+}
+
+fn parse_vulkaninfo_gpu_name_line(line: &str) -> Option<String> {
+    if let Some((prefix, rest)) = line.split_once('=') {
+        let key = normalize_gpu_name(prefix);
+        if key.replace(' ', "") == "devicename" {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+
+    // `vulkaninfo --summary` style line: `GPU id = 0 (Mali-G715 ... )`
+    if line.to_ascii_lowercase().starts_with("gpu id") {
+        let open = line.find('(')?;
+        let close = line.rfind(')')?;
+        if close > open + 1 {
+            return Some(line[open + 1..close].trim().to_owned());
+        }
+    }
+
+    None
+}
+
+fn split_kv_line(line: &str) -> Option<(&str, &str)> {
+    line.split_once('=').or_else(|| line.split_once(':'))
+}
+
+fn parse_first_u32(text: &str) -> Option<u32> {
+    let mut start = None;
+    for (i, ch) in text.char_indices() {
+        if ch.is_ascii_digit() {
+            start = Some(i);
+            break;
+        }
+    }
+    let start = start?;
+    let rest = &text[start..];
+    let end = rest
+        .char_indices()
+        .find_map(|(i, ch)| (!ch.is_ascii_digit()).then_some(i))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<u32>().ok()
+}
+
 fn parse_known_compute_units(name_lower: &str, vendor: VendorFamily) -> Option<u32> {
     match vendor {
         VendorFamily::Nvidia => parse_nvidia_sm(name_lower),
         VendorFamily::Amd => parse_amd_cu(name_lower),
         VendorFamily::Apple => parse_apple_gpu_clusters(name_lower),
         VendorFamily::Intel => parse_intel_gpu_clusters(name_lower),
+        VendorFamily::Arm => parse_arm_gpu_clusters(name_lower),
         VendorFamily::Other => None,
     }
+}
+
+fn parse_arm_gpu_clusters(name: &str) -> Option<u32> {
+    // ARM Mali/Immortalis adapters often encode shader core-cluster count as `MC<n>` / `MP<n>`.
+    // Examples: `Immortalis-G720 MC12`, `Mali-G78 MP14`.
+    parse_arm_cluster_suffix(name, "mc").or_else(|| parse_arm_cluster_suffix(name, "mp"))
+}
+
+fn parse_arm_cluster_suffix(name: &str, prefix: &str) -> Option<u32> {
+    let chars = name.chars().collect::<Vec<_>>();
+    for i in 0..chars.len() {
+        if !chars[i].eq_ignore_ascii_case(&prefix.chars().next()?) {
+            continue;
+        }
+        let next = i + 1;
+        if next >= chars.len() || !chars[next].eq_ignore_ascii_case(&prefix.chars().nth(1)?) {
+            continue;
+        }
+
+        let mut j = next + 1;
+        // Accept separators like `mc-12`, `mc 12`, `mc12`.
+        while j < chars.len() && (chars[j] == '-' || chars[j] == '_' || chars[j].is_whitespace()) {
+            j += 1;
+        }
+        let start = j;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+        if start == j {
+            continue;
+        }
+        let digits = chars[start..j].iter().collect::<String>();
+        if let Ok(count) = digits.parse::<u32>() {
+            if (1..=64).contains(&count) {
+                return Some(count);
+            }
+        }
+    }
+    None
 }
 
 fn parse_nvidia_sm(name: &str) -> Option<u32> {
@@ -858,7 +1150,12 @@ fn lookup_table_contains(name: &str, table: &[(&str, u32)]) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_amd_cu, parse_nvidia_sm};
+    use super::{
+        classify_memory_topology, merge_native_probe_outcomes, parse_amd_cu,
+        parse_arm_gpu_clusters, parse_nvidia_sm, parse_vulkaninfo_arm_cluster_entries,
+        vendor_family, MemoryTopology, NativeProbeOutcome, VendorFamily,
+    };
+    use wgpu::DeviceType;
 
     #[test]
     fn parses_nvidia_rtx_5060_ti_sm() {
@@ -881,6 +1178,67 @@ mod tests {
         assert_eq!(parse_amd_cu("amd radeon rx 6700"), Some(36));
         assert_eq!(parse_amd_cu("amd radeon rx 6400"), Some(12));
         assert_eq!(parse_amd_cu("amd radeon rx 7900 gre"), Some(80));
+    }
+
+    #[test]
+    fn parses_arm_mali_and_immortalis_mc_mp_cluster_counts() {
+        assert_eq!(parse_arm_gpu_clusters("arm immortalis-g720 mc12"), Some(12));
+        assert_eq!(parse_arm_gpu_clusters("mali-g78 mp14"), Some(14));
+        assert_eq!(parse_arm_gpu_clusters("mali g715 mc-10"), Some(10));
+    }
+
+    #[test]
+    fn detects_arm_vendor_family_by_id_and_name() {
+        assert_eq!(vendor_family(0x13B5, "arm gpu"), VendorFamily::Arm);
+        assert_eq!(
+            vendor_family(0, "arm immortalis-g715 mc16"),
+            VendorFamily::Arm
+        );
+        assert_eq!(vendor_family(0, "mali-g610"), VendorFamily::Arm);
+    }
+
+    #[test]
+    fn classifies_arm_other_device_as_unified_memory() {
+        assert_eq!(
+            classify_memory_topology(DeviceType::Other, VendorFamily::Arm, "mali-g720"),
+            MemoryTopology::Unified
+        );
+    }
+
+    #[test]
+    fn parses_vulkaninfo_arm_shader_core_count_entries() {
+        let text = r#"
+GPU id = 0 (Mali-G715)
+VkPhysicalDeviceProperties:
+    deviceName        = Mali-G715
+VkPhysicalDeviceShaderCorePropertiesARM:
+    shaderCoreCountARM = 10
+
+GPU id = 1 (Immortalis-G720 MC12)
+VkPhysicalDeviceProperties:
+    deviceName = Immortalis-G720 MC12
+VkPhysicalDeviceShaderCorePropertiesARM:
+    shaderCoreCountARM: 12
+"#;
+        let entries = parse_vulkaninfo_arm_cluster_entries(text);
+        assert!(entries
+            .iter()
+            .any(|(name, units)| name.contains("mali g715") && *units == 10));
+        assert!(entries
+            .iter()
+            .any(|(name, units)| name.contains("immortalis g720 mc12") && *units == 12));
+    }
+
+    #[test]
+    fn merges_native_probe_notes_when_both_paths_fail() {
+        let out = merge_native_probe_outcomes(
+            NativeProbeOutcome::failed("vulkaninfo unavailable".to_string()),
+            NativeProbeOutcome::failed("panthor driver detected".to_string()),
+        );
+        assert!(out.units.is_none());
+        let note = out.note.expect("merged note");
+        assert!(note.contains("vulkaninfo unavailable"));
+        assert!(note.contains("panthor driver detected"));
     }
 }
 

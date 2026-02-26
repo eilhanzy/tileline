@@ -2746,6 +2746,7 @@ dependencies = [
  "crossbeam",
  "gms",
  "mps",
+ "wasm-encoder 0.224.1",
  "wgpu",
 ]
 
@@ -2963,6 +2964,16 @@ dependencies = [
 
 [[package]]
 name = "wasm-encoder"
+version = "0.224.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ab7a13a23790fe91ea4eb7526a1f3131001d874e3e00c2976c48861f2e82920"
+dependencies = [
+ "leb128",
+ "wasmparser 0.224.1",
+]
+
+[[package]]
+name = "wasm-encoder"
 version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "990065f2fe63003fe337b932cfb5e3b80e0b4d0f5ff650e6985b1048f62c8319"
@@ -3142,6 +3153,17 @@ dependencies = [
  "thiserror 2.0.18",
  "wasmer-types",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.224.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04f17a5917c2ddd3819e84c661fae0d6ba29d7b9c1f0e96c708c65a9c4188e11"
+dependencies = [
+ "bitflags 2.11.0",
+ "indexmap",
+ "semver",
 ]
 
 [[package]]

@@ -8,3 +8,4 @@ crossbeam.workspace = true
 wgpu.workspace = true
 mps = { path = "../mps" }
 gms = { path = "../gms" }
+wasm-encoder = "0.224.0"

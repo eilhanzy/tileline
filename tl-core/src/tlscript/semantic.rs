@@ -13,7 +13,7 @@ use super::ast::*;
 use super::token::Span;
 
 /// Primitive/inferred value type produced by semantic analysis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SemanticType {
     Int,
     Float,
