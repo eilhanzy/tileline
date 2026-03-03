@@ -33,6 +33,7 @@ This workspace is currently in engine-foundation phase. The main goals are:
 - `docs/tlscript-parser-plan.md`: `.tlscript` parser/AST roadmap and V1 grammar
 - `docs/tlscript-semantic.md`: `.tlscript` semantic analyzer (types, handles, WASM sandboxing)
 - `docs/tlscript-parallel-runtime.md`: `.tlscript` parallel contracts, advisor, and runtime dispatch planning
+- `docs/tileline-beta-roadmap.md`: phased plan from foundation state to a usable beta
 - `docs/nps-protocol.md`: NPS packet format, reliability, authority handoff, and MPS integration
 - `docs/paradoxpe-foundation.md`: ParadoxPE handle model, SoA storage, broadphase/solver pipeline, snapshot base, and script ABI
 - `docs/paradoxpe-tlscript-examples.md`: verified `.tlscript` examples targeting the current ParadoxPE ABI
