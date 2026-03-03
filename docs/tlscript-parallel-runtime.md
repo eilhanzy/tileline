@@ -91,12 +91,23 @@ without re-reading decorators.
 Key types:
 
 - `IrExecutionPolicy` (`Serial`, `ParallelSafe`, `MainThreadOnly`)
+- `IrParallelDomain` (`Bodies`, `Particles`, `Chunks`, `Entities`, `Unknown`)
+- `IrEffectMask` (recognized read/write effect classes)
 - `TypedIrExecutionMeta`
 - `TypedIrFunctionMeta` (now includes `execution`)
 
 Helper:
 
 - `annotate_typed_ir_with_parallel_hooks(...)`
+
+This matters for ParadoxPE because `domain="bodies"` is no longer reduced to a generic
+"parallel-safe" bit. Runtime code can now distinguish:
+
+- physics body domains
+- generic entity domains
+- particle/chunk domains
+
+and apply domain-specific safety heuristics without reparsing script decorators.
 
 Implementation: `tl-core/src/tlscript/typed_ir.rs`, `tl-core/src/tlscript/parallel_hook.rs`
 
@@ -161,6 +172,25 @@ Implementation: `tl-core/src/tlscript/parallel_advisor.rs`
 - `WorkloadTooSmall`
 - `SingleChunkOnly`
 - `NonDeterministicReduction`
+- `UnsupportedBodyWriteSet`
+
+### ParadoxPE specialization
+
+The planner now contains a first domain-specific specialization for
+`@parallel(domain="bodies")`:
+
+- `schedule="auto"` is promoted to `performance` to favor hot physics cores
+- write effects are currently restricted to the velocity-oriented path
+- unsupported body write sets fall back to serial with explicit telemetry
+
+This is the first compiler/runtime contract that maps directly to ParadoxPE's current SoA safety
+shape:
+
+- body reads: transforms / forces / AABBs
+- body writes: velocities
+
+The point is to use MPS aggressively without pretending every physics-side mutation is already safe
+to shard.
 
 This gives engine developers concrete telemetry for why functions did not use full parallel chunking.
 
@@ -198,6 +228,16 @@ The helper maps script scheduling hints to MPS core preferences (`auto`, `perfor
 
 This is intentionally a native/chunked routing primitive so engine code can reuse it for script
 execution, staging transforms, or host callback fan-out without duplicating planner policy logic.
+
+### ParadoxPE body-domain helper
+
+`TlscriptParallelRuntimeCoordinator` now also exposes ParadoxPE-aware helpers:
+
+- `plan_paradox_body_dispatch(...)`
+- `dispatch_native_paradox_body_chunks_for_function(...)`
+
+These helpers derive workload size from `PhysicsWorld::active_parallel_body_count()` so sleeping and
+static bodies do not inflate chunk planning.
 
 ### Runtime metrics and tooling overlay support
 

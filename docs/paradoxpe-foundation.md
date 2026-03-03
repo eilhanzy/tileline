@@ -91,6 +91,9 @@ Two access views are already prepared for future `.tlscript` parallel domains:
 This is the key prerequisite for `@parallel(domain="bodies")` style script execution without
 coarse locks.
 
+`BodyRegistry` also exposes `active_parallel_body_count()` so runtime/MPS planners can scale script
+chunking to active simulation load instead of total handle count.
+
 ## World Pipeline
 
 `PhysicsWorld` currently provides:
@@ -167,6 +170,20 @@ larger sandbox scenes.
 
 The current sleep logic is intentionally simple, but the architecture is already reusable and
 hot-loop friendly.
+
+## `.tlscript` Parallel Runtime Alignment
+
+The `.tlscript` runtime planner now recognizes `domain="bodies"` as a first-class IR/runtime
+domain instead of a generic parallel flag.
+
+Current behavior:
+
+- `schedule="auto"` is upgraded to performance-core preference for body-domain work
+- body-domain chunk planning uses `PhysicsWorld::active_parallel_body_count()`
+- unsupported body-domain write sets fall back to serial with explicit planner telemetry
+
+This keeps the current script/runtime safety surface aligned with ParadoxPE's actual SoA access
+model instead of relying on generic heuristics.
 
 ## `.tlscript` / WASM Host ABI
 

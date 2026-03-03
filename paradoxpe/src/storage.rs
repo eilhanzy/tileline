@@ -80,6 +80,22 @@ impl BodyRegistry {
         self.handles.is_empty()
     }
 
+    /// Count bodies that currently participate in hot-path simulation work.
+    ///
+    /// Static bodies are excluded. Sleeping dynamic bodies are also excluded so script/runtime
+    /// planners can size `domain="bodies"` work to active simulation load.
+    pub fn active_parallel_body_count(&self) -> usize {
+        self.kinds
+            .iter()
+            .zip(self.awake.iter())
+            .filter(|(kind, awake)| match kind {
+                BodyKind::Static => false,
+                BodyKind::Kinematic => true,
+                BodyKind::Dynamic => **awake,
+            })
+            .count()
+    }
+
     pub fn handles(&self) -> &[BodyHandle] {
         &self.handles
     }

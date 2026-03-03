@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 use super::ast::{Decorator, DecoratorArg, DecoratorKind, DecoratorValue, Item, Module};
 use super::semantic::SemanticReport;
 use super::token::Span;
-use super::typed_ir::{IrExecutionPolicy, IrReduceKind, IrScheduleHint, TypedIrModule};
+use super::typed_ir::{
+    IrEffectMask, IrExecutionPolicy, IrParallelDomain, IrReduceKind, IrScheduleHint, TypedIrModule,
+};
 
 /// Execution policy emitted by the parallel hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,6 +666,10 @@ pub fn annotate_typed_ir_with_parallel_hooks<'src>(
             ParallelExecutionPolicy::ParallelSafe => IrExecutionPolicy::ParallelSafe,
             ParallelExecutionPolicy::MainThreadOnly => IrExecutionPolicy::MainThreadOnly,
         };
+        exec.domain = hook
+            .domain
+            .map(classify_parallel_domain)
+            .unwrap_or(IrParallelDomain::Unknown);
         exec.deterministic = hook.deterministic;
         exec.schedule_hint = match hook.schedule_hint {
             ParallelScheduleHint::Auto => IrScheduleHint::Auto,
@@ -678,9 +684,39 @@ pub fn annotate_typed_ir_with_parallel_hooks<'src>(
             ParallelReduceKind::BitOr => IrReduceKind::BitOr,
             ParallelReduceKind::BitAnd => IrReduceKind::BitAnd,
         });
+        exec.read_effect_mask = classify_effect_mask(&hook.read_effects);
+        exec.write_effect_mask = classify_effect_mask(&hook.write_effects);
         exec.read_effect_count = hook.read_effects.len().min(u16::MAX as usize) as u16;
         exec.write_effect_count = hook.write_effects.len().min(u16::MAX as usize) as u16;
     }
+}
+
+fn classify_parallel_domain(domain: &str) -> IrParallelDomain {
+    match domain {
+        "bodies" | "physics" => IrParallelDomain::Bodies,
+        "particles" => IrParallelDomain::Particles,
+        "chunks" | "tiles" => IrParallelDomain::Chunks,
+        "entities" => IrParallelDomain::Entities,
+        _ => IrParallelDomain::Unknown,
+    }
+}
+
+fn classify_effect_mask(effects: &[&str]) -> IrEffectMask {
+    let mut mask = IrEffectMask::NONE;
+    for effect in effects {
+        let effect_mask = match *effect {
+            "state" => IrEffectMask::STATE,
+            "transform" => IrEffectMask::TRANSFORM,
+            "force" => IrEffectMask::FORCE,
+            "velocity" => IrEffectMask::VELOCITY,
+            "position" => IrEffectMask::POSITION,
+            "aabb" | "bounds" => IrEffectMask::AABB,
+            "contact" | "contacts" => IrEffectMask::CONTACT,
+            _ => IrEffectMask::NONE,
+        };
+        mask.insert(effect_mask);
+    }
+    mask
 }
 
 #[cfg(test)]
@@ -723,6 +759,7 @@ mod tests {
         annotate_typed_ir_with_parallel_hooks(&mut ir, &hooks);
         let func = &ir.functions[0];
         assert_eq!(func.meta.execution.policy, IrExecutionPolicy::ParallelSafe);
+        assert_eq!(func.meta.execution.domain, IrParallelDomain::Bodies);
         assert!(func.meta.execution.deterministic);
         assert_eq!(func.meta.execution.chunk_hint, Some(256));
         assert_eq!(
@@ -730,6 +767,21 @@ mod tests {
             IrScheduleHint::Performance
         );
         assert_eq!(func.meta.execution.reduce, Some(IrReduceKind::Sum));
+        assert!(func
+            .meta
+            .execution
+            .read_effect_mask
+            .contains(IrEffectMask::TRANSFORM));
+        assert!(func
+            .meta
+            .execution
+            .read_effect_mask
+            .contains(IrEffectMask::FORCE));
+        assert!(func
+            .meta
+            .execution
+            .write_effect_mask
+            .contains(IrEffectMask::VELOCITY));
         assert_eq!(func.meta.execution.read_effect_count, 2);
         assert_eq!(func.meta.execution.write_effect_count, 1);
     }

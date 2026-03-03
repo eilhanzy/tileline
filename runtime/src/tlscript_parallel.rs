@@ -10,6 +10,7 @@
 //! that a future script VM/WASM host runtime can call before submitting work to MPS.
 
 use mps::{CorePreference, MpsScheduler, NativeTask, TaskId, TaskPriority};
+use paradoxpe::PhysicsWorld;
 use tl_core::{
     IrScheduleHint, Module, ParallelAdvisor, ParallelAdvisorConfig, ParallelAdvisorReport,
     ParallelDispatchDecision, ParallelDispatchMode, ParallelDispatchPlanner,
@@ -47,7 +48,7 @@ impl TlscriptParallelRuntimeMetrics {
     pub fn planner_fallbacks_line(&self) -> String {
         let p = self.planner;
         format!(
-            "tlscript planner: parallel={} serial={} main={} fallbacks[m_policy={} no_contract={} small={} one_chunk={} nondet_reduce={}]",
+            "tlscript planner: parallel={} serial={} main={} fallbacks[m_policy={} no_contract={} small={} one_chunk={} nondet_reduce={} body_write={}]",
             p.planned_parallel,
             p.planned_serial,
             p.planned_main_thread,
@@ -56,6 +57,7 @@ impl TlscriptParallelRuntimeMetrics {
             p.fallback_workload_too_small,
             p.fallback_single_chunk_only,
             p.fallback_nondeterministic_reduction,
+            p.fallback_unsupported_body_write_set,
         )
     }
 
@@ -200,6 +202,19 @@ impl TlscriptParallelRuntimeCoordinator {
         self.planner.plan_for_function(func, workload_items)
     }
 
+    /// Plan dispatch for ParadoxPE `domain="bodies"` functions from the current world state.
+    ///
+    /// The workload size is derived from active physics bodies so sleeping/static bodies do not
+    /// inflate chunk planning.
+    pub fn plan_paradox_body_dispatch<'src>(
+        &self,
+        func: &TypedIrFunction<'src>,
+        world: &PhysicsWorld,
+    ) -> ParallelDispatchDecision {
+        let workload_items = world.active_parallel_body_count();
+        self.planner.plan_for_function(func, workload_items)
+    }
+
     /// Plan and submit native script work to MPS according to the dispatch decision.
     ///
     /// The caller provides a chunk task factory that returns boxed native tasks for `MpsScheduler`.
@@ -298,6 +313,28 @@ impl TlscriptParallelRuntimeCoordinator {
         }
     }
 
+    /// Plan and submit native body-domain work sized from a `PhysicsWorld`.
+    ///
+    /// This is the first ParadoxPE-specific bridge between `.tlscript` parallel contracts and MPS
+    /// chunk routing. It keeps physics-domain planning in `src/` without requiring benchmark code.
+    pub fn dispatch_native_paradox_body_chunks_for_function<'src, F>(
+        &mut self,
+        mps: &MpsScheduler,
+        func: &TypedIrFunction<'src>,
+        world: &PhysicsWorld,
+        make_task: F,
+    ) -> TlscriptDispatchSubmission
+    where
+        F: FnMut(TlscriptWorkChunk) -> NativeTask,
+    {
+        self.dispatch_native_chunks_for_function(
+            mps,
+            func,
+            world.active_parallel_body_count(),
+            make_task,
+        )
+    }
+
     /// Access the underlying planner for advanced integrations.
     pub fn planner(&self) -> &ParallelDispatchPlanner {
         &self.planner
@@ -357,6 +394,7 @@ fn core_preference_from_schedule_hint(hint: IrScheduleHint) -> CorePreference {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paradoxpe::{BodyDesc, BodyKind, PhysicsWorld, PhysicsWorldConfig};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -476,5 +514,70 @@ mod tests {
         let lines = coord.metrics().overlay_lines();
         assert!(!lines.is_empty());
         assert!(lines.iter().any(|l| l.contains("tlscript planner:")));
+    }
+
+    #[test]
+    fn paradox_body_dispatch_uses_active_body_count_and_performance_hint() {
+        let (_module, _semantic, _hooks, ir) = compile_pipeline(concat!(
+            "@export\n",
+            "@parallel(domain=\"bodies\", read=\"transform,aabb\", write=\"velocity\", chunk=64)\n",
+            "@deterministic\n",
+            "def solve_bodies(dt: float):\n",
+            "    let x: int = 1\n",
+        ));
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
+        let _static_body = world.spawn_body(BodyDesc {
+            kind: BodyKind::Static,
+            ..BodyDesc::default()
+        });
+        let _dynamic_a = world.spawn_body(BodyDesc::default());
+        let _dynamic_b = world.spawn_body(BodyDesc::default());
+
+        let coord = TlscriptParallelRuntimeCoordinator::default();
+        let decision = coord.plan_paradox_body_dispatch(&ir.functions[0], &world);
+        assert_eq!(decision.schedule_hint, IrScheduleHint::Performance);
+        assert_eq!(
+            world.active_parallel_body_count(),
+            world.body_registry().active_parallel_body_count()
+        );
+    }
+
+    #[test]
+    fn paradox_body_dispatch_routes_chunks_to_mps_from_world_load() {
+        let (_module, _semantic, _hooks, ir) = compile_pipeline(concat!(
+            "@export\n",
+            "@parallel(domain=\"bodies\", read=\"transform,force\", write=\"velocity\", chunk=64)\n",
+            "@deterministic\n",
+            "def solve_bodies(dt: float):\n",
+            "    let x: int = 1\n",
+        ));
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
+        for _ in 0..192 {
+            let _ = world.spawn_body(BodyDesc::default());
+        }
+
+        let scheduler = MpsScheduler::new();
+        let mut coord = TlscriptParallelRuntimeCoordinator::default();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_tasks = Arc::clone(&counter);
+
+        let submission = coord.dispatch_native_paradox_body_chunks_for_function(
+            &scheduler,
+            &ir.functions[0],
+            &world,
+            move |_chunk| {
+                let c = Arc::clone(&counter_for_tasks);
+                Box::new(move || {
+                    c.fetch_add(1, Ordering::Relaxed);
+                })
+            },
+        );
+
+        assert!(submission.decision.is_parallel());
+        assert!(scheduler.wait_for_idle(Duration::from_millis(250)));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            submission.submitted_chunks.len()
+        );
     }
 }

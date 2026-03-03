@@ -60,9 +60,10 @@ pub use semantic::{
 };
 pub use token::{Span, Token, TokenKind};
 pub use typed_ir::{
-    IrBlockId, IrBlockKind, IrCallee, IrConstValue, IrExecutionPolicy, IrExternalCallFlavor,
-    IrFunctionId, IrInstKind, IrInstMeta, IrLocalId, IrLocalKind, IrReduceKind, IrScheduleHint,
-    IrSimdAnnotation, IrTempId, IrTerminator, IrValue, TypedIrArenaLayout, TypedIrArenaStats,
-    TypedIrBlock, TypedIrExecutionMeta, TypedIrFunction, TypedIrFunctionMeta, TypedIrInst,
-    TypedIrLocal, TypedIrModule, TypedIrModuleMeta, TypedIrOptimizationHooks, TypedIrTemp,
+    IrBlockId, IrBlockKind, IrCallee, IrConstValue, IrEffectMask, IrExecutionPolicy,
+    IrExternalCallFlavor, IrFunctionId, IrInstKind, IrInstMeta, IrLocalId, IrLocalKind,
+    IrParallelDomain, IrReduceKind, IrScheduleHint, IrSimdAnnotation, IrTempId, IrTerminator,
+    IrValue, TypedIrArenaLayout, TypedIrArenaStats, TypedIrBlock, TypedIrExecutionMeta,
+    TypedIrFunction, TypedIrFunctionMeta, TypedIrInst, TypedIrLocal, TypedIrModule,
+    TypedIrModuleMeta, TypedIrOptimizationHooks, TypedIrTemp,
 };

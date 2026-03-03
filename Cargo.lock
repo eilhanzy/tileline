@@ -2536,6 +2536,7 @@ version = "0.1.0"
 dependencies = [
  "gms",
  "mps",
+ "paradoxpe",
  "tl-core",
  "wgpu",
 ]

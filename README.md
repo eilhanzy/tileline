@@ -156,6 +156,7 @@ UMA-specific tuning and adaptive buffer controls are implemented in `gms` and wi
 - `@net(...)` compiler hook for sync metadata extraction
 - `@parallel(...)` / `@main_thread` / `@reduce(...)` contract validation
 - parallel advisor + runtime dispatch planner/fallback metrics
+- ParadoxPE-aware `domain="bodies"` runtime planning and MPS chunk routing helpers
 - initial ParadoxPE host ABI names wired into semantic/lowering/codegen defaults
 
 Next pipeline steps:

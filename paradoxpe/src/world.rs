@@ -178,6 +178,11 @@ impl PhysicsWorld {
         &mut self.bodies
     }
 
+    /// Active body workload size suitable for `.tlscript @parallel(domain="bodies")` planning.
+    pub fn active_parallel_body_count(&self) -> usize {
+        self.bodies.active_parallel_body_count()
+    }
+
     pub fn broadphase(&self) -> &BroadphasePipeline {
         &self.broadphase
     }
