@@ -7,7 +7,7 @@ Tileline is a parallel-first game engine architecture prototype focused on expli
 - `NPS` (Network Packet Scaler): bit-packed UDP protocol, reliability, and MPS-offloaded packet processing
 - `ParadoxPE`: fixed-step physics foundation with SoA storage, broadphase, solver, joints, sleep, snapshot/interpolation support, and script/WASM host ABI
 - `tl-core`: engine bridge layer that synchronizes MPS and GMS
-- `runtime`: render-loop integration glue for `wgpu` submit/present flows and NPS UDP transport pumping
+- `runtime`: render-loop integration glue for `wgpu` submit/present flows and NPS UDP transport/telemetry pumping
 
 This workspace is currently in engine-foundation phase. The main goals are:
 

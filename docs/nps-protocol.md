@@ -178,6 +178,22 @@ Current snapshot modes:
 This model is already used by `SendPolicy::for_payload(...)` so reliability/sequencing policy now
 derives from the same canonical mapping that future runtime transport code will use.
 
+## Link Telemetry
+
+NPS now exposes best-effort per-peer link telemetry derived from reliable ACK flow.
+
+Current fields:
+
+- smoothed RTT estimate
+- jitter estimate (EWMA of RTT deltas)
+- reliable sent count
+- reliable acked count
+- retransmit count
+- coarse retransmit-based loss estimate
+
+This is intentionally conservative. It is meant to give the runtime a stable diagnostics surface
+before more advanced transport estimation is added.
+
 ## `.tlscript` `@net(...)` Hook (Compiler Side)
 
 The `.tlscript` frontend now supports `@net(...)` decorators and a dedicated compiler hook that

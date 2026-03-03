@@ -32,6 +32,6 @@ pub use packet::{
 };
 pub use reliability::{
     seq_more_recent, AckWindow, AuthorityTransferReason, AuthorityTransition, NetObjectHandle,
-    PeerId, PeerReliabilityState, PhysAuthorityTable, ReliabilityMode, ReliableInFlight,
-    SendPolicy,
+    PeerId, PeerLinkMetrics, PeerReliabilityState, PhysAuthorityTable, ReliabilityMode,
+    ReliableInFlight, SendPolicy,
 };

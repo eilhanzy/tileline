@@ -283,6 +283,8 @@ Current implementation:
 - runtime-owned send queue for encoded and retransmit datagrams
 - ParadoxPE snapshot cadence helper
 - transport-level telemetry surface
+- lane-level send/receive counters
+- per-peer RTT/jitter/loss telemetry snapshots
 
 Still missing:
 

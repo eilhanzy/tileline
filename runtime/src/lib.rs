@@ -17,7 +17,8 @@ pub use frame_loop::{
     RuntimeTickResult,
 };
 pub use network_transport::{
-    NetworkPumpResult, NetworkTransportConfig, NetworkTransportMetrics, NetworkTransportRuntime,
+    LaneTrafficCounter, NetworkLaneMetrics, NetworkPeerMetrics, NetworkPumpResult,
+    NetworkTransportConfig, NetworkTransportMetrics, NetworkTransportRuntime,
     SnapshotCadenceConfig,
 };
 pub use tlscript_parallel::{

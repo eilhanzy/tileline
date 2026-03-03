@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use mps::MpsScheduler;
 use nps::{
-    DecodedPacketEvent, EncodedDatagram, NetworkPacketConfig, NetworkPacketManager,
-    NetworkPacketMetrics, PacketDecodeFailure, PacketEncodeFailure, PeerId,
+    packet_semantics, DecodedPacketEvent, EncodedDatagram, NetworkPacketConfig,
+    NetworkPacketManager, NetworkPacketMetrics, PacketDecodeFailure, PacketEncodeFailure,
+    PacketLane, PeerId, PeerLinkMetrics, NPS_HEADER_BYTES,
 };
 use paradoxpe::PhysicsWorld;
 use tokio::net::{ToSocketAddrs, UdpSocket};
@@ -102,8 +103,47 @@ pub struct NetworkPumpResult {
     pub pending_send_queue_len: usize,
 }
 
+/// Per-lane traffic counter snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LaneTrafficCounter {
+    pub datagrams: u64,
+    pub bytes: u64,
+}
+
+/// Aggregate traffic counters grouped by canonical NPS lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NetworkLaneMetrics {
+    pub physics_state: LaneTrafficCounter,
+    pub player_input: LaneTrafficCounter,
+    pub lifecycle_event: LaneTrafficCounter,
+    pub ui_sync: LaneTrafficCounter,
+    pub script_sync: LaneTrafficCounter,
+}
+
+impl NetworkLaneMetrics {
+    fn record(&mut self, lane: PacketLane, bytes: usize) {
+        let counter = match lane {
+            PacketLane::PhysicsState => &mut self.physics_state,
+            PacketLane::PlayerInput => &mut self.player_input,
+            PacketLane::LifecycleEvent => &mut self.lifecycle_event,
+            PacketLane::UiSync => &mut self.ui_sync,
+            PacketLane::ScriptSync => &mut self.script_sync,
+        };
+        counter.datagrams = counter.datagrams.saturating_add(1);
+        counter.bytes = counter.bytes.saturating_add(bytes as u64);
+    }
+}
+
+/// Per-peer runtime snapshot of link telemetry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetworkPeerMetrics {
+    pub peer: PeerId,
+    pub addr: Option<SocketAddr>,
+    pub link: PeerLinkMetrics,
+}
+
 /// Aggregate runtime transport metrics including underlying NPS counters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NetworkTransportMetrics {
     pub pump_calls: u64,
     pub recv_datagrams: u64,
@@ -121,6 +161,9 @@ pub struct NetworkTransportMetrics {
     pub last_snapshot_tick: Option<u64>,
     pub known_peers: usize,
     pub pending_send_queue_len: usize,
+    pub sent_by_lane: NetworkLaneMetrics,
+    pub received_by_lane: NetworkLaneMetrics,
+    pub peers: Vec<NetworkPeerMetrics>,
     pub manager: NetworkPacketMetrics,
 }
 
@@ -146,6 +189,8 @@ pub struct NetworkTransportRuntime {
     snapshot_skipped_cadence: u64,
     snapshot_skipped_duplicate_tick: u64,
     last_snapshot_tick: Option<u64>,
+    sent_by_lane: NetworkLaneMetrics,
+    received_by_lane: NetworkLaneMetrics,
 }
 
 impl NetworkTransportRuntime {
@@ -181,6 +226,8 @@ impl NetworkTransportRuntime {
             snapshot_skipped_cadence: 0,
             snapshot_skipped_duplicate_tick: 0,
             last_snapshot_tick: None,
+            sent_by_lane: NetworkLaneMetrics::default(),
+            received_by_lane: NetworkLaneMetrics::default(),
         }
     }
 
@@ -312,6 +359,12 @@ impl NetworkTransportRuntime {
     /// Drain decoded packets from NPS and account them in runtime transport telemetry.
     pub fn drain_decoded_packets(&mut self, max_events: usize) -> Vec<DecodedPacketEvent> {
         let events = self.manager.drain_decoded_packets(max_events);
+        for event in &events {
+            let semantics = packet_semantics(event.header.channel, event.header.kind);
+            let payload_bytes = usize::from(event.header.payload_bits).div_ceil(8);
+            self.received_by_lane
+                .record(semantics.lane, NPS_HEADER_BYTES + payload_bytes);
+        }
         self.decoded_events_drained = self
             .decoded_events_drained
             .saturating_add(events.len() as u64);
@@ -351,6 +404,18 @@ impl NetworkTransportRuntime {
             last_snapshot_tick: self.last_snapshot_tick,
             known_peers: self.peer_addrs.len(),
             pending_send_queue_len: self.pending_send.len(),
+            sent_by_lane: self.sent_by_lane,
+            received_by_lane: self.received_by_lane,
+            peers: self
+                .manager
+                .all_peer_link_metrics()
+                .into_iter()
+                .map(|(peer, link)| NetworkPeerMetrics {
+                    peer,
+                    addr: self.peer_addrs.get(&peer).copied(),
+                    link,
+                })
+                .collect(),
             manager: self.manager.metrics(),
         }
     }
@@ -393,6 +458,8 @@ impl NetworkTransportRuntime {
 
             match socket.try_send_to(&datagram.bytes, addr) {
                 Ok(len) => {
+                    let semantics = packet_semantics(datagram.header.channel, datagram.header.kind);
+                    self.sent_by_lane.record(semantics.lane, len);
                     sent_datagrams += 1;
                     sent_bytes += len;
                 }
@@ -453,6 +520,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(len > 0);
+        let metrics = runtime.metrics();
+        assert_eq!(metrics.sent_by_lane.player_input.datagrams, 1);
     }
 
     #[tokio::test]
@@ -510,6 +579,8 @@ mod tests {
             }
             other => panic!("expected input frame, got {other:?}"),
         }
+        let metrics = runtime.metrics();
+        assert_eq!(metrics.received_by_lane.player_input.datagrams, 1);
     }
 
     #[test]

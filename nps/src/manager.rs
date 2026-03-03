@@ -24,7 +24,9 @@ use crate::packet::{
     InputFrame, LifecycleEvent, PacketChannel, PacketError, PacketFlags, PacketHeader, PacketView,
     PayloadKind, TransformBatch, TransformSample, NPS_HEADER_BYTES, NPS_MAGIC, NPS_VERSION,
 };
-use crate::reliability::{PeerId, PeerReliabilityState, PhysAuthorityTable, SendPolicy};
+use crate::reliability::{
+    PeerId, PeerLinkMetrics, PeerReliabilityState, PhysAuthorityTable, SendPolicy,
+};
 
 /// Default datagram budget used by NPS manager encode tasks.
 pub const DEFAULT_MAX_DATAGRAM_BYTES: usize = 1200;
@@ -361,6 +363,7 @@ impl NetworkPacketManager {
                 event.header.sequence,
                 event.header.ack,
                 event.header.ack_bits,
+                event.decoded_at,
             );
             out.push(event);
         }
@@ -606,6 +609,22 @@ impl NetworkPacketManager {
     /// Read the current authoritative owner for a physics object.
     pub fn current_object_owner(&self, object: u32) -> Option<PeerId> {
         self.authority.current_owner(object)
+    }
+
+    /// Snapshot best-effort link telemetry for one peer.
+    pub fn peer_link_metrics(&self, peer: PeerId) -> Option<PeerLinkMetrics> {
+        self.peers.get(&peer).map(|peer| peer.reliability.metrics())
+    }
+
+    /// Snapshot link telemetry for all known peers.
+    pub fn all_peer_link_metrics(&self) -> Vec<(PeerId, PeerLinkMetrics)> {
+        let mut out = self
+            .peers
+            .iter()
+            .map(|(&peer_id, peer)| (peer_id, peer.reliability.metrics()))
+            .collect::<Vec<_>>();
+        out.sort_by_key(|(peer_id, _)| *peer_id);
+        out
     }
 
     /// Snapshot lock-free metrics counters.
