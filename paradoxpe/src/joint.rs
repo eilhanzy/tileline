@@ -13,6 +13,7 @@ use crate::storage::BodyRegistry;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JointKind {
     Distance,
+    Fixed,
 }
 
 /// Distance joint descriptor.
@@ -73,6 +74,90 @@ impl DistanceJoint {
     }
 }
 
+/// Fixed joint descriptor that preserves a target relative offset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedJointDesc {
+    pub body_a: BodyHandle,
+    pub body_b: BodyHandle,
+    pub target_offset: Vector3<f32>,
+    pub stiffness: f32,
+    pub damping: f32,
+}
+
+impl FixedJointDesc {
+    pub fn with_offset(
+        body_a: BodyHandle,
+        body_b: BodyHandle,
+        target_offset: Vector3<f32>,
+    ) -> Self {
+        Self {
+            body_a,
+            body_b,
+            target_offset,
+            stiffness: 1.0,
+            damping: 0.15,
+        }
+    }
+}
+
+/// Fixed joint that constrains relative translation to a target offset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedJoint {
+    pub handle: JointHandle,
+    pub body_a: BodyHandle,
+    pub body_b: BodyHandle,
+    pub target_offset: Vector3<f32>,
+    pub stiffness: f32,
+    pub damping: f32,
+}
+
+impl FixedJoint {
+    pub fn from_desc(handle: JointHandle, desc: FixedJointDesc) -> Self {
+        Self {
+            handle,
+            body_a: desc.body_a,
+            body_b: desc.body_b,
+            target_offset: desc.target_offset,
+            stiffness: desc.stiffness.clamp(0.0, 1.0),
+            damping: desc.damping.max(0.0),
+        }
+    }
+
+    pub fn kind(&self) -> JointKind {
+        JointKind::Fixed
+    }
+}
+
+/// Joint record stored by the world.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JointConstraint {
+    Distance(DistanceJoint),
+    Fixed(FixedJoint),
+}
+
+impl JointConstraint {
+    pub fn handle(&self) -> JointHandle {
+        match self {
+            Self::Distance(joint) => joint.handle,
+            Self::Fixed(joint) => joint.handle,
+        }
+    }
+
+    pub fn bodies(&self) -> (BodyHandle, BodyHandle) {
+        match self {
+            Self::Distance(joint) => (joint.body_a, joint.body_b),
+            Self::Fixed(joint) => (joint.body_a, joint.body_b),
+        }
+    }
+
+    pub fn kind(&self) -> JointKind {
+        match self {
+            Self::Distance(_) => JointKind::Distance,
+            Self::Fixed(_) => JointKind::Fixed,
+        }
+    }
+}
+
 /// Joint solver tuning.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JointSolverConfig {
@@ -121,7 +206,7 @@ impl JointConstraintSolver {
         self.stats
     }
 
-    pub fn solve(&mut self, bodies: &mut BodyRegistry, joints: &[DistanceJoint], dt: f32) {
+    pub fn solve(&mut self, bodies: &mut BodyRegistry, joints: &[JointConstraint], dt: f32) {
         self.stats = JointSolverStats {
             joints: joints.len(),
             iterations: self.config.iterations,
@@ -132,7 +217,12 @@ impl JointConstraintSolver {
         }
         for _ in 0..self.config.iterations {
             for joint in joints {
-                self.solve_distance_joint(bodies, joint, dt);
+                match joint {
+                    JointConstraint::Distance(joint) => {
+                        self.solve_distance_joint(bodies, joint, dt)
+                    }
+                    JointConstraint::Fixed(joint) => self.solve_fixed_joint(bodies, joint, dt),
+                }
             }
         }
     }
@@ -197,6 +287,65 @@ impl JointConstraintSolver {
         }
         self.stats.velocity_impulses = self.stats.velocity_impulses.saturating_add(1);
     }
+
+    fn solve_fixed_joint(&mut self, bodies: &mut BodyRegistry, joint: &FixedJoint, dt: f32) {
+        let Some(dense_a) = bodies.dense_index_of(joint.body_a) else {
+            return;
+        };
+        let Some(dense_b) = bodies.dense_index_of(joint.body_b) else {
+            return;
+        };
+        let inv_mass_a = bodies.inverse_masses[dense_a];
+        let inv_mass_b = bodies.inverse_masses[dense_b];
+        let total_inv_mass = inv_mass_a + inv_mass_b;
+        if total_inv_mass <= f32::EPSILON {
+            return;
+        }
+
+        let delta = (bodies.positions[dense_b] - bodies.positions[dense_a]) - joint.target_offset;
+        let distance = delta.norm();
+        let normal = if distance > 1e-6 {
+            delta / distance
+        } else {
+            Vector3::new(1.0, 0.0, 0.0)
+        };
+
+        let correction_mag =
+            (distance * joint.stiffness * self.config.positional_bias) / total_inv_mass;
+        if correction_mag > f32::EPSILON {
+            let correction = normal * correction_mag;
+            if inv_mass_a > 0.0 && bodies.kinds[dense_a] != BodyKind::Static {
+                bodies.positions[dense_a] += correction * inv_mass_a;
+                bodies.recompute_world_aabb_for_dense(dense_a);
+                bodies.wake_dense(dense_a);
+            }
+            if inv_mass_b > 0.0 && bodies.kinds[dense_b] != BodyKind::Static {
+                bodies.positions[dense_b] -= correction * inv_mass_b;
+                bodies.recompute_world_aabb_for_dense(dense_b);
+                bodies.wake_dense(dense_b);
+            }
+            self.stats.positional_corrections = self.stats.positional_corrections.saturating_add(1);
+        }
+
+        let relative_velocity =
+            bodies.linear_velocities[dense_b] - bodies.linear_velocities[dense_a];
+        let impulse_mag = -(relative_velocity.dot(&normal)
+            + distance * joint.damping / dt.max(1e-4))
+            / total_inv_mass;
+        if impulse_mag.abs() <= f32::EPSILON {
+            return;
+        }
+        let impulse = normal * impulse_mag;
+        if inv_mass_a > 0.0 && bodies.kinds[dense_a] == BodyKind::Dynamic {
+            bodies.linear_velocities[dense_a] -= impulse * inv_mass_a;
+            bodies.wake_dense(dense_a);
+        }
+        if inv_mass_b > 0.0 && bodies.kinds[dense_b] == BodyKind::Dynamic {
+            bodies.linear_velocities[dense_b] += impulse * inv_mass_b;
+            bodies.wake_dense(dense_b);
+        }
+        self.stats.velocity_impulses = self.stats.velocity_impulses.saturating_add(1);
+    }
 }
 
 #[cfg(test)]
@@ -214,11 +363,31 @@ mod tests {
             position: Vector3::new(4.0, 0.0, 0.0),
             ..BodyDesc::default()
         });
-        let joint =
-            DistanceJoint::from_desc(JointHandle::new(0, 1), DistanceJointDesc::new(a, b, 2.0));
+        let joint = JointConstraint::Distance(DistanceJoint::from_desc(
+            JointHandle::new(0, 1),
+            DistanceJointDesc::new(a, b, 2.0),
+        ));
         let mut solver = JointConstraintSolver::new(JointSolverConfig::default());
         solver.solve(&mut bodies, &[joint], 1.0 / 60.0);
         let separation = (bodies.position_for(b).unwrap() - bodies.position_for(a).unwrap()).norm();
         assert!(separation < 4.0);
+    }
+
+    #[test]
+    fn fixed_joint_preserves_relative_offset() {
+        let mut bodies = BodyRegistry::new();
+        let a = bodies.spawn(BodyDesc::default());
+        let b = bodies.spawn(BodyDesc {
+            position: Vector3::new(2.0, 1.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let joint = JointConstraint::Fixed(FixedJoint::from_desc(
+            JointHandle::new(0, 1),
+            FixedJointDesc::with_offset(a, b, Vector3::new(1.0, 0.0, 0.0)),
+        ));
+        let mut solver = JointConstraintSolver::new(JointSolverConfig::default());
+        solver.solve(&mut bodies, &[joint], 1.0 / 60.0);
+        let offset = bodies.position_for(b).unwrap() - bodies.position_for(a).unwrap();
+        assert!((offset - Vector3::new(1.0, 0.0, 0.0)).norm() < 2.25);
     }
 }

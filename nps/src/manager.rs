@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use crossbeam::queue::SegQueue;
 use mps::{CorePreference, MpsScheduler, TaskId, TaskPriority};
+use paradoxpe::PhysicsSnapshot;
 
 use crate::packet::{
     decode_payload_owned, encode_authority_transfer, encode_input_frame, encode_lifecycle_event,
@@ -43,6 +44,8 @@ pub struct NetworkPacketConfig {
     pub decode_core_preference: CorePreference,
     /// Core preference for encode work.
     pub encode_core_preference: CorePreference,
+    /// Velocity magnitude that maps to the `-1..=1` normalized transport domain.
+    pub velocity_normalization: f32,
 }
 
 impl Default for NetworkPacketConfig {
@@ -54,6 +57,7 @@ impl Default for NetworkPacketConfig {
             encode_priority: TaskPriority::Normal,
             decode_core_preference: CorePreference::Performance,
             encode_core_preference: CorePreference::Auto,
+            velocity_normalization: 64.0,
         }
     }
 }
@@ -383,6 +387,33 @@ impl NetworkPacketManager {
             tick,
             OutboundPayload::TransformBatch(samples),
         );
+    }
+
+    /// Queue a ParadoxPE world snapshot through the existing transform batch packet path.
+    ///
+    /// Object ids are the packed ParadoxPE body handles. Owner ids are resolved from the authority
+    /// table when available; otherwise they fall back to `0`.
+    pub fn queue_physics_snapshot(&mut self, peer: PeerId, tick: u32, snapshot: &PhysicsSnapshot) {
+        let normalization = self.config.velocity_normalization.max(1.0);
+        let samples = snapshot
+            .bodies
+            .iter()
+            .map(|body| {
+                let owner_peer = self.current_object_owner(body.handle.raw()).unwrap_or(0);
+                let flags = if body.awake { 0x1 } else { 0x0 };
+                TransformSample::quantize(
+                    body.handle.raw(),
+                    owner_peer,
+                    body.position.x,
+                    body.position.y,
+                    (body.linear_velocity.x / normalization).clamp(-1.0, 1.0),
+                    (body.linear_velocity.y / normalization).clamp(-1.0, 1.0),
+                    flags,
+                    self.config.grid,
+                )
+            })
+            .collect();
+        self.queue_physics_transforms(peer, tick, samples);
     }
 
     /// Queue a deterministic input frame for outbound encode.
@@ -736,6 +767,7 @@ fn drain_segqueue<T: Clone>(queue: &SegQueue<T>, max_events: usize) -> Vec<T> {
 mod tests {
     use super::*;
     use crate::reliability::AuthorityTransferReason;
+    use paradoxpe::{BodyHandle, BodyStateFrame, PhysicsSnapshot};
 
     #[test]
     fn manager_roundtrips_physics_batch_without_mps() {
@@ -804,5 +836,41 @@ mod tests {
             AuthorityTransferReason::PhysgunRelease as u8
         );
         assert_eq!(mgr.current_object_owner(77), Some(1));
+    }
+
+    #[test]
+    fn manager_queues_paradoxpe_snapshot_as_transform_batch() {
+        let mut mgr = NetworkPacketManager::new(NetworkPacketConfig::default());
+        mgr.set_peer_addr(4, "127.0.0.1:27016".parse().unwrap());
+        let body = BodyHandle::new(2, 1);
+        mgr.set_object_master_owner(body.raw(), 4);
+        let snapshot = PhysicsSnapshot {
+            tick: 55,
+            bodies: vec![BodyStateFrame {
+                handle: body,
+                position: nalgebra::Vector3::new(32.0, 64.0, 0.0),
+                rotation: nalgebra::UnitQuaternion::identity(),
+                linear_velocity: nalgebra::Vector3::new(8.0, -4.0, 0.0),
+                awake: true,
+            }],
+        };
+
+        mgr.queue_physics_snapshot(4, 55, &snapshot);
+        mgr.submit_outbound_encode_jobs(4);
+        let datagrams = mgr.drain_encoded_datagrams(4);
+        assert_eq!(datagrams.len(), 1);
+
+        mgr.enqueue_inbound_datagram(4, None, Arc::clone(&datagrams[0].bytes));
+        mgr.submit_inbound_decode_jobs(4);
+        let decoded = mgr.drain_decoded_packets(4);
+        match &decoded[0].payload {
+            DecodedPayload::TransformBatch(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].object, body.raw());
+                assert_eq!(samples[0].owner_peer, 4);
+                assert_eq!(samples[0].flags & 0x1, 0x1);
+            }
+            other => panic!("expected transform batch, got {other:?}"),
+        }
     }
 }

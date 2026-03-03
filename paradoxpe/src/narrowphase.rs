@@ -5,7 +5,9 @@
 
 use nalgebra::Vector3;
 
-use crate::body::{Aabb, ColliderShape, ContactId, ContactManifold};
+use crate::body::{
+    Aabb, ColliderMaterial, ColliderShape, ContactId, ContactManifold, MaterialCombineRule,
+};
 use crate::handle::BodyHandle;
 use crate::handle::ColliderHandle;
 use crate::storage::BodyRegistry;
@@ -15,18 +17,18 @@ use crate::storage::BodyRegistry;
 pub struct NarrowphaseConfig {
     /// Maximum manifold count stored without reallocating.
     pub max_manifolds: usize,
-    /// Default restitution applied to generated manifolds.
-    pub default_restitution: f32,
-    /// Default dynamic friction coefficient attached to generated manifolds.
-    pub default_friction: f32,
+    /// Global restitution combine rule.
+    pub restitution_combine_rule: MaterialCombineRule,
+    /// Global friction combine rule.
+    pub friction_combine_rule: MaterialCombineRule,
 }
 
 impl Default for NarrowphaseConfig {
     fn default() -> Self {
         Self {
             max_manifolds: 16_384,
-            default_restitution: 0.05,
-            default_friction: 0.6,
+            restitution_combine_rule: MaterialCombineRule::Max,
+            friction_combine_rule: MaterialCombineRule::Average,
         }
     }
 }
@@ -107,7 +109,13 @@ impl NarrowphasePipeline {
         mut collider_lookup: F,
     ) -> &[ContactManifold]
     where
-        F: FnMut(BodyHandle) -> Option<(crate::handle::ColliderHandle, ColliderShape)>,
+        F: FnMut(
+            BodyHandle,
+        ) -> Option<(
+            crate::handle::ColliderHandle,
+            ColliderShape,
+            ColliderMaterial,
+        )>,
     {
         self.stats = NarrowphaseStats {
             candidate_pairs: candidate_pairs.len(),
@@ -118,11 +126,11 @@ impl NarrowphasePipeline {
         self.sync_for_pair_capacity(candidate_pairs.len());
 
         for &(body_a, body_b) in candidate_pairs {
-            let Some((collider_a, shape_a)) = collider_lookup(body_a) else {
+            let Some((collider_a, shape_a, material_a)) = collider_lookup(body_a) else {
                 self.stats.culled_pairs += 1;
                 continue;
             };
-            let Some((collider_b, shape_b)) = collider_lookup(body_b) else {
+            let Some((collider_b, shape_b, material_b)) = collider_lookup(body_b) else {
                 self.stats.culled_pairs += 1;
                 continue;
             };
@@ -154,6 +162,14 @@ impl NarrowphasePipeline {
                 .lookup_persistent_state(contact_id)
                 .map(|state| state.persisted_frames.saturating_add(1))
                 .unwrap_or(1);
+            let restitution = self
+                .config
+                .restitution_combine_rule
+                .combine(material_a.restitution, material_b.restitution);
+            let friction = self
+                .config
+                .friction_combine_rule
+                .combine(material_a.friction, material_b.friction);
             if self.manifolds.len() < self.manifolds.capacity() {
                 self.manifolds.push(ContactManifold {
                     contact_id,
@@ -165,8 +181,8 @@ impl NarrowphasePipeline {
                     normal,
                     penetration,
                     persisted_frames,
-                    restitution: self.config.default_restitution,
-                    friction: self.config.default_friction,
+                    restitution,
+                    friction,
                 });
                 if persisted_frames > 1 {
                     self.stats.persistent_manifolds += 1;
@@ -353,7 +369,7 @@ mod tests {
     use nalgebra::Vector3;
 
     use super::*;
-    use crate::body::{BodyDesc, ColliderShape};
+    use crate::body::{BodyDesc, ColliderMaterial, ColliderShape};
     use crate::handle::ColliderHandle;
 
     #[test]
@@ -375,6 +391,7 @@ mod tests {
                 ColliderShape::Aabb {
                     half_extents: Vector3::new(0.5, 0.5, 0.5),
                 },
+                ColliderMaterial::default(),
             ))
         });
         assert_eq!(manifolds.len(), 1);
@@ -403,6 +420,7 @@ mod tests {
                     ColliderShape::Aabb {
                         half_extents: Vector3::new(0.5, 0.5, 0.5),
                     },
+                    ColliderMaterial::default(),
                 ))
             });
             assert_eq!(manifolds[0].persisted_frames, 1);
@@ -415,10 +433,49 @@ mod tests {
                 ColliderShape::Aabb {
                     half_extents: Vector3::new(0.5, 0.5, 0.5),
                 },
+                ColliderMaterial::default(),
             ))
         });
         assert_eq!(manifolds[0].contact_id, first_id);
         assert_eq!(manifolds[0].persisted_frames, 2);
         assert_eq!(narrowphase.stats().persistent_manifolds, 1);
+    }
+
+    #[test]
+    fn narrowphase_combines_material_coefficients() {
+        let mut bodies = BodyRegistry::new();
+        let a = bodies.spawn(BodyDesc::default());
+        let b = bodies.spawn(BodyDesc {
+            position: Vector3::new(0.5, 0.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let candidate_pairs = vec![(a, b)];
+        let mut narrowphase = NarrowphasePipeline::new(NarrowphaseConfig {
+            restitution_combine_rule: MaterialCombineRule::Max,
+            friction_combine_rule: MaterialCombineRule::Multiply,
+            ..NarrowphaseConfig::default()
+        });
+        let manifolds = narrowphase.rebuild_manifolds(&bodies, &candidate_pairs, |body| {
+            let material = if body == a {
+                ColliderMaterial {
+                    restitution: 0.1,
+                    friction: 0.5,
+                }
+            } else {
+                ColliderMaterial {
+                    restitution: 0.8,
+                    friction: 0.4,
+                }
+            };
+            Some((
+                ColliderHandle::new(body.index() as u16, body.generation()),
+                ColliderShape::Aabb {
+                    half_extents: Vector3::new(0.5, 0.5, 0.5),
+                },
+                material,
+            ))
+        });
+        assert!((manifolds[0].restitution - 0.8).abs() < 1e-6);
+        assert!((manifolds[0].friction - 0.2).abs() < 1e-6);
     }
 }

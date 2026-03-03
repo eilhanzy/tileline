@@ -1773,6 +1773,8 @@ version = "0.1.0"
 dependencies = [
  "crossbeam",
  "mps",
+ "nalgebra",
+ "paradoxpe",
 ]
 
 [[package]]

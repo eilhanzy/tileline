@@ -5,4 +5,6 @@ edition = "2021"
 
 [dependencies]
 crossbeam.workspace = true
+nalgebra.workspace = true
 mps = { path = "../mps" }
+paradoxpe = { path = "../paradoxpe" }

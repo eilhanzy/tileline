@@ -196,6 +196,44 @@ impl ColliderShape {
     }
 }
 
+/// Material combine policy used when two collider coefficients meet in narrowphase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MaterialCombineRule {
+    Average,
+    Min,
+    Max,
+    Multiply,
+}
+
+impl MaterialCombineRule {
+    pub fn combine(self, left: f32, right: f32) -> f32 {
+        let left = left.max(0.0);
+        let right = right.max(0.0);
+        match self {
+            Self::Average => (left + right) * 0.5,
+            Self::Min => left.min(right),
+            Self::Max => left.max(right),
+            Self::Multiply => left * right,
+        }
+    }
+}
+
+/// Per-collider material coefficients used by contact generation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColliderMaterial {
+    pub restitution: f32,
+    pub friction: f32,
+}
+
+impl Default for ColliderMaterial {
+    fn default() -> Self {
+        Self {
+            restitution: 0.05,
+            friction: 0.6,
+        }
+    }
+}
+
 /// Rigid body descriptor consumed by the SoA body registry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodyDesc {
@@ -247,6 +285,7 @@ pub struct RigidBody {
 pub struct ColliderDesc {
     pub body: Option<BodyHandle>,
     pub shape: ColliderShape,
+    pub material: ColliderMaterial,
     pub is_sensor: bool,
     pub user_tag: u32,
 }
@@ -256,6 +295,7 @@ impl ColliderDesc {
         Self {
             body: Some(body),
             shape,
+            material: ColliderMaterial::default(),
             is_sensor: false,
             user_tag: 0,
         }

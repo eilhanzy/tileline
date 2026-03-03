@@ -5,7 +5,7 @@ Tileline is a parallel-first game engine architecture prototype focused on expli
 - `MPS` (Multi Processing Scaler): CPU-side task scheduling and WASM execution
 - `GMS` (Graphics Multi Scaler): GPU discovery, scoring, and asymmetric multi-GPU planning
 - `NPS` (Network Packet Scaler): bit-packed UDP protocol, reliability, and MPS-offloaded packet processing
-- `ParadoxPE`: fixed-step physics foundation with SoA storage, broadphase, solver, joints, sleep, and script/WASM host ABI
+- `ParadoxPE`: fixed-step physics foundation with SoA storage, broadphase, solver, joints, sleep, snapshot/interpolation support, and script/WASM host ABI
 - `tl-core`: engine bridge layer that synchronizes MPS and GMS
 - `runtime`: render-loop integration glue for `wgpu` submit/present flows
 
@@ -21,7 +21,7 @@ This workspace is currently in engine-foundation phase. The main goals are:
 - `mps/`: CPU topology detection, priority balancer, lock-free scheduler, WASM dispatch (Wasmer)
 - `gms/`: GPU inventory/scoring, multi-GPU planner, adaptive UMA buffer control, benchmark tooling
 - `nps/`: low-level UDP packet protocol, bit packing, reliability, authority handoff, MPS-integrated packet manager
-- `paradoxpe/`: fixed-step physics core with packed handles, SoA body storage, parallel broadphase, narrowphase/solver passes, starter joints/sleep, and `.tlscript`-friendly host ABI
+- `paradoxpe/`: fixed-step physics core with packed handles, SoA body storage, parallel broadphase, narrowphase/solver passes, starter joints/sleep, snapshot/interpolation buffering, and `.tlscript`-friendly host ABI
 - `tl-core/`: `MpsGmsBridge`, portable multi-GPU sync abstractions, and `.tlscript` compiler/runtime metadata layers
 - `runtime/`: frame-loop coordinators and `.tlscript` parallel planning glue for engine-side integration
 
@@ -34,7 +34,7 @@ This workspace is currently in engine-foundation phase. The main goals are:
 - `docs/tlscript-semantic.md`: `.tlscript` semantic analyzer (types, handles, WASM sandboxing)
 - `docs/tlscript-parallel-runtime.md`: `.tlscript` parallel contracts, advisor, and runtime dispatch planning
 - `docs/nps-protocol.md`: NPS packet format, reliability, authority handoff, and MPS integration
-- `docs/paradoxpe-foundation.md`: ParadoxPE handle model, SoA storage, broadphase/solver pipeline, and script ABI
+- `docs/paradoxpe-foundation.md`: ParadoxPE handle model, SoA storage, broadphase/solver pipeline, snapshot base, and script ABI
 - `docs/paradoxpe-tlscript-examples.md`: verified `.tlscript` examples targeting the current ParadoxPE ABI
 - `docs/gms-dispatch-planner.md`: GMS workload planning and multi-GPU dispatch notes
 - `docs/runtime-bridge-flow.md`: canonical MPS -> GMS -> runtime synchronization flow
@@ -160,6 +160,8 @@ UMA-specific tuning and adaptive buffer controls are implemented in `gms` and wi
 - ParadoxPE-aware `domain="bodies"` runtime planning and MPS chunk routing helpers
 - verified ParadoxPE `.tlscript` examples compiled through lexer -> semantic -> IR -> WASM tests
 - initial ParadoxPE host ABI names wired into semantic/lowering/codegen defaults
+- fixed joint support, material combine rules, and snapshot/interpolation primitives in the physics core
+- NPS-side direct `PhysicsSnapshot` to quantized transform-batch export path
 
 Next pipeline steps:
 

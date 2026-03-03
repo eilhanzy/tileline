@@ -15,9 +15,13 @@ use crate::broadphase::{BroadphaseConfig, BroadphasePipeline};
 use crate::handle::{
     BodyHandle, ColliderHandle, ContactHandle, HandleKind, JointHandle, PhysicsHandle,
 };
-use crate::joint::{DistanceJoint, DistanceJointDesc, JointConstraintSolver, JointSolverConfig};
+use crate::joint::{
+    DistanceJoint, DistanceJointDesc, FixedJoint, FixedJointDesc, JointConstraint,
+    JointConstraintSolver, JointSolverConfig,
+};
 use crate::narrowphase::{NarrowphaseConfig, NarrowphasePipeline};
 use crate::sleep::{SleepConfig, SleepIslandManager};
+use crate::snapshot::{BodyStateFrame, PhysicsInterpolationBuffer, PhysicsSnapshot};
 use crate::solver::{ContactSolver, ContactSolverConfig};
 use crate::storage::BodyRegistry;
 
@@ -125,12 +129,13 @@ pub struct PhysicsWorld {
     sleep_manager: SleepIslandManager,
     colliders: Vec<Slot<ColliderRecord>>,
     free_colliders: Vec<u16>,
-    joints: Vec<Slot<DistanceJoint>>,
+    joints: Vec<Slot<JointConstraint>>,
     free_joints: Vec<u16>,
-    active_joints: Vec<DistanceJoint>,
+    active_joints: Vec<JointConstraint>,
     contact_snapshots: Vec<Slot<ContactSnapshot>>,
     free_contact_snapshots: Vec<u16>,
     contacts: Vec<ContactPair>,
+    interpolation: PhysicsInterpolationBuffer,
 }
 
 impl PhysicsWorld {
@@ -159,6 +164,7 @@ impl PhysicsWorld {
             contact_snapshots: Vec::new(),
             free_contact_snapshots: Vec::new(),
             contacts: Vec::new(),
+            interpolation: PhysicsInterpolationBuffer::default(),
         }
     }
 
@@ -203,6 +209,10 @@ impl PhysicsWorld {
         &self.sleep_manager
     }
 
+    pub fn interpolation(&self) -> &PhysicsInterpolationBuffer {
+        &self.interpolation
+    }
+
     pub fn spawn_body(&mut self, desc: BodyDesc) -> BodyHandle {
         let handle = self.bodies.spawn(desc);
         self.sync_hot_loop_buffers();
@@ -231,8 +241,11 @@ impl PhysicsWorld {
             .joints
             .iter()
             .filter_map(|slot| slot.value.as_ref())
-            .filter(|joint| joint.body_a == handle || joint.body_b == handle)
-            .map(|joint| joint.handle)
+            .filter(|joint| {
+                let (body_a, body_b) = joint.bodies();
+                body_a == handle || body_b == handle
+            })
+            .map(|joint| joint.handle())
             .collect::<Vec<_>>();
         for joint in joints_to_remove {
             let _ = self.destroy_joint(joint);
@@ -262,10 +275,37 @@ impl PhysicsWorld {
         self.bodies.body(desc.body_b)?;
         let (index, generation, slot) = alloc_slot(&mut self.joints, &mut self.free_joints);
         let handle = JointHandle::new(index, generation);
-        *slot = Some(DistanceJoint::from_desc(handle, desc));
+        *slot = Some(JointConstraint::Distance(DistanceJoint::from_desc(
+            handle, desc,
+        )));
         self.rebuild_active_joint_cache();
         self.sync_hot_loop_buffers();
         Some(handle)
+    }
+
+    pub fn spawn_fixed_joint(&mut self, desc: FixedJointDesc) -> Option<JointHandle> {
+        self.bodies.body(desc.body_a)?;
+        self.bodies.body(desc.body_b)?;
+        let (index, generation, slot) = alloc_slot(&mut self.joints, &mut self.free_joints);
+        let handle = JointHandle::new(index, generation);
+        *slot = Some(JointConstraint::Fixed(FixedJoint::from_desc(handle, desc)));
+        self.rebuild_active_joint_cache();
+        self.sync_hot_loop_buffers();
+        Some(handle)
+    }
+
+    pub fn lock_bodies_with_fixed_joint(
+        &mut self,
+        body_a: BodyHandle,
+        body_b: BodyHandle,
+    ) -> Option<JointHandle> {
+        let position_a = self.bodies.position_for(body_a)?;
+        let position_b = self.bodies.position_for(body_b)?;
+        self.spawn_fixed_joint(FixedJointDesc::with_offset(
+            body_a,
+            body_b,
+            position_b - position_a,
+        ))
     }
 
     pub fn destroy_collider(&mut self, handle: ColliderHandle) -> bool {
@@ -367,6 +407,7 @@ impl PhysicsWorld {
         let substeps = self.clock.accumulate(dt);
         let fixed_dt = self.clock.fixed_dt();
         for _ in 0..substeps {
+            self.interpolation.push_snapshot(self.capture_snapshot());
             self.bodies.integrate(fixed_dt, self.config.gravity);
             let bodies = &self.bodies;
             self.broadphase.rebuild_pairs_parallel(bodies);
@@ -385,6 +426,54 @@ impl PhysicsWorld {
                 .update(&mut self.bodies, manifolds, &self.active_joints, fixed_dt);
         }
         substeps
+    }
+
+    pub fn capture_snapshot(&self) -> PhysicsSnapshot {
+        let mut bodies_out = Vec::with_capacity(self.bodies.len());
+        let read = self.bodies.read_domain();
+        for index in 0..read.handles.len() {
+            bodies_out.push(BodyStateFrame {
+                handle: read.handles[index],
+                position: read.positions[index],
+                rotation: read.rotations[index],
+                linear_velocity: read.linear_velocities[index],
+                awake: read.awake[index],
+            });
+        }
+        PhysicsSnapshot {
+            tick: self.clock.tick(),
+            bodies: bodies_out,
+        }
+    }
+
+    pub fn restore_snapshot(&mut self, snapshot: &PhysicsSnapshot) -> usize {
+        let mut restored = 0usize;
+        for frame in &snapshot.bodies {
+            let Some(dense) = self.bodies.dense_index_of(frame.handle) else {
+                continue;
+            };
+            self.bodies.positions[dense] = frame.position;
+            self.bodies.rotations[dense] = frame.rotation;
+            self.bodies.linear_velocities[dense] = frame.linear_velocity;
+            self.bodies.awake[dense] = frame.awake;
+            self.bodies.recompute_world_aabb_for_dense(dense);
+            restored += 1;
+        }
+        self.clock.tick = snapshot.tick;
+        self.clock.accumulator = 0.0;
+        restored
+    }
+
+    pub fn push_interpolation_snapshot(&mut self) {
+        self.interpolation.push_snapshot(self.capture_snapshot());
+    }
+
+    pub fn interpolate_body_pose(
+        &self,
+        body: BodyHandle,
+        alpha: f32,
+    ) -> Option<crate::snapshot::InterpolatedBodyPose> {
+        self.interpolation.interpolate_body(body, alpha)
     }
 
     fn rebuild_contacts_from_manifolds(
@@ -537,10 +626,10 @@ fn primary_shape_for_body(
     colliders: &[Slot<ColliderRecord>],
     bodies: &BodyRegistry,
     body: BodyHandle,
-) -> Option<(ColliderHandle, ColliderShape)> {
+) -> Option<(ColliderHandle, ColliderShape, crate::body::ColliderMaterial)> {
     let collider = bodies.primary_collider(body)?;
     let record = get_slot(colliders, collider.erased())?.value.as_ref()?;
-    Some((collider, record.desc.shape.clone()))
+    Some((collider, record.desc.shape.clone(), record.desc.material))
 }
 
 fn alloc_slot<'a, T>(
@@ -585,6 +674,7 @@ fn free_slot<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::joint::FixedJointDesc;
 
     #[test]
     fn dynamic_body_integrates_with_force() {
@@ -668,5 +758,40 @@ mod tests {
         );
         assert_eq!(world.contacts.capacity(), contact_capacity);
         assert!(!world.broadphase().stats().overflowed);
+    }
+
+    #[test]
+    fn fixed_joint_can_be_spawned_from_world() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
+        let a = world.spawn_body(BodyDesc::default());
+        let b = world.spawn_body(BodyDesc {
+            position: Vector3::new(2.0, 0.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let joint = world
+            .spawn_fixed_joint(FixedJointDesc::with_offset(
+                a,
+                b,
+                Vector3::new(1.0, 0.0, 0.0),
+            ))
+            .unwrap();
+        assert!(world.release_handle(joint.erased()));
+    }
+
+    #[test]
+    fn world_can_restore_and_interpolate_snapshots() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
+        let body = world.spawn_body(BodyDesc::default());
+        let first = world.capture_snapshot();
+        world.set_velocity(body, Vector3::new(10.0, 0.0, 0.0));
+        let _ = world.step(1.0 / 60.0);
+        let second = world.capture_snapshot();
+        world.restore_snapshot(&first);
+        assert!(world.body(body).unwrap().position.x.abs() < 1e-5);
+
+        world.interpolation.push_snapshot(first.clone());
+        world.interpolation.push_snapshot(second.clone());
+        let pose = world.interpolate_body_pose(body, 0.5).unwrap();
+        assert!(pose.position.x >= 0.0);
     }
 }

@@ -5,7 +5,7 @@
 
 use crate::body::ContactManifold;
 use crate::handle::BodyHandle;
-use crate::joint::DistanceJoint;
+use crate::joint::JointConstraint;
 use crate::storage::BodyRegistry;
 
 /// Sleep manager tuning.
@@ -84,7 +84,7 @@ impl SleepIslandManager {
         &mut self,
         bodies: &mut BodyRegistry,
         manifolds: &[ContactManifold],
-        joints: &[DistanceJoint],
+        joints: &[JointConstraint],
         dt: f32,
     ) {
         self.stats = SleepStats::default();
@@ -107,7 +107,8 @@ impl SleepIslandManager {
             self.union_handles(bodies, manifold.body_a, manifold.body_b);
         }
         for joint in joints {
-            self.union_handles(bodies, joint.body_a, joint.body_b);
+            let (body_a, body_b) = joint.bodies();
+            self.union_handles(bodies, body_a, body_b);
         }
 
         self.island_counts.fill(0);
@@ -185,7 +186,7 @@ mod tests {
     use super::*;
     use crate::body::{BodyDesc, ContactId, ContactManifold};
     use crate::handle::{ColliderHandle, JointHandle};
-    use crate::joint::{DistanceJoint, DistanceJointDesc};
+    use crate::joint::{DistanceJoint, DistanceJointDesc, JointConstraint};
 
     #[test]
     fn islands_can_put_slow_bodies_to_sleep() {
@@ -208,8 +209,10 @@ mod tests {
             restitution: 0.0,
             friction: 0.5,
         };
-        let joint =
-            DistanceJoint::from_desc(JointHandle::new(0, 1), DistanceJointDesc::new(a, b, 1.0));
+        let joint = JointConstraint::Distance(DistanceJoint::from_desc(
+            JointHandle::new(0, 1),
+            DistanceJointDesc::new(a, b, 1.0),
+        ));
         let mut sleep = SleepIslandManager::new(SleepConfig {
             linear_speed_threshold: 0.1,
             time_to_sleep: 0.01,

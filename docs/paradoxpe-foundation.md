@@ -1,4 +1,4 @@
-# ParadoxPE Foundation (Handles, SoA Storage, Broadphase, Solver, Script ABI)
+# ParadoxPE Foundation (Handles, SoA Storage, Broadphase, Solver, Snapshot ABI)
 
 This document describes the current ParadoxPE foundation layer in the Tileline workspace.
 
@@ -12,6 +12,8 @@ physics pipeline that already covers the hot path shape:
 - narrowphase manifold generation
 - sequential impulse contact solving
 - starter joint and sleep/island systems
+- snapshot capture / restore / interpolation buffering
+- NPS-friendly quantized snapshot export path
 - pointer-free `.tlscript` / WASM host ABI
 
 ## Relevant Modules
@@ -24,6 +26,7 @@ physics pipeline that already covers the hot path shape:
 - `paradoxpe/src/solver.rs`
 - `paradoxpe/src/joint.rs`
 - `paradoxpe/src/sleep.rs`
+- `paradoxpe/src/snapshot.rs`
 - `paradoxpe/src/world.rs`
 - `paradoxpe/src/abi.rs`
 
@@ -100,7 +103,9 @@ chunking to active simulation load instead of total handle count.
 
 - body/collider/joint storage with generational invalidation
 - collider storage with body attachment
+- collider materials with friction/restitution combine rules
 - distance-joint storage
+- fixed-joint storage
 - generic `release_handle(...)`
 - fixed-step stepping via `FixedStepClock`
 - SoA integration path (`gravity`, accumulated force, velocity, damping)
@@ -110,6 +115,8 @@ chunking to active simulation load instead of total handle count.
 - joint solver pass
 - sleep/island update pass
 - immutable contact snapshots addressable by handle
+- full-world snapshot capture / restore
+- interpolation buffer maintenance for render/network smoothing
 
 The current fixed-step pass order is:
 
@@ -120,6 +127,7 @@ The current fixed-step pass order is:
 5. solve joints
 6. rebuild immutable contact snapshots
 7. update sleep/island state
+8. push world snapshot into the interpolation ring
 
 The architecture is still conservative, but it is no longer just a placeholder skeleton. It now
 exercises the actual physics hot path end-to-end.
@@ -149,6 +157,17 @@ Each manifold now carries:
 This lets ParadoxPE preserve contact identity across frames and gives the solver/snapshot layer a
 stable notion of "the same contact" instead of treating every overlap as a fresh event.
 
+Each collider also carries a `ColliderMaterial` with:
+
+- restitution
+- friction
+- restitution combine rule
+- friction combine rule
+
+The narrowphase resolves coefficients per contact pair before solver execution. This moves the
+material policy out of the hot impulse loop and makes the resulting behavior deterministic at the
+manifold level.
+
 The solver currently includes:
 
 - positional correction
@@ -164,13 +183,15 @@ rebuild, and data flow into higher layers.
 ParadoxPE now includes two more foundation systems that sit after contact solving:
 
 - distance joint solving
+- fixed joint solving
 - sleep/island management
 
-The distance-joint path currently provides a first constraint type that validates:
+The current joint path validates:
 
 - handle-based joint lifetime
 - constraint iteration ordering
 - joint participation in world stepping
+- preserved body offsets for fixed-body pair locking
 
 The sleep manager groups dynamic bodies into islands and can transition sufficiently calm islands
 into sleeping state. This reduces wasted work in the fixed-step loop and prepares the system for
@@ -178,6 +199,42 @@ larger sandbox scenes.
 
 The current sleep logic is intentionally simple, but the architecture is already reusable and
 hot-loop friendly.
+
+## Snapshot, Rollback, and Interpolation Base
+
+ParadoxPE now includes a first snapshot layer in `paradoxpe/src/snapshot.rs`.
+
+Current pieces:
+
+- `PhysicsSnapshot`: dense frame-state capture for active bodies
+- `PhysicsWorld::capture_snapshot()`
+- `PhysicsWorld::restore_snapshot(...)`
+- `PhysicsInterpolationBuffer`: bounded ring of recent snapshots
+- `PhysicsWorld::interpolate_body_pose(...)`
+
+This is not yet a full rollback netcode implementation, but it establishes the data shape needed
+for:
+
+- deterministic state rewinds
+- render-time pose interpolation
+- NPS snapshot packet generation
+
+The world now pushes snapshots into the interpolation ring after each fixed-step update.
+
+## NPS Snapshot Bridge
+
+`nps::NetworkPacketManager` can now consume a `PhysicsSnapshot` directly and queue it as a
+quantized transform batch.
+
+The current export path:
+
+- keeps handle transport in packed `u32` form
+- quantizes positions to Tileline's grid-oriented packet format
+- normalizes velocity before packet encoding
+- reuses the existing MPS-backed outbound encode path
+
+This gives ParadoxPE a direct bridge into NPS without introducing a second physics-specific
+network packet representation.
 
 ## `.tlscript` Parallel Runtime Alignment
 
@@ -228,6 +285,7 @@ Current implementation constraints:
 - body/joint/contact buffers are reused
 - hot stepping avoids fresh allocation once the world has been synchronized for its current load
 - broadphase and body storage both favor cache-line-friendly dense traversal
+- snapshot interpolation uses a bounded ring buffer instead of per-frame snapshot churn
 
 This is the baseline needed before pushing ParadoxPE harder through MPS and `.tlscript` parallel
 contracts.
@@ -236,10 +294,11 @@ contracts.
 
 The following are not implemented yet:
 
-- richer joint set beyond distance constraints
+- richer joint set beyond distance/fixed constraints
 - stronger island scheduling heuristics
 - sleep heuristics refinement and wake propagation tuning
-- rollback/interpolation hooks
+- solver quality upgrades for larger stack/contact scenarios
+- full rollback reconciliation and resimulation policy
 - broadphase variants beyond the current parallel SAP path
 - ECS/runtime-facing higher-level gameplay physics API
 
