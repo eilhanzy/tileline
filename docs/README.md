@@ -12,6 +12,7 @@ in `src/` crates (not benchmark-only code).
 - `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
 - `gms-dispatch-planner.md`: GPU scoring, workload assignment, and multi-GPU planning behavior
 - `runtime-bridge-flow.md`: canonical MPS -> `tl-core` -> GMS -> runtime submit/present flow
+- `pmta-payload-synthesis.md`: PMTA token decoding, AES-CTR synthesis, and dataset consistency workflow
 
 ## Documentation Style
 
