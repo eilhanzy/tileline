@@ -16,17 +16,19 @@ const GENERATION_SHIFT: u32 = INDEX_BITS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum HandleKind {
+    ContactSnapshot = 0,
     Body = 1,
     Collider = 2,
-    ContactSnapshot = 3,
+    Joint = 3,
 }
 
 impl HandleKind {
     fn from_bits(bits: u32) -> Option<Self> {
         match bits {
+            0 => Some(Self::ContactSnapshot),
             1 => Some(Self::Body),
             2 => Some(Self::Collider),
-            3 => Some(Self::ContactSnapshot),
+            3 => Some(Self::Joint),
             _ => None,
         }
     }
@@ -138,6 +140,7 @@ macro_rules! define_typed_handle {
 
 define_typed_handle!(BodyHandle, HandleKind::Body);
 define_typed_handle!(ColliderHandle, HandleKind::Collider);
+define_typed_handle!(JointHandle, HandleKind::Joint);
 define_typed_handle!(ContactHandle, HandleKind::ContactSnapshot);
 
 #[cfg(test)]

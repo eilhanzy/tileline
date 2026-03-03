@@ -3,13 +3,19 @@
 //! This crate provides the first engine-facing physics world skeleton used to prepare the
 //! `.tlscript`/WASM host ABI and the future ParadoxPE runtime:
 //! - typed opaque handles packed into 32-bit script-friendly IDs
-//! - a fixed-step physics world with body/collider storage
+//! - a fixed-step physics world with SoA body/collider storage
 //! - generic handle release for script/runtime integration
 //! - a small host ABI surface that `.tlscript` can target without raw pointers
 
 pub mod abi;
 pub mod body;
+pub mod broadphase;
 pub mod handle;
+pub mod joint;
+pub mod narrowphase;
+pub mod sleep;
+pub mod solver;
+pub mod storage;
 pub mod world;
 
 pub use abi::{
@@ -21,8 +27,19 @@ pub use abi::{
     HOST_CALL_SPAWN_COLLIDER, HOST_CALL_STEP_WORLD,
 };
 pub use body::{
-    BodyDesc, BodyKind, ColliderDesc, ColliderShape, ColliderShapeKind, ContactPair,
-    ContactSnapshot, RigidBody,
+    Aabb, BodyDesc, BodyKind, ColliderDesc, ColliderShape, ColliderShapeKind, ContactManifold,
+    ContactPair, ContactSnapshot, RigidBody,
 };
-pub use handle::{BodyHandle, ColliderHandle, ContactHandle, HandleKind, PhysicsHandle};
+pub use broadphase::{BroadphaseConfig, BroadphasePipeline, BroadphaseStats};
+pub use handle::{
+    BodyHandle, ColliderHandle, ContactHandle, HandleKind, JointHandle, PhysicsHandle,
+};
+pub use joint::{
+    DistanceJoint, DistanceJointDesc, JointConstraintSolver, JointKind, JointSolverConfig,
+    JointSolverStats,
+};
+pub use narrowphase::{NarrowphaseConfig, NarrowphasePipeline, NarrowphaseStats};
+pub use sleep::{SleepConfig, SleepIslandManager, SleepStats};
+pub use solver::{ContactSolver, ContactSolverConfig, ContactSolverStats};
+pub use storage::{BodyReadDomain, BodyRegistry, BodyVelocityWriteDomain};
 pub use world::{FixedStepClock, PhysicsWorld, PhysicsWorldConfig};

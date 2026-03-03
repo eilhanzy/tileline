@@ -1,16 +1,25 @@
-//! Fixed-step ParadoxPE world skeleton.
+//! Fixed-step ParadoxPE world skeleton built on SoA body storage and a parallel broadphase.
 //!
-//! This is intentionally conservative: it provides stable handles, deterministic stepping, and a
-//! starter contact pipeline without pretending to be a finished solver.
+//! This is still a foundation layer, not the final solver. The goal is to lock down the data flow:
+//! dense generational handles, cache-friendly body storage, allocation-free hot stepping, and a
+//! broadphase pipeline that can scale across Tileline's CPU task execution model.
 
-use nalgebra::Vector2;
+use nalgebra::Vector3;
 
 use crate::abi::ParadoxScriptHostAbi;
 use crate::body::{
-    BodyDesc, BodyKind, ColliderDesc, ColliderShape, ColliderShapeKind, ContactPair,
+    Aabb, BodyDesc, BodyKind, ColliderDesc, ColliderShape, ColliderShapeKind, ContactPair,
     ContactSnapshot, RigidBody,
 };
-use crate::handle::{BodyHandle, ColliderHandle, ContactHandle, HandleKind, PhysicsHandle};
+use crate::broadphase::{BroadphaseConfig, BroadphasePipeline};
+use crate::handle::{
+    BodyHandle, ColliderHandle, ContactHandle, HandleKind, JointHandle, PhysicsHandle,
+};
+use crate::joint::{DistanceJoint, DistanceJointDesc, JointConstraintSolver, JointSolverConfig};
+use crate::narrowphase::{NarrowphaseConfig, NarrowphasePipeline};
+use crate::sleep::{SleepConfig, SleepIslandManager};
+use crate::solver::{ContactSolver, ContactSolverConfig};
+use crate::storage::BodyRegistry;
 
 #[derive(Debug, Clone)]
 struct Slot<T> {
@@ -73,22 +82,32 @@ impl FixedStepClock {
     }
 }
 
-/// World configuration for the starter ParadoxPE runtime.
+/// World configuration for the ParadoxPE foundation runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicsWorldConfig {
-    pub gravity: Vector2<f32>,
+    pub gravity: Vector3<f32>,
     pub fixed_dt: f32,
     pub max_substeps: u32,
     pub max_contact_snapshots: usize,
+    pub broadphase: BroadphaseConfig,
+    pub narrowphase: NarrowphaseConfig,
+    pub solver: ContactSolverConfig,
+    pub joints: JointSolverConfig,
+    pub sleep: SleepConfig,
 }
 
 impl Default for PhysicsWorldConfig {
     fn default() -> Self {
         Self {
-            gravity: Vector2::new(0.0, -9.81),
+            gravity: Vector3::new(0.0, -9.81, 0.0),
             fixed_dt: 1.0 / 120.0,
             max_substeps: 8,
             max_contact_snapshots: 256,
+            broadphase: BroadphaseConfig::default(),
+            narrowphase: NarrowphaseConfig::default(),
+            solver: ContactSolverConfig::default(),
+            joints: JointSolverConfig::default(),
+            sleep: SleepConfig::default(),
         }
     }
 }
@@ -98,10 +117,17 @@ impl Default for PhysicsWorldConfig {
 pub struct PhysicsWorld {
     config: PhysicsWorldConfig,
     clock: FixedStepClock,
-    bodies: Vec<Slot<RigidBody>>,
-    free_bodies: Vec<u16>,
+    bodies: BodyRegistry,
+    broadphase: BroadphasePipeline,
+    narrowphase: NarrowphasePipeline,
+    solver: ContactSolver,
+    joint_solver: JointConstraintSolver,
+    sleep_manager: SleepIslandManager,
     colliders: Vec<Slot<ColliderRecord>>,
     free_colliders: Vec<u16>,
+    joints: Vec<Slot<DistanceJoint>>,
+    free_joints: Vec<u16>,
+    active_joints: Vec<DistanceJoint>,
     contact_snapshots: Vec<Slot<ContactSnapshot>>,
     free_contact_snapshots: Vec<u16>,
     contacts: Vec<ContactPair>,
@@ -109,13 +135,27 @@ pub struct PhysicsWorld {
 
 impl PhysicsWorld {
     pub fn new(config: PhysicsWorldConfig) -> Self {
+        let mut broadphase = BroadphasePipeline::new(config.broadphase.clone());
+        broadphase.sync_for_body_count(0);
+        let mut narrowphase = NarrowphasePipeline::new(config.narrowphase.clone());
+        narrowphase.sync_for_pair_capacity(0);
+        let solver = ContactSolver::new(config.solver.clone());
+        let joint_solver = JointConstraintSolver::new(config.joints.clone());
+        let sleep_manager = SleepIslandManager::new(config.sleep.clone());
         Self {
             clock: FixedStepClock::new(config.fixed_dt, config.max_substeps),
             config,
-            bodies: Vec::new(),
-            free_bodies: Vec::new(),
+            bodies: BodyRegistry::new(),
+            broadphase,
+            narrowphase,
+            solver,
+            joint_solver,
+            sleep_manager,
             colliders: Vec::new(),
             free_colliders: Vec::new(),
+            joints: Vec::new(),
+            free_joints: Vec::new(),
+            active_joints: Vec::new(),
             contact_snapshots: Vec::new(),
             free_contact_snapshots: Vec::new(),
             contacts: Vec::new(),
@@ -130,81 +170,132 @@ impl PhysicsWorld {
         &self.clock
     }
 
+    pub fn body_registry(&self) -> &BodyRegistry {
+        &self.bodies
+    }
+
+    pub fn body_registry_mut(&mut self) -> &mut BodyRegistry {
+        &mut self.bodies
+    }
+
+    pub fn broadphase(&self) -> &BroadphasePipeline {
+        &self.broadphase
+    }
+
+    pub fn narrowphase(&self) -> &NarrowphasePipeline {
+        &self.narrowphase
+    }
+
+    pub fn solver(&self) -> &ContactSolver {
+        &self.solver
+    }
+
+    pub fn joint_solver(&self) -> &JointConstraintSolver {
+        &self.joint_solver
+    }
+
+    pub fn sleep_manager(&self) -> &SleepIslandManager {
+        &self.sleep_manager
+    }
+
     pub fn spawn_body(&mut self, desc: BodyDesc) -> BodyHandle {
-        let (index, generation, slot) = alloc_slot(&mut self.bodies, &mut self.free_bodies);
-        let handle = BodyHandle::new(index, generation);
-        *slot = Some(RigidBody::from_desc(handle, desc));
+        let handle = self.bodies.spawn(desc);
+        self.sync_hot_loop_buffers();
         handle
     }
 
-    pub fn body(&self, handle: BodyHandle) -> Option<&RigidBody> {
-        get_slot(&self.bodies, handle.erased()).and_then(|slot| slot.value.as_ref())
-    }
-
-    pub fn body_mut(&mut self, handle: BodyHandle) -> Option<&mut RigidBody> {
-        get_slot_mut(&mut self.bodies, handle.erased()).and_then(|slot| slot.value.as_mut())
+    pub fn body(&self, handle: BodyHandle) -> Option<RigidBody> {
+        self.bodies.body(handle)
     }
 
     pub fn destroy_body(&mut self, handle: BodyHandle) -> bool {
-        let removed = free_slot(&mut self.bodies, &mut self.free_bodies, handle.erased()).is_some();
+        if !self.bodies.contains(handle) {
+            return false;
+        }
+        let colliders_to_remove = self
+            .colliders
+            .iter()
+            .filter_map(|slot| slot.value.as_ref())
+            .filter(|record| record.desc.body == Some(handle))
+            .map(|record| record.handle)
+            .collect::<Vec<_>>();
+        for collider in colliders_to_remove {
+            let _ = self.destroy_collider(collider);
+        }
+        let joints_to_remove = self
+            .joints
+            .iter()
+            .filter_map(|slot| slot.value.as_ref())
+            .filter(|joint| joint.body_a == handle || joint.body_b == handle)
+            .map(|joint| joint.handle)
+            .collect::<Vec<_>>();
+        for joint in joints_to_remove {
+            let _ = self.destroy_joint(joint);
+        }
+        let removed = self.bodies.remove(handle);
         if removed {
-            for idx in 0..self.colliders.len() {
-                let erase = if let Some(record) = self.colliders[idx].value.as_ref() {
-                    record.desc.body == Some(handle)
-                } else {
-                    false
-                };
-                if erase {
-                    let collider_handle =
-                        ColliderHandle::new(idx as u16, self.colliders[idx].generation);
-                    let _ = self.destroy_collider(collider_handle);
-                }
-            }
+            self.sync_hot_loop_buffers();
         }
         removed
     }
 
     pub fn spawn_collider(&mut self, desc: ColliderDesc) -> Option<ColliderHandle> {
         if let Some(body) = desc.body {
-            self.body(body)?;
+            self.bodies.body(body)?;
         }
         let (index, generation, slot) = alloc_slot(&mut self.colliders, &mut self.free_colliders);
         let handle = ColliderHandle::new(index, generation);
         *slot = Some(ColliderRecord { handle, desc });
+        if let Some(body) = slot.as_ref().and_then(|record| record.desc.body) {
+            self.rebuild_body_bounds_from_colliders(body);
+        }
+        Some(handle)
+    }
+
+    pub fn spawn_distance_joint(&mut self, desc: DistanceJointDesc) -> Option<JointHandle> {
+        self.bodies.body(desc.body_a)?;
+        self.bodies.body(desc.body_b)?;
+        let (index, generation, slot) = alloc_slot(&mut self.joints, &mut self.free_joints);
+        let handle = JointHandle::new(index, generation);
+        *slot = Some(DistanceJoint::from_desc(handle, desc));
+        self.rebuild_active_joint_cache();
+        self.sync_hot_loop_buffers();
         Some(handle)
     }
 
     pub fn destroy_collider(&mut self, handle: ColliderHandle) -> bool {
-        free_slot(
+        let body = get_slot(&self.colliders, handle.erased())
+            .and_then(|slot| slot.value.as_ref())
+            .and_then(|record| record.desc.body);
+        let removed = free_slot(
             &mut self.colliders,
             &mut self.free_colliders,
             handle.erased(),
         )
-        .is_some()
+        .is_some();
+        if removed {
+            if let Some(body) = body {
+                self.rebuild_body_bounds_from_colliders(body);
+            }
+        }
+        removed
     }
 
-    pub fn apply_force(&mut self, body: BodyHandle, force: Vector2<f32>) -> bool {
-        let Some(body) = self.body_mut(body) else {
-            return false;
-        };
-        if body.kind != BodyKind::Dynamic {
-            return false;
+    pub fn destroy_joint(&mut self, handle: JointHandle) -> bool {
+        let removed = free_slot(&mut self.joints, &mut self.free_joints, handle.erased()).is_some();
+        if removed {
+            self.rebuild_active_joint_cache();
+            self.sync_hot_loop_buffers();
         }
-        body.accumulated_force += force;
-        body.awake = true;
-        true
+        removed
     }
 
-    pub fn set_velocity(&mut self, body: BodyHandle, velocity: Vector2<f32>) -> bool {
-        let Some(body) = self.body_mut(body) else {
-            return false;
-        };
-        if body.kind == BodyKind::Static {
-            return false;
-        }
-        body.velocity = velocity;
-        body.awake = true;
-        true
+    pub fn apply_force(&mut self, body: BodyHandle, force: Vector3<f32>) -> bool {
+        self.bodies.apply_force(body, force)
+    }
+
+    pub fn set_velocity(&mut self, body: BodyHandle, velocity: Vector3<f32>) -> bool {
+        self.bodies.set_velocity(body, velocity)
     }
 
     pub fn contacts(&self) -> &[ContactPair] {
@@ -212,7 +303,7 @@ impl PhysicsWorld {
     }
 
     pub fn query_contacts(&mut self, body: BodyHandle) -> Option<ContactHandle> {
-        self.body(body)?;
+        self.bodies.body(body)?;
         let contacts = self
             .contacts
             .iter()
@@ -253,6 +344,10 @@ impl PhysicsWorld {
                 .ok()
                 .map(|h| self.destroy_collider(h))
                 .unwrap_or(false),
+            Some(HandleKind::Joint) => JointHandle::try_from(handle)
+                .ok()
+                .map(|h| self.destroy_joint(h))
+                .unwrap_or(false),
             Some(HandleKind::ContactSnapshot) => free_slot(
                 &mut self.contact_snapshots,
                 &mut self.free_contact_snapshots,
@@ -267,91 +362,96 @@ impl PhysicsWorld {
         let substeps = self.clock.accumulate(dt);
         let fixed_dt = self.clock.fixed_dt();
         for _ in 0..substeps {
-            self.integrate_bodies(fixed_dt);
-            self.rebuild_contacts();
+            self.bodies.integrate(fixed_dt, self.config.gravity);
+            let bodies = &self.bodies;
+            self.broadphase.rebuild_pairs_parallel(bodies);
+            let candidate_pairs = self.broadphase.candidate_pairs();
+            let colliders = &self.colliders;
+            let manifolds = self
+                .narrowphase
+                .rebuild_manifolds(bodies, candidate_pairs, |body| {
+                    primary_shape_for_body(colliders, bodies, body)
+                });
+            self.solver.solve(&mut self.bodies, manifolds, fixed_dt);
+            self.joint_solver
+                .solve(&mut self.bodies, &self.active_joints, fixed_dt);
+            Self::rebuild_contacts_from_manifolds(&mut self.contacts, manifolds);
+            self.sleep_manager
+                .update(&mut self.bodies, manifolds, &self.active_joints, fixed_dt);
         }
         substeps
     }
 
-    fn integrate_bodies(&mut self, dt: f32) {
-        for slot in &mut self.bodies {
-            let Some(body) = slot.value.as_mut() else {
+    fn rebuild_contacts_from_manifolds(
+        contacts: &mut Vec<ContactPair>,
+        manifolds: &[crate::body::ContactManifold],
+    ) {
+        contacts.clear();
+        for manifold in manifolds {
+            if contacts.len() < contacts.capacity() {
+                contacts.push(ContactPair {
+                    collider_a: manifold.collider_a,
+                    collider_b: manifold.collider_b,
+                    body_a: Some(manifold.body_a),
+                    body_b: Some(manifold.body_b),
+                    point: manifold.point,
+                    normal: manifold.normal,
+                    penetration: manifold.penetration,
+                });
+            }
+        }
+    }
+
+    fn rebuild_body_bounds_from_colliders(&mut self, body: BodyHandle) {
+        if !self.bodies.contains(body) {
+            return;
+        }
+        let mut union: Option<Aabb> = None;
+        let mut primary: Option<ColliderHandle> = None;
+        for slot in &self.colliders {
+            let Some(record) = slot.value.as_ref() else {
                 continue;
             };
-            match body.kind {
-                BodyKind::Static => continue,
-                BodyKind::Kinematic => {
-                    body.position += body.velocity * dt;
-                }
-                BodyKind::Dynamic => {
-                    let acceleration =
-                        self.config.gravity + body.accumulated_force * body.inverse_mass;
-                    body.velocity += acceleration * dt;
-                    body.velocity *= 1.0 - body.linear_damping.clamp(0.0, 0.95);
-                    body.position += body.velocity * dt;
-                    body.accumulated_force = Vector2::zeros();
-                }
+            if record.desc.body != Some(body) {
+                continue;
+            }
+            primary.get_or_insert(record.handle);
+            let local = record.desc.shape.local_aabb();
+            union = Some(match union {
+                Some(current) => current.union(local),
+                None => local,
+            });
+        }
+        let bounds = union.unwrap_or_default();
+        let _ = self.bodies.set_local_bounds(body, bounds);
+        let _ = self.bodies.set_primary_collider(body, primary);
+    }
+
+    fn sync_hot_loop_buffers(&mut self) {
+        self.broadphase.sync_for_body_count(self.bodies.len());
+        let target = self.broadphase.max_candidate_pairs_capacity();
+        self.narrowphase.sync_for_pair_capacity(target);
+        self.sleep_manager.prepare_for_bodies(self.bodies.len());
+        if self.contacts.capacity() < target {
+            self.contacts
+                .reserve(target.saturating_sub(self.contacts.capacity()));
+        }
+        if self.active_joints.capacity() < self.joints.len() {
+            self.active_joints.reserve(
+                self.joints
+                    .len()
+                    .saturating_sub(self.active_joints.capacity()),
+            );
+        }
+    }
+
+    fn rebuild_active_joint_cache(&mut self) {
+        self.active_joints.clear();
+        for slot in &self.joints {
+            if let Some(joint) = slot.value.as_ref() {
+                self.active_joints.push(joint.clone());
             }
         }
-    }
-
-    fn rebuild_contacts(&mut self) {
-        self.contacts.clear();
-
-        let colliders = self
-            .colliders
-            .iter()
-            .filter_map(|slot| slot.value.as_ref())
-            .collect::<Vec<_>>();
-
-        for i in 0..colliders.len() {
-            for j in (i + 1)..colliders.len() {
-                let a = colliders[i];
-                let b = colliders[j];
-                if let Some(contact) = self.compute_contact(a, b) {
-                    self.contacts.push(contact);
-                }
-            }
-        }
-    }
-
-    fn compute_contact(&self, a: &ColliderRecord, b: &ColliderRecord) -> Option<ContactPair> {
-        let center_a = self.collider_center(a)?;
-        let center_b = self.collider_center(b)?;
-        let extents_a = a.desc.shape.half_extents();
-        let extents_b = b.desc.shape.half_extents();
-        let delta = center_b - center_a;
-        let overlap_x = extents_a.x + extents_b.x - delta.x.abs();
-        let overlap_y = extents_a.y + extents_b.y - delta.y.abs();
-        if overlap_x <= 0.0 || overlap_y <= 0.0 {
-            return None;
-        }
-
-        let (penetration, normal) = if overlap_x < overlap_y {
-            (
-                overlap_x,
-                Vector2::new(if delta.x >= 0.0 { 1.0 } else { -1.0 }, 0.0),
-            )
-        } else {
-            (
-                overlap_y,
-                Vector2::new(0.0, if delta.y >= 0.0 { 1.0 } else { -1.0 }),
-            )
-        };
-
-        Some(ContactPair {
-            collider_a: a.handle,
-            collider_b: b.handle,
-            body_a: a.desc.body,
-            body_b: b.desc.body,
-            normal,
-            penetration,
-        })
-    }
-
-    fn collider_center(&self, collider: &ColliderRecord) -> Option<Vector2<f32>> {
-        let body = collider.desc.body?;
-        Some(self.body(body)?.position)
     }
 }
 
@@ -364,7 +464,7 @@ impl ParadoxScriptHostAbi for PhysicsWorld {
             self,
             BodyDesc {
                 kind,
-                position: Vector2::new(x, y),
+                position: Vector3::new(x, y, 0.0),
                 mass,
                 ..BodyDesc::default()
             },
@@ -395,14 +495,14 @@ impl ParadoxScriptHostAbi for PhysicsWorld {
         let Ok(body) = BodyHandle::try_from(PhysicsHandle::from(body)) else {
             return false;
         };
-        PhysicsWorld::apply_force(self, body, Vector2::new(x, y))
+        PhysicsWorld::apply_force(self, body, Vector3::new(x, y, 0.0))
     }
 
     fn set_velocity(&mut self, body: u32, x: f32, y: f32) -> bool {
         let Ok(body) = BodyHandle::try_from(PhysicsHandle::from(body)) else {
             return false;
         };
-        PhysicsWorld::set_velocity(self, body, Vector2::new(x, y))
+        PhysicsWorld::set_velocity(self, body, Vector3::new(x, y, 0.0))
     }
 
     fn query_contacts(&mut self, body: u32) -> u32 {
@@ -424,6 +524,16 @@ impl ParadoxScriptHostAbi for PhysicsWorld {
     fn step_world(&mut self, dt: f32) -> u32 {
         PhysicsWorld::step(self, dt)
     }
+}
+
+fn primary_shape_for_body(
+    colliders: &[Slot<ColliderRecord>],
+    bodies: &BodyRegistry,
+    body: BodyHandle,
+) -> Option<(ColliderHandle, ColliderShape)> {
+    let collider = bodies.primary_collider(body)?;
+    let record = get_slot(colliders, collider.erased())?.value.as_ref()?;
+    Some((collider, record.desc.shape.clone()))
 }
 
 fn alloc_slot<'a, T>(
@@ -450,15 +560,6 @@ fn get_slot<T>(slots: &[Slot<T>], handle: PhysicsHandle) -> Option<&Slot<T>> {
     }
 }
 
-fn get_slot_mut<T>(slots: &mut [Slot<T>], handle: PhysicsHandle) -> Option<&mut Slot<T>> {
-    let slot = slots.get_mut(handle.index())?;
-    if slot.generation == handle.generation() && slot.value.is_some() {
-        Some(slot)
-    } else {
-        None
-    }
-}
-
 fn free_slot<T>(
     slots: &mut [Slot<T>],
     free_list: &mut Vec<u16>,
@@ -477,13 +578,12 @@ fn free_slot<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::body::{ColliderDesc, ColliderShape};
 
     #[test]
     fn dynamic_body_integrates_with_force() {
         let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
         let body = world.spawn_body(BodyDesc::default());
-        assert!(world.apply_force(body, Vector2::new(10.0, 0.0)));
+        assert!(world.apply_force(body, Vector3::new(10.0, 0.0, 0.0)));
         let steps = world.step(1.0 / 60.0);
         assert!(steps > 0);
         let body = world.body(body).unwrap();
@@ -495,19 +595,19 @@ mod tests {
         let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
         let a = world.spawn_body(BodyDesc {
             kind: BodyKind::Static,
-            position: Vector2::new(0.0, 0.0),
+            position: Vector3::new(0.0, 0.0, 0.0),
             ..BodyDesc::default()
         });
         let b = world.spawn_body(BodyDesc {
             kind: BodyKind::Static,
-            position: Vector2::new(0.5, 0.0),
+            position: Vector3::new(0.5, 0.0, 0.0),
             ..BodyDesc::default()
         });
         world
             .spawn_collider(ColliderDesc::attached(
                 a,
                 ColliderShape::Aabb {
-                    half_extents: Vector2::new(1.0, 1.0),
+                    half_extents: Vector3::new(1.0, 1.0, 1.0),
                 },
             ))
             .unwrap();
@@ -515,7 +615,7 @@ mod tests {
             .spawn_collider(ColliderDesc::attached(
                 b,
                 ColliderShape::Aabb {
-                    half_extents: Vector2::new(1.0, 1.0),
+                    half_extents: Vector3::new(1.0, 1.0, 1.0),
                 },
             ))
             .unwrap();
@@ -532,5 +632,34 @@ mod tests {
         assert!(world.release_handle(body.erased()));
         assert!(world.body(body).is_none());
         assert!(!world.release_handle(body.erased()));
+    }
+
+    #[test]
+    fn broadphase_hot_loop_reuses_buffers() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
+        for i in 0..32 {
+            let body = world.spawn_body(BodyDesc {
+                kind: BodyKind::Static,
+                position: Vector3::new(i as f32 * 0.75, 0.0, 0.0),
+                ..BodyDesc::default()
+            });
+            world
+                .spawn_collider(ColliderDesc::attached(
+                    body,
+                    ColliderShape::Aabb {
+                        half_extents: Vector3::new(1.0, 1.0, 1.0),
+                    },
+                ))
+                .unwrap();
+        }
+        let pair_capacity = world.broadphase().max_candidate_pairs_capacity();
+        let contact_capacity = world.contacts.capacity();
+        let _ = world.step(1.0 / 60.0);
+        assert_eq!(
+            world.broadphase().max_candidate_pairs_capacity(),
+            pair_capacity
+        );
+        assert_eq!(world.contacts.capacity(), contact_capacity);
+        assert!(!world.broadphase().stats().overflowed);
     }
 }
