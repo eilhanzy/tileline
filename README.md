@@ -35,6 +35,7 @@ This workspace is currently in engine-foundation phase. The main goals are:
 - `docs/tlscript-parallel-runtime.md`: `.tlscript` parallel contracts, advisor, and runtime dispatch planning
 - `docs/nps-protocol.md`: NPS packet format, reliability, authority handoff, and MPS integration
 - `docs/paradoxpe-foundation.md`: ParadoxPE handle model, SoA storage, broadphase/solver pipeline, and script ABI
+- `docs/paradoxpe-tlscript-examples.md`: verified `.tlscript` examples targeting the current ParadoxPE ABI
 - `docs/gms-dispatch-planner.md`: GMS workload planning and multi-GPU dispatch notes
 - `docs/runtime-bridge-flow.md`: canonical MPS -> GMS -> runtime synchronization flow
 
@@ -157,6 +158,7 @@ UMA-specific tuning and adaptive buffer controls are implemented in `gms` and wi
 - `@parallel(...)` / `@main_thread` / `@reduce(...)` contract validation
 - parallel advisor + runtime dispatch planner/fallback metrics
 - ParadoxPE-aware `domain="bodies"` runtime planning and MPS chunk routing helpers
+- verified ParadoxPE `.tlscript` examples compiled through lexer -> semantic -> IR -> WASM tests
 - initial ParadoxPE host ABI names wired into semantic/lowering/codegen defaults
 
 Next pipeline steps:

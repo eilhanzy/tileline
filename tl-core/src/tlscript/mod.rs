@@ -53,10 +53,11 @@ pub use parallel_runtime::{
 };
 pub use parser::{ParseError, ParseErrorKind, Parser};
 pub use semantic::{
-    BoundsCheckEnforcement, BoundsCheckPolicy, ExportAbiPolicy, FunctionSemanticSummary,
-    FunctionSignature, OwnershipLifetimePolicy, PointerPolicy, SemanticAnalyzer, SemanticConfig,
-    SemanticError, SemanticErrorKind, SemanticOutcome, SemanticReport, SemanticSafetyPolicy,
-    SemanticSafetySummary, SemanticType, SemanticWarning, SemanticWarningKind, WasmSandboxPolicy,
+    BoundsCheckEnforcement, BoundsCheckPolicy, ExportAbiPolicy, ExternalCallReturnHint,
+    FunctionSemanticSummary, FunctionSignature, OwnershipLifetimePolicy, PointerPolicy,
+    SemanticAnalyzer, SemanticConfig, SemanticError, SemanticErrorKind, SemanticOutcome,
+    SemanticReport, SemanticSafetyPolicy, SemanticSafetySummary, SemanticType, SemanticWarning,
+    SemanticWarningKind, WasmSandboxPolicy,
 };
 pub use token::{Span, Token, TokenKind};
 pub use typed_ir::{

@@ -1,0 +1,4 @@
+# Advance the fixed-step world from an exported script entrypoint.
+@export
+def tick_world(dt: float):
+    let substeps: int = step_world(dt)

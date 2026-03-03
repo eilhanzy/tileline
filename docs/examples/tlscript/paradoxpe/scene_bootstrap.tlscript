@@ -1,0 +1,8 @@
+# Create a minimal floor + crate setup inside ParadoxPE.
+@export
+def bootstrap_scene():
+    let floor = spawn_body(0, 0.0, -4.0, 0.0)
+    let floor_shape = spawn_collider(floor, 1, 8.0, 0.5)
+    let crate_body = spawn_body(2, 0.0, 2.0, 1.0)
+    let crate_shape = spawn_collider(crate_body, 1, 0.5, 0.5)
+    apply_force(crate_body, 0.0, -9.81)
