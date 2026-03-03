@@ -5,8 +5,9 @@
 
 use nalgebra::Vector3;
 
-use crate::body::{Aabb, ColliderShape, ContactManifold};
+use crate::body::{Aabb, ColliderShape, ContactId, ContactManifold};
 use crate::handle::BodyHandle;
+use crate::handle::ColliderHandle;
 use crate::storage::BodyRegistry;
 
 /// Narrowphase configuration.
@@ -35,8 +36,15 @@ impl Default for NarrowphaseConfig {
 pub struct NarrowphaseStats {
     pub candidate_pairs: usize,
     pub manifolds: usize,
+    pub persistent_manifolds: usize,
     pub culled_pairs: usize,
     pub overflowed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistentManifoldState {
+    contact_id: ContactId,
+    persisted_frames: u16,
 }
 
 /// Reusable manifold builder.
@@ -44,6 +52,8 @@ pub struct NarrowphaseStats {
 pub struct NarrowphasePipeline {
     config: NarrowphaseConfig,
     manifolds: Vec<ContactManifold>,
+    previous_states: Vec<PersistentManifoldState>,
+    next_states: Vec<PersistentManifoldState>,
     stats: NarrowphaseStats,
 }
 
@@ -51,6 +61,8 @@ impl NarrowphasePipeline {
     pub fn new(config: NarrowphaseConfig) -> Self {
         Self {
             manifolds: Vec::new(),
+            previous_states: Vec::new(),
+            next_states: Vec::new(),
             config,
             stats: NarrowphaseStats::default(),
         }
@@ -78,6 +90,14 @@ impl NarrowphasePipeline {
             self.manifolds
                 .reserve(target.saturating_sub(self.manifolds.capacity()));
         }
+        if self.previous_states.capacity() < target {
+            self.previous_states
+                .reserve(target.saturating_sub(self.previous_states.capacity()));
+        }
+        if self.next_states.capacity() < target {
+            self.next_states
+                .reserve(target.saturating_sub(self.next_states.capacity()));
+        }
     }
 
     pub fn rebuild_manifolds<F>(
@@ -94,6 +114,7 @@ impl NarrowphasePipeline {
             ..NarrowphaseStats::default()
         };
         self.manifolds.clear();
+        self.next_states.clear();
         self.sync_for_pair_capacity(candidate_pairs.len());
 
         for &(body_a, body_b) in candidate_pairs {
@@ -127,8 +148,15 @@ impl NarrowphasePipeline {
                 self.stats.culled_pairs += 1;
                 continue;
             };
+            let feature_tag = feature_tag_for_contact(&shape_a, &shape_b, normal);
+            let contact_id = build_contact_id(collider_a, collider_b, feature_tag);
+            let persisted_frames = self
+                .lookup_persistent_state(contact_id)
+                .map(|state| state.persisted_frames.saturating_add(1))
+                .unwrap_or(1);
             if self.manifolds.len() < self.manifolds.capacity() {
                 self.manifolds.push(ContactManifold {
+                    contact_id,
                     collider_a,
                     collider_b,
                     body_a,
@@ -136,9 +164,21 @@ impl NarrowphasePipeline {
                     point,
                     normal,
                     penetration,
+                    persisted_frames,
                     restitution: self.config.default_restitution,
                     friction: self.config.default_friction,
                 });
+                if persisted_frames > 1 {
+                    self.stats.persistent_manifolds += 1;
+                }
+                if self.next_states.len() < self.next_states.capacity() {
+                    self.next_states.push(PersistentManifoldState {
+                        contact_id,
+                        persisted_frames,
+                    });
+                } else {
+                    self.stats.overflowed = true;
+                }
             } else {
                 self.stats.overflowed = true;
                 self.stats.culled_pairs += 1;
@@ -146,7 +186,15 @@ impl NarrowphasePipeline {
         }
 
         self.stats.manifolds = self.manifolds.len();
+        std::mem::swap(&mut self.previous_states, &mut self.next_states);
         &self.manifolds
+    }
+
+    fn lookup_persistent_state(&self, contact_id: ContactId) -> Option<PersistentManifoldState> {
+        self.previous_states
+            .iter()
+            .find(|state| state.contact_id == contact_id)
+            .copied()
     }
 }
 
@@ -255,6 +303,51 @@ fn aabb_aabb(a: Aabb, b: Aabb) -> Option<(Vector3<f32>, Vector3<f32>, f32)> {
     Some((point, normal, penetration))
 }
 
+fn build_contact_id(
+    collider_a: ColliderHandle,
+    collider_b: ColliderHandle,
+    feature_tag: u8,
+) -> ContactId {
+    let low = collider_a.raw().min(collider_b.raw()) as u64;
+    let high = collider_a.raw().max(collider_b.raw()) as u64;
+    ContactId::new(((low << 32) | high) ^ ((feature_tag as u64) << 56))
+}
+
+fn feature_tag_for_contact(
+    shape_a: &ColliderShape,
+    shape_b: &ColliderShape,
+    normal: Vector3<f32>,
+) -> u8 {
+    let axis_tag = axis_feature_tag(normal);
+    match (shape_a, shape_b) {
+        (ColliderShape::Sphere { .. }, ColliderShape::Sphere { .. }) => 0x01,
+        (ColliderShape::Sphere { .. }, ColliderShape::Aabb { .. }) => 0x10 | axis_tag,
+        (ColliderShape::Aabb { .. }, ColliderShape::Sphere { .. }) => 0x20 | axis_tag,
+        (ColliderShape::Aabb { .. }, ColliderShape::Aabb { .. }) => 0x30 | axis_tag,
+    }
+}
+
+fn axis_feature_tag(normal: Vector3<f32>) -> u8 {
+    let abs = normal.map(f32::abs);
+    if abs.x >= abs.y && abs.x >= abs.z {
+        if normal.x >= 0.0 {
+            0x1
+        } else {
+            0x2
+        }
+    } else if abs.y >= abs.z {
+        if normal.y >= 0.0 {
+            0x3
+        } else {
+            0x4
+        }
+    } else if normal.z >= 0.0 {
+        0x5
+    } else {
+        0x6
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nalgebra::Vector3;
@@ -286,5 +379,46 @@ mod tests {
         });
         assert_eq!(manifolds.len(), 1);
         assert!(manifolds[0].penetration > 0.0);
+        assert_eq!(manifolds[0].persisted_frames, 1);
+    }
+
+    #[test]
+    fn narrowphase_preserves_contact_ids_across_frames() {
+        let mut bodies = BodyRegistry::new();
+        let a = bodies.spawn(BodyDesc {
+            position: Vector3::new(0.0, 0.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let b = bodies.spawn(BodyDesc {
+            position: Vector3::new(0.5, 0.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let candidate_pairs = vec![(a, b)];
+        let mut narrowphase = NarrowphasePipeline::new(NarrowphaseConfig::default());
+
+        let first_id = {
+            let manifolds = narrowphase.rebuild_manifolds(&bodies, &candidate_pairs, |body| {
+                Some((
+                    ColliderHandle::new(body.index() as u16, body.generation()),
+                    ColliderShape::Aabb {
+                        half_extents: Vector3::new(0.5, 0.5, 0.5),
+                    },
+                ))
+            });
+            assert_eq!(manifolds[0].persisted_frames, 1);
+            manifolds[0].contact_id
+        };
+
+        let manifolds = narrowphase.rebuild_manifolds(&bodies, &candidate_pairs, |body| {
+            Some((
+                ColliderHandle::new(body.index() as u16, body.generation()),
+                ColliderShape::Aabb {
+                    half_extents: Vector3::new(0.5, 0.5, 0.5),
+                },
+            ))
+        });
+        assert_eq!(manifolds[0].contact_id, first_id);
+        assert_eq!(manifolds[0].persisted_frames, 2);
+        assert_eq!(narrowphase.stats().persistent_manifolds, 1);
     }
 }

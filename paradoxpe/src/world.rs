@@ -395,6 +395,7 @@ impl PhysicsWorld {
         for manifold in manifolds {
             if contacts.len() < contacts.capacity() {
                 contacts.push(ContactPair {
+                    contact_id: manifold.contact_id,
                     collider_a: manifold.collider_a,
                     collider_b: manifold.collider_b,
                     body_a: Some(manifold.body_a),
@@ -402,6 +403,7 @@ impl PhysicsWorld {
                     point: manifold.point,
                     normal: manifold.normal,
                     penetration: manifold.penetration,
+                    persisted_frames: manifold.persisted_frames,
                 });
             }
         }

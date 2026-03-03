@@ -141,12 +141,20 @@ This is the first stage that prepares ParadoxPE for real MPS-backed CPU parallel
 
 The narrowphase currently supports conservative manifold generation for the starter collider set.
 
+Each manifold now carries:
+
+- a stable `ContactId`
+- a `persisted_frames` counter
+
+This lets ParadoxPE preserve contact identity across frames and gives the solver/snapshot layer a
+stable notion of "the same contact" instead of treating every overlap as a fresh event.
+
 The solver currently includes:
 
 - positional correction
 - normal impulse solving
 - tangent/friction impulse solving
-- pair-based warm-start caching
+- `ContactId`-based warm-start caching
 
 This is still a first-pass solver. It is good enough to validate world stepping, contact snapshot
 rebuild, and data flow into higher layers.
@@ -228,7 +236,6 @@ contracts.
 
 The following are not implemented yet:
 
-- manifold persistence / contact IDs
 - richer joint set beyond distance constraints
 - stronger island scheduling heuristics
 - sleep heuristics refinement and wake propagation tuning

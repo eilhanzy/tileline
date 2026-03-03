@@ -4,6 +4,20 @@ use nalgebra::{UnitQuaternion, Vector3};
 
 use crate::handle::{BodyHandle, ColliderHandle};
 
+/// Stable frame-to-frame contact identifier used for manifold persistence and warm-start caching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ContactId(u64);
+
+impl ContactId {
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Axis-aligned bounding box used by the SoA storage and broadphase.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Aabb {
@@ -251,6 +265,7 @@ impl ColliderDesc {
 /// Physics contact pair produced by broadphase/contact candidate generation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContactPair {
+    pub contact_id: ContactId,
     pub collider_a: ColliderHandle,
     pub collider_b: ColliderHandle,
     pub body_a: Option<BodyHandle>,
@@ -258,11 +273,13 @@ pub struct ContactPair {
     pub point: Vector3<f32>,
     pub normal: Vector3<f32>,
     pub penetration: f32,
+    pub persisted_frames: u16,
 }
 
 /// Narrowphase manifold emitted before the solver stage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContactManifold {
+    pub contact_id: ContactId,
     pub collider_a: ColliderHandle,
     pub collider_b: ColliderHandle,
     pub body_a: BodyHandle,
@@ -270,6 +287,7 @@ pub struct ContactManifold {
     pub point: Vector3<f32>,
     pub normal: Vector3<f32>,
     pub penetration: f32,
+    pub persisted_frames: u16,
     pub restitution: f32,
     pub friction: f32,
 }

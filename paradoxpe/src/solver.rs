@@ -8,14 +8,12 @@
 
 use nalgebra::Vector3;
 
-use crate::body::{BodyKind, ContactManifold};
-use crate::handle::ColliderHandle;
+use crate::body::{BodyKind, ContactId, ContactManifold};
 use crate::storage::BodyRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CachedContactImpulse {
-    collider_a: ColliderHandle,
-    collider_b: ColliderHandle,
+    contact_id: ContactId,
     normal_impulse: f32,
     tangent_impulse: f32,
 }
@@ -123,8 +121,7 @@ impl ContactSolver {
             }
             if self.next_cached_impulses.len() < self.next_cached_impulses.capacity() {
                 self.next_cached_impulses.push(CachedContactImpulse {
-                    collider_a: manifold.collider_a,
-                    collider_b: manifold.collider_b,
+                    contact_id: manifold.contact_id,
                     normal_impulse,
                     tangent_impulse,
                 });
@@ -154,7 +151,7 @@ impl ContactSolver {
 
     fn apply_warmstart(&mut self, bodies: &mut BodyRegistry, manifolds: &[ContactManifold]) {
         for (index, manifold) in manifolds.iter().enumerate() {
-            let Some(cached) = self.lookup_cached(manifold.collider_a, manifold.collider_b) else {
+            let Some(cached) = self.lookup_cached(manifold.contact_id) else {
                 continue;
             };
             let normal = safe_normal(manifold.normal);
@@ -269,14 +266,10 @@ impl ContactSolver {
         }
     }
 
-    fn lookup_cached(
-        &self,
-        collider_a: ColliderHandle,
-        collider_b: ColliderHandle,
-    ) -> Option<CachedContactImpulse> {
+    fn lookup_cached(&self, contact_id: ContactId) -> Option<CachedContactImpulse> {
         self.cached_impulses
             .iter()
-            .find(|cached| cached.collider_a == collider_a && cached.collider_b == collider_b)
+            .find(|cached| cached.contact_id == contact_id)
             .copied()
     }
 }
@@ -307,7 +300,7 @@ mod tests {
     use nalgebra::Vector3;
 
     use super::*;
-    use crate::body::{Aabb, BodyDesc, ContactManifold};
+    use crate::body::{Aabb, BodyDesc, ContactId, ContactManifold};
     use crate::handle::ColliderHandle;
 
     #[test]
@@ -325,6 +318,7 @@ mod tests {
             ..BodyDesc::default()
         });
         let manifolds = vec![ContactManifold {
+            contact_id: ContactId::new(1),
             collider_a: ColliderHandle::new(a.index() as u16, a.generation()),
             collider_b: ColliderHandle::new(b.index() as u16, b.generation()),
             body_a: a,
@@ -332,6 +326,7 @@ mod tests {
             point: Vector3::new(0.25, 0.0, 0.0),
             normal: Vector3::new(1.0, 0.0, 0.0),
             penetration: 1.5,
+            persisted_frames: 1,
             restitution: 0.0,
             friction: 0.5,
         }];
@@ -357,6 +352,7 @@ mod tests {
             ..BodyDesc::default()
         });
         let manifolds = vec![ContactManifold {
+            contact_id: ContactId::new(2),
             collider_a: ColliderHandle::new(a.index() as u16, a.generation()),
             collider_b: ColliderHandle::new(b.index() as u16, b.generation()),
             body_a: a,
@@ -364,6 +360,7 @@ mod tests {
             point: Vector3::zeros(),
             normal: Vector3::new(0.0, 1.0, 0.0),
             penetration: 0.2,
+            persisted_frames: 1,
             restitution: 0.0,
             friction: 1.0,
         }];

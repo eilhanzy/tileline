@@ -183,7 +183,7 @@ mod tests {
     use nalgebra::Vector3;
 
     use super::*;
-    use crate::body::{BodyDesc, ContactManifold};
+    use crate::body::{BodyDesc, ContactId, ContactManifold};
     use crate::handle::{ColliderHandle, JointHandle};
     use crate::joint::{DistanceJoint, DistanceJointDesc};
 
@@ -196,6 +196,7 @@ mod tests {
             ..BodyDesc::default()
         });
         let manifold = ContactManifold {
+            contact_id: ContactId::new(7),
             collider_a: ColliderHandle::new(a.index() as u16, a.generation()),
             collider_b: ColliderHandle::new(b.index() as u16, b.generation()),
             body_a: a,
@@ -203,6 +204,7 @@ mod tests {
             point: Vector3::new(0.5, 0.0, 0.0),
             normal: Vector3::new(1.0, 0.0, 0.0),
             penetration: 0.01,
+            persisted_frames: 1,
             restitution: 0.0,
             friction: 0.5,
         };

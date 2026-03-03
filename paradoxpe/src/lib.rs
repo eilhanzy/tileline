@@ -27,8 +27,8 @@ pub use abi::{
     HOST_CALL_SPAWN_COLLIDER, HOST_CALL_STEP_WORLD,
 };
 pub use body::{
-    Aabb, BodyDesc, BodyKind, ColliderDesc, ColliderShape, ColliderShapeKind, ContactManifold,
-    ContactPair, ContactSnapshot, RigidBody,
+    Aabb, BodyDesc, BodyKind, ColliderDesc, ColliderShape, ColliderShapeKind, ContactId,
+    ContactManifold, ContactPair, ContactSnapshot, RigidBody,
 };
 pub use broadphase::{BroadphaseConfig, BroadphasePipeline, BroadphaseStats};
 pub use handle::{
