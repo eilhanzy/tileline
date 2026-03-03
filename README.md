@@ -35,6 +35,7 @@ This workspace is currently in engine-foundation phase. The main goals are:
 - `docs/tlscript-parallel-runtime.md`: `.tlscript` parallel contracts, advisor, and runtime dispatch planning
 - `docs/tileline-beta-roadmap.md`: phased plan from foundation state to a usable beta
 - `docs/nps-protocol.md`: NPS packet format, reliability, authority handoff, and MPS integration
+- `docs/nps-runtime-plan.md`: NPS channel/tick/snapshot runtime plan for the beta transport path
 - `docs/paradoxpe-foundation.md`: ParadoxPE handle model, SoA storage, broadphase/solver pipeline, snapshot base, and script ABI
 - `docs/paradoxpe-tlscript-examples.md`: verified `.tlscript` examples targeting the current ParadoxPE ABI
 - `docs/gms-dispatch-planner.md`: GMS workload planning and multi-GPU dispatch notes

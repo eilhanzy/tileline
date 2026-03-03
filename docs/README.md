@@ -11,6 +11,7 @@ in `src/` crates (not benchmark-only code).
 - `tlscript-parallel-runtime.md`: parallel contracts, advisor suggestions, and runtime dispatch planning
 - `tileline-beta-roadmap.md`: phased beta roadmap, integration milestones, and deferred scope
 - `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
+- `nps-runtime-plan.md`: canonical NPS channel, tick, snapshot, and transport runtime plan
 - `paradoxpe-foundation.md`: ParadoxPE handles, SoA storage, broadphase/solver pipeline, snapshot base, and script ABI
 - `paradoxpe-tlscript-examples.md`: verified `.tlscript` examples targeting the current ParadoxPE ABI
 - `gms-dispatch-planner.md`: GPU scoring, workload assignment, and multi-GPU planning behavior

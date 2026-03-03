@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::model::packet_semantics;
 use crate::packet::{PacketChannel, PacketFlags, PayloadKind};
 
 /// NPS peer identifier.
@@ -35,19 +36,14 @@ pub struct SendPolicy {
 impl SendPolicy {
     /// Derive a policy from channel and payload kind.
     pub fn for_payload(channel: PacketChannel, kind: PayloadKind) -> Self {
-        match (channel, kind) {
-            (PacketChannel::Physics, _) | (PacketChannel::Input, _) => Self {
-                reliability: ReliabilityMode::UnreliableSequenced,
-                sequenced: true,
+        let semantics = packet_semantics(channel, kind);
+        Self {
+            reliability: if semantics.reliable {
+                ReliabilityMode::ReliableOrdered
+            } else {
+                ReliabilityMode::UnreliableSequenced
             },
-            (PacketChannel::Lifecycle, _) | (_, PayloadKind::LifecycleEvent) => Self {
-                reliability: ReliabilityMode::ReliableOrdered,
-                sequenced: false,
-            },
-            _ => Self {
-                reliability: ReliabilityMode::ReliableOrdered,
-                sequenced: false,
-            },
+            sequenced: semantics.sequenced,
         }
     }
 

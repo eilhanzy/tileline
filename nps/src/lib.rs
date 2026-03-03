@@ -11,6 +11,7 @@
 
 pub mod bitpack;
 pub mod manager;
+pub mod model;
 pub mod packet;
 pub mod reliability;
 
@@ -20,6 +21,7 @@ pub use manager::{
     NetworkPacketManager, NetworkPacketMetrics, OutboundPacketJob, OutboundPayload,
     PacketDecodeFailure, PacketEncodeFailure,
 };
+pub use model::{packet_semantics, PacketLane, PacketSemantics, SnapshotMode, TickScope};
 pub use packet::{
     decode_authority_transfer, decode_input_frame, decode_lifecycle_event, decode_payload_owned,
     decode_transform_batch, dequantize_u16_to_unit, encode_authority_transfer, encode_input_frame,
