@@ -9,6 +9,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use paradoxpe::abi::{HOST_CALLS_ALLOWLIST, HOST_CALLS_HANDLE_ACQUIRE, HOST_CALLS_HANDLE_RELEASE};
+
 use super::ast::*;
 use super::token::Span;
 
@@ -151,19 +153,38 @@ impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
             safety: SemanticSafetyPolicy::default(),
-            external_call_allowlist: Vec::new(),
-            handle_acquire_call_allowlist: vec![
-                "spawn_sprite".to_string(),
-                "spawn_body".to_string(),
-                "create_sprite".to_string(),
-                "create_body".to_string(),
-                "alloc_handle".to_string(),
-            ],
-            handle_release_call_allowlist: vec![
-                "release_handle".to_string(),
-                "destroy_handle".to_string(),
-                "free_handle".to_string(),
-            ],
+            external_call_allowlist: HOST_CALLS_ALLOWLIST
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            handle_acquire_call_allowlist: {
+                let mut names = vec![
+                    "spawn_sprite".to_string(),
+                    "create_sprite".to_string(),
+                    "alloc_handle".to_string(),
+                ];
+                names.extend(
+                    HOST_CALLS_HANDLE_ACQUIRE
+                        .iter()
+                        .map(|name| (*name).to_string()),
+                );
+                names
+            },
+            handle_release_call_allowlist: {
+                let mut names = vec![
+                    "release_handle".to_string(),
+                    "destroy_handle".to_string(),
+                    "free_handle".to_string(),
+                ];
+                names.extend(
+                    HOST_CALLS_HANDLE_RELEASE
+                        .iter()
+                        .map(|name| (*name).to_string()),
+                );
+                names.sort();
+                names.dedup();
+                names
+            },
             export_abi: ExportAbiPolicy::default(),
         }
     }

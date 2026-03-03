@@ -8,4 +8,5 @@ crossbeam.workspace = true
 wgpu.workspace = true
 mps = { path = "../mps" }
 gms = { path = "../gms" }
+paradoxpe = { path = "../paradoxpe" }
 wasm-encoder = "0.224.0"

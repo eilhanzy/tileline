@@ -1,5 +1,5 @@
 [workspace]
-members = ["mps", "gms", "nps", "runtime", "tl-core"]
+members = ["mps", "gms", "nps", "paradoxpe", "runtime", "tl-core"]
 resolver = "2"
 
 [workspace.package]

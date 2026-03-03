@@ -5,6 +5,7 @@ Tileline is a parallel-first game engine architecture prototype focused on expli
 - `MPS` (Multi Processing Scaler): CPU-side task scheduling and WASM execution
 - `GMS` (Graphics Multi Scaler): GPU discovery, scoring, and asymmetric multi-GPU planning
 - `NPS` (Network Packet Scaler): bit-packed UDP protocol, reliability, and MPS-offloaded packet processing
+- `ParadoxPE`: fixed-step physics foundation and script/WASM host ABI surface
 - `tl-core`: engine bridge layer that synchronizes MPS and GMS
 - `runtime`: render-loop integration glue for `wgpu` submit/present flows
 
@@ -20,6 +21,7 @@ This workspace is currently in engine-foundation phase. The main goals are:
 - `mps/`: CPU topology detection, priority balancer, lock-free scheduler, WASM dispatch (Wasmer)
 - `gms/`: GPU inventory/scoring, multi-GPU planner, adaptive UMA buffer control, benchmark tooling
 - `nps/`: low-level UDP packet protocol, bit packing, reliability, authority handoff, MPS-integrated packet manager
+- `paradoxpe/`: fixed-step physics world skeleton, packed handles, and `.tlscript`-friendly host ABI
 - `tl-core/`: `MpsGmsBridge`, portable multi-GPU sync abstractions, and `.tlscript` compiler/runtime metadata layers
 - `runtime/`: frame-loop coordinators and `.tlscript` parallel planning glue for engine-side integration
 
@@ -32,6 +34,7 @@ This workspace is currently in engine-foundation phase. The main goals are:
 - `docs/tlscript-semantic.md`: `.tlscript` semantic analyzer (types, handles, WASM sandboxing)
 - `docs/tlscript-parallel-runtime.md`: `.tlscript` parallel contracts, advisor, and runtime dispatch planning
 - `docs/nps-protocol.md`: NPS packet format, reliability, authority handoff, and MPS integration
+- `docs/paradoxpe-foundation.md`: ParadoxPE handle model, world skeleton, and script ABI
 - `docs/gms-dispatch-planner.md`: GMS workload planning and multi-GPU dispatch notes
 - `docs/runtime-bridge-flow.md`: canonical MPS -> GMS -> runtime synchronization flow
 
@@ -153,12 +156,13 @@ UMA-specific tuning and adaptive buffer controls are implemented in `gms` and wi
 - `@net(...)` compiler hook for sync metadata extraction
 - `@parallel(...)` / `@main_thread` / `@reduce(...)` contract validation
 - parallel advisor + runtime dispatch planner/fallback metrics
+- initial ParadoxPE host ABI names wired into semantic/lowering/codegen defaults
 
 Next pipeline steps:
 
 - typed IR-driven WASM codegen refactor (replace remaining AST-direct paths)
 - `.tlscript` -> MPS compile/cache/submit runtime path
-- host ABI for gameplay systems (ParadoxPE physics, networking, engine handles)
+- richer host ABI for gameplay systems (ParadoxPE solver/control, networking, engine handles)
 - runtime profiling/diagnostics surfaces for script parallel dispatch decisions
 
 ## License

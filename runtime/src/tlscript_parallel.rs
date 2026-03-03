@@ -247,7 +247,8 @@ impl TlscriptParallelRuntimeCoordinator {
                     core_preference,
                     make_task(chunk),
                 );
-                self.dispatch_serial_submissions = self.dispatch_serial_submissions.saturating_add(1);
+                self.dispatch_serial_submissions =
+                    self.dispatch_serial_submissions.saturating_add(1);
                 TlscriptDispatchSubmission {
                     decision,
                     main_thread_required: false,
@@ -275,7 +276,11 @@ impl TlscriptParallelRuntimeCoordinator {
                 let task_ids = if tasks.is_empty() {
                     Vec::new()
                 } else {
-                    mps.submit_batch_native(self.dispatch_config.parallel_priority, core_preference, tasks)
+                    mps.submit_batch_native(
+                        self.dispatch_config.parallel_priority,
+                        core_preference,
+                        tasks,
+                    )
                 };
 
                 self.dispatch_parallel_batches = self.dispatch_parallel_batches.saturating_add(1);
@@ -352,12 +357,12 @@ fn core_preference_from_schedule_hint(hint: IrScheduleHint) -> CorePreference {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
     use tl_core::{
-        Lexer, ParallelHookAnalyzer, Parser, SemanticAnalyzer, annotate_typed_ir_with_parallel_hooks,
-        lower_to_typed_ir,
+        annotate_typed_ir_with_parallel_hooks, lower_to_typed_ir, Lexer, ParallelHookAnalyzer,
+        Parser, SemanticAnalyzer,
     };
 
     fn compile_pipeline(
@@ -441,9 +446,15 @@ mod tests {
 
         assert!(submission.decision.is_parallel());
         assert!(!submission.mps_task_ids.is_empty());
-        assert_eq!(submission.mps_task_ids.len(), submission.submitted_chunks.len());
+        assert_eq!(
+            submission.mps_task_ids.len(),
+            submission.submitted_chunks.len()
+        );
         assert!(scheduler.wait_for_idle(Duration::from_millis(250)));
-        assert_eq!(counter.load(Ordering::Relaxed), submission.submitted_chunks.len());
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            submission.submitted_chunks.len()
+        );
 
         let metrics = coord.metrics();
         assert_eq!(metrics.dispatch_parallel_batches, 1);
