@@ -271,6 +271,27 @@ Without this, network optimization will be guesswork.
 4. Add lane-level metrics and loss/jitter reporting.
 5. Only then add delta compression and more advanced sync policies.
 
+## Current Implementation Status
+
+The first runtime-owned transport layer now exists in `runtime/src/network_transport.rs`.
+
+Current implementation:
+
+- non-blocking `tokio::UdpSocket` pump via `try_recv_from` / `try_send_to`
+- explicit peer/address mapping
+- integration with `nps::NetworkPacketManager`
+- runtime-owned send queue for encoded and retransmit datagrams
+- ParadoxPE snapshot cadence helper
+- transport-level telemetry surface
+
+Still missing:
+
+- long-lived `tokio` service wrapper / worker task orchestration
+- lane-level bandwidth budget enforcement
+- RTT/jitter/loss estimation
+- session/auth lifecycle
+- delta snapshot transport
+
 ## Beta Non-Goals
 
 These should not block the first NPS beta milestone:

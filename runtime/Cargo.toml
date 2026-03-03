@@ -8,4 +8,6 @@ tl-core = { path = "../tl-core" }
 wgpu.workspace = true
 gms = { path = "../gms" }
 mps = { path = "../mps" }
+nps = { path = "../nps" }
 paradoxpe = { path = "../paradoxpe" }
+tokio = { workspace = true, features = ["net", "time", "rt", "macros"] }
