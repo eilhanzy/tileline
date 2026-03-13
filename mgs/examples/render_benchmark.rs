@@ -6,7 +6,11 @@ use std::time::{Duration, Instant};
 
 use mgs::bridge::MpsWorkloadHint;
 use mgs::fallback::FallbackLevel;
-use mgs::{MgsBridge, MobileGpuFamily, MobileGpuProfile, TbdrArchitecture};
+use mgs::runtime::{RuntimeMode, RuntimePacingMode, ThroughputMemoryPolicy, VsyncMode};
+use mgs::{
+    is_unified_memory_profile, select_present_mode, select_throughput_burst, startup_ramp,
+    AdaptiveBurstController, AggressiveNoVsyncPolicy, MgsBridge, MobileGpuProfile,
+};
 use wgpu::{Color, CompositeAlphaMode, PresentMode, SurfaceError, TextureFormat};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -362,11 +366,7 @@ impl ApplicationHandler for RenderBenchmarkApp {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BenchmarkPacingMode {
-    Stable,
-    MaxThroughput,
-}
+type BenchmarkPacingMode = RuntimePacingMode;
 
 struct BenchmarkRuntime {
     window: Arc<Window>,
@@ -398,7 +398,12 @@ impl BenchmarkRuntime {
 
         let renderer = Renderer::new(Arc::clone(&window), options)?;
         let pacing_mode = choose_pacing_mode(options);
-        let min_frame_interval = recommended_min_frame_interval(&renderer, pacing_mode);
+        let min_frame_interval = mgs::recommended_min_frame_interval(
+            &renderer.profile,
+            renderer.memory_policy.is_uma(),
+            renderer.throughput_target_burst,
+            pacing_mode,
+        );
         let stats = FrameStats::new(renderer.size, Duration::from_millis(500));
         let session_start = Instant::now();
         let sample_started_at = if options.warmup_duration.is_zero() {
@@ -460,10 +465,10 @@ impl BenchmarkRuntime {
         } else {
             String::new()
         };
-        let vsync_suffix = if self.renderer.aggressive_no_vsync_fallback {
+        let vsync_suffix = if self.renderer.no_vsync_policy.enabled {
             format!(
                 " | AggNoVsync x{}",
-                self.renderer.forced_present_interval.max(1)
+                self.renderer.no_vsync_policy.forced_present_interval.max(1)
             )
         } else {
             String::new()
@@ -534,8 +539,8 @@ impl BenchmarkRuntime {
             sample_duration: self.options.sample_duration,
             pacing_mode: self.pacing_mode,
             adaptive_burst_cap,
-            aggressive_no_vsync_fallback: self.renderer.aggressive_no_vsync_fallback,
-            forced_present_interval: self.renderer.forced_present_interval,
+            aggressive_no_vsync_fallback: self.renderer.no_vsync_policy.enabled,
+            forced_present_interval: self.renderer.no_vsync_policy.forced_present_interval,
         }
     }
 
@@ -620,7 +625,7 @@ struct Renderer {
     bridge: MgsBridge,
     throughput_target_burst: u32,
     adaptive_burst: AdaptiveBurstController,
-    uma_shared_memory: bool,
+    memory_policy: ThroughputMemoryPolicy,
     throughput_targets: Vec<wgpu::Texture>,
     throughput_target_views: Vec<wgpu::TextureView>,
     throughput_target_signature: Option<ThroughputTargetSignature>,
@@ -630,8 +635,7 @@ struct Renderer {
     no_vsync_main_signature: Option<ThroughputTargetSignature>,
     total_frames_submitted: u64,
     presented_frames: u64,
-    aggressive_no_vsync_fallback: bool,
-    forced_present_interval: u32,
+    no_vsync_policy: AggressiveNoVsyncPolicy,
     last_fallback: FallbackLevel,
     fallback_counts: [u64; 4],
     last_tile_count: u32,
@@ -659,6 +663,9 @@ impl Renderer {
         let adapter_info = adapter.get_info();
         let profile = MobileGpuProfile::detect(&adapter_info.name);
         let uma_shared_memory = is_unified_memory_profile(&profile, &adapter_info);
+        let memory_policy = ThroughputMemoryPolicy::new(uma_shared_memory);
+        let runtime_mode = runtime_mode_from_override(options.mode_override);
+        let vsync_mode = runtime_vsync_from_override(options.vsync_override);
         let tuning = mgs::MgsTuningProfile::from_profile(&profile);
         let bridge = MgsBridge::with_tuning(profile.clone(), tuning);
         let (device, queue) =
@@ -691,30 +698,26 @@ impl Renderer {
         config.present_mode = select_present_mode(
             &capabilities.present_modes,
             prefer_stable_present,
-            options.vsync_override,
+            vsync_mode,
         );
-        let aggressive_no_vsync_fallback = matches!(options.vsync_override, VsyncOverride::Off)
-            && !present_mode_allows_uncapped(config.present_mode);
-        let forced_present_interval = if aggressive_no_vsync_fallback {
-            if uma_shared_memory {
-                4
-            } else {
-                3
-            }
-        } else {
-            1
-        };
+        let no_vsync_policy = AggressiveNoVsyncPolicy::from_selection(
+            vsync_mode,
+            config.present_mode,
+            uma_shared_memory,
+        );
         if matches!(options.vsync_override, VsyncOverride::Off)
-            && !present_mode_allows_uncapped(config.present_mode)
+            && !mgs::present_mode_allows_uncapped(config.present_mode)
         {
             eprintln!(
                 "MGS note: --vsync off requested but selected present mode is {:?}. Driver/compositor may still cap present FPS; use WFPS for throughput.",
                 config.present_mode
             );
-            eprintln!(
+            if no_vsync_policy.enabled {
+                eprintln!(
                 "MGS note: aggressive no-vsync fallback enabled (present every {} frame) to bypass compositor throttling.",
-                forced_present_interval
-            );
+                    no_vsync_policy.forced_present_interval
+                );
+            }
         }
         config.alpha_mode = capabilities
             .alpha_modes
@@ -722,14 +725,14 @@ impl Renderer {
             .copied()
             .find(|mode| *mode == CompositeAlphaMode::Opaque)
             .unwrap_or(config.alpha_mode);
-        // Keep fewer queued frames on UMA to reduce shared-memory pressure.
-        config.desired_maximum_frame_latency = if uma_shared_memory { 2 } else { 3 };
+        config.desired_maximum_frame_latency = memory_policy.desired_surface_frame_latency();
         surface.configure(&device, &config);
 
-        let throughput_target_burst = select_throughput_burst(&profile, options, uma_shared_memory);
+        let throughput_target_burst =
+            select_throughput_burst(&profile, runtime_mode, uma_shared_memory);
         let adaptive_burst = AdaptiveBurstController::new(
             throughput_target_burst,
-            options.mode_override,
+            runtime_mode,
             config.present_mode,
             uma_shared_memory,
         );
@@ -748,7 +751,7 @@ impl Renderer {
             bridge,
             throughput_target_burst,
             adaptive_burst,
-            uma_shared_memory,
+            memory_policy,
             throughput_targets: Vec::new(),
             throughput_target_views: Vec::new(),
             throughput_target_signature: None,
@@ -758,17 +761,19 @@ impl Renderer {
             no_vsync_main_signature: None,
             total_frames_submitted: 0,
             presented_frames: 0,
-            aggressive_no_vsync_fallback,
-            forced_present_interval,
+            no_vsync_policy,
             last_fallback: FallbackLevel::TbdrOptimized,
             fallback_counts: [0; 4],
             last_tile_count: 0,
             last_memory_pressure: false,
         };
 
-        if renderer.uma_shared_memory && renderer.throughput_target_burst > 1 {
+        let preallocate = renderer
+            .memory_policy
+            .initial_target_count(renderer.throughput_target_burst);
+        if preallocate > 0 {
             // Unified memory systems can spike on first target growth; preallocate once.
-            renderer.ensure_throughput_targets(12);
+            renderer.ensure_throughput_targets(preallocate);
         }
 
         Ok(renderer)
@@ -819,8 +824,9 @@ impl Renderer {
 
         self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
         let clear_color = animated_clear_color(self.clear_phase);
-        let should_present = !self.aggressive_no_vsync_fallback
-            || self.total_frames_submitted % u64::from(self.forced_present_interval.max(1)) == 0;
+        let should_present = self
+            .no_vsync_policy
+            .should_present(self.total_frames_submitted);
         let mut present_frame: Option<wgpu::SurfaceTexture> = None;
         let main_view = if should_present {
             let frame = self
@@ -854,8 +860,10 @@ impl Renderer {
             self.fallback_counts[self.last_fallback as usize].saturating_add(1);
         self.last_tile_count = plan.tile_plan.tile_count;
         self.last_memory_pressure = plan.memory_pressure;
-        if self.uma_shared_memory && plan.memory_pressure {
-            self.trim_throughput_targets(2);
+        if let Some(keep_len) = self.memory_policy.pressure_trim_keep_len() {
+            if plan.memory_pressure {
+                self.trim_throughput_targets(keep_len);
+            }
         }
 
         let mut planned_units = self.derive_work_units_from_plan(&plan);
@@ -872,11 +880,7 @@ impl Renderer {
 
         if work_units > 1 {
             self.ensure_throughput_targets(work_units as usize);
-            let throughput_store = if self.uma_shared_memory {
-                wgpu::StoreOp::Discard
-            } else {
-                wgpu::StoreOp::Store
-            };
+            let throughput_store = self.memory_policy.throughput_store_op();
             for i in 0..(work_units - 1) {
                 let target_view = self.next_throughput_view();
                 let color = animated_clear_color(self.clear_phase + f64::from(i) * 0.071);
@@ -958,7 +962,7 @@ impl Renderer {
         }
 
         let ring_len = self.desired_throughput_ring_len(required_work_units);
-        if self.uma_shared_memory && self.throughput_targets.len() > ring_len {
+        if self.memory_policy.is_uma() && self.throughput_targets.len() > ring_len {
             self.throughput_targets.truncate(ring_len);
             self.throughput_target_views.truncate(ring_len);
             if ring_len == 0 || self.throughput_target_cursor >= ring_len {
@@ -1048,19 +1052,12 @@ impl Renderer {
     }
 
     fn desired_throughput_ring_len(&self, required_work_units: usize) -> usize {
-        let max_ring_len = if self.uma_shared_memory { 6 } else { 12 };
-        required_work_units.max(2).min(max_ring_len)
+        self.memory_policy.desired_ring_len(required_work_units)
     }
 
     fn offscreen_target_dimensions(&self) -> (u32, u32) {
-        if self.uma_shared_memory {
-            (
-                self.size.width.max(1).div_ceil(2),
-                self.size.height.max(1).div_ceil(2),
-            )
-        } else {
-            (self.size.width.max(1), self.size.height.max(1))
-        }
+        self.memory_policy
+            .offscreen_dimensions(self.size.width, self.size.height)
     }
 
     fn trim_throughput_targets(&mut self, keep_len: usize) {
@@ -1073,202 +1070,6 @@ impl Renderer {
         if self.throughput_target_cursor >= keep_len {
             self.throughput_target_cursor = 0;
         }
-    }
-}
-
-fn recommended_min_frame_interval(
-    renderer: &Renderer,
-    pacing_mode: BenchmarkPacingMode,
-) -> Duration {
-    if !matches!(pacing_mode, BenchmarkPacingMode::MaxThroughput) {
-        return Duration::ZERO;
-    }
-    if renderer.throughput_target_burst <= 1 {
-        return Duration::ZERO;
-    }
-
-    // Keep uncapped mode cooperative and less jitter-prone.
-    if renderer.uma_shared_memory {
-        // Apple UMA benefits from slightly longer pacing to reduce oscillation.
-        Duration::from_micros(2_400)
-    } else if renderer.profile.is_mobile_tbdr() {
-        Duration::from_micros(1_100)
-    } else {
-        Duration::from_micros(700)
-    }
-}
-
-fn is_unified_memory_profile(profile: &MobileGpuProfile, adapter_info: &wgpu::AdapterInfo) -> bool {
-    matches!(profile.architecture, TbdrArchitecture::AppleTbdr)
-        || matches!(profile.family, MobileGpuFamily::Apple)
-        || matches!(adapter_info.backend, wgpu::Backend::Metal)
-}
-
-#[derive(Debug, Clone)]
-struct AdaptiveBurstController {
-    enabled: bool,
-    uma_shared_memory: bool,
-    min_units: u32,
-    max_units_soft: u32,
-    cap_units: u32,
-    initialized: bool,
-    ema_ms_per_unit: f64,
-    ema_abs_delta: f64,
-    cooldown_frames: u32,
-    recovery_frames: u32,
-    low_jitter_streak: u32,
-}
-
-impl AdaptiveBurstController {
-    fn new(
-        base_units: u32,
-        mode: ModeOverride,
-        present_mode: PresentMode,
-        uma_shared_memory: bool,
-    ) -> Self {
-        let enabled = base_units > 1
-            && !matches!(mode, ModeOverride::Stable)
-            && present_mode_allows_uncapped(present_mode);
-        let min_units = if !enabled {
-            1
-        } else if uma_shared_memory {
-            1
-        } else {
-            2
-        };
-        let max_units_soft = if uma_shared_memory { 8 } else { 24 };
-        Self {
-            enabled,
-            uma_shared_memory,
-            min_units,
-            max_units_soft,
-            cap_units: base_units.max(1),
-            initialized: false,
-            ema_ms_per_unit: 0.0,
-            ema_abs_delta: 0.0,
-            cooldown_frames: 0,
-            recovery_frames: 0,
-            low_jitter_streak: 0,
-        }
-    }
-
-    fn reset(&mut self, base_units: u32) {
-        self.cap_units = base_units.max(self.min_units).min(self.max_units_soft);
-        self.initialized = false;
-        self.ema_ms_per_unit = 0.0;
-        self.ema_abs_delta = 0.0;
-        self.cooldown_frames = 0;
-        self.recovery_frames = 0;
-        self.low_jitter_streak = 0;
-    }
-
-    fn resolve(&self, planned_units: u32) -> u32 {
-        let planned_units = planned_units.max(1);
-        if !self.enabled {
-            return planned_units;
-        }
-        planned_units.min(self.cap_units.max(self.min_units))
-    }
-
-    fn observe(
-        &mut self,
-        frame_ms: f64,
-        used_units: u32,
-        planned_units: u32,
-        memory_pressure: bool,
-    ) {
-        if !self.enabled {
-            return;
-        }
-
-        let upper_bound = planned_units.max(1).min(self.max_units_soft).clamp(1, 24);
-        let lower_bound = self.min_units.min(upper_bound);
-        self.cap_units = self.cap_units.clamp(lower_bound, upper_bound);
-
-        let sample = (frame_ms / f64::from(used_units.max(1))).max(0.0001);
-        if !self.initialized {
-            self.initialized = true;
-            self.ema_ms_per_unit = sample;
-            self.ema_abs_delta = 0.0;
-            return;
-        }
-
-        let alpha = 0.08;
-        self.ema_ms_per_unit = self.ema_ms_per_unit * (1.0 - alpha) + sample * alpha;
-        let abs_delta = (sample - self.ema_ms_per_unit).abs();
-        self.ema_abs_delta = self.ema_abs_delta * (1.0 - alpha) + abs_delta * alpha;
-        let jitter_ratio = self.ema_abs_delta / self.ema_ms_per_unit.max(0.0001);
-
-        if memory_pressure {
-            self.cap_units = self.cap_units.saturating_sub(1).max(lower_bound);
-            self.cooldown_frames = if self.uma_shared_memory { 36 } else { 24 };
-            self.recovery_frames = if self.uma_shared_memory { 48 } else { 0 };
-            self.low_jitter_streak = 0;
-            return;
-        }
-
-        if self.cooldown_frames > 0 {
-            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
-        }
-        if self.recovery_frames > 0 {
-            self.recovery_frames = self.recovery_frames.saturating_sub(1);
-            if self.uma_shared_memory && self.cap_units > 2 {
-                self.cap_units = self.cap_units.saturating_sub(1).max(lower_bound);
-            }
-        }
-
-        let spike = if self.uma_shared_memory {
-            sample > self.ema_ms_per_unit * 1.70
-        } else {
-            sample > self.ema_ms_per_unit * 1.85
-        };
-        let high_jitter = if self.uma_shared_memory {
-            jitter_ratio > 0.18 || spike
-        } else {
-            jitter_ratio > 0.24 || spike
-        };
-        if high_jitter {
-            let reduction = if self.uma_shared_memory {
-                if jitter_ratio > 0.26 || sample > self.ema_ms_per_unit * 2.0 {
-                    2
-                } else {
-                    1
-                }
-            } else if jitter_ratio > 0.35 || sample > self.ema_ms_per_unit * 2.20 {
-                2
-            } else {
-                1
-            };
-            self.cap_units = self.cap_units.saturating_sub(reduction).max(lower_bound);
-            self.cooldown_frames = if self.uma_shared_memory { 30 } else { 18 };
-            if self.uma_shared_memory {
-                self.recovery_frames = 36;
-            }
-            self.low_jitter_streak = 0;
-        } else if (if self.uma_shared_memory {
-            jitter_ratio < 0.06
-        } else {
-            jitter_ratio < 0.10
-        }) && self.cap_units < upper_bound
-        {
-            self.low_jitter_streak = self.low_jitter_streak.saturating_add(1);
-            let growth_streak_target = if self.uma_shared_memory { 48 } else { 24 };
-            if self.low_jitter_streak >= growth_streak_target
-                && self.cooldown_frames == 0
-                && self.recovery_frames == 0
-            {
-                self.cap_units = (self.cap_units + 1).min(upper_bound);
-                self.low_jitter_streak = 0;
-            }
-        } else {
-            self.low_jitter_streak = 0;
-        }
-
-        self.cap_units = self.cap_units.clamp(lower_bound, upper_bound);
-    }
-
-    fn current_cap(&self) -> u32 {
-        self.cap_units.max(1)
     }
 }
 
@@ -1536,107 +1337,26 @@ struct BenchmarkSummary {
 }
 
 fn choose_pacing_mode(options: CliOptions) -> BenchmarkPacingMode {
-    match options.mode_override {
-        ModeOverride::Stable => BenchmarkPacingMode::Stable,
-        ModeOverride::Max => BenchmarkPacingMode::MaxThroughput,
-        ModeOverride::Auto => match options.vsync_override {
-            VsyncOverride::On => BenchmarkPacingMode::Stable,
-            VsyncOverride::Off => BenchmarkPacingMode::MaxThroughput,
-            VsyncOverride::Auto => BenchmarkPacingMode::Stable,
-        },
+    mgs::choose_pacing_mode(
+        runtime_mode_from_override(options.mode_override),
+        runtime_vsync_from_override(options.vsync_override),
+    )
+}
+
+fn runtime_mode_from_override(mode: ModeOverride) -> RuntimeMode {
+    match mode {
+        ModeOverride::Auto => RuntimeMode::Auto,
+        ModeOverride::Stable => RuntimeMode::Stable,
+        ModeOverride::Max => RuntimeMode::MaxThroughput,
     }
 }
 
-fn select_throughput_burst(
-    profile: &MobileGpuProfile,
-    options: CliOptions,
-    uma_shared_memory: bool,
-) -> u32 {
-    let mut burst = match options.mode_override {
-        ModeOverride::Stable => 1,
-        ModeOverride::Max => match profile.architecture {
-            TbdrArchitecture::AppleTbdr => 4,
-            TbdrArchitecture::MaliTbdr => 4,
-            TbdrArchitecture::FlexRender => 8,
-            TbdrArchitecture::PowerVrTbdr => 4,
-            TbdrArchitecture::Unknown => 3,
-        },
-        ModeOverride::Auto => {
-            if profile.is_mobile_tbdr() {
-                if matches!(profile.architecture, TbdrArchitecture::AppleTbdr) {
-                    2
-                } else {
-                    3
-                }
-            } else {
-                2
-            }
-        }
-    };
-
-    if uma_shared_memory {
-        burst = burst.min(match options.mode_override {
-            ModeOverride::Stable => 1,
-            ModeOverride::Auto => 2,
-            ModeOverride::Max => 4,
-        });
+fn runtime_vsync_from_override(vsync: VsyncOverride) -> VsyncMode {
+    match vsync {
+        VsyncOverride::Auto => VsyncMode::Auto,
+        VsyncOverride::On => VsyncMode::On,
+        VsyncOverride::Off => VsyncMode::Off,
     }
-    burst.max(1)
-}
-
-fn startup_ramp(target: u32, presented_frames: u64) -> u32 {
-    if target <= 1 {
-        return target;
-    }
-    let ramp_frames = 60.0;
-    let progress = ((presented_frames.saturating_add(1)) as f64 / ramp_frames).clamp(0.0, 1.0);
-    let eased = progress * progress * (3.0 - 2.0 * progress);
-    let scaled = 1.0 + (target.saturating_sub(1) as f64) * eased;
-    scaled.round().clamp(1.0, target as f64) as u32
-}
-
-fn select_present_mode(
-    available: &[PresentMode],
-    prefer_stable: bool,
-    vsync_override: VsyncOverride,
-) -> PresentMode {
-    let has = |mode: PresentMode| available.contains(&mode);
-    match vsync_override {
-        VsyncOverride::On => {
-            if has(PresentMode::Fifo) {
-                PresentMode::Fifo
-            } else {
-                available.first().copied().unwrap_or(PresentMode::AutoVsync)
-            }
-        }
-        VsyncOverride::Off => {
-            if has(PresentMode::Immediate) {
-                PresentMode::Immediate
-            } else if has(PresentMode::AutoNoVsync) {
-                PresentMode::AutoNoVsync
-            } else if has(PresentMode::Mailbox) {
-                PresentMode::Mailbox
-            } else {
-                available
-                    .first()
-                    .copied()
-                    .unwrap_or(PresentMode::AutoNoVsync)
-            }
-        }
-        VsyncOverride::Auto => {
-            if prefer_stable && has(PresentMode::Fifo) {
-                PresentMode::Fifo
-            } else if has(PresentMode::AutoVsync) {
-                PresentMode::AutoVsync
-            } else {
-                available.first().copied().unwrap_or(PresentMode::AutoVsync)
-            }
-        }
-    }
-}
-
-fn present_mode_allows_uncapped(mode: PresentMode) -> bool {
-    matches!(mode, PresentMode::Immediate | PresentMode::AutoNoVsync)
 }
 
 fn animated_clear_color(phase: f64) -> Color {

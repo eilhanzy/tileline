@@ -10,12 +10,19 @@
 pub mod bridge;
 pub mod fallback;
 pub mod hardware;
+pub mod runtime;
 pub mod tile_planner;
 pub mod tuning;
 
 pub use bridge::MgsBridge;
 pub use fallback::FallbackChain;
 pub use hardware::{GfxBackend, MobileGpuFamily, MobileGpuProfile, TbdrArchitecture};
+pub use runtime::{
+    choose_pacing_mode, is_unified_memory_profile, present_mode_allows_uncapped,
+    recommended_min_frame_interval, select_present_mode, select_throughput_burst, startup_ramp,
+    AdaptiveBurstController, AggressiveNoVsyncPolicy, RuntimeMode, RuntimePacingMode,
+    ThroughputMemoryPolicy, VsyncMode,
+};
 pub use tile_planner::MgsPlanner;
 pub use tuning::{
     BackendRenderHints, LoadAction, MetalPassHints, MgsTuningProfile, StoreAction, VulkanPassHints,
