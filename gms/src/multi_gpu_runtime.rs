@@ -73,6 +73,12 @@ pub struct MultiGpuExecutorSummary {
     pub aggressive_integrated_preallocation: bool,
     pub integrated_encoder_pool: u32,
     pub integrated_ring_segments: u32,
+    /// True when Vulkan version compatibility gating was applied.
+    pub vulkan_version_gate_enabled: bool,
+    /// Primary adapter Vulkan API version (major.minor), if detected.
+    pub primary_vulkan_api_version: Option<String>,
+    /// Secondary adapter Vulkan API version (major.minor), if detected.
+    pub secondary_vulkan_api_version: Option<String>,
 }
 
 /// Result of one secondary helper-lane frame submission.
@@ -104,6 +110,9 @@ pub struct MultiGpuExecutor {
     sync_state: MultiGpuSyncState,
     total_secondary_work_units: u64,
     total_secondary_submissions: u64,
+    vulkan_version_gate_enabled: bool,
+    primary_vulkan_api_version: Option<VulkanApiVersion>,
+    secondary_vulkan_api_version: Option<VulkanApiVersion>,
 }
 
 struct MultiGpuBridgeRuntime {
@@ -215,6 +224,19 @@ impl MultiGpuExecutor {
                     secondary_profile.name
                 ))) as Box<dyn Error>
             })?;
+        let secondary_adapter_info = secondary_adapter.get_info();
+        let version_gate = match validate_vulkan_version_compatibility(
+            &primary_adapter_info,
+            &secondary_adapter_info,
+        ) {
+            Ok(gate) => gate,
+            Err(err) => {
+                return match policy {
+                    MultiGpuInitPolicy::Auto => Ok(None),
+                    MultiGpuInitPolicy::Force => Err(Box::new(SimpleError(err))),
+                };
+            }
+        };
 
         // Some mobile/embedded stacks (including Panthor-class ARM drivers) can reject the
         // default requested texture limits (notably `max_texture_dimension_3d = 2048`) even when
@@ -300,6 +322,9 @@ impl MultiGpuExecutor {
             sync_state,
             total_secondary_work_units: 0,
             total_secondary_submissions: 0,
+            vulkan_version_gate_enabled: version_gate.enabled,
+            primary_vulkan_api_version: version_gate.primary_version,
+            secondary_vulkan_api_version: version_gate.secondary_version,
         }))
     }
 
@@ -441,6 +466,9 @@ impl MultiGpuExecutor {
             aggressive_integrated_preallocation: self.plan.sync.aggressive_integrated_preallocation,
             integrated_encoder_pool: self.plan.sync.integrated_encoder_pool,
             integrated_ring_segments: self.plan.sync.integrated_ring_segments,
+            vulkan_version_gate_enabled: self.vulkan_version_gate_enabled,
+            primary_vulkan_api_version: self.primary_vulkan_api_version.map(|v| v.to_string()),
+            secondary_vulkan_api_version: self.secondary_vulkan_api_version.map(|v| v.to_string()),
         }
     }
 
@@ -668,6 +696,204 @@ impl fmt::Display for SimpleError {
 }
 
 impl Error for SimpleError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VulkanApiVersion {
+    major: u32,
+    minor: u32,
+}
+
+impl fmt::Display for VulkanApiVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VulkanVersionGate {
+    enabled: bool,
+    primary_version: Option<VulkanApiVersion>,
+    secondary_version: Option<VulkanApiVersion>,
+}
+
+fn validate_vulkan_version_compatibility(
+    primary: &wgpu::AdapterInfo,
+    secondary: &wgpu::AdapterInfo,
+) -> Result<VulkanVersionGate, String> {
+    if !matches!(primary.backend, wgpu::Backend::Vulkan)
+        || !matches!(secondary.backend, wgpu::Backend::Vulkan)
+    {
+        return Ok(VulkanVersionGate {
+            enabled: false,
+            primary_version: None,
+            secondary_version: None,
+        });
+    }
+
+    let primary_version = parse_adapter_vulkan_api_version(primary);
+    let secondary_version = parse_adapter_vulkan_api_version(secondary);
+
+    match (primary_version, secondary_version) {
+        (Some(left), Some(right)) if left == right => Ok(VulkanVersionGate {
+            enabled: true,
+            primary_version: Some(left),
+            secondary_version: Some(right),
+        }),
+        (Some(left), Some(right)) => Err(format!(
+            "multi-GPU requested but Vulkan API versions are incompatible: primary '{}' uses {}, secondary '{}' uses {}",
+            primary.name, left, secondary.name, right
+        )),
+        (None, Some(right)) => Err(format!(
+            "multi-GPU requested but primary adapter '{}' Vulkan API version could not be parsed (secondary parsed as {})",
+            primary.name, right
+        )),
+        (Some(left), None) => Err(format!(
+            "multi-GPU requested but secondary adapter '{}' Vulkan API version could not be parsed (primary parsed as {})",
+            secondary.name, left
+        )),
+        (None, None) => Err(format!(
+            "multi-GPU requested but Vulkan API versions could not be parsed for either adapter ('{}' and '{}')",
+            primary.name, secondary.name
+        )),
+    }
+}
+
+fn parse_adapter_vulkan_api_version(info: &wgpu::AdapterInfo) -> Option<VulkanApiVersion> {
+    if !matches!(info.backend, wgpu::Backend::Vulkan) {
+        return None;
+    }
+    parse_vulkan_api_version_from_text(&info.driver_info)
+        .or_else(|| parse_vulkan_api_version_from_text(&info.driver))
+        .or_else(|| parse_vulkan_api_version_from_text(&info.name))
+}
+
+fn parse_vulkan_api_version_from_text(text: &str) -> Option<VulkanApiVersion> {
+    if text.is_empty() {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+
+        let (major, next_i) = match parse_u32_at(bytes, i) {
+            Some(parsed) => parsed,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if next_i >= bytes.len() || bytes[next_i] != b'.' {
+            i += 1;
+            continue;
+        }
+        let minor_start = next_i + 1;
+        if minor_start >= bytes.len() || !bytes[minor_start].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let (minor, _) = match parse_u32_at(bytes, minor_start) {
+            Some(parsed) => parsed,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // Vulkan API major/minor are small numbers in practice (1.x today).
+        if major <= 5 && minor <= 10 {
+            return Some(VulkanApiVersion { major, minor });
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_u32_at(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
+    let mut i = start;
+    let mut value: u32 = 0;
+    let mut consumed = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        value = value
+            .checked_mul(10)?
+            .checked_add(u32::from(bytes[i] - b'0'))?;
+        i += 1;
+        consumed += 1;
+    }
+    if consumed == 0 {
+        None
+    } else {
+        Some((value, i))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wgpu::{AdapterInfo, Backend, DeviceType};
+
+    fn vk_info(name: &str, driver: &str, driver_info: &str) -> AdapterInfo {
+        AdapterInfo {
+            name: name.to_owned(),
+            vendor: 0x1002,
+            device: 0x73BF,
+            device_type: DeviceType::DiscreteGpu,
+            device_pci_bus_id: "0000:01:00.0".to_owned(),
+            driver: driver.to_owned(),
+            driver_info: driver_info.to_owned(),
+            backend: Backend::Vulkan,
+            subgroup_min_size: 32,
+            subgroup_max_size: 32,
+            transient_saves_memory: false,
+        }
+    }
+
+    #[test]
+    fn parses_vulkan_major_minor_from_driver_info() {
+        let parsed = parse_vulkan_api_version_from_text("Mesa RADV Vulkan 1.3.302");
+        assert_eq!(parsed, Some(VulkanApiVersion { major: 1, minor: 3 }));
+    }
+
+    #[test]
+    fn vulkan_gate_accepts_matching_major_minor() {
+        let primary = vk_info("Primary", "Mesa", "Vulkan 1.3.290");
+        let secondary = vk_info("Secondary", "NVIDIA", "Vulkan 1.3.280");
+        let gate = validate_vulkan_version_compatibility(&primary, &secondary)
+            .expect("matching Vulkan versions should pass");
+        assert!(gate.enabled);
+        assert_eq!(
+            gate.primary_version,
+            Some(VulkanApiVersion { major: 1, minor: 3 })
+        );
+        assert_eq!(
+            gate.secondary_version,
+            Some(VulkanApiVersion { major: 1, minor: 3 })
+        );
+    }
+
+    #[test]
+    fn vulkan_gate_rejects_major_minor_mismatch() {
+        let primary = vk_info("Primary", "Mesa", "Vulkan 1.3.290");
+        let secondary = vk_info("Secondary", "Mesa", "Vulkan 1.2.250");
+        let err = validate_vulkan_version_compatibility(&primary, &secondary)
+            .expect_err("mismatched Vulkan versions should fail");
+        assert!(err.contains("incompatible"));
+        assert!(err.contains("1.3"));
+        assert!(err.contains("1.2"));
+    }
+
+    #[test]
+    fn vulkan_gate_rejects_when_version_unparseable() {
+        let primary = vk_info("Primary", "Mesa", "Vulkan 1.3.290");
+        let secondary = vk_info("Secondary", "Mesa", "unknown");
+        let err = validate_vulkan_version_compatibility(&primary, &secondary)
+            .expect_err("unparseable Vulkan version should fail");
+        assert!(err.contains("could not be parsed"));
+    }
+}
 
 fn build_no_secondary_assignment_diagnostic(
     primary_adapter_info: &wgpu::AdapterInfo,

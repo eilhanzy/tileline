@@ -1576,6 +1576,19 @@ fn print_summary(summary: &BenchmarkSummary) {
             multi_gpu.projected_score_gain_pct,
             multi_gpu.meets_target_gain_20pct
         );
+        if multi_gpu.vulkan_version_gate_enabled {
+            println!(
+                "Vulkan version gate: enabled | primary: {} | secondary: {}",
+                multi_gpu
+                    .primary_vulkan_api_version
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                multi_gpu
+                    .secondary_vulkan_api_version
+                    .as_deref()
+                    .unwrap_or("unknown")
+            );
+        }
         println!(
             "Bridge: {:?} | bytes/frame: {} | chunk: {} | sync frames_in_flight: {} | queue waits/polls: {}/{}",
             multi_gpu.bridge_kind,

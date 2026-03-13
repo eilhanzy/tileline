@@ -11,8 +11,8 @@
 pub mod adaptive_buffer;
 pub mod bridge;
 pub mod hardware;
-pub mod render_benchmark;
 pub mod multi_gpu_runtime;
+pub mod render_benchmark;
 pub mod tuning;
 
 pub use adaptive_buffer::{

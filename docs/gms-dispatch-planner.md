@@ -52,6 +52,23 @@ latency-sensitive lanes to secondary adapters when beneficial.
 - shared transfer strategy (portable host-bridge model in `wgpu`)
 - sync plan metadata (timeline-like queue submissions + bounded waits)
 - projected score gain estimates and `%20` target checks
+- Vulkan API compatibility gate for explicit multi-GPU startup
+
+## Vulkan Version Gate (Explicit Multi-GPU Safety)
+
+`gms/src/multi_gpu_runtime.rs` now validates Vulkan API major/minor compatibility before opening
+the secondary helper lane:
+
+- Both adapters must report Vulkan API versions with the same `major.minor` (for example `1.3` +
+  `1.3`).
+- A mismatch (`1.3` + `1.2`) hard-stops explicit multi-GPU startup.
+- If a Vulkan version cannot be parsed for either adapter, explicit multi-GPU startup is refused
+  to avoid undefined cross-adapter behavior.
+
+Policy behavior:
+
+- `MultiGpuInitPolicy::Auto`: returns `Ok(None)` (multi-GPU disabled for the session)
+- `MultiGpuInitPolicy::Force`: returns an initialization error with adapter/version diagnostics
 
 ## Portable Synchronization Model
 
@@ -71,4 +88,3 @@ GMS tuning and `AdaptiveBuffer` support provide UMA-aware behavior for Metal/App
 - stability recovery heuristics
 
 These policies are consumed by `tl-core` and `runtime` rather than being confined to benchmarks.
-
