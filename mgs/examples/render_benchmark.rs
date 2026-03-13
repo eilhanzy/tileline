@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use mgs::bridge::MpsWorkloadHint;
 use mgs::fallback::FallbackLevel;
-use mgs::{MgsBridge, MobileGpuProfile, TbdrArchitecture};
+use mgs::{MgsBridge, MobileGpuFamily, MobileGpuProfile, TbdrArchitecture};
 use wgpu::{Color, CompositeAlphaMode, PresentMode, SurfaceError, TextureFormat};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -609,6 +609,7 @@ struct Renderer {
     bridge: MgsBridge,
     throughput_target_burst: u32,
     adaptive_burst: AdaptiveBurstController,
+    uma_shared_memory: bool,
     throughput_targets: Vec<wgpu::Texture>,
     throughput_target_cursor: usize,
     presented_frames: u64,
@@ -631,6 +632,7 @@ impl Renderer {
 
         let adapter_info = adapter.get_info();
         let profile = MobileGpuProfile::detect(&adapter_info.name);
+        let uma_shared_memory = is_unified_memory_profile(&profile, &adapter_info);
         let tuning = mgs::MgsTuningProfile::from_profile(&profile);
         let bridge = MgsBridge::with_tuning(profile.clone(), tuning);
         let (device, queue) =
@@ -679,17 +681,18 @@ impl Renderer {
             .copied()
             .find(|mode| *mode == CompositeAlphaMode::Opaque)
             .unwrap_or(config.alpha_mode);
-        config.desired_maximum_frame_latency = 3;
+        config.desired_maximum_frame_latency = if uma_shared_memory { 4 } else { 3 };
         surface.configure(&device, &config);
 
-        let throughput_target_burst = select_throughput_burst(&profile, options);
+        let throughput_target_burst = select_throughput_burst(&profile, options, uma_shared_memory);
         let adaptive_burst = AdaptiveBurstController::new(
             throughput_target_burst,
             options.mode_override,
             config.present_mode,
+            uma_shared_memory,
         );
 
-        Ok(Self {
+        let mut renderer = Self {
             _instance: instance,
             surface,
             adapter_info,
@@ -703,6 +706,7 @@ impl Renderer {
             bridge,
             throughput_target_burst,
             adaptive_burst,
+            uma_shared_memory,
             throughput_targets: Vec::new(),
             throughput_target_cursor: 0,
             presented_frames: 0,
@@ -710,7 +714,14 @@ impl Renderer {
             fallback_counts: [0; 4],
             last_tile_count: 0,
             last_memory_pressure: false,
-        })
+        };
+
+        if renderer.uma_shared_memory && renderer.throughput_target_burst > 1 {
+            // Unified memory systems can spike on first target growth; preallocate once.
+            renderer.ensure_throughput_targets(12);
+        }
+
+        Ok(renderer)
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -901,50 +912,78 @@ fn recommended_min_frame_interval(
         return Duration::ZERO;
     }
 
-    // Keep uncapped mode cooperative and less jitter-prone on desktop GPUs.
-    if renderer.profile.is_mobile_tbdr() {
+    // Keep uncapped mode cooperative and less jitter-prone.
+    if renderer.uma_shared_memory {
+        // Apple UMA benefits from slightly longer pacing to reduce oscillation.
+        Duration::from_micros(2_400)
+    } else if renderer.profile.is_mobile_tbdr() {
         Duration::from_micros(1_100)
     } else {
         Duration::from_micros(700)
     }
 }
 
+fn is_unified_memory_profile(profile: &MobileGpuProfile, adapter_info: &wgpu::AdapterInfo) -> bool {
+    matches!(profile.architecture, TbdrArchitecture::AppleTbdr)
+        || matches!(profile.family, MobileGpuFamily::Apple)
+        || matches!(adapter_info.backend, wgpu::Backend::Metal)
+}
+
 #[derive(Debug, Clone)]
 struct AdaptiveBurstController {
     enabled: bool,
+    uma_shared_memory: bool,
     min_units: u32,
+    max_units_soft: u32,
     cap_units: u32,
     initialized: bool,
     ema_ms_per_unit: f64,
     ema_abs_delta: f64,
     cooldown_frames: u32,
+    recovery_frames: u32,
     low_jitter_streak: u32,
 }
 
 impl AdaptiveBurstController {
-    fn new(base_units: u32, mode: ModeOverride, present_mode: PresentMode) -> Self {
+    fn new(
+        base_units: u32,
+        mode: ModeOverride,
+        present_mode: PresentMode,
+        uma_shared_memory: bool,
+    ) -> Self {
         let enabled = base_units > 1
             && !matches!(mode, ModeOverride::Stable)
             && present_mode_allows_uncapped(present_mode);
-        let min_units = if enabled { 2 } else { 1 };
+        let min_units = if !enabled {
+            1
+        } else if uma_shared_memory {
+            1
+        } else {
+            2
+        };
+        let max_units_soft = if uma_shared_memory { 8 } else { 24 };
         Self {
             enabled,
+            uma_shared_memory,
             min_units,
+            max_units_soft,
             cap_units: base_units.max(1),
             initialized: false,
             ema_ms_per_unit: 0.0,
             ema_abs_delta: 0.0,
             cooldown_frames: 0,
+            recovery_frames: 0,
             low_jitter_streak: 0,
         }
     }
 
     fn reset(&mut self, base_units: u32) {
-        self.cap_units = base_units.max(self.min_units);
+        self.cap_units = base_units.max(self.min_units).min(self.max_units_soft);
         self.initialized = false;
         self.ema_ms_per_unit = 0.0;
         self.ema_abs_delta = 0.0;
         self.cooldown_frames = 0;
+        self.recovery_frames = 0;
         self.low_jitter_streak = 0;
     }
 
@@ -967,7 +1006,7 @@ impl AdaptiveBurstController {
             return;
         }
 
-        let upper_bound = planned_units.max(1).clamp(1, 24);
+        let upper_bound = planned_units.max(1).min(self.max_units_soft).clamp(1, 24);
         let lower_bound = self.min_units.min(upper_bound);
         self.cap_units = self.cap_units.clamp(lower_bound, upper_bound);
 
@@ -986,8 +1025,9 @@ impl AdaptiveBurstController {
         let jitter_ratio = self.ema_abs_delta / self.ema_ms_per_unit.max(0.0001);
 
         if memory_pressure {
-            self.cap_units = self.cap_units.saturating_sub(1).max(1);
-            self.cooldown_frames = 24;
+            self.cap_units = self.cap_units.saturating_sub(1).max(lower_bound);
+            self.cooldown_frames = if self.uma_shared_memory { 36 } else { 24 };
+            self.recovery_frames = if self.uma_shared_memory { 48 } else { 0 };
             self.low_jitter_streak = 0;
             return;
         }
@@ -995,20 +1035,53 @@ impl AdaptiveBurstController {
         if self.cooldown_frames > 0 {
             self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
         }
+        if self.recovery_frames > 0 {
+            self.recovery_frames = self.recovery_frames.saturating_sub(1);
+            if self.uma_shared_memory && self.cap_units > 2 {
+                self.cap_units = self.cap_units.saturating_sub(1).max(lower_bound);
+            }
+        }
 
-        let spike = sample > self.ema_ms_per_unit * 1.85;
-        if jitter_ratio > 0.24 || spike {
-            let reduction = if jitter_ratio > 0.35 || sample > self.ema_ms_per_unit * 2.20 {
+        let spike = if self.uma_shared_memory {
+            sample > self.ema_ms_per_unit * 1.70
+        } else {
+            sample > self.ema_ms_per_unit * 1.85
+        };
+        let high_jitter = if self.uma_shared_memory {
+            jitter_ratio > 0.18 || spike
+        } else {
+            jitter_ratio > 0.24 || spike
+        };
+        if high_jitter {
+            let reduction = if self.uma_shared_memory {
+                if jitter_ratio > 0.26 || sample > self.ema_ms_per_unit * 2.0 {
+                    2
+                } else {
+                    1
+                }
+            } else if jitter_ratio > 0.35 || sample > self.ema_ms_per_unit * 2.20 {
                 2
             } else {
                 1
             };
-            self.cap_units = self.cap_units.saturating_sub(reduction).max(self.min_units);
-            self.cooldown_frames = 18;
+            self.cap_units = self.cap_units.saturating_sub(reduction).max(lower_bound);
+            self.cooldown_frames = if self.uma_shared_memory { 30 } else { 18 };
+            if self.uma_shared_memory {
+                self.recovery_frames = 36;
+            }
             self.low_jitter_streak = 0;
-        } else if jitter_ratio < 0.10 && self.cap_units < upper_bound {
+        } else if (if self.uma_shared_memory {
+            jitter_ratio < 0.06
+        } else {
+            jitter_ratio < 0.10
+        }) && self.cap_units < upper_bound
+        {
             self.low_jitter_streak = self.low_jitter_streak.saturating_add(1);
-            if self.low_jitter_streak >= 24 && self.cooldown_frames == 0 {
+            let growth_streak_target = if self.uma_shared_memory { 48 } else { 24 };
+            if self.low_jitter_streak >= growth_streak_target
+                && self.cooldown_frames == 0
+                && self.recovery_frames == 0
+            {
                 self.cap_units = (self.cap_units + 1).min(upper_bound);
                 self.low_jitter_streak = 0;
             }
@@ -1297,11 +1370,15 @@ fn choose_pacing_mode(options: CliOptions) -> BenchmarkPacingMode {
     }
 }
 
-fn select_throughput_burst(profile: &MobileGpuProfile, options: CliOptions) -> u32 {
-    match options.mode_override {
+fn select_throughput_burst(
+    profile: &MobileGpuProfile,
+    options: CliOptions,
+    uma_shared_memory: bool,
+) -> u32 {
+    let mut burst = match options.mode_override {
         ModeOverride::Stable => 1,
         ModeOverride::Max => match profile.architecture {
-            TbdrArchitecture::AppleTbdr => 6,
+            TbdrArchitecture::AppleTbdr => 4,
             TbdrArchitecture::MaliTbdr => 4,
             TbdrArchitecture::FlexRender => 8,
             TbdrArchitecture::PowerVrTbdr => 4,
@@ -1309,12 +1386,25 @@ fn select_throughput_burst(profile: &MobileGpuProfile, options: CliOptions) -> u
         },
         ModeOverride::Auto => {
             if profile.is_mobile_tbdr() {
-                3
+                if matches!(profile.architecture, TbdrArchitecture::AppleTbdr) {
+                    2
+                } else {
+                    3
+                }
             } else {
                 2
             }
         }
+    };
+
+    if uma_shared_memory {
+        burst = burst.min(match options.mode_override {
+            ModeOverride::Stable => 1,
+            ModeOverride::Auto => 2,
+            ModeOverride::Max => 4,
+        });
     }
+    burst.max(1)
 }
 
 fn startup_ramp(target: u32, presented_frames: u64) -> u32 {
