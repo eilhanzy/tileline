@@ -23,6 +23,7 @@ pub use hardware::{
     MemoryTopology,
 };
 pub use multi_gpu_runtime::{
-    MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary, MultiGpuInitPolicy,
+    MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary, MultiGpuFrameSubmitResult,
+    MultiGpuInitPolicy,
 };
 pub use tuning::GmsRuntimeTuningProfile;

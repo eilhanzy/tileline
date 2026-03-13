@@ -1,11 +1,8 @@
 [package]
-name = "tl-core"
+name = "nps"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 crossbeam.workspace = true
-wgpu.workspace = true
 mps = { path = "../mps" }
-gms = { path = "../gms" }
-wasm-encoder = "0.224.0"
