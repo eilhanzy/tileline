@@ -49,6 +49,9 @@ latency-sensitive lanes to secondary adapters when beneficial.
 `MultiGpuDispatcher` emits:
 
 - lane roles (primary present / secondary latency / auxiliary compute)
+- dual-dGPU-ready helper selection:
+  if primary is discrete and another discrete adapter exists, helper lane prefers the secondary
+  discrete adapter before falling back to integrated-latency selection
 - shared transfer strategy (portable host-bridge model in `wgpu`)
 - sync plan metadata (timeline-like queue submissions + bounded waits)
 - projected score gain estimates and `%20` target checks

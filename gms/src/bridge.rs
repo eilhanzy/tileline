@@ -356,8 +356,8 @@ impl MultiGpuDispatcher {
         }
 
         let primary_slot = select_primary_adapter_slot(&usable);
-        let secondary_slot = select_secondary_adapter_slot(&usable, primary_slot);
         let primary_gpu = usable[primary_slot];
+        let secondary_slot = select_secondary_adapter_slot(&usable, primary_slot, primary_gpu);
         let secondary_gpu = secondary_slot.map(|slot| usable[slot]);
         let best_score = usable.iter().map(|gpu| gpu.score).max().unwrap_or(1);
 
@@ -608,7 +608,31 @@ fn primary_priority(gpu: &GpuAdapterProfile) -> f64 {
 fn select_secondary_adapter_slot(
     usable: &[&GpuAdapterProfile],
     primary_slot: usize,
+    primary_gpu: &GpuAdapterProfile,
 ) -> Option<usize> {
+    let has_discrete_helper = usable.iter().enumerate().any(|(idx, gpu)| {
+        idx != primary_slot && matches!(gpu.memory_topology, MemoryTopology::DiscreteVram)
+    });
+
+    // Future-proof for dual-dGPU systems:
+    // If the present adapter is discrete and another discrete adapter exists, select that helper
+    // first so heavy secondary lanes can scale with higher VRAM bandwidth before falling back to
+    // integrated-latency routing.
+    if matches!(primary_gpu.memory_topology, MemoryTopology::DiscreteVram) && has_discrete_helper {
+        return usable
+            .iter()
+            .enumerate()
+            .filter(|(idx, gpu)| {
+                *idx != primary_slot && matches!(gpu.memory_topology, MemoryTopology::DiscreteVram)
+            })
+            .max_by(|(_, left), (_, right)| {
+                secondary_discrete_priority(left)
+                    .partial_cmp(&secondary_discrete_priority(right))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx);
+    }
+
     usable
         .iter()
         .enumerate()
@@ -619,6 +643,19 @@ fn select_secondary_adapter_slot(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(idx, _)| idx)
+}
+
+fn secondary_discrete_priority(gpu: &GpuAdapterProfile) -> f64 {
+    let score = gpu.score.max(1) as f64;
+    let vram_factor = ((gpu.estimated_vram_mb.max(1024) as f64) / 8_192.0)
+        .sqrt()
+        .clamp(0.80, 1.60);
+    let map_factor = if gpu.supports_mappable_primary_buffers {
+        1.05
+    } else {
+        1.0
+    };
+    score * vram_factor * map_factor
 }
 
 fn secondary_priority(gpu: &GpuAdapterProfile) -> f64 {
