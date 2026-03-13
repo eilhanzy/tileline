@@ -1,0 +1,9 @@
+[package]
+name = "mgs"
+version.workspace = true
+edition.workspace = true
+
+# Mobile Graphics Scheduler (MGS)
+# GMS'e sıfır bağımlılık. Mobil platform ve serial fallback odaklı.
+
+[dependencies]
