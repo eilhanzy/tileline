@@ -72,6 +72,8 @@ pub struct MultiGpuExecutorSummary {
     pub sync_frames_in_flight: u32,
     pub sync_queue_waits: u64,
     pub sync_queue_polls: u64,
+    pub sync_queue_wait_timeouts: u64,
+    pub sync_skipped_submissions: u64,
     pub aggressive_integrated_preallocation: bool,
     pub integrated_encoder_pool: u32,
     pub integrated_ring_segments: u32,
@@ -129,6 +131,8 @@ struct MultiGpuSyncState {
     pending_secondary_submissions: VecDeque<wgpu::SubmissionIndex>,
     poll_count: u64,
     wait_count: u64,
+    wait_timeout_count: u64,
+    skipped_submission_count: u64,
 }
 
 impl MultiGpuExecutor {
@@ -359,14 +363,37 @@ impl MultiGpuExecutor {
 
         let frames_in_flight_limit = self.plan.sync.frames_in_flight.max(1) as usize;
         if self.sync_state.pending_secondary_submissions.len() >= frames_in_flight_limit {
-            if let Some(oldest_submission) =
-                self.sync_state.pending_secondary_submissions.pop_front()
+            if let Some(oldest_submission) = self
+                .sync_state
+                .pending_secondary_submissions
+                .front()
+                .cloned()
             {
-                let _ = self.secondary_device.poll(wgpu::PollType::Wait {
-                    submission_index: Some(oldest_submission),
-                    timeout: Some(Duration::from_micros(250)),
-                });
                 self.sync_state.wait_count = self.sync_state.wait_count.saturating_add(1);
+                match self.secondary_device.poll(wgpu::PollType::Wait {
+                    submission_index: Some(oldest_submission),
+                    timeout: Some(Duration::from_micros(125)),
+                }) {
+                    Ok(status) if status.wait_finished() => {
+                        let _ = self.sync_state.pending_secondary_submissions.pop_front();
+                    }
+                    Ok(_) => {}
+                    Err(wgpu::PollError::Timeout) => {
+                        self.sync_state.wait_timeout_count =
+                            self.sync_state.wait_timeout_count.saturating_add(1);
+                        self.sync_state.skipped_submission_count =
+                            self.sync_state.skipped_submission_count.saturating_add(1);
+                        let _ = self.secondary_device.poll(wgpu::PollType::Poll);
+                        self.sync_state.poll_count = self.sync_state.poll_count.saturating_add(1);
+                        return MultiGpuFrameSubmitResult {
+                            work_units: 0,
+                            submission_index: None,
+                        };
+                    }
+                    Err(wgpu::PollError::WrongSubmissionIndex(_, _)) => {
+                        let _ = self.sync_state.pending_secondary_submissions.pop_front();
+                    }
+                }
             }
         }
 
@@ -465,6 +492,8 @@ impl MultiGpuExecutor {
             sync_frames_in_flight: self.plan.sync.frames_in_flight,
             sync_queue_waits: self.sync_state.wait_count,
             sync_queue_polls: self.sync_state.poll_count,
+            sync_queue_wait_timeouts: self.sync_state.wait_timeout_count,
+            sync_skipped_submissions: self.sync_state.skipped_submission_count,
             aggressive_integrated_preallocation: self.plan.sync.aggressive_integrated_preallocation,
             integrated_encoder_pool: self.plan.sync.integrated_encoder_pool,
             integrated_ring_segments: self.plan.sync.integrated_ring_segments,
@@ -780,11 +809,9 @@ fn parse_vulkan_api_version_from_text(text: &str) -> Option<VulkanApiVersion> {
         while let Some(rel_idx) = lower[offset..].find(key) {
             let abs_idx = offset + rel_idx;
             let window_end = (abs_idx + key.len() + 32).min(text.len());
-            if let Some(parsed) = parse_vulkan_api_version_in_range(
-                text.as_bytes(),
-                abs_idx,
-                window_end,
-            ) {
+            if let Some(parsed) =
+                parse_vulkan_api_version_in_range(text.as_bytes(), abs_idx, window_end)
+            {
                 return Some(parsed);
             }
             offset = abs_idx + key.len();
@@ -893,9 +920,9 @@ fn probe_vulkaninfo_api_version(info: &wgpu::AdapterInfo) -> Option<VulkanApiVer
                     || entry.normalized_name.contains(&target_name))
         })
         .or_else(|| {
-            entries
-                .iter()
-                .find(|entry| entry.vendor == Some(info.vendor) && entry.device == Some(info.device))
+            entries.iter().find(|entry| {
+                entry.vendor == Some(info.vendor) && entry.device == Some(info.device)
+            })
         })
         .or_else(|| {
             entries

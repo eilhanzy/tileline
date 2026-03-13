@@ -80,6 +80,8 @@ sync with:
 - queue `SubmissionIndex` values as timeline markers
 - bounded `Device::poll(...)` waits
 - explicit compose budget policy (sub-millisecond target in `tl-core`)
+- in-flight backpressure: if secondary queue depth is saturated and wait times out, helper submit is
+  skipped for that frame instead of over-queuing bursts
 
 ## Apple Silicon / UMA Interaction
 

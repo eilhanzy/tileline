@@ -1590,13 +1590,15 @@ fn print_summary(summary: &BenchmarkSummary) {
             );
         }
         println!(
-            "Bridge: {:?} | bytes/frame: {} | chunk: {} | sync frames_in_flight: {} | queue waits/polls: {}/{}",
+            "Bridge: {:?} | bytes/frame: {} | chunk: {} | sync frames_in_flight: {} | queue waits/polls/timeouts/skips: {}/{}/{}/{}",
             multi_gpu.bridge_kind,
             multi_gpu.bridge_bytes_per_frame,
             multi_gpu.bridge_chunk_bytes,
             multi_gpu.sync_frames_in_flight,
             multi_gpu.sync_queue_waits,
-            multi_gpu.sync_queue_polls
+            multi_gpu.sync_queue_polls,
+            multi_gpu.sync_queue_wait_timeouts,
+            multi_gpu.sync_skipped_submissions
         );
         if multi_gpu.aggressive_integrated_preallocation {
             println!(
