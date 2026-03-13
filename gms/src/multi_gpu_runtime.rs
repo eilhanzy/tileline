@@ -60,6 +60,7 @@ pub struct MultiGpuExecutorSummary {
     pub secondary_adapter_name: String,
     pub secondary_memory_topology: MemoryTopology,
     pub secondary_work_units_per_present: u32,
+    pub secondary_passes_per_work_unit: u32,
     pub total_secondary_work_units: u64,
     pub total_secondary_submissions: u64,
     pub projected_score_gain_pct: f64,
@@ -110,6 +111,7 @@ pub struct MultiGpuExecutor {
     secondary_format: TextureFormat,
     secondary_clear_phase: f64,
     secondary_work_units_per_present: u32,
+    secondary_passes_per_work_unit: u32,
     bridge_runtime: Option<MultiGpuBridgeRuntime>,
     sync_state: MultiGpuSyncState,
     total_secondary_work_units: u64,
@@ -285,6 +287,8 @@ impl MultiGpuExecutor {
             secondary_assignment.total_jobs,
             &plan,
         );
+        let secondary_passes_per_work_unit =
+            derive_secondary_passes_per_work_unit(&secondary_profile, &plan);
 
         if matches!(policy, MultiGpuInitPolicy::Auto) && secondary_work_units_per_present == 0 {
             return Ok(None);
@@ -324,6 +328,7 @@ impl MultiGpuExecutor {
             secondary_format: secondary_offscreen_format,
             secondary_clear_phase: 0.0,
             secondary_work_units_per_present,
+            secondary_passes_per_work_unit,
             bridge_runtime,
             sync_state,
             total_secondary_work_units: 0,
@@ -407,13 +412,15 @@ impl MultiGpuExecutor {
                 });
 
         for _ in 0..self.secondary_work_units_per_present {
-            self.secondary_clear_phase =
-                (self.secondary_clear_phase + 0.0175) % std::f64::consts::TAU;
-            encode_clear_pass(
-                &mut encoder,
-                &view,
-                synthetic_clear_color(self.secondary_clear_phase),
-            );
+            for _ in 0..self.secondary_passes_per_work_unit {
+                self.secondary_clear_phase =
+                    (self.secondary_clear_phase + 0.0175) % std::f64::consts::TAU;
+                encode_clear_pass(
+                    &mut encoder,
+                    &view,
+                    synthetic_clear_color(self.secondary_clear_phase),
+                );
+            }
         }
 
         // Portable `wgpu` cannot directly share textures across devices. Keep a warm host ring so
@@ -480,6 +487,7 @@ impl MultiGpuExecutor {
             secondary_adapter_name: self.secondary_profile.name.clone(),
             secondary_memory_topology: self.secondary_profile.memory_topology,
             secondary_work_units_per_present: self.secondary_work_units_per_present,
+            secondary_passes_per_work_unit: self.secondary_passes_per_work_unit,
             total_secondary_work_units: self.total_secondary_work_units,
             total_secondary_submissions: self.total_secondary_submissions,
             projected_score_gain_pct: self.plan.projected_score_gain_pct,
@@ -553,6 +561,28 @@ fn derive_secondary_work_units_per_present(
         (1.0 + plan.projected_score_gain_pct.max(0.0) / 100.0).clamp(1.0, 2.5);
     let raw = (primary_units.max(1) as f64) * ratio * projected_gain_bias.sqrt();
     raw.round().clamp(1.0, 256.0) as u32
+}
+
+fn derive_secondary_passes_per_work_unit(
+    secondary_profile: &GpuAdapterProfile,
+    plan: &MultiGpuDispatchPlan,
+) -> u32 {
+    let topology_base: u32 = match secondary_profile.memory_topology {
+        MemoryTopology::Unified => 6,
+        MemoryTopology::DiscreteVram => 4,
+        MemoryTopology::Virtualized => 3,
+        MemoryTopology::System | MemoryTopology::Unknown => 3,
+    };
+    let unit_bias = (secondary_profile.estimated_compute_units / 24).clamp(0, 6);
+    let gain_bias: u32 = if plan.projected_score_gain_pct < 10.0 {
+        2
+    } else {
+        0
+    };
+    topology_base
+        .saturating_add(unit_bias)
+        .saturating_add(gain_bias)
+        .clamp(2, 16)
 }
 
 fn build_multi_gpu_bridge_runtime(

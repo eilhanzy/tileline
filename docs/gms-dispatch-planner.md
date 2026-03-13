@@ -52,6 +52,9 @@ latency-sensitive lanes to secondary adapters when beneficial.
 - dual-dGPU-ready helper selection:
   if primary is discrete and another discrete adapter exists, helper lane prefers the secondary
   discrete adapter before falling back to integrated-latency selection
+- adaptive throughput stress:
+  benchmark burst work units scale with resolution/device type, and secondary helper workload uses
+  `passes_per_work_unit` intensity to reduce low-utilization spikes
 - shared transfer strategy (portable host-bridge model in `wgpu`)
 - sync plan metadata (timeline-like queue submissions + bounded waits)
 - projected score gain estimates and `%20` target checks

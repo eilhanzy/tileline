@@ -1085,7 +1085,7 @@ fn select_throughput_burst(
     adapter_info: &wgpu::AdapterInfo,
     runtime_tuning: &GmsRuntimeTuningProfile,
     options: CliOptions,
-    _present_mode: PresentMode,
+    present_mode: PresentMode,
 ) -> Option<ThroughputBurst> {
     let mode_allows_burst = match options.mode_override {
         ModeOverride::Stable => false,
@@ -1100,11 +1100,42 @@ fn select_throughput_burst(
         return None;
     }
 
-    let work_units_per_present = match adapter_info.device_type {
+    let base_units = match adapter_info.device_type {
         wgpu::DeviceType::DiscreteGpu => 64,
         wgpu::DeviceType::VirtualGpu => 16,
         _ => runtime_tuning.integrated_throughput_burst_work_units,
     };
+    let max_units = match adapter_info.device_type {
+        wgpu::DeviceType::DiscreteGpu => 768,
+        wgpu::DeviceType::VirtualGpu => 128,
+        _ => 384,
+    };
+
+    let pixels_per_present = (options.resolution.width.max(1) as u64)
+        .saturating_mul(options.resolution.height.max(1) as u64)
+        .max(1);
+    let vsync_locked = matches!(
+        present_mode,
+        PresentMode::Fifo | PresentMode::FifoRelaxed | PresentMode::AutoVsync
+    );
+    let target_pixels_per_present = match adapter_info.device_type {
+        wgpu::DeviceType::DiscreteGpu => match options.mode_override {
+            ModeOverride::Max => 320_000_000u64,
+            _ => 220_000_000u64,
+        },
+        wgpu::DeviceType::VirtualGpu => 90_000_000u64,
+        _ => {
+            if vsync_locked {
+                140_000_000u64
+            } else {
+                100_000_000u64
+            }
+        }
+    };
+
+    let scaled_units = ((target_pixels_per_present + pixels_per_present - 1) / pixels_per_present)
+        .clamp(1, max_units as u64) as u32;
+    let work_units_per_present = scaled_units.clamp(base_units.max(1), max_units.max(base_units));
 
     Some(ThroughputBurst {
         work_units_per_present,
@@ -1558,11 +1589,12 @@ fn print_summary(summary: &BenchmarkSummary) {
     }
     if let Some(multi_gpu) = summary.multi_gpu.as_ref() {
         println!(
-            "Multi-GPU: {} -> {} ({:?}) | secondary WU/present: {} | total secondary WU: {}",
+            "Multi-GPU: {} -> {} ({:?}) | secondary WU/present: {} | passes/WU: {} | total secondary WU: {}",
             multi_gpu.primary_adapter_name,
             multi_gpu.secondary_adapter_name,
             multi_gpu.secondary_memory_topology,
             multi_gpu.secondary_work_units_per_present,
+            multi_gpu.secondary_passes_per_work_unit,
             multi_gpu.total_secondary_work_units
         );
         println!(

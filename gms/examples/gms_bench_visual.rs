@@ -1901,18 +1901,35 @@ fn select_throughput_burst(
         pm,
         PresentMode::Fifo | PresentMode::FifoRelaxed | PresentMode::AutoVsync
     );
-    let wu = match ai.device_type {
+    let base_wu = match ai.device_type {
         wgpu::DeviceType::DiscreteGpu => 64,
         wgpu::DeviceType::VirtualGpu => 16,
-        // IntegratedGpu (Apple Silicon dahil) veya bilinmeyen: vsync kilitliyse daha az burst.
+        _ => rt.integrated_throughput_burst_work_units.max(8),
+    };
+    let max_wu = match ai.device_type {
+        wgpu::DeviceType::DiscreteGpu => 768,
+        wgpu::DeviceType::VirtualGpu => 128,
+        _ => 384,
+    };
+    let px = (opts.resolution.width.max(1) as u64)
+        .saturating_mul(opts.resolution.height.max(1) as u64)
+        .max(1);
+    let target_px = match ai.device_type {
+        wgpu::DeviceType::DiscreteGpu => match opts.mode_override {
+            ModeOverride::Max => 320_000_000u64,
+            _ => 220_000_000u64,
+        },
+        wgpu::DeviceType::VirtualGpu => 90_000_000u64,
         _ => {
             if vsync_locked {
-                rt.integrated_throughput_burst_work_units.max(8)
+                140_000_000u64
             } else {
-                rt.integrated_throughput_burst_work_units
+                100_000_000u64
             }
         }
     };
+    let scaled = ((target_px + px - 1) / px).clamp(1, max_wu as u64) as u32;
+    let wu = scaled.clamp(base_wu, max_wu.max(base_wu));
     Some(ThroughputBurst {
         work_units_per_present: wu,
         offscreen_target_ring_len: rt.throughput_offscreen_target_ring_len,
@@ -2186,10 +2203,11 @@ fn print_summary(s: &BenchmarkSummary) {
     );
     if let Some(mg) = &s.multi_gpu {
         println!(
-            "Multi-GPU: {} → {} | WU/present: {} | toplam WU: {}",
+            "Multi-GPU: {} → {} | WU/present: {} | pass/WU: {} | toplam WU: {}",
             mg.primary_adapter_name,
             mg.secondary_adapter_name,
             mg.secondary_work_units_per_present,
+            mg.secondary_passes_per_work_unit,
             mg.total_secondary_work_units
         );
         println!(
