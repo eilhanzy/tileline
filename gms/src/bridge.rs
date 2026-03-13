@@ -376,10 +376,12 @@ impl MultiGpuDispatcher {
             .map(|gpu| heavy_weight_for(gpu, TaskClass::Physics))
             .collect::<Vec<_>>();
 
-        let sampled_distribution =
+        let mut sampled_distribution =
             allocate_weighted_counts(request.sampled_processing_jobs, &sampled_weights);
-        let object_distribution = allocate_weighted_counts(request.object_updates, &object_weights);
-        let physics_distribution = allocate_weighted_counts(request.physics_jobs, &physics_weights);
+        let mut object_distribution =
+            allocate_weighted_counts(request.object_updates, &object_weights);
+        let mut physics_distribution =
+            allocate_weighted_counts(request.physics_jobs, &physics_weights);
 
         let mut ui_distribution = vec![0u32; usable.len()];
         let mut post_fx_distribution = vec![0u32; usable.len()];
@@ -417,6 +419,22 @@ impl MultiGpuDispatcher {
                 post_fx_distribution[primary_slot].saturating_add(post_fx_spill);
             latency_spillback_by_slot[primary_slot] =
                 latency_spillback_by_slot[primary_slot].saturating_add(ui_spill + post_fx_spill);
+
+            // Multi-GPU aggressive balancing:
+            // Ensure the secondary lane receives a minimum total job share so helper adapters
+            // (especially iGPU or 2nd dGPU) are not underutilized while the primary stays saturated.
+            enforce_secondary_minimum_job_share(
+                primary_slot,
+                sec_slot,
+                primary_gpu,
+                sec_gpu,
+                request,
+                &mut sampled_distribution,
+                &mut object_distribution,
+                &mut physics_distribution,
+                &ui_distribution,
+                &post_fx_distribution,
+            );
         } else {
             // Single-GPU fallback: run all latency work on the primary adapter.
             ui_distribution[primary_slot] = request.ui_jobs;
@@ -711,6 +729,131 @@ fn secondary_latency_budget_ms(target_frame_budget_ms: f64) -> f64 {
     // Reserve margin for interop/copy/present. The latency helper should finish early enough that
     // the primary can absorb jitter without stalling the frame.
     (target * 0.70).clamp(0.10, 12.0)
+}
+
+fn enforce_secondary_minimum_job_share(
+    primary_slot: usize,
+    secondary_slot: usize,
+    primary_gpu: &GpuAdapterProfile,
+    secondary_gpu: &GpuAdapterProfile,
+    request: MultiGpuWorkloadRequest,
+    sampled_distribution: &mut [u32],
+    object_distribution: &mut [u32],
+    physics_distribution: &mut [u32],
+    ui_distribution: &[u32],
+    post_fx_distribution: &[u32],
+) {
+    let total_jobs_requested = request
+        .sampled_processing_jobs
+        .saturating_add(request.object_updates)
+        .saturating_add(request.physics_jobs)
+        .saturating_add(request.ui_jobs)
+        .saturating_add(request.post_fx_jobs);
+    if total_jobs_requested == 0 {
+        return;
+    }
+
+    let secondary_current_jobs = sampled_distribution
+        .get(secondary_slot)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(
+            object_distribution
+                .get(secondary_slot)
+                .copied()
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            physics_distribution
+                .get(secondary_slot)
+                .copied()
+                .unwrap_or(0),
+        )
+        .saturating_add(ui_distribution.get(secondary_slot).copied().unwrap_or(0))
+        .saturating_add(
+            post_fx_distribution
+                .get(secondary_slot)
+                .copied()
+                .unwrap_or(0),
+        );
+
+    let target_share = aggressive_secondary_target_share(primary_gpu, secondary_gpu);
+    let target_secondary_jobs = ((total_jobs_requested as f64) * target_share)
+        .ceil()
+        .clamp(1.0, total_jobs_requested as f64) as u32;
+    if secondary_current_jobs >= target_secondary_jobs {
+        return;
+    }
+
+    let mut needed = target_secondary_jobs.saturating_sub(secondary_current_jobs);
+
+    // Move heavy lanes from primary to secondary according to topology:
+    // - secondary dGPU: sampled/physics first
+    // - secondary UMA/iGPU: object/physics first
+    match secondary_gpu.memory_topology {
+        MemoryTopology::DiscreteVram => {
+            needed = move_lane_jobs(sampled_distribution, primary_slot, secondary_slot, needed);
+            needed = move_lane_jobs(physics_distribution, primary_slot, secondary_slot, needed);
+            let _ = move_lane_jobs(object_distribution, primary_slot, secondary_slot, needed);
+        }
+        MemoryTopology::Unified => {
+            needed = move_lane_jobs(object_distribution, primary_slot, secondary_slot, needed);
+            needed = move_lane_jobs(physics_distribution, primary_slot, secondary_slot, needed);
+            let _ = move_lane_jobs(sampled_distribution, primary_slot, secondary_slot, needed);
+        }
+        MemoryTopology::Virtualized | MemoryTopology::System | MemoryTopology::Unknown => {
+            needed = move_lane_jobs(object_distribution, primary_slot, secondary_slot, needed);
+            let _ = move_lane_jobs(physics_distribution, primary_slot, secondary_slot, needed);
+        }
+    }
+}
+
+fn aggressive_secondary_target_share(
+    primary_gpu: &GpuAdapterProfile,
+    secondary_gpu: &GpuAdapterProfile,
+) -> f64 {
+    let primary_score = primary_gpu.score.max(1) as f64;
+    let secondary_score = secondary_gpu.score.max(1) as f64;
+    let relative = (secondary_score / primary_score).clamp(0.05, 1.60);
+
+    let (base, max_share) = match secondary_gpu.memory_topology {
+        MemoryTopology::DiscreteVram => (0.24, 0.58),
+        MemoryTopology::Unified => (0.18, 0.36),
+        MemoryTopology::Virtualized => (0.10, 0.22),
+        MemoryTopology::System | MemoryTopology::Unknown => (0.08, 0.18),
+    };
+    let dual_discrete_bonus = if matches!(primary_gpu.memory_topology, MemoryTopology::DiscreteVram)
+        && matches!(secondary_gpu.memory_topology, MemoryTopology::DiscreteVram)
+    {
+        0.08
+    } else {
+        0.0
+    };
+
+    (base + relative.sqrt() * 0.18 + dual_discrete_bonus).clamp(base, max_share)
+}
+
+fn move_lane_jobs(
+    lane_distribution: &mut [u32],
+    from_slot: usize,
+    to_slot: usize,
+    needed: u32,
+) -> u32 {
+    if needed == 0 {
+        return 0;
+    }
+    let available = lane_distribution.get(from_slot).copied().unwrap_or(0);
+    if available == 0 {
+        return needed;
+    }
+    let moved = available.min(needed);
+    if let Some(from) = lane_distribution.get_mut(from_slot) {
+        *from = from.saturating_sub(moved);
+    }
+    if let Some(to) = lane_distribution.get_mut(to_slot) {
+        *to = to.saturating_add(moved);
+    }
+    needed.saturating_sub(moved)
 }
 
 fn estimate_lane_ms(

@@ -384,16 +384,16 @@ impl MultiGpuExecutor {
                     }
                     Ok(_) => {}
                     Err(wgpu::PollError::Timeout) => {
+                        // Aggressive helper-lane policy:
+                        // instead of dropping an entire secondary frame on wait timeout,
+                        // release one oldest tracking slot and keep submitting.
                         self.sync_state.wait_timeout_count =
                             self.sync_state.wait_timeout_count.saturating_add(1);
+                        let _ = self.sync_state.pending_secondary_submissions.pop_front();
                         self.sync_state.skipped_submission_count =
                             self.sync_state.skipped_submission_count.saturating_add(1);
                         let _ = self.secondary_device.poll(wgpu::PollType::Poll);
                         self.sync_state.poll_count = self.sync_state.poll_count.saturating_add(1);
-                        return MultiGpuFrameSubmitResult {
-                            work_units: 0,
-                            submission_index: None,
-                        };
                     }
                     Err(wgpu::PollError::WrongSubmissionIndex(_, _)) => {
                         let _ = self.sync_state.pending_secondary_submissions.pop_front();
@@ -558,9 +558,25 @@ fn derive_secondary_work_units_per_present(
     };
 
     let projected_gain_bias =
-        (1.0 + plan.projected_score_gain_pct.max(0.0) / 100.0).clamp(1.0, 2.5);
-    let raw = (primary_units.max(1) as f64) * ratio * projected_gain_bias.sqrt();
-    raw.round().clamp(1.0, 256.0) as u32
+        (1.0 + plan.projected_score_gain_pct.max(0.0) / 100.0).clamp(1.0, 3.5);
+    let raw = (primary_units.max(1) as f64) * ratio * projected_gain_bias;
+
+    // Keep the helper lane active even when planner ratios are conservative, so secondary
+    // adapters can hold meaningful utilization in explicit multi-GPU mode.
+    let min_util_floor = if ratio < 0.15 {
+        0.35
+    } else if ratio < 0.30 {
+        0.25
+    } else {
+        0.15
+    };
+    let floor_by_primary = (primary_units.max(1) as f64 * min_util_floor).ceil();
+    let floor_by_jobs = (secondary_jobs as f64).sqrt().clamp(1.0, 96.0);
+
+    raw.max(floor_by_primary)
+        .max(floor_by_jobs)
+        .round()
+        .clamp(1.0, 512.0) as u32
 }
 
 fn derive_secondary_passes_per_work_unit(
@@ -568,21 +584,36 @@ fn derive_secondary_passes_per_work_unit(
     plan: &MultiGpuDispatchPlan,
 ) -> u32 {
     let topology_base: u32 = match secondary_profile.memory_topology {
-        MemoryTopology::Unified => 6,
-        MemoryTopology::DiscreteVram => 4,
-        MemoryTopology::Virtualized => 3,
-        MemoryTopology::System | MemoryTopology::Unknown => 3,
+        MemoryTopology::Unified => 8,
+        MemoryTopology::DiscreteVram => 10,
+        MemoryTopology::Virtualized => 4,
+        MemoryTopology::System | MemoryTopology::Unknown => 4,
     };
-    let unit_bias = (secondary_profile.estimated_compute_units / 24).clamp(0, 6);
+    let unit_bias = (secondary_profile.estimated_compute_units / 16).clamp(0, 12);
     let gain_bias: u32 = if plan.projected_score_gain_pct < 10.0 {
+        4
+    } else if plan.projected_score_gain_pct < 20.0 {
         2
     } else {
         0
     };
+    let bridge_bias: u32 = match plan.shared_texture_bridge.as_ref() {
+        Some(bridge)
+            if matches!(
+                bridge.transfer_kind,
+                crate::SharedTransferKind::UnifiedMemoryMirror
+            ) =>
+        {
+            2
+        }
+        Some(_) => 1,
+        None => 0,
+    };
     topology_base
         .saturating_add(unit_bias)
         .saturating_add(gain_bias)
-        .clamp(2, 16)
+        .saturating_add(bridge_bias)
+        .clamp(4, 32)
 }
 
 fn build_multi_gpu_bridge_runtime(
