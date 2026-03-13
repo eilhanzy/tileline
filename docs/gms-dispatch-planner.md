@@ -55,6 +55,9 @@ latency-sensitive lanes to secondary adapters when beneficial.
 - adaptive throughput stress:
   benchmark burst work units scale with resolution/device type, and secondary helper workload uses
   `passes_per_work_unit` intensity to reduce low-utilization spikes
+- non-multi-GPU parity:
+  primary (single-GPU) path also applies `passes_per_work_unit` intensity so utilization tuning is
+  consistent whether helper lanes are enabled or disabled
 - shared transfer strategy (portable host-bridge model in `wgpu`)
 - sync plan metadata (timeline-like queue submissions + bounded waits)
 - projected score gain estimates and `%20` target checks

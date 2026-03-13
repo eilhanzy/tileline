@@ -414,7 +414,7 @@ impl BenchmarkRuntime {
                 frame_width: renderer.size.width,
                 frame_height: renderer.size.height,
                 secondary_offscreen_format: TextureFormat::Rgba8Unorm,
-                primary_work_units_per_present: renderer.work_units_per_present(),
+                primary_work_units_per_present: renderer.synthetic_work_units_per_present(),
                 workload_request,
                 auto_min_projected_gain_pct: 5.0,
             })?
@@ -495,7 +495,7 @@ impl BenchmarkRuntime {
             .map(compact_compute_unit_title_suffix)
             .unwrap_or_default();
         let phase = self.phase_label();
-        let burst = self.renderer.work_units_per_present();
+        let burst = self.renderer.synthetic_work_units_per_present();
         let secondary_burst = self
             .multi_gpu
             .as_ref()
@@ -599,7 +599,8 @@ impl BenchmarkRuntime {
             render_score: score.score,
             render_tier: score.tier,
             score_breakdown: score,
-            work_units_per_present: self.renderer.work_units_per_present(),
+            work_units_per_present: self.renderer.synthetic_work_units_per_present(),
+            primary_passes_per_work_unit: self.renderer.passes_per_work_unit(),
             multi_gpu: multi_gpu_summary,
             pacing_mode: self.pacing_mode,
             warmup_duration: self.options.warmup_duration,
@@ -668,7 +669,7 @@ fn build_multi_gpu_workload_request(
         ModeOverride::Stable => 16.67,
         ModeOverride::Max => 0.26,
         ModeOverride::Auto => {
-            if renderer.work_units_per_present() > 1 {
+            if renderer.synthetic_work_units_per_present() > 1 {
                 0.50
             } else {
                 8.33
@@ -715,6 +716,7 @@ struct Renderer {
 #[derive(Debug, Clone, Copy)]
 struct ThroughputBurst {
     work_units_per_present: u32,
+    passes_per_work_unit: u32,
     offscreen_target_ring_len: usize,
 }
 
@@ -847,9 +849,6 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
-        let clear_color = animated_clear_color(self.clear_phase);
-
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -857,6 +856,7 @@ impl Renderer {
             });
 
         let work_units_per_present = self.effective_work_units_per_present();
+        let passes_per_work_unit = self.passes_per_work_unit();
         if work_units_per_present > 1 {
             // Windowed presentation may still be throttled by the compositor (often ~60/120 Hz),
             // even when a non-vsync present mode is selected. Run extra offscreen work in the
@@ -865,29 +865,45 @@ impl Renderer {
             if let Some(target) = self.current_throughput_target() {
                 let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
                 for _ in 0..(work_units_per_present - 1) {
-                    self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
-                    encode_clear_pass(
-                        &mut encoder,
-                        &target_view,
-                        animated_clear_color(self.clear_phase),
-                    );
+                    for _ in 0..passes_per_work_unit {
+                        self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
+                        encode_clear_pass(
+                            &mut encoder,
+                            &target_view,
+                            animated_clear_color(self.clear_phase),
+                        );
+                    }
                 }
             }
         }
 
-        encode_clear_pass(&mut encoder, &view, clear_color);
+        for _ in 0..passes_per_work_unit {
+            self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
+            encode_clear_pass(&mut encoder, &view, animated_clear_color(self.clear_phase));
+        }
 
         self.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
         frame.present();
         self.presented_frames = self.presented_frames.saturating_add(1);
-        Ok(work_units_per_present)
+        Ok(work_units_per_present.saturating_mul(passes_per_work_unit))
     }
 
     fn work_units_per_present(&self) -> u32 {
         self.throughput_burst
             .map(|mode| mode.work_units_per_present)
             .unwrap_or(1)
+    }
+
+    fn passes_per_work_unit(&self) -> u32 {
+        self.throughput_burst
+            .map(|mode| mode.passes_per_work_unit)
+            .unwrap_or(1)
+    }
+
+    fn synthetic_work_units_per_present(&self) -> u32 {
+        self.work_units_per_present()
+            .saturating_mul(self.passes_per_work_unit())
     }
 
     fn effective_work_units_per_present(&self) -> u32 {
@@ -986,12 +1002,14 @@ impl Renderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("gms-render-benchmark-throughput-prewarm-encoder"),
                 });
-            self.clear_phase = (self.clear_phase + 0.00625) % std::f64::consts::TAU;
-            encode_clear_pass(
-                &mut encoder,
-                &target_view,
-                animated_clear_color(self.clear_phase),
-            );
+            for _ in 0..self.passes_per_work_unit() {
+                self.clear_phase = (self.clear_phase + 0.00625) % std::f64::consts::TAU;
+                encode_clear_pass(
+                    &mut encoder,
+                    &target_view,
+                    animated_clear_color(self.clear_phase),
+                );
+            }
             self.queue.submit(Some(encoder.finish()));
         }
 
@@ -1136,11 +1154,51 @@ fn select_throughput_burst(
     let scaled_units = ((target_pixels_per_present + pixels_per_present - 1) / pixels_per_present)
         .clamp(1, max_units as u64) as u32;
     let work_units_per_present = scaled_units.clamp(base_units.max(1), max_units.max(base_units));
+    let passes_per_work_unit =
+        select_primary_passes_per_work_unit(adapter_info, options, present_mode);
 
     Some(ThroughputBurst {
         work_units_per_present,
+        passes_per_work_unit,
         offscreen_target_ring_len: runtime_tuning.throughput_offscreen_target_ring_len,
     })
+}
+
+fn select_primary_passes_per_work_unit(
+    adapter_info: &wgpu::AdapterInfo,
+    options: CliOptions,
+    present_mode: PresentMode,
+) -> u32 {
+    let pixels_per_present = (options.resolution.width.max(1) as u64)
+        .saturating_mul(options.resolution.height.max(1) as u64)
+        .max(1);
+    let vsync_locked = matches!(
+        present_mode,
+        PresentMode::Fifo | PresentMode::FifoRelaxed | PresentMode::AutoVsync
+    );
+
+    let (target_pixels_per_wu, max_passes) = match adapter_info.device_type {
+        wgpu::DeviceType::DiscreteGpu => (
+            match options.mode_override {
+                ModeOverride::Max => 6_000_000u64,
+                ModeOverride::Stable => 2_000_000u64,
+                ModeOverride::Auto => 4_000_000u64,
+            },
+            12u32,
+        ),
+        wgpu::DeviceType::VirtualGpu => (3_000_000u64, 8u32),
+        _ => (
+            if vsync_locked {
+                2_500_000u64
+            } else {
+                2_000_000u64
+            },
+            10u32,
+        ),
+    };
+
+    ((target_pixels_per_wu + pixels_per_present - 1) / pixels_per_present)
+        .clamp(1, max_passes as u64) as u32
 }
 
 fn frame_stats_timing_capacity(tuning: &GmsRuntimeTuningProfile) -> usize {
@@ -1487,6 +1545,7 @@ struct BenchmarkSummary {
     render_tier: &'static str,
     score_breakdown: RenderScore,
     work_units_per_present: u32,
+    primary_passes_per_work_unit: u32,
     multi_gpu: Option<MultiGpuExecutorSummary>,
     pacing_mode: BenchmarkPacingMode,
     warmup_duration: Duration,
@@ -1526,8 +1585,9 @@ fn print_summary(summary: &BenchmarkSummary) {
     );
     if summary.work_units_per_present > 1 {
         println!(
-            "Throughput burst: x{} work units / present (WFPS may exceed display refresh)",
-            summary.work_units_per_present
+            "Throughput burst: x{} work units / present | primary passes/WU: {} (WFPS may exceed display refresh)",
+            summary.work_units_per_present,
+            summary.primary_passes_per_work_unit
         );
     }
     println!(

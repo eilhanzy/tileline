@@ -1104,7 +1104,7 @@ impl VisualRuntime {
                 frame_width: renderer.size.width,
                 frame_height: renderer.size.height,
                 secondary_offscreen_format: TextureFormat::Rgba8Unorm,
-                primary_work_units_per_present: renderer.work_units_per_present(),
+                primary_work_units_per_present: renderer.synthetic_work_units_per_present(),
                 workload_request: workload,
                 auto_min_projected_gain_pct: 5.0,
             })?
@@ -1180,7 +1180,7 @@ impl VisualRuntime {
         let p99_ms = percentile_ms(&self.stats.frame_intervals_ms, 99.0).unwrap_or(p95_ms);
         let stddev_ms = stddev(&self.stats.frame_intervals_ms).unwrap_or(0.0);
 
-        let wu = self.renderer.work_units_per_present();
+        let wu = self.renderer.synthetic_work_units_per_present();
         let sec_wu = self
             .multi_gpu
             .as_ref()
@@ -1281,7 +1281,7 @@ impl VisualRuntime {
             render_score: score.score,
             render_tier: score.tier,
             score_breakdown: score,
-            work_units_per_present: self.renderer.work_units_per_present(),
+            work_units_per_present: self.renderer.synthetic_work_units_per_present(),
             multi_gpu: self.multi_gpu.as_ref().map(|mg| mg.summary()),
             pacing_mode: self.pacing_mode,
             warmup_duration: self.options.warmup_duration,
@@ -1363,6 +1363,7 @@ struct Renderer {
 #[derive(Debug, Clone, Copy)]
 struct ThroughputBurst {
     work_units_per_present: u32,
+    passes_per_work_unit: u32,
     offscreen_target_ring_len: usize,
 }
 
@@ -1485,9 +1486,8 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
-        let clear_color = animated_clear_color(self.clear_phase);
         let work_units = self.effective_work_units_per_present();
+        let passes_per_work_unit = self.passes_per_work_unit();
 
         let mut encoder = self
             .device
@@ -1501,14 +1501,23 @@ impl Renderer {
             if let Some(target) = self.current_throughput_target() {
                 let tv = target.create_view(&wgpu::TextureViewDescriptor::default());
                 for _ in 0..(work_units - 1) {
-                    self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
-                    encode_clear_pass(&mut encoder, &tv, animated_clear_color(self.clear_phase));
+                    for _ in 0..passes_per_work_unit {
+                        self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
+                        encode_clear_pass(
+                            &mut encoder,
+                            &tv,
+                            animated_clear_color(self.clear_phase),
+                        );
+                    }
                 }
             }
         }
 
         // Ana yüzey clear pass
-        encode_clear_pass(&mut encoder, &view, clear_color);
+        for _ in 0..passes_per_work_unit {
+            self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
+            encode_clear_pass(&mut encoder, &view, animated_clear_color(self.clear_phase));
+        }
 
         // HUD CPU render + GPU yükleme + kompozitleme
         self.hud
@@ -1519,13 +1528,22 @@ impl Renderer {
         self.window.pre_present_notify();
         frame.present();
         self.presented_frames = self.presented_frames.saturating_add(1);
-        Ok(work_units)
+        Ok(work_units.saturating_mul(passes_per_work_unit))
     }
 
     fn work_units_per_present(&self) -> u32 {
         self.throughput_burst
             .map(|b| b.work_units_per_present)
             .unwrap_or(1)
+    }
+    fn passes_per_work_unit(&self) -> u32 {
+        self.throughput_burst
+            .map(|b| b.passes_per_work_unit)
+            .unwrap_or(1)
+    }
+    fn synthetic_work_units_per_present(&self) -> u32 {
+        self.work_units_per_present()
+            .saturating_mul(self.passes_per_work_unit())
     }
     fn effective_work_units_per_present(&self) -> u32 {
         self.runtime_tuning
@@ -1604,8 +1622,10 @@ impl Renderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("gms-bench-visual-prewarm"),
                 });
-            self.clear_phase = (self.clear_phase + 0.00625) % std::f64::consts::TAU;
-            encode_clear_pass(&mut enc, &tv, animated_clear_color(self.clear_phase));
+            for _ in 0..self.passes_per_work_unit() {
+                self.clear_phase = (self.clear_phase + 0.00625) % std::f64::consts::TAU;
+                encode_clear_pass(&mut enc, &tv, animated_clear_color(self.clear_phase));
+            }
             self.queue.submit(Some(enc.finish()));
         }
         let _ = self.device.poll(wgpu::PollType::Poll);
@@ -1930,10 +1950,46 @@ fn select_throughput_burst(
     };
     let scaled = ((target_px + px - 1) / px).clamp(1, max_wu as u64) as u32;
     let wu = scaled.clamp(base_wu, max_wu.max(base_wu));
+    let passes = select_primary_passes_per_work_unit(ai, opts, pm);
     Some(ThroughputBurst {
         work_units_per_present: wu,
+        passes_per_work_unit: passes,
         offscreen_target_ring_len: rt.throughput_offscreen_target_ring_len,
     })
+}
+
+fn select_primary_passes_per_work_unit(
+    ai: &wgpu::AdapterInfo,
+    opts: CliOptions,
+    pm: PresentMode,
+) -> u32 {
+    let px = (opts.resolution.width.max(1) as u64)
+        .saturating_mul(opts.resolution.height.max(1) as u64)
+        .max(1);
+    let vsync_locked = matches!(
+        pm,
+        PresentMode::Fifo | PresentMode::FifoRelaxed | PresentMode::AutoVsync
+    );
+    let (target_px_per_wu, max_passes) = match ai.device_type {
+        wgpu::DeviceType::DiscreteGpu => (
+            match opts.mode_override {
+                ModeOverride::Max => 6_000_000u64,
+                ModeOverride::Stable => 2_000_000u64,
+                ModeOverride::Auto => 4_000_000u64,
+            },
+            12u32,
+        ),
+        wgpu::DeviceType::VirtualGpu => (3_000_000u64, 8u32),
+        _ => (
+            if vsync_locked {
+                2_500_000u64
+            } else {
+                2_000_000u64
+            },
+            10u32,
+        ),
+    };
+    ((target_px_per_wu + px - 1) / px).clamp(1, max_passes as u64) as u32
 }
 fn build_multi_gpu_workload_request(
     renderer: &Renderer,
@@ -1944,7 +2000,7 @@ fn build_multi_gpu_workload_request(
         ModeOverride::Stable => 16.67,
         ModeOverride::Max => 0.26,
         ModeOverride::Auto => {
-            if renderer.work_units_per_present() > 1 {
+            if renderer.synthetic_work_units_per_present() > 1 {
                 0.50
             } else {
                 8.33
