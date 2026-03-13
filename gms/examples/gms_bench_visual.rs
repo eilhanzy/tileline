@@ -1083,11 +1083,8 @@ impl Renderer {
         if let Some(srgb) = capabilities.formats.iter().copied().find(TextureFormat::is_srgb) {
             config.format = srgb;
         }
-        let prefer_stable = match options.vsync_override {
-            VsyncOverride::On  => true,
-            VsyncOverride::Off => false,
-            VsyncOverride::Auto => matches!(adapter_info.device_type, wgpu::DeviceType::IntegratedGpu),
-        };
+        // Benchmark varsayılanı: vsync kapalı (max throughput). Sadece --vsync on açar.
+        let prefer_stable = matches!(options.vsync_override, VsyncOverride::On);
         config.present_mode = select_present_mode(&capabilities.present_modes, prefer_stable, options.vsync_override);
         config.alpha_mode = capabilities.alpha_modes.iter().copied()
             .find(|m| *m == CompositeAlphaMode::Opaque).unwrap_or(config.alpha_mode);
