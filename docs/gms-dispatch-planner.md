@@ -66,6 +66,23 @@ latency-sensitive lanes to secondary adapters when beneficial.
 - projected score gain estimates and `%20` target checks
 - Vulkan API compatibility gate for explicit multi-GPU startup
 
+### Aggressive Secondary Utilization (Core Path)
+
+To avoid the helper GPU staying near-idle while the primary is saturated, the core planner/runtime
+now apply an aggressive secondary-lane policy directly in `gms/src`:
+
+- `gms/src/bridge.rs` enforces a minimum secondary total-job share after initial lane assignment.
+- If secondary load is below target, heavy lanes are moved from primary -> secondary.
+- Lane move order is topology-aware:
+  - secondary dGPU: sampled/physics first
+  - secondary UMA/iGPU: object/physics first
+- Target share is bounded by topology and relative score, with dual-dGPU bias for stronger helper
+  scaling.
+- `gms/src/multi_gpu_runtime.rs` derives secondary WU/present with stronger floors so helper
+  submission remains meaningful even when planner ratios are conservative.
+- Secondary pass intensity (`passes_per_work_unit`) is expanded to a wider range so helper-side
+  GPU occupancy is less bursty.
+
 ## Vulkan Version Gate (Explicit Multi-GPU Safety)
 
 `gms/src/multi_gpu_runtime.rs` now validates Vulkan API major/minor compatibility before opening
@@ -92,8 +109,20 @@ sync with:
 - queue `SubmissionIndex` values as timeline markers
 - bounded `Device::poll(...)` waits
 - explicit compose budget policy (sub-millisecond target in `tl-core`)
-- in-flight backpressure: if secondary queue depth is saturated and wait times out, helper submit is
-  skipped for that frame instead of over-queuing bursts
+- in-flight backpressure: if secondary queue depth is saturated and wait times out, runtime drops
+  one oldest tracked submission slot and continues helper submission (instead of stalling the lane)
+
+## Runtime Telemetry To Watch
+
+When tuning explicit multi-GPU behavior, track these summary fields:
+
+- `secondary WU/present`
+- `passes/WU`
+- `total secondary WU`
+- `queue waits/polls/timeouts/skips`
+
+These values are emitted by `gms/src/render_benchmark.rs` from `MultiGpuExecutorSummary` and map
+directly to the core planner/runtime behavior.
 
 ## Apple Silicon / UMA Interaction
 

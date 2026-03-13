@@ -71,6 +71,8 @@ GMS provides:
 - adapter discovery and scoring
 - SM/CU/CoreCluster-aware distribution heuristics (with native-probe -> table -> heuristic fallback)
 - asymmetric multi-GPU planning (heavy lanes to primary, UI/Post-FX to secondary)
+- aggressive secondary-lane floor + heavy spill redistribution so helper GPU utilization does not
+  collapse under primary saturation
 - portable sync plan metadata (queue timelines + bounded waits)
 
 `tl-core` adds a portable runtime synchronizer:
