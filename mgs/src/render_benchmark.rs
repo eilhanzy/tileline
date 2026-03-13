@@ -1361,16 +1361,33 @@ fn runtime_vsync_from_override(vsync: VsyncOverride) -> VsyncMode {
 }
 
 fn animated_clear_color(phase: f64) -> Color {
-    // Keep the clear pattern intentionally vivid so users can immediately
-    // validate that frame presentation is alive on new drivers/devices.
-    let r = 0.12 + 0.32 * phase.sin().abs();
-    let g = 0.14 + 0.34 * (phase * 1.37).sin().abs();
-    let b = 0.16 + 0.36 * (phase * 0.91).cos().abs();
-    Color {
-        r: r.clamp(0.0, 1.0),
-        g: g.clamp(0.0, 1.0),
-        b: b.clamp(0.0, 1.0),
-        a: 1.0,
+    // Use a full hue wheel instead of abs(sin/cos) channel waves to avoid
+    // persistent lavender/purple bias on some driver + swapchain paths.
+    let hue = phase.rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+    let (r, g, b) = hsv_to_rgb(hue, 0.78, 0.92);
+    Color { r, g, b, a: 1.0 }
+}
+
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
+    let h = h.rem_euclid(1.0);
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    if s <= f64::EPSILON {
+        return (v, v, v);
+    }
+
+    let sector = (h * 6.0).floor();
+    let f = h * 6.0 - sector;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    match (sector as i32).rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
     }
 }
 

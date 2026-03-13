@@ -679,10 +679,32 @@ fn encode_clear_pass(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureVie
 }
 
 fn synthetic_clear_color(phase: f64) -> Color {
-    let r = 0.10 + 0.30 * (phase * 1.11).sin().abs();
-    let g = 0.08 + 0.34 * (phase * 0.91).cos().abs();
-    let b = 0.12 + 0.26 * (phase * 1.49).sin().abs();
+    let hue = (phase * 0.73).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+    let (r, g, b) = hsv_to_rgb(hue, 0.72, 0.88);
     Color { r, g, b, a: 1.0 }
+}
+
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
+    let h = h.rem_euclid(1.0);
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    if s <= f64::EPSILON {
+        return (v, v, v);
+    }
+
+    let sector = (h * 6.0).floor();
+    let f = h * 6.0 - sector;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    match (sector as i32).rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
 }
 
 fn adapter_info_matches_profile(profile: &GpuAdapterProfile, info: &wgpu::AdapterInfo) -> bool {

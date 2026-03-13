@@ -1816,11 +1816,29 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 // ── Render yardımcıları (render_benchmark ile aynı) ───────────────────────────
 
 fn animated_clear_color(phase: f64) -> Color {
-    Color {
-        r: 0.15 + 0.25 * phase.sin().abs(),
-        g: 0.12 + 0.28 * (phase * 1.37).sin().abs(),
-        b: 0.18 + 0.30 * (phase * 0.73).cos().abs(),
-        a: 1.0,
+    let hue = phase.rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+    let (r, g, b) = hsv_to_rgb(hue, 0.78, 0.92);
+    Color { r, g, b, a: 1.0 }
+}
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) {
+    let h = h.rem_euclid(1.0);
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    if s <= f64::EPSILON {
+        return (v, v, v);
+    }
+    let sector = (h * 6.0).floor();
+    let f = h * 6.0 - sector;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    match (sector as i32).rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
     }
 }
 fn encode_clear_pass(enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, color: Color) {
