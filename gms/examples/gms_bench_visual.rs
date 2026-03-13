@@ -2201,8 +2201,12 @@ fn print_summary(s: &BenchmarkSummary) {
         if mg.vulkan_version_gate_enabled {
             println!(
                 "Vulkan gate: açık | primary {} | secondary {}",
-                mg.primary_vulkan_api_version.as_deref().unwrap_or("unknown"),
-                mg.secondary_vulkan_api_version.as_deref().unwrap_or("unknown")
+                mg.primary_vulkan_api_version
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                mg.secondary_vulkan_api_version
+                    .as_deref()
+                    .unwrap_or("unknown")
             );
         }
     }
