@@ -317,6 +317,8 @@ struct HudSnapshot {
     gms_score: u64,
     /// Work-units/present (burst modu; 1 = normal).
     work_units: u32,
+    /// Gerçek present mode kısa etiketi ("FIFO", "MAIL", "IMMD", "AUTO").
+    present_mode_label: &'static str,
     /// Son ≤120 frame-time (ms, f32) — çubuk grafik için.
     recent_ms: Vec<f32>,
 }
@@ -621,7 +623,7 @@ impl HudRenderer {
         fill_rect(buf, w, 4, info_y - 2, HUD_PX_W as usize - 8, 1, [60, 60, 80, 200]);
         let gpu_str = truncate(&s.gpu_name, 36);
         Font::draw_str(buf, w, 6, info_y + 1, &gpu_str, 1, [140, 140, 160, 255]);
-        let score_str = format!("GMS {}", s.gms_score);
+        let score_str = format!("GMS {}  PM:{}", s.gms_score, s.present_mode_label);
         Font::draw_str(buf, w, 6, info_y + 11, &score_str, 1, [200, 200, 80, 255]);
     }
 }
@@ -931,6 +933,7 @@ impl VisualRuntime {
             gpu_name,
             gms_score: self.adapter_profile.as_ref().map(|p| p.score).unwrap_or(0),
             work_units: wu.saturating_add(sec_wu),
+            present_mode_label: present_mode_label(self.renderer.present_mode),
             recent_ms: self.stats.recent_frame_ms.iter().copied().collect(),
         }
     }
@@ -1357,6 +1360,17 @@ fn encode_clear_pass(enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, c
         depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
     });
 }
+fn present_mode_label(pm: PresentMode) -> &'static str {
+    match pm {
+        PresentMode::Fifo         => "FIFO",
+        PresentMode::FifoRelaxed  => "FREL",
+        PresentMode::Mailbox      => "MAIL",
+        PresentMode::Immediate    => "IMMD",
+        PresentMode::AutoVsync    => "AVSY",
+        PresentMode::AutoNoVsync  => "ANSV",
+        _                         => "????",
+    }
+}
 fn select_present_mode(modes: &[PresentMode], prefer_stable: bool, vsync: VsyncOverride) -> PresentMode {
     if matches!(vsync, VsyncOverride::On) {
         for p in [PresentMode::AutoVsync, PresentMode::Fifo, PresentMode::Mailbox] {
@@ -1373,13 +1387,22 @@ fn select_present_mode(modes: &[PresentMode], prefer_stable: bool, vsync: VsyncO
     for p in if prefer_stable { stable } else { throughput } { if modes.contains(&p) { return p; } }
     PresentMode::Fifo
 }
-fn select_throughput_burst(ai: &wgpu::AdapterInfo, rt: &GmsRuntimeTuningProfile, opts: CliOptions, _pm: PresentMode) -> Option<ThroughputBurst> {
+fn select_throughput_burst(ai: &wgpu::AdapterInfo, rt: &GmsRuntimeTuningProfile, opts: CliOptions, pm: PresentMode) -> Option<ThroughputBurst> {
     let burst_ok = match opts.mode_override {
         ModeOverride::Stable => false, ModeOverride::Max => true,
-        ModeOverride::Auto => !matches!(ai.device_type, wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu),
+        // macOS/Metal'de Immediate desteklenmez; platform gerçek vsync'i kıramıyorsa
+        // throughput burst tek çaredir — CPU tipleri hariç her GPU'ya izin ver.
+        ModeOverride::Auto => !matches!(ai.device_type, wgpu::DeviceType::Cpu),
     };
     if !burst_ok || matches!(opts.vsync_override, VsyncOverride::On) { return None; }
-    let wu = match ai.device_type { wgpu::DeviceType::DiscreteGpu => 64, wgpu::DeviceType::VirtualGpu => 16, _ => rt.integrated_throughput_burst_work_units };
+    // Fifo/AutoVsync seçildiyse (vsync kırılamadı) burst'ü etkinleştir.
+    let vsync_locked = matches!(pm, PresentMode::Fifo | PresentMode::FifoRelaxed | PresentMode::AutoVsync);
+    let wu = match ai.device_type {
+        wgpu::DeviceType::DiscreteGpu => 64,
+        wgpu::DeviceType::VirtualGpu  => 16,
+        // IntegratedGpu (Apple Silicon dahil) veya bilinmeyen: vsync kilitliyse daha az burst.
+        _ => if vsync_locked { rt.integrated_throughput_burst_work_units.max(8) } else { rt.integrated_throughput_burst_work_units },
+    };
     Some(ThroughputBurst { work_units_per_present: wu, offscreen_target_ring_len: rt.throughput_offscreen_target_ring_len })
 }
 fn build_multi_gpu_workload_request(renderer: &Renderer, opts: CliOptions) -> MultiGpuWorkloadRequest {
