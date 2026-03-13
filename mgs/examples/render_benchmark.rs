@@ -293,6 +293,35 @@ impl ApplicationHandler for RenderBenchmarkApp {
             }
             WindowEvent::Resized(size) => runtime.resize(size),
             WindowEvent::RedrawRequested => {
+                if runtime.use_redraw_chaining() {
+                    if let Err(render_outcome) = runtime.render_frame() {
+                        match render_outcome {
+                            RenderOutcome::SurfaceLost | RenderOutcome::Outdated => {
+                                runtime.reconfigure_surface();
+                            }
+                            RenderOutcome::OutOfMemory => {
+                                eprintln!("wgpu surface out of memory, exiting benchmark");
+                                self.exit_requested = true;
+                                event_loop.exit();
+                            }
+                            RenderOutcome::Timeout | RenderOutcome::Other => {}
+                        }
+                    }
+                    runtime.window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            event_loop.set_control_flow(runtime.preferred_control_flow());
+            if runtime.use_redraw_chaining() {
+                if runtime.stats.total_frames == 0 {
+                    runtime.window.request_redraw();
+                }
+            } else {
                 if let Err(render_outcome) = runtime.render_frame() {
                     match render_outcome {
                         RenderOutcome::SurfaceLost | RenderOutcome::Outdated => {
@@ -306,23 +335,6 @@ impl ApplicationHandler for RenderBenchmarkApp {
                         RenderOutcome::Timeout | RenderOutcome::Other => {}
                     }
                 }
-                if runtime.use_redraw_chaining() {
-                    runtime.window.request_redraw();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(runtime) = self.runtime.as_ref() {
-            event_loop.set_control_flow(runtime.preferred_control_flow());
-            if runtime.use_redraw_chaining() {
-                if runtime.stats.total_frames == 0 {
-                    runtime.window.request_redraw();
-                }
-            } else {
-                runtime.window.request_redraw();
             }
 
             if runtime.should_auto_exit() {
