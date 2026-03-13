@@ -414,7 +414,7 @@ impl BenchmarkRuntime {
                 frame_width: renderer.size.width,
                 frame_height: renderer.size.height,
                 secondary_offscreen_format: TextureFormat::Rgba8Unorm,
-                primary_work_units_per_present: renderer.synthetic_work_units_per_present(),
+                primary_work_units_per_present: renderer.work_units_per_present(),
                 workload_request,
                 auto_min_projected_gain_pct: 5.0,
             })?
@@ -709,6 +709,7 @@ struct Renderer {
     throughput_burst: Option<ThroughputBurst>,
     throughput_targets: Vec<wgpu::Texture>,
     throughput_target_cursor: usize,
+    primary_stress: PrimaryStressKernel,
     runtime_tuning: GmsRuntimeTuningProfile,
     presented_frames: u64,
 }
@@ -718,6 +719,150 @@ struct ThroughputBurst {
     work_units_per_present: u32,
     passes_per_work_unit: u32,
     offscreen_target_ring_len: usize,
+}
+
+struct PrimaryStressKernel {
+    pipeline: wgpu::ComputePipeline,
+    bind_groups: Vec<wgpu::BindGroup>,
+    params_buffer: wgpu::Buffer,
+    element_count: u32,
+    dispatch_groups: u32,
+    ring_cursor: usize,
+}
+
+impl PrimaryStressKernel {
+    fn new(
+        device: &wgpu::Device,
+        adapter_info: &wgpu::AdapterInfo,
+        size: PhysicalSize<u32>,
+        ring_len_hint: usize,
+    ) -> Self {
+        let element_count = select_primary_stress_elements(adapter_info, size);
+        let dispatch_groups = ceil_div_u32(element_count.max(1), 128).max(1);
+        let ring_len = ring_len_hint.clamp(2, 8);
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gms-primary-stress-shader"),
+            source: wgpu::ShaderSource::Wgsl(PRIMARY_STRESS_WGSL.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gms-primary-stress-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gms-primary-stress-pipeline-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gms-primary-stress-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            cache: None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gms-primary-stress-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let payload_bytes = (element_count as u64).saturating_mul(16).max(16);
+        let mut bind_groups = Vec::with_capacity(ring_len);
+        for idx in 0..ring_len {
+            let payload = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gms-primary-stress-payload"),
+                size: payload_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gms-primary-stress-bg"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: payload.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let _ = idx;
+            bind_groups.push(bind_group);
+        }
+
+        Self {
+            pipeline,
+            bind_groups,
+            params_buffer,
+            element_count,
+            dispatch_groups,
+            ring_cursor: 0,
+        }
+    }
+
+    fn write_params(
+        &self,
+        queue: &wgpu::Queue,
+        phase: f32,
+        amplitude: f32,
+        len: u32,
+        iterations: u32,
+    ) {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&phase.to_bits().to_ne_bytes());
+        bytes[4..8].copy_from_slice(&amplitude.to_bits().to_ne_bytes());
+        bytes[8..12].copy_from_slice(&len.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&iterations.max(1).to_ne_bytes());
+        queue.write_buffer(&self.params_buffer, 0, &bytes);
+    }
+
+    fn encode_one(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.bind_groups.is_empty() {
+            return;
+        }
+        let idx = self.ring_cursor % self.bind_groups.len();
+        self.ring_cursor = self.ring_cursor.wrapping_add(1);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gms-primary-stress-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_groups[idx], &[]);
+        pass.dispatch_workgroups(self.dispatch_groups, 1, 1);
+    }
 }
 
 impl Renderer {
@@ -790,6 +935,14 @@ impl Renderer {
 
         let throughput_burst =
             select_throughput_burst(&adapter_info, &runtime_tuning, options, config.present_mode);
+        let primary_stress = PrimaryStressKernel::new(
+            &device,
+            &adapter_info,
+            size,
+            throughput_burst
+                .map(|mode| mode.offscreen_target_ring_len)
+                .unwrap_or(2),
+        );
 
         let mut renderer = Self {
             _instance: instance,
@@ -804,6 +957,7 @@ impl Renderer {
             throughput_burst,
             throughput_targets: Vec::new(),
             throughput_target_cursor: 0,
+            primary_stress,
             runtime_tuning,
             presented_frames: 0,
         };
@@ -825,6 +979,14 @@ impl Renderer {
         self.config.height = size.height;
         self.throughput_targets.clear();
         self.throughput_target_cursor = 0;
+        self.primary_stress = PrimaryStressKernel::new(
+            &self.device,
+            &self.adapter_info,
+            size,
+            self.throughput_burst
+                .map(|mode| mode.offscreen_target_ring_len)
+                .unwrap_or(2),
+        );
         self.presented_frames = 0;
         self.surface.configure(&self.device, &self.config);
     }
@@ -857,36 +1019,26 @@ impl Renderer {
 
         let work_units_per_present = self.effective_work_units_per_present();
         let passes_per_work_unit = self.passes_per_work_unit();
-        if work_units_per_present > 1 {
-            // Windowed presentation may still be throttled by the compositor (often ~60/120 Hz),
-            // even when a non-vsync present mode is selected. Run extra offscreen work in the
-            // same present interval so the benchmark tracks GPU throughput instead of display Hz.
-            self.ensure_throughput_target_ring();
-            if let Some(target) = self.current_throughput_target() {
-                let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-                for _ in 0..(work_units_per_present - 1) {
-                    for _ in 0..passes_per_work_unit {
-                        self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
-                        encode_clear_pass(
-                            &mut encoder,
-                            &target_view,
-                            animated_clear_color(self.clear_phase),
-                        );
-                    }
-                }
-            }
+        let total_stress_passes = work_units_per_present.max(1);
+        let synthetic_work_units = total_stress_passes.saturating_mul(passes_per_work_unit);
+        self.primary_stress.write_params(
+            &self.queue,
+            self.clear_phase as f32,
+            0.92,
+            self.primary_stress.element_count,
+            passes_per_work_unit,
+        );
+        for _ in 0..total_stress_passes {
+            self.primary_stress.encode_one(&mut encoder);
         }
-
-        for _ in 0..passes_per_work_unit {
-            self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
-            encode_clear_pass(&mut encoder, &view, animated_clear_color(self.clear_phase));
-        }
+        self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
+        encode_clear_pass(&mut encoder, &view, animated_clear_color(self.clear_phase));
 
         self.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
         frame.present();
         self.presented_frames = self.presented_frames.saturating_add(1);
-        Ok(work_units_per_present.saturating_mul(passes_per_work_unit))
+        Ok(synthetic_work_units)
     }
 
     fn work_units_per_present(&self) -> u32 {
@@ -1200,6 +1352,63 @@ fn select_primary_passes_per_work_unit(
     ((target_pixels_per_wu + pixels_per_present - 1) / pixels_per_present)
         .clamp(1, max_passes as u64) as u32
 }
+
+fn select_primary_stress_elements(
+    adapter_info: &wgpu::AdapterInfo,
+    size: PhysicalSize<u32>,
+) -> u32 {
+    let pixels = (size.width.max(1) as u64)
+        .saturating_mul(size.height.max(1) as u64)
+        .max(262_144);
+    match adapter_info.device_type {
+        wgpu::DeviceType::DiscreteGpu => {
+            (pixels.saturating_mul(4)).clamp(1_048_576, 8_388_608) as u32
+        }
+        wgpu::DeviceType::VirtualGpu => (pixels.saturating_mul(2)).clamp(524_288, 2_097_152) as u32,
+        _ => (pixels.saturating_mul(2)).clamp(524_288, 4_194_304) as u32,
+    }
+}
+
+fn ceil_div_u32(numerator: u32, denominator: u32) -> u32 {
+    if denominator == 0 {
+        0
+    } else {
+        (numerator.saturating_add(denominator - 1)) / denominator
+    }
+}
+
+const PRIMARY_STRESS_WGSL: &str = r#"
+struct StressParams {
+    phase_bits: u32,
+    amplitude_bits: u32,
+    len: u32,
+    iterations: u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> payload: array<vec4<f32>>;
+@group(0) @binding(1) var<uniform> params: StressParams;
+
+@compute @workgroup_size(128, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.len) {
+        return;
+    }
+
+    let phase = bitcast<f32>(params.phase_bits);
+    let amplitude = bitcast<f32>(params.amplitude_bits);
+    let prev = payload[i];
+    var acc = prev;
+    let iters = max(params.iterations, 1u);
+    for (var it: u32 = 0u; it < iters; it = it + 1u) {
+        let x = f32(i) * 0.0000152587890625 + phase + f32(it) * 0.03125;
+        let wave = sin(x) * cos(x * 1.37);
+        let mix_target = vec4<f32>(wave * amplitude, wave * 0.73, wave * 0.41, 1.0);
+        acc = mix(acc, mix_target, 0.35);
+    }
+    payload[i] = acc;
+}
+"#;
 
 fn frame_stats_timing_capacity(tuning: &GmsRuntimeTuningProfile) -> usize {
     tuning.benchmark_timing_capacity.max(16_384)

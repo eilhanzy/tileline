@@ -58,6 +58,9 @@ latency-sensitive lanes to secondary adapters when beneficial.
 - non-multi-GPU parity:
   primary (single-GPU) path also applies `passes_per_work_unit` intensity so utilization tuning is
   consistent whether helper lanes are enabled or disabled
+- primary stress kernel:
+  single-GPU path can route synthetic workload through a compute shader storage-buffer stress pass
+  (not only clear passes) to improve sustained GPU occupancy and reduce command-burst overhead
 - shared transfer strategy (portable host-bridge model in `wgpu`)
 - sync plan metadata (timeline-like queue submissions + bounded waits)
 - projected score gain estimates and `%20` target checks

@@ -1104,7 +1104,7 @@ impl VisualRuntime {
                 frame_width: renderer.size.width,
                 frame_height: renderer.size.height,
                 secondary_offscreen_format: TextureFormat::Rgba8Unorm,
-                primary_work_units_per_present: renderer.synthetic_work_units_per_present(),
+                primary_work_units_per_present: renderer.work_units_per_present(),
                 workload_request: workload,
                 auto_min_projected_gain_pct: 5.0,
             })?
