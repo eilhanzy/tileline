@@ -247,6 +247,7 @@ impl ApplicationHandler for RenderBenchmarkApp {
 
         match BenchmarkRuntime::new(event_loop, self.options) {
             Ok(runtime) => {
+                runtime.window.request_redraw();
                 event_loop.set_control_flow(runtime.preferred_control_flow());
                 self.runtime = Some(runtime);
             }
@@ -780,8 +781,10 @@ impl Renderer {
 
     fn derive_work_units_from_plan(&self, plan: &mgs::bridge::MgsBridgePlan) -> u32 {
         let mut units = self.throughput_target_burst.max(1);
-        let tile_factor = (plan.tile_plan.tile_count / 120).max(1);
-        units = units.saturating_mul(tile_factor);
+        if units > 1 {
+            let tile_factor = (plan.tile_plan.tile_count / 120).max(1);
+            units = units.saturating_mul(tile_factor);
+        }
         if plan.memory_pressure {
             units = (units / 2).max(1);
         }
@@ -1073,9 +1076,11 @@ fn select_present_mode(
 }
 
 fn animated_clear_color(phase: f64) -> Color {
-    let r = 0.18 + 0.12 * phase.sin();
-    let g = 0.20 + 0.10 * (phase * 1.37).sin();
-    let b = 0.24 + 0.08 * (phase * 1.91).sin();
+    // Keep the clear pattern intentionally vivid so users can immediately
+    // validate that frame presentation is alive on new drivers/devices.
+    let r = 0.12 + 0.32 * phase.sin().abs();
+    let g = 0.14 + 0.34 * (phase * 1.37).sin().abs();
+    let b = 0.16 + 0.36 * (phase * 0.91).cos().abs();
     Color {
         r: r.clamp(0.0, 1.0),
         g: g.clamp(0.0, 1.0),
