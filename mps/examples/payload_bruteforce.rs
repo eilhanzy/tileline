@@ -7,7 +7,9 @@ use ctr::Ctr128BE;
 use hex::encode as hex_encode;
 use hkdf::Hkdf;
 use md5::Md5;
-use mps::{normalize_candidate_keys, parse_strict_key_record, BLOB_BYTES, CIPHERTEXT_BYTES, HEADER_BYTES};
+use mps::{
+    normalize_candidate_keys, parse_strict_key_record, BLOB_BYTES, CIPHERTEXT_BYTES, HEADER_BYTES,
+};
 use percent_encoding::percent_decode_str;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
@@ -171,29 +173,34 @@ struct HexTokenCandidate {
     score: usize,
 }
 
-fn build_fixed_decryptor(
-    stages: &[CandidateStage],
-    local_part: &[u8],
-) -> FixedDecryptor {
+fn build_fixed_decryptor(stages: &[CandidateStage], local_part: &[u8]) -> FixedDecryptor {
     // Keep one pinned candidate for the whole dataset so cross-line comparisons
     // reflect payload differences instead of key churn.
     let stage = stages
         .iter()
         .find(|stage| stage.name == FIXED_STAGE)
         .unwrap_or_else(|| panic!("missing stage {FIXED_STAGE}"));
-    let candidate_keys =
-        normalize_candidate_keys(stage.raw_keys.iter().map(|key| key.as_slice())).unwrap_or_else(
-            |error| panic!("invalid candidate key set in {}: {error:?}", stage.name),
-        );
+    let candidate_keys = normalize_candidate_keys(stage.raw_keys.iter().map(|key| key.as_slice()))
+        .unwrap_or_else(|error| panic!("invalid candidate key set in {}: {error:?}", stage.name));
 
     let raw_key = candidate_keys
         .get(FIXED_CANDIDATE_INDEX)
-        .unwrap_or_else(|| panic!("missing fixed candidate index {}", FIXED_CANDIDATE_INDEX + 1));
+        .unwrap_or_else(|| {
+            panic!(
+                "missing fixed candidate index {}",
+                FIXED_CANDIDATE_INDEX + 1
+            )
+        });
     let mut raw_key_array = [0_u8; 32];
     raw_key_array.copy_from_slice(raw_key);
 
     let mut derived_key = [0_u8; 32];
-    derive_hkdf_sha256(raw_key, Some(local_part), HkdfInfoKind::Envelope.as_bytes(), &mut derived_key);
+    derive_hkdf_sha256(
+        raw_key,
+        Some(local_part),
+        HkdfInfoKind::Envelope.as_bytes(),
+        &mut derived_key,
+    );
 
     FixedDecryptor {
         raw_key: raw_key_array,
@@ -219,13 +226,20 @@ fn decrypt_payload_with_fixed_candidate(
             continue;
         };
         let score = score_resync_candidate(&plaintext, local_part);
-        if best.as_ref().map_or(true, |(best_score, _, _)| score > *best_score) {
+        if best
+            .as_ref()
+            .map_or(true, |(best_score, _, _)| score > *best_score)
+        {
             best = Some((score, plaintext, mode));
         }
     }
 
-    let (_, plaintext, nonce_mode) = best.unwrap_or_else(|| panic!("fixed candidate failed to decrypt"));
-    FixedCandidate { plaintext, nonce_mode }
+    let (_, plaintext, nonce_mode) =
+        best.unwrap_or_else(|| panic!("fixed candidate failed to decrypt"));
+    FixedCandidate {
+        plaintext,
+        nonce_mode,
+    }
 }
 
 fn synthesize_dataset(
@@ -236,8 +250,11 @@ fn synthesize_dataset(
     payloads
         .iter()
         .map(|payload| {
-            let decrypted =
-                decrypt_payload_with_fixed_candidate(&payload.payload, fixed, local_part.as_bytes());
+            let decrypted = decrypt_payload_with_fixed_candidate(
+                &payload.payload,
+                fixed,
+                local_part.as_bytes(),
+            );
             let parsed = parse_segmented_record(&decrypted.plaintext, local_part, false);
             DatasetSynthesisRow {
                 line_no: payload.line_no,
@@ -260,14 +277,19 @@ fn run_line11_surgical_extraction(
 ) -> Option<SurgicalTimestampReport> {
     // Line 11 is the only record that needed progressively deeper recovery
     // passes. The rest stay on the fast deterministic synthesis path.
-    let payload = payloads.iter().find(|payload| payload.line_no == SURGICAL_LINE_NO)?;
+    let payload = payloads
+        .iter()
+        .find(|payload| payload.line_no == SURGICAL_LINE_NO)?;
     let previous_line_epoch = rows
         .iter()
         .find(|row| row.line_no == SURGICAL_LINE_NO.saturating_sub(1))
         .and_then(|row| extract_named_value(&row.parsed.polished_pairs, &["t", "timestamp"]))
         .and_then(|value| value.parse::<i64>().ok());
-    let row = rows.iter_mut().find(|row| row.line_no == SURGICAL_LINE_NO)?;
-    let decrypted = decrypt_payload_with_fixed_candidate(&payload.payload, fixed, local_part.as_bytes());
+    let row = rows
+        .iter_mut()
+        .find(|row| row.line_no == SURGICAL_LINE_NO)?;
+    let decrypted =
+        decrypt_payload_with_fixed_candidate(&payload.payload, fixed, local_part.as_bytes());
     let (segment_best, segment_attempts) = scan_line11_timestamp_surgical(&decrypted.plaintext);
     let (aes_best, aes_attempts) = scan_line11_aes_state_jitter(
         &payload.payload,
@@ -344,7 +366,8 @@ fn apply_surgical_timestamp(row: &mut DatasetSynthesisRow, hit: &TimestampGolden
         &row.parsed.user_id,
         &row.parsed.campaign_id,
     );
-    row.parsed.final_string = build_final_string(&row.parsed.polished_pairs, &row.parsed.combined_text);
+    row.parsed.final_string =
+        build_final_string(&row.parsed.polished_pairs, &row.parsed.combined_text);
     let (golden_result, realistic_score) =
         synthesize_realistic_result(Some(hit), &row.parsed.user_id, &row.parsed.campaign_id);
     row.parsed.golden_result = golden_result;
@@ -373,9 +396,14 @@ fn parse_segmented_record(
     let timestamp_golden = scan_timestamp_segment_with_shift(&timestamp_bytes, shift_key);
     let timestamp_texts = build_flag_sync_timestamp_texts(&plaintext[..16], shift_key);
     let timestamp_segment = choose_segment_display(&timestamp_texts, "t");
-    let timestamp_note = timestamp_golden
-        .as_ref()
-        .map(|hit| format!("{} ({}) [{}]", hit.epoch, hit.datetime.format("%Y-%m-%d %H:%M:%S UTC"), hit.rule));
+    let timestamp_note = timestamp_golden.as_ref().map(|hit| {
+        format!(
+            "{} ({}) [{}]",
+            hit.epoch,
+            hit.datetime.format("%Y-%m-%d %H:%M:%S UTC"),
+            hit.rule
+        )
+    });
 
     let uid_plus56_texts = build_dynamic_segment_texts(&plaintext[8..24], 56, shift_key);
     let uid_segment_plus56 = choose_segment_display(&uid_plus56_texts, "u");
@@ -391,17 +419,23 @@ fn parse_segmented_record(
     }
     let c_hex_token = synthesize_hex_token_with_shift(&plaintext[8..24], 115, 4, shift_key);
 
-    let reassembled_segment = [timestamp_segment.as_str(), uid_segment_plus56.as_str(), uid_segment_plus115.as_str()]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join("|");
+    let reassembled_segment = [
+        timestamp_segment.as_str(),
+        uid_segment_plus56.as_str(),
+        uid_segment_plus115.as_str(),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join("|");
     let tail_hybrid = choose_hybrid_tail_decoder(&tail_candidates, Some(&reassembled_segment));
     let aligned_body = choose_global_alignment(
         plaintext,
         local_part,
         Some(&reassembled_segment),
-        tail_hybrid.as_ref().map(|candidate| candidate.value.as_str()),
+        tail_hybrid
+            .as_ref()
+            .map(|candidate| candidate.value.as_str()),
     );
 
     let mut source_texts = vec![
@@ -456,24 +490,35 @@ fn parse_segmented_record(
         .map(|candidate| candidate.value.clone())
         .or_else(|| extract_named_value(&polished_pairs, &["c", "campaign", "campaign_id"]))
         .unwrap_or_else(|| "-".to_owned());
-    canonicalize_core_pairs(&mut polished_pairs, timestamp_golden.as_ref(), &user_id, &campaign_id);
-    let final_string = build_final_string(&polished_pairs, &combined_text);
-    let validated_fields = collect_validated_fields(
-        &polished_pairs,
-        tail_hybrid.as_ref().map(|candidate| candidate.value.as_str()),
-    );
-    let report_timestamp = timestamp_golden
-        .as_ref()
-        .map(|hit| format!("{} ({}) [{}]", hit.epoch, hit.datetime.format("%Y-%m-%d %H:%M:%S UTC"), hit.rule))
-        .or(timestamp_note.clone())
-        .unwrap_or_else(|| "-".to_owned());
-    let extra_flags = collect_extra_flags(&polished_pairs, tail_hybrid.as_ref(), &validated_fields);
-    let diamond_polished = has_polished_core_fields(&polished_pairs);
-    let (golden_result, realistic_score) = synthesize_realistic_result(
+    canonicalize_core_pairs(
+        &mut polished_pairs,
         timestamp_golden.as_ref(),
         &user_id,
         &campaign_id,
     );
+    let final_string = build_final_string(&polished_pairs, &combined_text);
+    let validated_fields = collect_validated_fields(
+        &polished_pairs,
+        tail_hybrid
+            .as_ref()
+            .map(|candidate| candidate.value.as_str()),
+    );
+    let report_timestamp = timestamp_golden
+        .as_ref()
+        .map(|hit| {
+            format!(
+                "{} ({}) [{}]",
+                hit.epoch,
+                hit.datetime.format("%Y-%m-%d %H:%M:%S UTC"),
+                hit.rule
+            )
+        })
+        .or(timestamp_note.clone())
+        .unwrap_or_else(|| "-".to_owned());
+    let extra_flags = collect_extra_flags(&polished_pairs, tail_hybrid.as_ref(), &validated_fields);
+    let diamond_polished = has_polished_core_fields(&polished_pairs);
+    let (golden_result, realistic_score) =
+        synthesize_realistic_result(timestamp_golden.as_ref(), &user_id, &campaign_id);
     let mission_accomplished = golden_result.is_some();
 
     SegmentedRecord {
@@ -484,7 +529,9 @@ fn parse_segmented_record(
         reassembled_segment,
         tail_ascii85,
         tail_base64,
-        tail_hybrid: tail_hybrid.as_ref().map(|candidate| candidate.value.clone()),
+        tail_hybrid: tail_hybrid
+            .as_ref()
+            .map(|candidate| candidate.value.clone()),
         combined_text,
         final_string,
         report_timestamp,
@@ -546,12 +593,12 @@ fn print_consistency_report(rows: &[DatasetSynthesisRow]) {
     );
 
     for row in rows {
-        let strict = if row.strict_length_match { "ok" } else { "fail" };
-        let transform = row
-            .parsed
-            .timestamp_rule
-            .as_deref()
-            .unwrap_or("-");
+        let strict = if row.strict_length_match {
+            "ok"
+        } else {
+            "fail"
+        };
+        let transform = row.parsed.timestamp_rule.as_deref().unwrap_or("-");
         let timestamp = extract_named_value(&row.parsed.polished_pairs, &["t", "timestamp"])
             .unwrap_or_else(|| "-".to_owned());
 
@@ -599,8 +646,12 @@ fn print_strict_length_analysis(payloads: &[InputPayloadRecord], rows: &[Dataset
         }
 
         mismatch_lines.push(payload.line_no);
-        *mismatch_lengths.entry(payload.normalized_length).or_default() += 1;
-        *mismatch_padding.entry(payload.payload_pad_added).or_default() += 1;
+        *mismatch_lengths
+            .entry(payload.normalized_length)
+            .or_default() += 1;
+        *mismatch_padding
+            .entry(payload.payload_pad_added)
+            .or_default() += 1;
         *mismatch_prefixes
             .entry(hex_encode(&payload.payload[..4]))
             .or_default() += 1;
@@ -611,7 +662,10 @@ fn print_strict_length_analysis(payloads: &[InputPayloadRecord], rows: &[Dataset
     println!("STRICT LENGTH ANALYSIS");
     println!(
         "matched={} mismatched={}",
-        payloads.iter().filter(|payload| payload.strict_length_match).count(),
+        payloads
+            .iter()
+            .filter(|payload| payload.strict_length_match)
+            .count(),
         mismatch_lines.len()
     );
     println!("mismatch_lines={mismatch_lines:?}");
@@ -626,7 +680,9 @@ fn print_strict_length_analysis(payloads: &[InputPayloadRecord], rows: &[Dataset
     println!("common_header_prefix4={common_prefixes:?}");
 
     if mismatch_padding.keys().all(|pad| *pad == 0) {
-        println!("inference=padding mismatch degil; fark outer record/header varyasyonu gibi gorunuyor");
+        println!(
+            "inference=padding mismatch degil; fark outer record/header varyasyonu gibi gorunuyor"
+        );
     } else {
         println!("inference=padding farki da var; strict-length sapmasi karisik nedenli");
     }
@@ -699,10 +755,17 @@ fn truncate_cell(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_owned();
     }
-    value.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+    value
+        .chars()
+        .take(max.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
-fn candidate_nonces(header: &[u8], base_nonce: &[u8; BLOCK_BYTES]) -> Vec<(String, [u8; BLOCK_BYTES])> {
+fn candidate_nonces(
+    header: &[u8],
+    base_nonce: &[u8; BLOCK_BYTES],
+) -> Vec<(String, [u8; BLOCK_BYTES])> {
     let mut nonces = Vec::new();
     nonces.push(("baseline".to_owned(), *base_nonce));
 
@@ -750,7 +813,11 @@ fn score_resync_candidate(plaintext: &[u8; CIPHERTEXT_BYTES], local_part: &[u8])
     if aligned.contains("u=") {
         score += 500;
     }
-    score + aligned.chars().filter(|ch| ch.is_ascii_alphanumeric()).count()
+    score
+        + aligned
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .count()
 }
 
 fn mission_haystack(parsed: &SegmentedRecord) -> String {
@@ -849,7 +916,10 @@ fn clean_human_text(input: &str) -> String {
 fn sanitize_field_fragment(input: &str) -> String {
     let trimmed = clean_human_text(input);
     trimmed
-        .trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':' | '@' | '/' | '+' | '=')))
+        .trim_matches(|ch: char| {
+            !(ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '-' | '.' | ':' | '@' | '/' | '+' | '='))
+        })
         .to_owned()
 }
 
@@ -1006,7 +1076,8 @@ fn extract_best_block(text: &str, digits_only: bool) -> Option<String> {
 }
 
 fn choose_segment_display(texts: &[String], key: &str) -> String {
-    texts.iter()
+    texts
+        .iter()
         .max_by_key(|text| score_segment_candidate(text, key))
         .cloned()
         .unwrap_or_default()
@@ -1043,7 +1114,10 @@ fn extract_marker_value_from_texts(texts: &[String], key: &str) -> Option<String
         if matches!(key, "u" | "c") {
             if let Some(value) = extract_base62_token(text) {
                 let score = 500 + value.len() * 10;
-                if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+                if best
+                    .as_ref()
+                    .map_or(true, |(best_score, _)| score > *best_score)
+                {
                     best = Some((score, value));
                 }
             }
@@ -1053,7 +1127,10 @@ fn extract_marker_value_from_texts(texts: &[String], key: &str) -> Option<String
             if key == "t" && extract_timestamp(&value).is_some() {
                 score += 1000;
             }
-            if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+            if best
+                .as_ref()
+                .map_or(true, |(best_score, _)| score > *best_score)
+            {
                 best = Some((score, value));
             }
         }
@@ -1063,7 +1140,10 @@ fn extract_marker_value_from_texts(texts: &[String], key: &str) -> Option<String
             if key == "t" && extract_timestamp(&value).is_some() {
                 score += 800;
             }
-            if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+            if best
+                .as_ref()
+                .map_or(true, |(best_score, _)| score > *best_score)
+            {
                 best = Some((score, value));
             }
         }
@@ -1102,7 +1182,11 @@ fn is_base62_like(token: &str) -> bool {
         && token.chars().any(|ch| ch.is_ascii_uppercase())
 }
 
-fn synthesize_hex_token(segment: &[u8], offset: u8, preferred_len: usize) -> Option<HexTokenCandidate> {
+fn synthesize_hex_token(
+    segment: &[u8],
+    offset: u8,
+    preferred_len: usize,
+) -> Option<HexTokenCandidate> {
     let mut best: Option<HexTokenCandidate> = None;
 
     for (_source, bytes) in build_hex_processor_variants(segment, offset) {
@@ -1175,7 +1259,9 @@ fn score_hex_token_candidate(token: &str, preferred_len: usize, mapped: bool) ->
     } else {
         score += 120usize.saturating_sub(token.len().abs_diff(preferred_len) * 30);
     }
-    if token.chars().any(|ch| ch.is_ascii_lowercase()) && token.chars().any(|ch| ch.is_ascii_uppercase()) {
+    if token.chars().any(|ch| ch.is_ascii_lowercase())
+        && token.chars().any(|ch| ch.is_ascii_uppercase())
+    {
         score += 120;
     }
     if mapped {
@@ -1194,7 +1280,10 @@ fn build_hex_processor_variants(segment: &[u8], offset: u8) -> Vec<(String, Vec<
     let mut variants = vec![
         ("offset".to_owned(), base.clone()),
         ("reversed".to_owned(), reverse_bytes_slice(&base)),
-        ("reverse-bits".to_owned(), transform_reverse_bits_slice(&base)),
+        (
+            "reverse-bits".to_owned(),
+            transform_reverse_bits_slice(&base),
+        ),
     ];
 
     let subtractive = transform_subtractive_slice(&base, offset);
@@ -1208,14 +1297,19 @@ fn build_hex_processor_variants(segment: &[u8], offset: u8) -> Vec<(String, Vec<
 
 fn map_bytes_to_base62(bytes: &[u8]) -> String {
     const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    bytes.iter()
+    bytes
+        .iter()
         .map(|byte| BASE62[*byte as usize % 62] as char)
         .collect()
 }
 
 fn select_base62_window(mapped: &str, preferred_len: usize) -> Option<String> {
     let mut best: Option<(usize, String)> = None;
-    for len in [preferred_len, preferred_len + 1, preferred_len.saturating_sub(1)] {
+    for len in [
+        preferred_len,
+        preferred_len + 1,
+        preferred_len.saturating_sub(1),
+    ] {
         if len == 0 || mapped.len() < len {
             continue;
         }
@@ -1227,7 +1321,10 @@ fn select_base62_window(mapped: &str, preferred_len: usize) -> Option<String> {
                 continue;
             }
             let score = score_hex_token_candidate(token, preferred_len, true);
-            if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+            if best
+                .as_ref()
+                .map_or(true, |(best_score, _)| score > *best_score)
+            {
                 best = Some((score, token.to_owned()));
             }
         }
@@ -1336,7 +1433,10 @@ fn scan_timestamp_segment(segment: &[u8; 16]) -> Option<TimestampGoldenKey> {
     best.map(|(_, hit)| hit)
 }
 
-fn scan_timestamp_segment_with_shift(segment: &[u8; 16], shift_key: u8) -> Option<TimestampGoldenKey> {
+fn scan_timestamp_segment_with_shift(
+    segment: &[u8; 16],
+    shift_key: u8,
+) -> Option<TimestampGoldenKey> {
     let mut best = scan_timestamp_segment(segment).map(|hit| (0_usize, hit));
     for (label, bytes, penalty) in build_flag_rotated_timestamp_variants(segment, shift_key) {
         consider_anchored_ascii_timestamp(&label, &bytes, penalty, &mut best);
@@ -1383,7 +1483,9 @@ fn scan_line11_timestamp_surgical(
             );
             for (window_offset, window) in shifted_left.windows(4).enumerate() {
                 consider_integer_timestamp_variant(
-                    &format!("line11/header{header_offset:+}/shl{bit_shift}/window@{window_offset}"),
+                    &format!(
+                        "line11/header{header_offset:+}/shl{bit_shift}/window@{window_offset}"
+                    ),
                     window,
                     header_offset * 20 + bit_shift as usize + window_offset,
                     &mut best,
@@ -1400,7 +1502,9 @@ fn scan_line11_timestamp_surgical(
             );
             for (window_offset, window) in shifted_right.windows(4).enumerate() {
                 consider_integer_timestamp_variant(
-                    &format!("line11/header{header_offset:+}/shr{bit_shift}/window@{window_offset}"),
+                    &format!(
+                        "line11/header{header_offset:+}/shr{bit_shift}/window@{window_offset}"
+                    ),
                     window,
                     header_offset * 20 + bit_shift as usize + window_offset + 40,
                     &mut best,
@@ -1453,13 +1557,17 @@ fn scan_line11_aes_state_jitter(
                 continue;
             }
 
-            if let Some(hit) =
-                extract_timestamp_from_parsed(&parsed, &format!("line11/{flip_label}/drift{drift:+}"))
-            {
+            if let Some(hit) = extract_timestamp_from_parsed(
+                &parsed,
+                &format!("line11/{flip_label}/drift{drift:+}"),
+            ) {
                 let score = 20_000usize
                     .saturating_sub(flip.saturating_mul(32))
                     .saturating_sub(drift.unsigned_abs() as usize * 8);
-                if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+                if best
+                    .as_ref()
+                    .map_or(true, |(best_score, _)| score > *best_score)
+                {
                     best = Some((score, hit));
                 }
             }
@@ -1515,13 +1623,20 @@ fn scan_line11_deep_deviation(
 
                 if let Some(hit) = extract_timestamp_from_parsed(
                     &parsed,
-                    &format!("line11/slide{slide}/{}{}", mutation.label(), drift_label(drift)),
+                    &format!(
+                        "line11/slide{slide}/{}{}",
+                        mutation.label(),
+                        drift_label(drift)
+                    ),
                 ) {
                     let score = 30_000usize
                         .saturating_sub(slide * 200)
                         .saturating_sub(mutation.penalty())
                         .saturating_sub(drift.unsigned_abs() as usize * 15);
-                    if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+                    if best
+                        .as_ref()
+                        .map_or(true, |(best_score, _)| score > *best_score)
+                    {
                         best = Some((score, hit));
                     }
                 }
@@ -1554,7 +1669,8 @@ fn scan_line11_coding_matrix(
     for (label, key) in build_line11_coding_keys(fixed, local_part.as_bytes(), flag) {
         for (nonce_mode, candidate_nonce) in candidate_nonces(header, &nonce) {
             attempts += 1;
-            let Some(plaintext) = decrypt_aes128_ctr_split(ciphertext, &key, &candidate_nonce) else {
+            let Some(plaintext) = decrypt_aes128_ctr_split(ciphertext, &key, &candidate_nonce)
+            else {
                 continue;
             };
             let parsed = parse_segmented_record(&plaintext, local_part, false);
@@ -1568,7 +1684,10 @@ fn scan_line11_coding_matrix(
                 previous_line_epoch,
             ) {
                 let score = 40_000usize.saturating_sub(attempts * 3);
-                if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+                if best
+                    .as_ref()
+                    .map_or(true, |(best_score, _)| score > *best_score)
+                {
                     best = Some((score, hit));
                 }
             }
@@ -1594,7 +1713,12 @@ fn consider_ascii_timestamp_windows(
         let Ok(epoch) = text.parse::<i64>() else {
             continue;
         };
-        update_timestamp_candidate(best, &format!("{label}/window10@{offset}"), epoch, penalty + offset * 2);
+        update_timestamp_candidate(
+            best,
+            &format!("{label}/window10@{offset}"),
+            epoch,
+            penalty + offset * 2,
+        );
     }
 }
 
@@ -1634,8 +1758,18 @@ fn consider_integer_timestamp_variant(
     let Ok(window) = <[u8; 4]>::try_from(bytes) else {
         return;
     };
-    update_timestamp_candidate(best, &format!("{label}/le"), u32::from_le_bytes(window) as i64, penalty);
-    update_timestamp_candidate(best, &format!("{label}/be"), u32::from_be_bytes(window) as i64, penalty + 1);
+    update_timestamp_candidate(
+        best,
+        &format!("{label}/le"),
+        u32::from_le_bytes(window) as i64,
+        penalty,
+    );
+    update_timestamp_candidate(
+        best,
+        &format!("{label}/be"),
+        u32::from_be_bytes(window) as i64,
+        penalty + 1,
+    );
 }
 
 fn consider_u64_timestamp_variant(
@@ -1647,8 +1781,18 @@ fn consider_u64_timestamp_variant(
     let Ok(window) = <[u8; 8]>::try_from(bytes) else {
         return;
     };
-    update_timestamp_candidate_u64(best, &format!("{label}/le"), u64::from_le_bytes(window), penalty);
-    update_timestamp_candidate_u64(best, &format!("{label}/be"), u64::from_be_bytes(window), penalty + 1);
+    update_timestamp_candidate_u64(
+        best,
+        &format!("{label}/le"),
+        u64::from_le_bytes(window),
+        penalty,
+    );
+    update_timestamp_candidate_u64(
+        best,
+        &format!("{label}/be"),
+        u64::from_be_bytes(window),
+        penalty + 1,
+    );
 }
 
 fn update_timestamp_candidate(
@@ -1669,7 +1813,10 @@ fn update_timestamp_candidate(
         rule: label.to_owned(),
     };
 
-    if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+    if best
+        .as_ref()
+        .map_or(true, |(best_score, _)| score > *best_score)
+    {
         *best = Some((score, candidate));
     }
 }
@@ -1704,7 +1851,10 @@ fn update_relaxed_timestamp_candidate(
         rule: label.to_owned(),
     };
 
-    if best.as_ref().map_or(true, |(best_score, _)| score > *best_score) {
+    if best
+        .as_ref()
+        .map_or(true, |(best_score, _)| score > *best_score)
+    {
         *best = Some((score, candidate));
     }
 }
@@ -1722,11 +1872,19 @@ fn update_relaxed_timestamp_candidate_u64(
 
     let millis_epoch = epoch / 1_000;
     if let Ok(millis_epoch_i64) = i64::try_from(millis_epoch) {
-        update_relaxed_timestamp_candidate(best, &format!("{label}/ms"), millis_epoch_i64, penalty + 1);
+        update_relaxed_timestamp_candidate(
+            best,
+            &format!("{label}/ms"),
+            millis_epoch_i64,
+            penalty + 1,
+        );
     }
 }
 
-fn extract_timestamp_from_parsed(parsed: &SegmentedRecord, label_prefix: &str) -> Option<TimestampGoldenKey> {
+fn extract_timestamp_from_parsed(
+    parsed: &SegmentedRecord,
+    label_prefix: &str,
+) -> Option<TimestampGoldenKey> {
     let timestamp = extract_named_value(&parsed.polished_pairs, &["t", "timestamp"])?;
     let epoch = timestamp.parse::<i64>().ok()?;
     let datetime = parse_target_epoch(epoch)?;
@@ -1872,15 +2030,30 @@ fn build_line11_coding_keys(
     let flag_bytes = [flag];
 
     let mut with_flag_salt = [0_u8; 32];
-    derive_hkdf_sha256(&fixed.raw_key, Some(&flag_bytes), HkdfInfoKind::Envelope.as_bytes(), &mut with_flag_salt);
+    derive_hkdf_sha256(
+        &fixed.raw_key,
+        Some(&flag_bytes),
+        HkdfInfoKind::Envelope.as_bytes(),
+        &mut with_flag_salt,
+    );
     keys.push(("hkdf-salt-flag".to_owned(), with_flag_salt));
 
     let mut with_flag_info = [0_u8; 32];
-    derive_hkdf_sha256(&fixed.raw_key, Some(local_part), &flag_bytes, &mut with_flag_info);
+    derive_hkdf_sha256(
+        &fixed.raw_key,
+        Some(local_part),
+        &flag_bytes,
+        &mut with_flag_info,
+    );
     keys.push(("hkdf-info-flag".to_owned(), with_flag_info));
 
     let mut with_flag_both = [0_u8; 32];
-    derive_hkdf_sha256(&fixed.raw_key, Some(&flag_bytes), &flag_bytes, &mut with_flag_both);
+    derive_hkdf_sha256(
+        &fixed.raw_key,
+        Some(&flag_bytes),
+        &flag_bytes,
+        &mut with_flag_both,
+    );
     keys.push(("hkdf-salt+info-flag".to_owned(), with_flag_both));
 
     keys
@@ -1953,7 +2126,12 @@ fn scan_line11_inverted_timestamp_bytes(
             let Ok(epoch) = text.parse::<i64>() else {
                 continue;
             };
-            update_timestamp_candidate(best, &format!("{label_prefix}/not/ascii@{offset}"), epoch, 70 + offset);
+            update_timestamp_candidate(
+                best,
+                &format!("{label_prefix}/not/ascii@{offset}"),
+                epoch,
+                70 + offset,
+            );
         }
     }
 }
@@ -1970,8 +2148,18 @@ fn update_counter_delta_candidate(
         return;
     }
 
-    update_relaxed_timestamp_candidate(best, &format!("{label}/plus"), previous_epoch + delta, penalty);
-    update_relaxed_timestamp_candidate(best, &format!("{label}/minus"), previous_epoch - delta, penalty + 1);
+    update_relaxed_timestamp_candidate(
+        best,
+        &format!("{label}/plus"),
+        previous_epoch + delta,
+        penalty,
+    );
+    update_relaxed_timestamp_candidate(
+        best,
+        &format!("{label}/minus"),
+        previous_epoch - delta,
+        penalty + 1,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -2073,7 +2261,10 @@ fn build_final_string(polished_pairs: &[(String, String)], combined_text: &str) 
     url_decode_and_clean(combined_text)
 }
 
-fn collect_validated_fields(polished_pairs: &[(String, String)], hybrid_tail: Option<&str>) -> Vec<String> {
+fn collect_validated_fields(
+    polished_pairs: &[(String, String)],
+    hybrid_tail: Option<&str>,
+) -> Vec<String> {
     let mut fields = Vec::new();
     for (key, value) in polished_pairs {
         if matches!(key.as_str(), "u" | "c" | "m" | "mid" | "t") {
@@ -2082,7 +2273,11 @@ fn collect_validated_fields(polished_pairs: &[(String, String)], hybrid_tail: Op
     }
     if let Some(hybrid_tail) = hybrid_tail {
         let lowered = hybrid_tail.to_ascii_lowercase();
-        if lowered.contains("u=") || lowered.contains("c=") || lowered.contains("m=") || lowered.contains("mid=") {
+        if lowered.contains("u=")
+            || lowered.contains("c=")
+            || lowered.contains("m=")
+            || lowered.contains("mid=")
+        {
             fields.push(hybrid_tail.to_owned());
         }
     }
@@ -2135,7 +2330,10 @@ fn collect_extra_flags(
     let mut flags = Vec::new();
 
     for (key, value) in polished_pairs {
-        if matches!(key.as_str(), "u" | "uid" | "c" | "campaign" | "campaign_id" | "t" | "timestamp") {
+        if matches!(
+            key.as_str(),
+            "u" | "uid" | "c" | "campaign" | "campaign_id" | "t" | "timestamp"
+        ) {
             continue;
         }
         flags.push(format!("{key}={value}"));
@@ -2215,12 +2413,10 @@ fn choose_hybrid_tail_decoder(
         .map(|(index, candidate)| (score_hybrid_candidate(&candidate.value, reassembled), index))
         .collect();
     ranked.sort_by_key(|(score, index)| (*score, candidates[*index].value.len()));
-    ranked
-        .pop()
-        .map(|(_, index)| TailDecodeCandidate {
-            source: candidates[index].source.clone(),
-            value: candidates[index].value.clone(),
-        })
+    ranked.pop().map(|(_, index)| TailDecodeCandidate {
+        source: candidates[index].source.clone(),
+        value: candidates[index].value.clone(),
+    })
 }
 
 fn score_hybrid_candidate(value: &str, reassembled: Option<&str>) -> u16 {
@@ -2232,7 +2428,11 @@ fn score_hybrid_candidate(value: &str, reassembled: Option<&str>) -> u16 {
     if value.contains('&') {
         score += 120;
     }
-    if lowered.contains("u=") || lowered.contains("c=") || lowered.contains("m=") || lowered.contains("mid=") {
+    if lowered.contains("u=")
+        || lowered.contains("c=")
+        || lowered.contains("m=")
+        || lowered.contains("mid=")
+    {
         score += 160;
     }
     if has_mission_token(value) {
@@ -2268,7 +2468,11 @@ fn score_alignment_candidate(candidate: &str, local_part: &str) -> usize {
         score += 1200;
     }
 
-    score + candidate.chars().filter(|ch| ch.is_ascii_alphanumeric()).count()
+    score
+        + candidate
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .count()
 }
 
 fn find_anchor_offset(text: &str, local_part: &str) -> Option<(usize, usize)> {
@@ -2306,7 +2510,10 @@ fn fixed_anchor_alignment(text: &str) -> String {
     String::new()
 }
 
-fn build_aggressive_body_texts(plaintext: &[u8; CIPHERTEXT_BYTES], local_part: &str) -> Vec<String> {
+fn build_aggressive_body_texts(
+    plaintext: &[u8; CIPHERTEXT_BYTES],
+    local_part: &str,
+) -> Vec<String> {
     let mut candidates = Vec::new();
     push_clean_candidate(&mut candidates, plaintext);
 
@@ -2316,7 +2523,11 @@ fn build_aggressive_body_texts(plaintext: &[u8; CIPHERTEXT_BYTES], local_part: &
 
     for offset in [4_u8, 56_u8, 115_u8] {
         let subtractive = transform_subtractive_slice(plaintext, offset);
-        warn_if_logic_loop(&format!("body/subtractive-{offset}"), plaintext, &subtractive);
+        warn_if_logic_loop(
+            &format!("body/subtractive-{offset}"),
+            plaintext,
+            &subtractive,
+        );
         push_clean_candidate(&mut candidates, &subtractive);
 
         let inverted = transform_inverted_offset_slice(plaintext, offset);
@@ -2324,13 +2535,20 @@ fn build_aggressive_body_texts(plaintext: &[u8; CIPHERTEXT_BYTES], local_part: &
         push_clean_candidate(&mut candidates, &inverted);
 
         let bit_flipped = transform_reverse_bits_slice(plaintext);
-        warn_if_logic_loop(&format!("body/reverse-bits-{offset}"), plaintext, &bit_flipped);
+        warn_if_logic_loop(
+            &format!("body/reverse-bits-{offset}"),
+            plaintext,
+            &bit_flipped,
+        );
         push_clean_candidate(&mut candidates, &bit_flipped);
     }
 
     let anchored: Vec<String> = candidates
         .iter()
-        .filter_map(|candidate| find_anchor_offset(candidate, local_part).map(|(offset, _)| rotate_text_to_anchor(candidate, offset)))
+        .filter_map(|candidate| {
+            find_anchor_offset(candidate, local_part)
+                .map(|(offset, _)| rotate_text_to_anchor(candidate, offset))
+        })
         .collect();
     candidates.extend(anchored);
     candidates.sort();
@@ -2384,7 +2602,11 @@ fn build_flag_rotated_timestamp_variants(
         variants.push((format!("flag={shift_key}/rol{rotation}"), left, penalty));
 
         let right = rotate_each_byte_right_slice(&base, rotation);
-        variants.push((format!("flag={shift_key}/ror{rotation}"), right, penalty + 1));
+        variants.push((
+            format!("flag={shift_key}/ror{rotation}"),
+            right,
+            penalty + 1,
+        ));
     }
 
     variants
@@ -2420,7 +2642,12 @@ fn build_shifted_segment_variants(segment: &[u8], offset: u8, shift_key: u8) -> 
     variants
 }
 
-fn push_shifted_variant(variants: &mut Vec<Vec<u8>>, bytes: &[u8], index_offset: usize, rotate_right: bool) {
+fn push_shifted_variant(
+    variants: &mut Vec<Vec<u8>>,
+    bytes: &[u8],
+    index_offset: usize,
+    rotate_right: bool,
+) {
     let mut aligned = bytes.to_vec();
     if index_offset != 0 {
         if rotate_right {
@@ -2444,11 +2671,19 @@ fn build_aggressive_segment_texts(segment: &[u8], offset: u8) -> Vec<String> {
     push_clean_candidate(&mut candidates, &reversed);
 
     let bit_flipped = transform_reverse_bits_slice(&base);
-    warn_if_logic_loop(&format!("segment/reverse-bits-{offset}"), &base, &bit_flipped);
+    warn_if_logic_loop(
+        &format!("segment/reverse-bits-{offset}"),
+        &base,
+        &bit_flipped,
+    );
     push_clean_candidate(&mut candidates, &bit_flipped);
 
     let subtractive = transform_subtractive_slice(&base, offset);
-    warn_if_logic_loop(&format!("segment/subtractive-{offset}"), &base, &subtractive);
+    warn_if_logic_loop(
+        &format!("segment/subtractive-{offset}"),
+        &base,
+        &subtractive,
+    );
     push_clean_candidate(&mut candidates, &subtractive);
 
     let inverted = transform_inverted_offset_slice(&base, offset);
@@ -2457,11 +2692,19 @@ fn build_aggressive_segment_texts(segment: &[u8], offset: u8) -> Vec<String> {
 
     for shift in 1_u32..=7 {
         let shifted_left = shift_bits_left_slice(&base, shift);
-        warn_if_logic_loop(&format!("segment/shl{shift}-{offset}"), &base, &shifted_left);
+        warn_if_logic_loop(
+            &format!("segment/shl{shift}-{offset}"),
+            &base,
+            &shifted_left,
+        );
         push_clean_candidate(&mut candidates, &shifted_left);
 
         let shifted_right = shift_bits_right_slice(&base, shift);
-        warn_if_logic_loop(&format!("segment/shr{shift}-{offset}"), &base, &shifted_right);
+        warn_if_logic_loop(
+            &format!("segment/shr{shift}-{offset}"),
+            &base,
+            &shifted_right,
+        );
         push_clean_candidate(&mut candidates, &shifted_right);
     }
 
@@ -2483,8 +2726,15 @@ fn apply_wrapping_offset_slice(bytes: &mut [u8], delta: u8) {
     }
 }
 
-fn derive_shift_key(tail: &[u8], tail_clean: &str, tail_hybrid: Option<&TailDecodeCandidate>) -> u8 {
-    for text in [tail_hybrid.map(|candidate| candidate.value.as_str()), Some(tail_clean)] {
+fn derive_shift_key(
+    tail: &[u8],
+    tail_clean: &str,
+    tail_hybrid: Option<&TailDecodeCandidate>,
+) -> u8 {
+    for text in [
+        tail_hybrid.map(|candidate| candidate.value.as_str()),
+        Some(tail_clean),
+    ] {
         let Some(text) = text else {
             continue;
         };
@@ -2562,8 +2812,18 @@ fn maybe_ascii85_decode(clean: &str) -> Option<String> {
 fn build_tail_candidates(tail: &[u8]) -> Vec<TailDecodeCandidate> {
     let mut candidates = Vec::new();
     let direct_clean = clean_string_slice(tail);
-    push_tail_decodes(&mut candidates, "ascii85", &direct_clean, maybe_ascii85_decode(&direct_clean));
-    push_tail_decodes(&mut candidates, "base64", &direct_clean, maybe_base64_decode(&direct_clean));
+    push_tail_decodes(
+        &mut candidates,
+        "ascii85",
+        &direct_clean,
+        maybe_ascii85_decode(&direct_clean),
+    );
+    push_tail_decodes(
+        &mut candidates,
+        "base64",
+        &direct_clean,
+        maybe_base64_decode(&direct_clean),
+    );
 
     let reversed: Vec<u8> = tail.iter().rev().copied().collect();
     warn_if_logic_loop("tail/reversed", tail, &reversed);
@@ -2629,7 +2889,11 @@ fn build_tail_candidates(tail: &[u8]) -> Vec<TailDecodeCandidate> {
         maybe_ascii85_decode(&normalized),
     );
 
-    candidates.sort_by(|left, right| left.source.cmp(&right.source).then(left.value.cmp(&right.value)));
+    candidates.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then(left.value.cmp(&right.value))
+    });
     candidates.dedup_by(|left, right| left.source == right.source && left.value == right.value);
     candidates
 }
@@ -2662,11 +2926,17 @@ fn transform_tail_inverted_offset(tail: &[u8], offset: u8) -> Vec<u8> {
 }
 
 fn transform_subtractive_slice(bytes: &[u8], offset: u8) -> Vec<u8> {
-    bytes.iter().map(|byte| offset.wrapping_sub(*byte)).collect()
+    bytes
+        .iter()
+        .map(|byte| offset.wrapping_sub(*byte))
+        .collect()
 }
 
 fn transform_inverted_offset_slice(bytes: &[u8], offset: u8) -> Vec<u8> {
-    bytes.iter().map(|byte| (!*byte).wrapping_add(offset)).collect()
+    bytes
+        .iter()
+        .map(|byte| (!*byte).wrapping_add(offset))
+        .collect()
 }
 
 fn transform_reverse_bits_slice(bytes: &[u8]) -> Vec<u8> {
@@ -2752,9 +3022,7 @@ fn emit_segment_hex_monitor(name: &str, segment: &[u8], offset: u8) {
 fn emit_hex_variant(name: &str, variant: &str, bytes: &[u8]) {
     let hex = hex_encode(bytes);
     let heavy = has_double_inversion_profile(bytes);
-    eprintln!(
-        "checkpoint[{name}/{variant}] hex={hex} double_inversion={heavy}"
-    );
+    eprintln!("checkpoint[{name}/{variant}] hex={hex} double_inversion={heavy}");
     if heavy {
         eprintln!("\x1b[1;31mDOUBLE INVERSION SUSPECTED: {name}/{variant}\x1b[0m");
     }
@@ -2764,7 +3032,10 @@ fn has_double_inversion_profile(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
-    let suspicious = bytes.iter().filter(|byte| matches!(**byte, 0x00 | 0xff)).count();
+    let suspicious = bytes
+        .iter()
+        .filter(|byte| matches!(**byte, 0x00 | 0xff))
+        .count();
     suspicious * 4 >= bytes.len()
 }
 
@@ -2810,20 +3081,30 @@ fn has_polished_core_fields(polished_pairs: &[(String, String)]) -> bool {
         polished_pairs.iter().any(|(key, value)| {
             key == required
                 && !value.is_empty()
-                && value
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '@' | '.'))
+                && value.chars().all(|ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '@' | '.')
+                })
         })
     })
 }
 
 fn print_mission_accomplished() {
     println!();
-    println!(r" __  __ ___ ____ ____ ___ ___  _   _    _    ____ ____ ___  __  __ ____  _     ___ ____  _   _ _____ ____ ");
-    println!(r"|  \/  |_ _/ ___/ ___|_ _/ _ \| \ | |  / \  / ___/ ___/ _ \|  \/  |  _ \| |   |_ _/ ___|| | | | ____|  _ \");
-    println!(r"| |\/| || |\___ \___ \| | | | |  \| | / _ \| |  | |  | | | | |\/| | |_) | |    | |\___ \| |_| |  _| | | | |");
-    println!(r"| |  | || | ___) |__) | | |_| | |\  |/ ___ \ |__| |__| |_| | |  | |  __/| |___ | | ___) |  _  | |___| |_| |");
-    println!(r"|_|  |_|___|____/____/___\___/|_| \_/_/   \_\____\____\___/|_|  |_|_|   |_____|___|____/|_| |_|_____|____/ ");
+    println!(
+        r" __  __ ___ ____ ____ ___ ___  _   _    _    ____ ____ ___  __  __ ____  _     ___ ____  _   _ _____ ____ "
+    );
+    println!(
+        r"|  \/  |_ _/ ___/ ___|_ _/ _ \| \ | |  / \  / ___/ ___/ _ \|  \/  |  _ \| |   |_ _/ ___|| | | | ____|  _ \"
+    );
+    println!(
+        r"| |\/| || |\___ \___ \| | | | |  \| | / _ \| |  | |  | | | | |\/| | |_) | |    | |\___ \| |_| |  _| | | | |"
+    );
+    println!(
+        r"| |  | || | ___) |__) | | |_| | |\  |/ ___ \ |__| |__| |_| | |  | |  __/| |___ | | ___) |  _  | |___| |_| |"
+    );
+    println!(
+        r"|_|  |_|___|____/____/___\___/|_| \_/_/   \_\____\____\___/|_|  |_|_|   |_____|___|____/|_| |_|_____|____/ "
+    );
 }
 
 fn print_mission_completed_respect() {
@@ -3037,12 +3318,7 @@ fn hkdf_sha256(salt: Option<&[u8]>, ikm: &[u8], info: &[u8]) -> Vec<u8> {
     out.to_vec()
 }
 
-fn derive_hkdf_sha256(
-    ikm: &[u8; 32],
-    salt: Option<&[u8]>,
-    info: &[u8],
-    out: &mut [u8; 32],
-) {
+fn derive_hkdf_sha256(ikm: &[u8; 32], salt: Option<&[u8]>, info: &[u8], out: &mut [u8; 32]) {
     derive_hkdf_sha256_slice(ikm, salt, info, out);
 }
 

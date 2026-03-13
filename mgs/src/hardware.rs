@@ -160,8 +160,7 @@ impl MobileGpuProfile {
 
     /// True when the profile represents a known mobile TBDR target.
     pub fn is_mobile_tbdr(&self) -> bool {
-        self.architecture.is_tbdr()
-            && !matches!(self.family, MobileGpuFamily::Unknown)
+        self.architecture.is_tbdr() && !matches!(self.family, MobileGpuFamily::Unknown)
     }
 }
 

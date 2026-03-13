@@ -153,7 +153,7 @@ fn vulkan_hints(arch: TbdrArchitecture) -> VulkanPassHints {
         color_load: LoadAction::Clear,
         color_store: StoreAction::Store,
         depth_load: LoadAction::Clear,
-        depth_store: StoreAction::DontCare,  // ← TBDR kritik optimizasyon
+        depth_store: StoreAction::DontCare, // ← TBDR kritik optimizasyon
         stencil_store: StoreAction::DontCare,
         prefer_input_attachments: prefer_input,
         recommended_subpass_count: subpass_count,
@@ -168,7 +168,7 @@ fn metal_hints(arch: TbdrArchitecture) -> MetalPassHints {
         color_load: LoadAction::Clear,
         color_store: StoreAction::Store,
         depth_load: LoadAction::Clear,
-        depth_store: StoreAction::DontCare,  // ← memoryless ile birleşir
+        depth_store: StoreAction::DontCare, // ← memoryless ile birleşir
         use_tile_shaders: tile_shaders,
         memoryless_depth: tile_shaders,
     }
@@ -203,8 +203,10 @@ impl MgsTuningProfile {
         let (render_pass_strategy, vertex_batch_size, recommended_msaa_samples) =
             arch_defaults(profile.architecture);
 
-        let tile_bandwidth_budget_mb = family_bandwidth_budget(profile.family, profile.estimated_cores);
-        let backend_hints = BackendRenderHints::from_backend(profile.gfx_backend, profile.architecture);
+        let tile_bandwidth_budget_mb =
+            family_bandwidth_budget(profile.family, profile.estimated_cores);
+        let backend_hints =
+            BackendRenderHints::from_backend(profile.gfx_backend, profile.architecture);
 
         Self {
             thermal_state: ThermalState::Unknown,
@@ -250,9 +252,7 @@ fn arch_defaults(arch: TbdrArchitecture) -> (RenderPassStrategy, u32, u32) {
             // Mali — saf TBDR; tek pass en verimli yoldur.
             (RenderPassStrategy::SinglePassPerFrame, 128, 4)
         }
-        TbdrArchitecture::PowerVrTbdr => {
-            (RenderPassStrategy::SinglePassPerFrame, 128, 4)
-        }
+        TbdrArchitecture::PowerVrTbdr => (RenderPassStrategy::SinglePassPerFrame, 128, 4),
         TbdrArchitecture::AppleTbdr => {
             // Apple GPU — büyük tile bellek kapasitesi; MSAA'ya toleranslı.
             (RenderPassStrategy::MergedPasses, 512, 4)
@@ -282,8 +282,8 @@ mod tests {
     #[test]
     fn hot_thermal_state_reduces_draw_calls() {
         let profile = MobileGpuProfile::detect("Adreno 750");
-        let tuning = MgsTuningProfile::from_profile(&profile)
-            .apply_thermal_state(ThermalState::Hot);
+        let tuning =
+            MgsTuningProfile::from_profile(&profile).apply_thermal_state(ThermalState::Hot);
         // 512 * 0.45 = 230 (yuvarlama dahil)
         assert!(tuning.max_draw_calls_per_frame < 512);
         assert!(tuning.power_saving_mode);
@@ -292,8 +292,8 @@ mod tests {
     #[test]
     fn nominal_thermal_state_keeps_full_budget() {
         let profile = MobileGpuProfile::detect("Mali-G78 MC24");
-        let tuning = MgsTuningProfile::from_profile(&profile)
-            .apply_thermal_state(ThermalState::Nominal);
+        let tuning =
+            MgsTuningProfile::from_profile(&profile).apply_thermal_state(ThermalState::Nominal);
         assert_eq!(tuning.max_draw_calls_per_frame, 512);
     }
 
@@ -301,7 +301,10 @@ mod tests {
     fn apple_profile_uses_merged_passes() {
         let profile = MobileGpuProfile::detect("Apple M2 Pro");
         let tuning = MgsTuningProfile::from_profile(&profile);
-        assert_eq!(tuning.render_pass_strategy, RenderPassStrategy::MergedPasses);
+        assert_eq!(
+            tuning.render_pass_strategy,
+            RenderPassStrategy::MergedPasses
+        );
     }
 
     #[test]

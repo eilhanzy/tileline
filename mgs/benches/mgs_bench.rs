@@ -1,8 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use mgs::{MgsBridge, MgsPlanner, MobileGpuProfile};
 use mgs::bridge::MpsWorkloadHint;
 use mgs::tile_planner::TileWorkloadRequest;
 use mgs::tuning::{MgsTuningProfile, ThermalState};
+use mgs::{MgsBridge, MgsPlanner, MobileGpuProfile};
 
 // ── Hardware detect ────────────────────────────────────────────────────────────
 
@@ -57,8 +57,7 @@ fn bench_thermal_apply(c: &mut Criterion) {
     for (state, label) in states.iter().zip(labels.iter()) {
         group.bench_with_input(BenchmarkId::from_parameter(label), state, |b, &state| {
             b.iter(|| {
-                MgsTuningProfile::from_profile(black_box(&profile))
-                    .apply_thermal_state(state)
+                MgsTuningProfile::from_profile(black_box(&profile)).apply_thermal_state(state)
             });
         });
     }
@@ -77,10 +76,34 @@ fn bench_tile_plan(c: &mut Criterion) {
     }
 
     let cases = [
-        Case { label: "Adreno-1080p-200draws",  gpu: "Adreno 750",     width: 1920, height: 1080, draws: 200 },
-        Case { label: "Mali-1440p-512draws",     gpu: "Mali-G78 MC24",  width: 2560, height: 1440, draws: 512 },
-        Case { label: "Apple-4K-1024draws",      gpu: "Apple M3",       width: 3840, height: 2160, draws: 1024 },
-        Case { label: "Unknown-720p-32draws",    gpu: "SomeUnknownGPU", width: 1280, height: 720,  draws: 32 },
+        Case {
+            label: "Adreno-1080p-200draws",
+            gpu: "Adreno 750",
+            width: 1920,
+            height: 1080,
+            draws: 200,
+        },
+        Case {
+            label: "Mali-1440p-512draws",
+            gpu: "Mali-G78 MC24",
+            width: 2560,
+            height: 1440,
+            draws: 512,
+        },
+        Case {
+            label: "Apple-4K-1024draws",
+            gpu: "Apple M3",
+            width: 3840,
+            height: 2160,
+            draws: 1024,
+        },
+        Case {
+            label: "Unknown-720p-32draws",
+            gpu: "SomeUnknownGPU",
+            width: 1280,
+            height: 720,
+            draws: 32,
+        },
     ];
 
     let mut group = c.benchmark_group("tile_planner/plan");
@@ -103,9 +126,18 @@ fn bench_tile_plan(c: &mut Criterion) {
 
 fn bench_bridge_translate(c: &mut Criterion) {
     let bridges = [
-        ("Adreno 750",    MgsBridge::new(MobileGpuProfile::detect("Adreno 750"))),
-        ("Mali-G78 MC24", MgsBridge::new(MobileGpuProfile::detect("Mali-G78 MC24"))),
-        ("Apple M3",      MgsBridge::new(MobileGpuProfile::detect("Apple M3"))),
+        (
+            "Adreno 750",
+            MgsBridge::new(MobileGpuProfile::detect("Adreno 750")),
+        ),
+        (
+            "Mali-G78 MC24",
+            MgsBridge::new(MobileGpuProfile::detect("Mali-G78 MC24")),
+        ),
+        (
+            "Apple M3",
+            MgsBridge::new(MobileGpuProfile::detect("Apple M3")),
+        ),
     ];
 
     let hint = MpsWorkloadHint {

@@ -96,7 +96,8 @@ impl MgsBridge {
                         target_width: hint.target_width,
                         target_height: hint.target_height,
                         total_draw_calls: hint.object_count,
-                        bytes_per_draw_kb: (hint.transfer_size_kb / hint.object_count.max(1)).max(1),
+                        bytes_per_draw_kb: (hint.transfer_size_kb / hint.object_count.max(1))
+                            .max(1),
                     };
                     self.planner.plan(fullscreen_req)
                 }
@@ -176,7 +177,12 @@ mod tests {
             ..Default::default()
         };
         let plan = bridge.translate(hint);
-        let total: u32 = plan.tile_plan.assignments.iter().map(|a| a.draw_calls).sum();
+        let total: u32 = plan
+            .tile_plan
+            .assignments
+            .iter()
+            .map(|a| a.draw_calls)
+            .sum();
         assert_eq!(total, 128);
     }
 }

@@ -18,6 +18,5 @@ pub use fallback::FallbackChain;
 pub use hardware::{GfxBackend, MobileGpuFamily, MobileGpuProfile, TbdrArchitecture};
 pub use tile_planner::MgsPlanner;
 pub use tuning::{
-    BackendRenderHints, LoadAction, MetalPassHints, MgsTuningProfile, StoreAction,
-    VulkanPassHints,
+    BackendRenderHints, LoadAction, MetalPassHints, MgsTuningProfile, StoreAction, VulkanPassHints,
 };
