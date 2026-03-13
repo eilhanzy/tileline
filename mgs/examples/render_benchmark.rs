@@ -373,6 +373,7 @@ struct BenchmarkRuntime {
     renderer: Renderer,
     stats: FrameStats,
     pacing_mode: BenchmarkPacingMode,
+    min_frame_interval: Duration,
     options: CliOptions,
     session_start: Instant,
     sample_started_at: Option<Instant>,
@@ -397,6 +398,7 @@ impl BenchmarkRuntime {
 
         let renderer = Renderer::new(Arc::clone(&window), options)?;
         let pacing_mode = choose_pacing_mode(options);
+        let min_frame_interval = recommended_min_frame_interval(&renderer, pacing_mode);
         let stats = FrameStats::new(renderer.size, Duration::from_millis(500));
         let session_start = Instant::now();
         let sample_started_at = if options.warmup_duration.is_zero() {
@@ -409,6 +411,7 @@ impl BenchmarkRuntime {
             renderer,
             stats,
             pacing_mode,
+            min_frame_interval,
             options,
             session_start,
             sample_started_at,
@@ -444,6 +447,7 @@ impl BenchmarkRuntime {
                 timing.avg_wfps,
             );
         }
+        self.apply_max_throughput_pacing(frame_start, frame_end);
         Ok(())
     }
 
@@ -451,14 +455,20 @@ impl BenchmarkRuntime {
         let phase = self.phase_label();
         let show_throughput = self.renderer.throughput_target_burst > 1
             || matches!(self.pacing_mode, BenchmarkPacingMode::MaxThroughput);
+        let burst_suffix = if show_throughput {
+            format!(" | BurstCap {}", self.renderer.adaptive_burst_cap())
+        } else {
+            String::new()
+        };
         let title = if show_throughput {
             format!(
-                "MGS Render Benchmark [{}] | WFPS {:.1} | WAvg {:.1} | FPS {:.1} | Frames {} | {} {} {} | Close/Esc to finish",
+                "MGS Render Benchmark [{}] | WFPS {:.1} | WAvg {:.1} | FPS {:.1} | Frames {}{} | {} {} {} | Close/Esc to finish",
                 phase,
                 instant_wfps,
                 avg_wfps,
                 instant_fps,
                 self.stats.total_frames,
+                burst_suffix,
                 self.renderer.profile.family.short_label(),
                 self.renderer.profile.gfx_backend.label(),
                 self.renderer.last_fallback.label(),
@@ -481,6 +491,7 @@ impl BenchmarkRuntime {
     fn finish(self) -> BenchmarkSummary {
         let computed = self.stats.compute_summary();
         let score = compute_render_score(&computed, &self.renderer.profile);
+        let adaptive_burst_cap = self.renderer.adaptive_burst_cap();
 
         BenchmarkSummary {
             adapter_name: self.renderer.adapter_info.name.clone(),
@@ -513,6 +524,7 @@ impl BenchmarkRuntime {
             warmup_duration: self.options.warmup_duration,
             sample_duration: self.options.sample_duration,
             pacing_mode: self.pacing_mode,
+            adaptive_burst_cap,
         }
     }
 
@@ -561,6 +573,26 @@ impl BenchmarkRuntime {
             "Warmup"
         }
     }
+
+    fn apply_max_throughput_pacing(&self, frame_start: Instant, frame_end: Instant) {
+        if !matches!(self.pacing_mode, BenchmarkPacingMode::MaxThroughput) {
+            return;
+        }
+        if self.min_frame_interval.is_zero() {
+            return;
+        }
+
+        let elapsed = frame_end.saturating_duration_since(frame_start);
+        if elapsed >= self.min_frame_interval {
+            return;
+        }
+
+        let wait_until = frame_start + self.min_frame_interval;
+        std::thread::yield_now();
+        while Instant::now() < wait_until {
+            std::hint::spin_loop();
+        }
+    }
 }
 
 struct Renderer {
@@ -576,6 +608,7 @@ struct Renderer {
     profile: MobileGpuProfile,
     bridge: MgsBridge,
     throughput_target_burst: u32,
+    adaptive_burst: AdaptiveBurstController,
     throughput_targets: Vec<wgpu::Texture>,
     throughput_target_cursor: usize,
     presented_frames: u64,
@@ -650,6 +683,11 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let throughput_target_burst = select_throughput_burst(&profile, options);
+        let adaptive_burst = AdaptiveBurstController::new(
+            throughput_target_burst,
+            options.mode_override,
+            config.present_mode,
+        );
 
         Ok(Self {
             _instance: instance,
@@ -664,6 +702,7 @@ impl Renderer {
             profile,
             bridge,
             throughput_target_burst,
+            adaptive_burst,
             throughput_targets: Vec::new(),
             throughput_target_cursor: 0,
             presented_frames: 0,
@@ -688,6 +727,7 @@ impl Renderer {
         self.throughput_targets.clear();
         self.throughput_target_cursor = 0;
         self.presented_frames = 0;
+        self.adaptive_burst.reset(self.throughput_target_burst);
     }
 
     fn reconfigure(&mut self) {
@@ -701,6 +741,7 @@ impl Renderer {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(1);
         }
+        let frame_begin = Instant::now();
 
         let frame = self
             .surface
@@ -732,10 +773,11 @@ impl Renderer {
         self.last_tile_count = plan.tile_plan.tile_count;
         self.last_memory_pressure = plan.memory_pressure;
 
-        let mut work_units = self.derive_work_units_from_plan(&plan);
-        if work_units > 1 {
-            work_units = startup_ramp(work_units, self.presented_frames);
+        let mut planned_units = self.derive_work_units_from_plan(&plan);
+        if planned_units > 1 {
+            planned_units = startup_ramp(planned_units, self.presented_frames);
         }
+        let work_units = self.adaptive_burst.resolve(planned_units);
 
         let mut encoder = self
             .device
@@ -790,6 +832,9 @@ impl Renderer {
         window.pre_present_notify();
         frame.present();
         self.presented_frames = self.presented_frames.saturating_add(1);
+        let frame_ms = frame_begin.elapsed().as_secs_f64() * 1000.0;
+        self.adaptive_burst
+            .observe(frame_ms, work_units, planned_units, plan.memory_pressure);
 
         Ok(work_units.max(1))
     }
@@ -838,6 +883,144 @@ impl Renderer {
             units = (units / 2).max(1);
         }
         units.clamp(1, 24)
+    }
+
+    fn adaptive_burst_cap(&self) -> u32 {
+        self.adaptive_burst.current_cap()
+    }
+}
+
+fn recommended_min_frame_interval(
+    renderer: &Renderer,
+    pacing_mode: BenchmarkPacingMode,
+) -> Duration {
+    if !matches!(pacing_mode, BenchmarkPacingMode::MaxThroughput) {
+        return Duration::ZERO;
+    }
+    if renderer.throughput_target_burst <= 1 {
+        return Duration::ZERO;
+    }
+
+    // Keep uncapped mode cooperative and less jitter-prone on desktop GPUs.
+    if renderer.profile.is_mobile_tbdr() {
+        Duration::from_micros(1_100)
+    } else {
+        Duration::from_micros(700)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AdaptiveBurstController {
+    enabled: bool,
+    min_units: u32,
+    cap_units: u32,
+    initialized: bool,
+    ema_ms_per_unit: f64,
+    ema_abs_delta: f64,
+    cooldown_frames: u32,
+    low_jitter_streak: u32,
+}
+
+impl AdaptiveBurstController {
+    fn new(base_units: u32, mode: ModeOverride, present_mode: PresentMode) -> Self {
+        let enabled = base_units > 1
+            && !matches!(mode, ModeOverride::Stable)
+            && present_mode_allows_uncapped(present_mode);
+        let min_units = if enabled { 2 } else { 1 };
+        Self {
+            enabled,
+            min_units,
+            cap_units: base_units.max(1),
+            initialized: false,
+            ema_ms_per_unit: 0.0,
+            ema_abs_delta: 0.0,
+            cooldown_frames: 0,
+            low_jitter_streak: 0,
+        }
+    }
+
+    fn reset(&mut self, base_units: u32) {
+        self.cap_units = base_units.max(self.min_units);
+        self.initialized = false;
+        self.ema_ms_per_unit = 0.0;
+        self.ema_abs_delta = 0.0;
+        self.cooldown_frames = 0;
+        self.low_jitter_streak = 0;
+    }
+
+    fn resolve(&self, planned_units: u32) -> u32 {
+        let planned_units = planned_units.max(1);
+        if !self.enabled {
+            return planned_units;
+        }
+        planned_units.min(self.cap_units.max(self.min_units))
+    }
+
+    fn observe(
+        &mut self,
+        frame_ms: f64,
+        used_units: u32,
+        planned_units: u32,
+        memory_pressure: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+
+        let upper_bound = planned_units.max(1).clamp(1, 24);
+        let lower_bound = self.min_units.min(upper_bound);
+        self.cap_units = self.cap_units.clamp(lower_bound, upper_bound);
+
+        let sample = (frame_ms / f64::from(used_units.max(1))).max(0.0001);
+        if !self.initialized {
+            self.initialized = true;
+            self.ema_ms_per_unit = sample;
+            self.ema_abs_delta = 0.0;
+            return;
+        }
+
+        let alpha = 0.08;
+        self.ema_ms_per_unit = self.ema_ms_per_unit * (1.0 - alpha) + sample * alpha;
+        let abs_delta = (sample - self.ema_ms_per_unit).abs();
+        self.ema_abs_delta = self.ema_abs_delta * (1.0 - alpha) + abs_delta * alpha;
+        let jitter_ratio = self.ema_abs_delta / self.ema_ms_per_unit.max(0.0001);
+
+        if memory_pressure {
+            self.cap_units = self.cap_units.saturating_sub(1).max(1);
+            self.cooldown_frames = 24;
+            self.low_jitter_streak = 0;
+            return;
+        }
+
+        if self.cooldown_frames > 0 {
+            self.cooldown_frames = self.cooldown_frames.saturating_sub(1);
+        }
+
+        let spike = sample > self.ema_ms_per_unit * 1.85;
+        if jitter_ratio > 0.24 || spike {
+            let reduction = if jitter_ratio > 0.35 || sample > self.ema_ms_per_unit * 2.20 {
+                2
+            } else {
+                1
+            };
+            self.cap_units = self.cap_units.saturating_sub(reduction).max(self.min_units);
+            self.cooldown_frames = 18;
+            self.low_jitter_streak = 0;
+        } else if jitter_ratio < 0.10 && self.cap_units < upper_bound {
+            self.low_jitter_streak = self.low_jitter_streak.saturating_add(1);
+            if self.low_jitter_streak >= 24 && self.cooldown_frames == 0 {
+                self.cap_units = (self.cap_units + 1).min(upper_bound);
+                self.low_jitter_streak = 0;
+            }
+        } else {
+            self.low_jitter_streak = 0;
+        }
+
+        self.cap_units = self.cap_units.clamp(lower_bound, upper_bound);
+    }
+
+    fn current_cap(&self) -> u32 {
+        self.cap_units.max(1)
     }
 }
 
@@ -1099,6 +1282,7 @@ struct BenchmarkSummary {
     warmup_duration: Duration,
     sample_duration: Duration,
     pacing_mode: BenchmarkPacingMode,
+    adaptive_burst_cap: u32,
 }
 
 fn choose_pacing_mode(options: CliOptions) -> BenchmarkPacingMode {
@@ -1335,12 +1519,13 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.score.work_stability * 100.0
     );
     println!(
-        "Mode={:?} | VSync={:?} | Warmup={:.2}s | Sample={:.2}s | Pacing={:?}",
+        "Mode={:?} | VSync={:?} | Warmup={:.2}s | Sample={:.2}s | Pacing={:?} | BurstCap={}",
         summary.mode_override,
         summary.vsync_override,
         summary.warmup_duration.as_secs_f64(),
         summary.sample_duration.as_secs_f64(),
-        summary.pacing_mode
+        summary.pacing_mode,
+        summary.adaptive_burst_cap
     );
 }
 
