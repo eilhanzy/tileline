@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Write as _;
+use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::bridge::{MultiGpuDispatchPlan, MultiGpuDispatcher, MultiGpuWorkloadRequest};
@@ -765,15 +767,50 @@ fn parse_adapter_vulkan_api_version(info: &wgpu::AdapterInfo) -> Option<VulkanAp
     parse_vulkan_api_version_from_text(&info.driver_info)
         .or_else(|| parse_vulkan_api_version_from_text(&info.driver))
         .or_else(|| parse_vulkan_api_version_from_text(&info.name))
+        .or_else(|| probe_vulkaninfo_api_version(info))
 }
 
 fn parse_vulkan_api_version_from_text(text: &str) -> Option<VulkanApiVersion> {
     if text.is_empty() {
         return None;
     }
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
+    let lower = text.to_ascii_lowercase();
+    for key in ["vulkan", "api version", "apiversion"] {
+        let mut offset = 0usize;
+        while let Some(rel_idx) = lower[offset..].find(key) {
+            let abs_idx = offset + rel_idx;
+            let window_end = (abs_idx + key.len() + 32).min(text.len());
+            if let Some(parsed) = parse_vulkan_api_version_in_range(
+                text.as_bytes(),
+                abs_idx,
+                window_end,
+            ) {
+                return Some(parsed);
+            }
+            offset = abs_idx + key.len();
+        }
+    }
+    None
+}
+
+fn parse_vulkan_api_version_anywhere(text: &str) -> Option<VulkanApiVersion> {
+    if text.is_empty() {
+        return None;
+    }
+    parse_vulkan_api_version_in_range(text.as_bytes(), 0, text.len())
+}
+
+fn parse_vulkan_api_version_in_range(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Option<VulkanApiVersion> {
+    if start >= end || start >= bytes.len() {
+        return None;
+    }
+    let end = end.min(bytes.len());
+    let mut i = start;
+    while i < end {
         if !bytes[i].is_ascii_digit() {
             i += 1;
             continue;
@@ -786,12 +823,12 @@ fn parse_vulkan_api_version_from_text(text: &str) -> Option<VulkanApiVersion> {
                 continue;
             }
         };
-        if next_i >= bytes.len() || bytes[next_i] != b'.' {
+        if next_i >= end || bytes[next_i] != b'.' {
             i += 1;
             continue;
         }
         let minor_start = next_i + 1;
-        if minor_start >= bytes.len() || !bytes[minor_start].is_ascii_digit() {
+        if minor_start >= end || !bytes[minor_start].is_ascii_digit() {
             i += 1;
             continue;
         }
@@ -803,8 +840,8 @@ fn parse_vulkan_api_version_from_text(text: &str) -> Option<VulkanApiVersion> {
             }
         };
 
-        // Vulkan API major/minor are small numbers in practice (1.x today).
-        if major <= 5 && minor <= 10 {
+        // Vulkan API major/minor should be >= 1.x in modern stacks.
+        if (1..=5).contains(&major) && minor <= 10 {
             return Some(VulkanApiVersion { major, minor });
         }
         i += 1;
@@ -828,6 +865,199 @@ fn parse_u32_at(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
     } else {
         Some((value, i))
     }
+}
+
+#[derive(Debug, Clone)]
+struct VulkanInfoApiVersionEntry {
+    normalized_name: String,
+    vendor: Option<u32>,
+    device: Option<u32>,
+    api_version: VulkanApiVersion,
+}
+
+fn probe_vulkaninfo_api_version(info: &wgpu::AdapterInfo) -> Option<VulkanApiVersion> {
+    static CACHE: OnceLock<Vec<VulkanInfoApiVersionEntry>> = OnceLock::new();
+    let entries = CACHE.get_or_init(load_vulkaninfo_api_version_entries);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let target_name = normalize_gpu_name(&info.name);
+    entries
+        .iter()
+        .find(|entry| {
+            entry.vendor == Some(info.vendor)
+                && entry.device == Some(info.device)
+                && !entry.normalized_name.is_empty()
+                && (target_name.contains(&entry.normalized_name)
+                    || entry.normalized_name.contains(&target_name))
+        })
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|entry| entry.vendor == Some(info.vendor) && entry.device == Some(info.device))
+        })
+        .or_else(|| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    !entry.normalized_name.is_empty()
+                        && (target_name.contains(&entry.normalized_name)
+                            || entry.normalized_name.contains(&target_name))
+                })
+                .max_by_key(|entry| entry.normalized_name.len())
+        })
+        .map(|entry| entry.api_version)
+}
+
+fn load_vulkaninfo_api_version_entries() -> Vec<VulkanInfoApiVersionEntry> {
+    let output = match Command::new("vulkaninfo").arg("--summary").output() {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_vulkaninfo_api_version_entries(&text)
+}
+
+fn parse_vulkaninfo_api_version_entries(text: &str) -> Vec<VulkanInfoApiVersionEntry> {
+    let mut entries = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_vendor: Option<u32> = None;
+    let mut current_device: Option<u32> = None;
+    let mut current_api: Option<VulkanApiVersion> = None;
+
+    let flush = |entries: &mut Vec<VulkanInfoApiVersionEntry>,
+                 current_name: &mut Option<String>,
+                 current_vendor: &mut Option<u32>,
+                 current_device: &mut Option<u32>,
+                 current_api: &mut Option<VulkanApiVersion>| {
+        let Some(api_version) = current_api.take() else {
+            *current_name = None;
+            *current_vendor = None;
+            *current_device = None;
+            return;
+        };
+        let normalized_name = current_name
+            .take()
+            .map(|name| normalize_gpu_name(&name))
+            .unwrap_or_default();
+        entries.push(VulkanInfoApiVersionEntry {
+            normalized_name,
+            vendor: current_vendor.take(),
+            device: current_device.take(),
+            api_version,
+        });
+    };
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("GPU") && line.ends_with(':') {
+            flush(
+                &mut entries,
+                &mut current_name,
+                &mut current_vendor,
+                &mut current_device,
+                &mut current_api,
+            );
+            continue;
+        }
+        if let Some(name) = parse_vulkaninfo_gpu_name_line(line) {
+            current_name = Some(name);
+            continue;
+        }
+        let Some((key, value)) = split_vulkaninfo_kv_line(line) else {
+            continue;
+        };
+        let key = normalize_gpu_name(key).replace(' ', "");
+        if key == "devicename" {
+            current_name = Some(value.trim().to_owned());
+            continue;
+        }
+        if key == "vendorid" {
+            current_vendor = parse_first_u32_hex_or_decimal(value);
+            continue;
+        }
+        if key == "deviceid" {
+            current_device = parse_first_u32_hex_or_decimal(value);
+            continue;
+        }
+        if key == "apiversion" {
+            current_api = parse_vulkan_api_version_anywhere(value);
+        }
+    }
+
+    flush(
+        &mut entries,
+        &mut current_name,
+        &mut current_vendor,
+        &mut current_device,
+        &mut current_api,
+    );
+    entries
+}
+
+fn normalize_gpu_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_space = false;
+    for ch in name.chars().flat_map(|c| c.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_owned()
+}
+
+fn parse_vulkaninfo_gpu_name_line(line: &str) -> Option<String> {
+    if line.to_ascii_lowercase().starts_with("gpu id") {
+        let open = line.find('(')?;
+        let close = line.rfind(')')?;
+        if close > open + 1 {
+            return Some(line[open + 1..close].trim().to_owned());
+        }
+    }
+    None
+}
+
+fn split_vulkaninfo_kv_line(line: &str) -> Option<(&str, &str)> {
+    line.split_once('=').or_else(|| line.split_once(':'))
+}
+
+fn parse_first_u32_hex_or_decimal(text: &str) -> Option<u32> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(idx) = lower.find("0x") {
+        let mut end = idx + 2;
+        let bytes = lower.as_bytes();
+        while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+            end += 1;
+        }
+        if end > idx + 2 {
+            return u32::from_str_radix(&lower[idx + 2..end], 16).ok();
+        }
+    }
+    let mut start = None;
+    for (i, ch) in text.char_indices() {
+        if ch.is_ascii_digit() {
+            start = Some(i);
+            break;
+        }
+    }
+    let start = start?;
+    let rest = &text[start..];
+    let end = rest
+        .char_indices()
+        .find_map(|(i, ch)| (!ch.is_ascii_digit()).then_some(i))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<u32>().ok()
 }
 
 #[cfg(test)]
@@ -855,6 +1085,40 @@ mod tests {
     fn parses_vulkan_major_minor_from_driver_info() {
         let parsed = parse_vulkan_api_version_from_text("Mesa RADV Vulkan 1.3.302");
         assert_eq!(parsed, Some(VulkanApiVersion { major: 1, minor: 3 }));
+    }
+
+    #[test]
+    fn rejects_non_vulkan_driver_like_versions() {
+        let parsed = parse_vulkan_api_version_from_text("NVIDIA 590.48.01");
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn parses_vulkaninfo_summary_api_versions() {
+        let text = r#"
+GPU0:
+    apiVersion         = 1.4.325
+    vendorID           = 0x10de
+    deviceID           = 0x2d04
+    deviceName         = NVIDIA GeForce RTX 5060 Ti
+GPU1:
+    apiVersion         = 1.4.335
+    vendorID           = 0x1002
+    deviceID           = 0x164e
+    deviceName         = AMD Ryzen 9 7900 12-Core Processor (RADV RAPHAEL_MENDOCINO)
+"#;
+        let entries = parse_vulkaninfo_api_version_entries(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].api_version,
+            VulkanApiVersion { major: 1, minor: 4 }
+        );
+        assert_eq!(entries[0].vendor, Some(0x10de));
+        assert_eq!(entries[0].device, Some(0x2d04));
+        assert_eq!(
+            entries[1].api_version,
+            VulkanApiVersion { major: 1, minor: 4 }
+        );
     }
 
     #[test]

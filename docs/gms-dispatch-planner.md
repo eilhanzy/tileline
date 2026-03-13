@@ -64,6 +64,8 @@ the secondary helper lane:
 - A mismatch (`1.3` + `1.2`) hard-stops explicit multi-GPU startup.
 - If a Vulkan version cannot be parsed for either adapter, explicit multi-GPU startup is refused
   to avoid undefined cross-adapter behavior.
+- Version extraction first checks adapter text fields for Vulkan/API-version markers, then falls
+  back to `vulkaninfo --summary` device rows (`apiVersion`) when needed.
 
 Policy behavior:
 
