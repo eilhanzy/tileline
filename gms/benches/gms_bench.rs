@@ -10,9 +10,13 @@ fn make_adapter_info(name: &str, device_type: DeviceType) -> AdapterInfo {
         vendor: 0,
         device: 0,
         device_type,
+        device_pci_bus_id: String::new(),
         driver: String::new(),
         driver_info: String::new(),
         backend: Backend::Metal,
+        subgroup_min_size: 4,
+        subgroup_max_size: 32,
+        transient_saves_memory: false,
     }
 }
 
