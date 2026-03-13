@@ -10,6 +10,7 @@
 pub mod bridge;
 pub mod fallback;
 pub mod hardware;
+pub mod render_benchmark;
 pub mod runtime;
 pub mod tile_planner;
 pub mod tuning;
