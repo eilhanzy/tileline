@@ -460,15 +460,24 @@ impl BenchmarkRuntime {
         } else {
             String::new()
         };
+        let vsync_suffix = if self.renderer.aggressive_no_vsync_fallback {
+            format!(
+                " | AggNoVsync x{}",
+                self.renderer.forced_present_interval.max(1)
+            )
+        } else {
+            String::new()
+        };
         let title = if show_throughput {
             format!(
-                "MGS Render Benchmark [{}] | WFPS {:.1} | WAvg {:.1} | FPS {:.1} | Frames {}{} | {} {} {} | Close/Esc to finish",
+                "MGS Render Benchmark [{}] | WFPS {:.1} | WAvg {:.1} | FPS {:.1} | Frames {}{}{} | {} {} {} | Close/Esc to finish",
                 phase,
                 instant_wfps,
                 avg_wfps,
                 instant_fps,
                 self.stats.total_frames,
                 burst_suffix,
+                vsync_suffix,
                 self.renderer.profile.family.short_label(),
                 self.renderer.profile.gfx_backend.label(),
                 self.renderer.last_fallback.label(),
@@ -525,6 +534,8 @@ impl BenchmarkRuntime {
             sample_duration: self.options.sample_duration,
             pacing_mode: self.pacing_mode,
             adaptive_burst_cap,
+            aggressive_no_vsync_fallback: self.renderer.aggressive_no_vsync_fallback,
+            forced_present_interval: self.renderer.forced_present_interval,
         }
     }
 
@@ -614,7 +625,13 @@ struct Renderer {
     throughput_target_views: Vec<wgpu::TextureView>,
     throughput_target_signature: Option<ThroughputTargetSignature>,
     throughput_target_cursor: usize,
+    no_vsync_main_target: Option<wgpu::Texture>,
+    no_vsync_main_view: Option<wgpu::TextureView>,
+    no_vsync_main_signature: Option<ThroughputTargetSignature>,
+    total_frames_submitted: u64,
     presented_frames: u64,
+    aggressive_no_vsync_fallback: bool,
+    forced_present_interval: u32,
     last_fallback: FallbackLevel,
     fallback_counts: [u64; 4],
     last_tile_count: u32,
@@ -676,12 +693,27 @@ impl Renderer {
             prefer_stable_present,
             options.vsync_override,
         );
+        let aggressive_no_vsync_fallback = matches!(options.vsync_override, VsyncOverride::Off)
+            && !present_mode_allows_uncapped(config.present_mode);
+        let forced_present_interval = if aggressive_no_vsync_fallback {
+            if uma_shared_memory {
+                4
+            } else {
+                3
+            }
+        } else {
+            1
+        };
         if matches!(options.vsync_override, VsyncOverride::Off)
             && !present_mode_allows_uncapped(config.present_mode)
         {
             eprintln!(
                 "MGS note: --vsync off requested but selected present mode is {:?}. Driver/compositor may still cap present FPS; use WFPS for throughput.",
                 config.present_mode
+            );
+            eprintln!(
+                "MGS note: aggressive no-vsync fallback enabled (present every {} frame) to bypass compositor throttling.",
+                forced_present_interval
             );
         }
         config.alpha_mode = capabilities
@@ -721,7 +753,13 @@ impl Renderer {
             throughput_target_views: Vec::new(),
             throughput_target_signature: None,
             throughput_target_cursor: 0,
+            no_vsync_main_target: None,
+            no_vsync_main_view: None,
+            no_vsync_main_signature: None,
+            total_frames_submitted: 0,
             presented_frames: 0,
+            aggressive_no_vsync_fallback,
+            forced_present_interval,
             last_fallback: FallbackLevel::TbdrOptimized,
             fallback_counts: [0; 4],
             last_tile_count: 0,
@@ -742,7 +780,12 @@ impl Renderer {
             self.throughput_targets.clear();
             self.throughput_target_views.clear();
             self.throughput_target_signature = None;
+            self.no_vsync_main_target = None;
+            self.no_vsync_main_view = None;
+            self.no_vsync_main_signature = None;
             self.throughput_target_cursor = 0;
+            self.total_frames_submitted = 0;
+            self.presented_frames = 0;
             return;
         }
         self.size = size;
@@ -752,7 +795,11 @@ impl Renderer {
         self.throughput_targets.clear();
         self.throughput_target_views.clear();
         self.throughput_target_signature = None;
+        self.no_vsync_main_target = None;
+        self.no_vsync_main_view = None;
+        self.no_vsync_main_signature = None;
         self.throughput_target_cursor = 0;
+        self.total_frames_submitted = 0;
         self.presented_frames = 0;
         self.adaptive_burst.reset(self.throughput_target_burst);
     }
@@ -770,16 +817,24 @@ impl Renderer {
         }
         let frame_begin = Instant::now();
 
-        let frame = self
-            .surface
-            .get_current_texture()
-            .map_err(RenderOutcome::from)?;
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
         self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
         let clear_color = animated_clear_color(self.clear_phase);
+        let should_present = !self.aggressive_no_vsync_fallback
+            || self.total_frames_submitted % u64::from(self.forced_present_interval.max(1)) == 0;
+        let mut present_frame: Option<wgpu::SurfaceTexture> = None;
+        let main_view = if should_present {
+            let frame = self
+                .surface
+                .get_current_texture()
+                .map_err(RenderOutcome::from)?;
+            let view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            present_frame = Some(frame);
+            view
+        } else {
+            self.no_vsync_main_view()
+        };
 
         let hint = MpsWorkloadHint {
             transfer_size_kb: (((self.size.width as u64 * self.size.height as u64 * 4) / 1024)
@@ -805,7 +860,7 @@ impl Renderer {
 
         let mut planned_units = self.derive_work_units_from_plan(&plan);
         if planned_units > 1 {
-            planned_units = startup_ramp(planned_units, self.presented_frames);
+            planned_units = startup_ramp(planned_units, self.total_frames_submitted);
         }
         let work_units = self.adaptive_burst.resolve(planned_units);
 
@@ -848,12 +903,16 @@ impl Renderer {
             let _main_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("mgs-main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &main_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
+                        store: if should_present {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -864,9 +923,12 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        window.pre_present_notify();
-        frame.present();
-        self.presented_frames = self.presented_frames.saturating_add(1);
+        if let Some(frame) = present_frame {
+            window.pre_present_notify();
+            frame.present();
+            self.presented_frames = self.presented_frames.saturating_add(1);
+        }
+        self.total_frames_submitted = self.total_frames_submitted.saturating_add(1);
         let frame_ms = frame_begin.elapsed().as_secs_f64() * 1000.0;
         self.adaptive_burst
             .observe(frame_ms, work_units, planned_units, plan.memory_pressure);
@@ -931,6 +993,42 @@ impl Renderer {
         let idx = self.throughput_target_cursor % self.throughput_target_views.len();
         self.throughput_target_cursor = self.throughput_target_cursor.saturating_add(1);
         self.throughput_target_views[idx].clone()
+    }
+
+    fn no_vsync_main_view(&mut self) -> wgpu::TextureView {
+        let (target_width, target_height) = self.offscreen_target_dimensions();
+        let signature = ThroughputTargetSignature {
+            width: target_width,
+            height: target_height,
+            format: self.config.format,
+        };
+        let must_recreate = self.no_vsync_main_signature != Some(signature)
+            || self.no_vsync_main_target.is_none()
+            || self.no_vsync_main_view.is_none();
+        if must_recreate {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("mgs-no-vsync-main-target"),
+                size: wgpu::Extent3d {
+                    width: target_width,
+                    height: target_height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.no_vsync_main_target = Some(texture);
+            self.no_vsync_main_view = Some(view);
+            self.no_vsync_main_signature = Some(signature);
+        }
+        self.no_vsync_main_view
+            .as_ref()
+            .expect("no-vsync main target view must be initialized")
+            .clone()
     }
 
     fn derive_work_units_from_plan(&self, plan: &mgs::bridge::MgsBridgePlan) -> u32 {
@@ -1433,6 +1531,8 @@ struct BenchmarkSummary {
     sample_duration: Duration,
     pacing_mode: BenchmarkPacingMode,
     adaptive_burst_cap: u32,
+    aggressive_no_vsync_fallback: bool,
+    forced_present_interval: u32,
 }
 
 fn choose_pacing_mode(options: CliOptions) -> BenchmarkPacingMode {
@@ -1686,13 +1786,15 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.score.work_stability * 100.0
     );
     println!(
-        "Mode={:?} | VSync={:?} | Warmup={:.2}s | Sample={:.2}s | Pacing={:?} | BurstCap={}",
+        "Mode={:?} | VSync={:?} | Warmup={:.2}s | Sample={:.2}s | Pacing={:?} | BurstCap={} | AggNoVsync={} | PresentEvery={}",
         summary.mode_override,
         summary.vsync_override,
         summary.warmup_duration.as_secs_f64(),
         summary.sample_duration.as_secs_f64(),
         summary.pacing_mode,
-        summary.adaptive_burst_cap
+        summary.adaptive_burst_cap,
+        summary.aggressive_no_vsync_fallback,
+        summary.forced_present_interval
     );
 }
 
