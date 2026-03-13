@@ -611,12 +611,21 @@ struct Renderer {
     adaptive_burst: AdaptiveBurstController,
     uma_shared_memory: bool,
     throughput_targets: Vec<wgpu::Texture>,
+    throughput_target_views: Vec<wgpu::TextureView>,
+    throughput_target_signature: Option<ThroughputTargetSignature>,
     throughput_target_cursor: usize,
     presented_frames: u64,
     last_fallback: FallbackLevel,
     fallback_counts: [u64; 4],
     last_tile_count: u32,
     last_memory_pressure: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThroughputTargetSignature {
+    width: u32,
+    height: u32,
+    format: TextureFormat,
 }
 
 impl Renderer {
@@ -681,7 +690,8 @@ impl Renderer {
             .copied()
             .find(|mode| *mode == CompositeAlphaMode::Opaque)
             .unwrap_or(config.alpha_mode);
-        config.desired_maximum_frame_latency = if uma_shared_memory { 4 } else { 3 };
+        // Keep fewer queued frames on UMA to reduce shared-memory pressure.
+        config.desired_maximum_frame_latency = if uma_shared_memory { 2 } else { 3 };
         surface.configure(&device, &config);
 
         let throughput_target_burst = select_throughput_burst(&profile, options, uma_shared_memory);
@@ -708,6 +718,8 @@ impl Renderer {
             adaptive_burst,
             uma_shared_memory,
             throughput_targets: Vec::new(),
+            throughput_target_views: Vec::new(),
+            throughput_target_signature: None,
             throughput_target_cursor: 0,
             presented_frames: 0,
             last_fallback: FallbackLevel::TbdrOptimized,
@@ -728,6 +740,8 @@ impl Renderer {
         if size.width == 0 || size.height == 0 {
             self.size = size;
             self.throughput_targets.clear();
+            self.throughput_target_views.clear();
+            self.throughput_target_signature = None;
             self.throughput_target_cursor = 0;
             return;
         }
@@ -736,6 +750,8 @@ impl Renderer {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.throughput_targets.clear();
+        self.throughput_target_views.clear();
+        self.throughput_target_signature = None;
         self.throughput_target_cursor = 0;
         self.presented_frames = 0;
         self.adaptive_burst.reset(self.throughput_target_burst);
@@ -783,6 +799,9 @@ impl Renderer {
             self.fallback_counts[self.last_fallback as usize].saturating_add(1);
         self.last_tile_count = plan.tile_plan.tile_count;
         self.last_memory_pressure = plan.memory_pressure;
+        if self.uma_shared_memory && plan.memory_pressure {
+            self.trim_throughput_targets(2);
+        }
 
         let mut planned_units = self.derive_work_units_from_plan(&plan);
         if planned_units > 1 {
@@ -798,6 +817,11 @@ impl Renderer {
 
         if work_units > 1 {
             self.ensure_throughput_targets(work_units as usize);
+            let throughput_store = if self.uma_shared_memory {
+                wgpu::StoreOp::Discard
+            } else {
+                wgpu::StoreOp::Store
+            };
             for i in 0..(work_units - 1) {
                 let target_view = self.next_throughput_view();
                 let color = animated_clear_color(self.clear_phase + f64::from(i) * 0.071);
@@ -809,7 +833,7 @@ impl Renderer {
                         depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(color),
-                            store: wgpu::StoreOp::Store,
+                            store: throughput_store,
                         },
                     })],
                     depth_stencil_attachment: None,
@@ -853,35 +877,60 @@ impl Renderer {
     fn ensure_throughput_targets(&mut self, required_work_units: usize) {
         if self.size.width == 0 || self.size.height == 0 {
             self.throughput_targets.clear();
+            self.throughput_target_views.clear();
+            self.throughput_target_signature = None;
             return;
         }
-        let ring_len = (required_work_units.max(2)).min(12);
+
+        let (target_width, target_height) = self.offscreen_target_dimensions();
+        let signature = ThroughputTargetSignature {
+            width: target_width,
+            height: target_height,
+            format: self.config.format,
+        };
+        if self.throughput_target_signature != Some(signature) {
+            self.throughput_targets.clear();
+            self.throughput_target_views.clear();
+            self.throughput_target_signature = Some(signature);
+            self.throughput_target_cursor = 0;
+        }
+
+        let ring_len = self.desired_throughput_ring_len(required_work_units);
+        if self.uma_shared_memory && self.throughput_targets.len() > ring_len {
+            self.throughput_targets.truncate(ring_len);
+            self.throughput_target_views.truncate(ring_len);
+            if ring_len == 0 || self.throughput_target_cursor >= ring_len {
+                self.throughput_target_cursor = 0;
+            }
+        }
         if self.throughput_targets.len() >= ring_len {
             return;
         }
         while self.throughput_targets.len() < ring_len {
-            self.throughput_targets
-                .push(self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("mgs-throughput-target"),
-                    size: wgpu::Extent3d {
-                        width: self.size.width.max(1),
-                        height: self.size.height.max(1),
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: self.config.format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                }));
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("mgs-throughput-target"),
+                size: wgpu::Extent3d {
+                    width: target_width,
+                    height: target_height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.throughput_targets.push(texture);
+            self.throughput_target_views.push(view);
         }
     }
 
     fn next_throughput_view(&mut self) -> wgpu::TextureView {
-        let idx = self.throughput_target_cursor % self.throughput_targets.len();
+        let idx = self.throughput_target_cursor % self.throughput_target_views.len();
         self.throughput_target_cursor = self.throughput_target_cursor.saturating_add(1);
-        self.throughput_targets[idx].create_view(&wgpu::TextureViewDescriptor::default())
+        self.throughput_target_views[idx].clone()
     }
 
     fn derive_work_units_from_plan(&self, plan: &mgs::bridge::MgsBridgePlan) -> u32 {
@@ -898,6 +947,34 @@ impl Renderer {
 
     fn adaptive_burst_cap(&self) -> u32 {
         self.adaptive_burst.current_cap()
+    }
+
+    fn desired_throughput_ring_len(&self, required_work_units: usize) -> usize {
+        let max_ring_len = if self.uma_shared_memory { 6 } else { 12 };
+        required_work_units.max(2).min(max_ring_len)
+    }
+
+    fn offscreen_target_dimensions(&self) -> (u32, u32) {
+        if self.uma_shared_memory {
+            (
+                self.size.width.max(1).div_ceil(2),
+                self.size.height.max(1).div_ceil(2),
+            )
+        } else {
+            (self.size.width.max(1), self.size.height.max(1))
+        }
+    }
+
+    fn trim_throughput_targets(&mut self, keep_len: usize) {
+        let keep_len = keep_len.max(1);
+        if self.throughput_targets.len() <= keep_len {
+            return;
+        }
+        self.throughput_targets.truncate(keep_len);
+        self.throughput_target_views.truncate(keep_len);
+        if self.throughput_target_cursor >= keep_len {
+            self.throughput_target_cursor = 0;
+        }
     }
 }
 
