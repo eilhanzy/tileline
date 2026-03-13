@@ -378,7 +378,9 @@ impl BenchmarkRuntime {
         );
 
         if !matches!(options.multi_gpu_override, MultiGpuOverride::Off) {
-            eprintln!("MGS note: --multi-gpu is ignored (serial single-GPU fallback architecture).");
+            eprintln!(
+                "MGS note: --multi-gpu is ignored (serial single-GPU fallback architecture)."
+            );
         }
 
         let renderer = Renderer::new(Arc::clone(&window), options)?;
@@ -400,7 +402,7 @@ impl BenchmarkRuntime {
             sample_started_at,
             sample_finished: false,
         };
-        runtime.update_title(0.0, 0.0);
+        runtime.update_title(0.0, 0.0, 0.0, 0.0);
         Ok(runtime)
     }
 
@@ -423,23 +425,44 @@ impl BenchmarkRuntime {
         self.update_phase_after_frame(frame_end);
 
         if timing.should_update_title {
-            self.update_title(timing.instant_fps, timing.avg_fps);
+            self.update_title(
+                timing.instant_fps,
+                timing.avg_fps,
+                timing.instant_wfps,
+                timing.avg_wfps,
+            );
         }
         Ok(())
     }
 
-    fn update_title(&mut self, instant_fps: f64, avg_fps: f64) {
+    fn update_title(&mut self, instant_fps: f64, avg_fps: f64, instant_wfps: f64, avg_wfps: f64) {
         let phase = self.phase_label();
-        let title = format!(
-            "MGS Render Benchmark [{}] | FPS {:.1} | Avg {:.1} | Frames {} | {} {} {} | Close/Esc to finish",
-            phase,
-            instant_fps,
-            avg_fps,
-            self.stats.total_frames,
-            self.renderer.profile.family.short_label(),
-            self.renderer.profile.gfx_backend.label(),
-            self.renderer.last_fallback.label(),
-        );
+        let show_throughput = self.renderer.throughput_target_burst > 1
+            || matches!(self.pacing_mode, BenchmarkPacingMode::MaxThroughput);
+        let title = if show_throughput {
+            format!(
+                "MGS Render Benchmark [{}] | WFPS {:.1} | WAvg {:.1} | FPS {:.1} | Frames {} | {} {} {} | Close/Esc to finish",
+                phase,
+                instant_wfps,
+                avg_wfps,
+                instant_fps,
+                self.stats.total_frames,
+                self.renderer.profile.family.short_label(),
+                self.renderer.profile.gfx_backend.label(),
+                self.renderer.last_fallback.label(),
+            )
+        } else {
+            format!(
+                "MGS Render Benchmark [{}] | FPS {:.1} | Avg {:.1} | Frames {} | {} {} {} | Close/Esc to finish",
+                phase,
+                instant_fps,
+                avg_fps,
+                self.stats.total_frames,
+                self.renderer.profile.family.short_label(),
+                self.renderer.profile.gfx_backend.label(),
+                self.renderer.last_fallback.label(),
+            )
+        };
         self.window.set_title(&title);
     }
 
@@ -455,9 +478,12 @@ impl BenchmarkRuntime {
             present_mode: self.renderer.present_mode,
             resolution: self.renderer.size,
             total_frames: computed.total_frames,
+            total_work_units: computed.total_work_units,
             elapsed: computed.elapsed,
             avg_fps: computed.avg_fps,
             peak_fps: computed.peak_fps,
+            avg_work_fps: computed.avg_work_fps,
+            peak_work_fps: computed.peak_work_fps,
             avg_frame_ms: computed.avg_frame_ms,
             p95_frame_ms: computed.p95_frame_ms,
             p99_frame_ms: computed.p99_frame_ms,
@@ -585,13 +611,23 @@ impl Renderer {
         let prefer_stable_present = match options.vsync_override {
             VsyncOverride::On => true,
             VsyncOverride::Off => false,
-            VsyncOverride::Auto => matches!(adapter_info.device_type, wgpu::DeviceType::IntegratedGpu),
+            VsyncOverride::Auto => {
+                matches!(adapter_info.device_type, wgpu::DeviceType::IntegratedGpu)
+            }
         };
         config.present_mode = select_present_mode(
             &capabilities.present_modes,
             prefer_stable_present,
             options.vsync_override,
         );
+        if matches!(options.vsync_override, VsyncOverride::Off)
+            && !present_mode_allows_uncapped(config.present_mode)
+        {
+            eprintln!(
+                "MGS note: --vsync off requested but selected present mode is {:?}. Driver/compositor may still cap present FPS; use WFPS for throughput.",
+                config.present_mode
+            );
+        }
         config.alpha_mode = capabilities
             .alpha_modes
             .iter()
@@ -658,7 +694,9 @@ impl Renderer {
             .surface
             .get_current_texture()
             .map_err(RenderOutcome::from)?;
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
         let clear_color = animated_clear_color(self.clear_phase);
@@ -754,8 +792,8 @@ impl Renderer {
             return;
         }
         while self.throughput_targets.len() < ring_len {
-            self.throughput_targets.push(self.device.create_texture(
-                &wgpu::TextureDescriptor {
+            self.throughput_targets
+                .push(self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("mgs-throughput-target"),
                     size: wgpu::Extent3d {
                         width: self.size.width.max(1),
@@ -768,8 +806,7 @@ impl Renderer {
                     format: self.config.format,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
-                },
-            ));
+                }));
         }
     }
 
@@ -796,19 +833,26 @@ impl Renderer {
 struct FrameTiming {
     instant_fps: f64,
     avg_fps: f64,
+    instant_wfps: f64,
+    avg_wfps: f64,
     should_update_title: bool,
 }
 
 struct FrameStats {
     resolution: PhysicalSize<u32>,
     total_frames: u64,
+    total_work_units: u64,
     sample_start: Instant,
     frame_times_ms: Vec<f64>,
     work_times_ms: Vec<f64>,
+    work_fps_samples: Vec<f64>,
     last_frame_end: Option<Instant>,
     fps_window: [f64; 32],
     fps_window_len: usize,
     fps_window_cursor: usize,
+    wfps_window: [f64; 32],
+    wfps_window_len: usize,
+    wfps_window_cursor: usize,
     last_title_update: Instant,
     title_update_interval: Duration,
 }
@@ -819,13 +863,18 @@ impl FrameStats {
         Self {
             resolution,
             total_frames: 0,
+            total_work_units: 0,
             sample_start: now,
             frame_times_ms: Vec::with_capacity(64 * 1024),
             work_times_ms: Vec::with_capacity(64 * 1024),
+            work_fps_samples: Vec::with_capacity(64 * 1024),
             last_frame_end: None,
             fps_window: [0.0; 32],
             fps_window_len: 0,
             fps_window_cursor: 0,
+            wfps_window: [0.0; 32],
+            wfps_window_len: 0,
+            wfps_window_cursor: 0,
             last_title_update: now,
             title_update_interval,
         }
@@ -839,20 +888,31 @@ impl FrameStats {
         self.sample_start = now;
         self.frame_times_ms.clear();
         self.work_times_ms.clear();
+        self.work_fps_samples.clear();
         self.total_frames = 0;
+        self.total_work_units = 0;
         self.last_frame_end = None;
         self.fps_window = [0.0; 32];
         self.fps_window_len = 0;
         self.fps_window_cursor = 0;
+        self.wfps_window = [0.0; 32];
+        self.wfps_window_len = 0;
+        self.wfps_window_cursor = 0;
         self.last_title_update = now;
     }
 
-    fn record_frame(&mut self, frame_start: Instant, frame_end: Instant, work_units: u32) -> FrameTiming {
+    fn record_frame(
+        &mut self,
+        frame_start: Instant,
+        frame_end: Instant,
+        work_units: u32,
+    ) -> FrameTiming {
         self.total_frames = self.total_frames.saturating_add(1);
+        let work_units = work_units.max(1);
+        self.total_work_units = self.total_work_units.saturating_add(u64::from(work_units));
         let frame_ms = frame_end.duration_since(frame_start).as_secs_f64() * 1000.0;
         self.frame_times_ms.push(frame_ms);
-        self.work_times_ms
-            .push(frame_ms / f64::from(work_units.max(1)));
+        self.work_times_ms.push(frame_ms / f64::from(work_units));
 
         let instant_fps = if let Some(prev_end) = self.last_frame_end {
             let dt = frame_end.duration_since(prev_end).as_secs_f64();
@@ -864,11 +924,21 @@ impl FrameStats {
         } else {
             0.0
         };
+        let instant_wfps = instant_fps * f64::from(work_units);
         self.last_frame_end = Some(frame_end);
+
         self.fps_window[self.fps_window_cursor] = instant_fps;
         self.fps_window_cursor = (self.fps_window_cursor + 1) % self.fps_window.len();
         if self.fps_window_len < self.fps_window.len() {
             self.fps_window_len += 1;
+        }
+        self.wfps_window[self.wfps_window_cursor] = instant_wfps;
+        self.wfps_window_cursor = (self.wfps_window_cursor + 1) % self.wfps_window.len();
+        if self.wfps_window_len < self.wfps_window.len() {
+            self.wfps_window_len += 1;
+        }
+        if instant_wfps > 0.0 {
+            self.work_fps_samples.push(instant_wfps);
         }
 
         let avg_fps = if self.fps_window_len == 0 {
@@ -876,8 +946,15 @@ impl FrameStats {
         } else {
             self.fps_window[..self.fps_window_len].iter().sum::<f64>() / self.fps_window_len as f64
         };
+        let avg_wfps = if self.wfps_window_len == 0 {
+            0.0
+        } else {
+            self.wfps_window[..self.wfps_window_len].iter().sum::<f64>()
+                / self.wfps_window_len as f64
+        };
 
-        let should_update_title = frame_end.duration_since(self.last_title_update) >= self.title_update_interval;
+        let should_update_title =
+            frame_end.duration_since(self.last_title_update) >= self.title_update_interval;
         if should_update_title {
             self.last_title_update = frame_end;
         }
@@ -885,6 +962,8 @@ impl FrameStats {
         FrameTiming {
             instant_fps,
             avg_fps,
+            instant_wfps,
+            avg_wfps,
             should_update_title,
         }
     }
@@ -902,6 +981,11 @@ impl FrameStats {
         } else {
             self.total_frames as f64 / elapsed.as_secs_f64()
         };
+        let avg_work_fps = if elapsed.is_zero() {
+            0.0
+        } else {
+            self.total_work_units as f64 / elapsed.as_secs_f64()
+        };
         let peak_fps = self
             .frame_times_ms
             .iter()
@@ -909,6 +993,7 @@ impl FrameStats {
             .filter(|ms| *ms > 0.0)
             .map(|ms| 1000.0 / ms)
             .fold(0.0, f64::max);
+        let peak_work_fps = self.work_fps_samples.iter().copied().fold(0.0, f64::max);
         let avg_frame_ms = mean(&self.frame_times_ms);
         let p95_frame_ms = percentile(self.frame_times_ms.clone(), 0.95);
         let p99_frame_ms = percentile(self.frame_times_ms.clone(), 0.99);
@@ -925,9 +1010,12 @@ impl FrameStats {
 
         ComputedStats {
             total_frames: self.total_frames,
+            total_work_units: self.total_work_units,
             elapsed,
             avg_fps,
             peak_fps,
+            avg_work_fps,
+            peak_work_fps,
             avg_frame_ms,
             p95_frame_ms,
             p99_frame_ms,
@@ -943,9 +1031,12 @@ impl FrameStats {
 #[derive(Debug, Clone)]
 struct ComputedStats {
     total_frames: u64,
+    total_work_units: u64,
     elapsed: Duration,
     avg_fps: f64,
     peak_fps: f64,
+    avg_work_fps: f64,
+    peak_work_fps: f64,
     avg_frame_ms: f64,
     p95_frame_ms: f64,
     p99_frame_ms: f64,
@@ -973,9 +1064,12 @@ struct BenchmarkSummary {
     present_mode: PresentMode,
     resolution: PhysicalSize<u32>,
     total_frames: u64,
+    total_work_units: u64,
     elapsed: Duration,
     avg_fps: f64,
     peak_fps: f64,
+    avg_work_fps: f64,
+    peak_work_fps: f64,
     avg_frame_ms: f64,
     p95_frame_ms: f64,
     p99_frame_ms: f64,
@@ -1055,12 +1149,15 @@ fn select_present_mode(
         VsyncOverride::Off => {
             if has(PresentMode::Immediate) {
                 PresentMode::Immediate
-            } else if has(PresentMode::Mailbox) {
-                PresentMode::Mailbox
             } else if has(PresentMode::AutoNoVsync) {
                 PresentMode::AutoNoVsync
+            } else if has(PresentMode::Mailbox) {
+                PresentMode::Mailbox
             } else {
-                available.first().copied().unwrap_or(PresentMode::AutoNoVsync)
+                available
+                    .first()
+                    .copied()
+                    .unwrap_or(PresentMode::AutoNoVsync)
             }
         }
         VsyncOverride::Auto => {
@@ -1073,6 +1170,10 @@ fn select_present_mode(
             }
         }
     }
+}
+
+fn present_mode_allows_uncapped(mode: PresentMode) -> bool {
+    matches!(mode, PresentMode::Immediate | PresentMode::AutoNoVsync)
 }
 
 fn animated_clear_color(phase: f64) -> Color {
@@ -1108,7 +1209,9 @@ fn compute_render_score(stats: &ComputedStats, profile: &MobileGpuProfile) -> Re
         .clamp(2.0, 96.0)
         / 16.0;
 
-    let score_f = stats.avg_fps * resolution_factor * (0.60 * stability + 0.40 * work_stability)
+    let score_f = stats.avg_fps
+        * resolution_factor
+        * (0.60 * stability + 0.40 * work_stability)
         * profile_factor;
     let score = score_f.round().max(0.0) as u32;
 
@@ -1177,10 +1280,11 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.profile.tile_memory_kb
     );
     println!(
-        "Resolution: {}x{} | Frames: {} | Elapsed: {:.3}s",
+        "Resolution: {}x{} | Frames: {} | WorkUnits: {} | Elapsed: {:.3}s",
         summary.resolution.width,
         summary.resolution.height,
         summary.total_frames,
+        summary.total_work_units,
         summary.elapsed.as_secs_f64()
     );
     println!(
@@ -1188,8 +1292,15 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.avg_fps, summary.peak_fps, summary.low_1_percent_fps
     );
     println!(
+        "WFPS: avg={:.2} peak={:.2}",
+        summary.avg_work_fps, summary.peak_work_fps
+    );
+    println!(
         "Frame ms: avg={:.3} p95={:.3} p99={:.3} stddev={:.3}",
-        summary.avg_frame_ms, summary.p95_frame_ms, summary.p99_frame_ms, summary.frame_time_stddev_ms
+        summary.avg_frame_ms,
+        summary.p95_frame_ms,
+        summary.p99_frame_ms,
+        summary.frame_time_stddev_ms
     );
     println!(
         "Work ms/unit: avg={:.3} p95={:.3} p99={:.3}",
