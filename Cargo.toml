@@ -21,3 +21,4 @@ wasmer = "7.0.1"
 wgpu = "28.0.0"
 winit = "0.30.12"
 wit-bindgen = "0.53.1"
+criterion = { version = "0.5", features = ["html_reports"] }

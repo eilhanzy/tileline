@@ -7,3 +7,10 @@ edition.workspace = true
 # GMS'e sıfır bağımlılık. Mobil platform ve serial fallback odaklı.
 
 [dependencies]
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "mgs_bench"
+harness = false

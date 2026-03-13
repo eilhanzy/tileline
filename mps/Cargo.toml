@@ -3,9 +3,13 @@ name = "mps"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+mobile = ["dep:mgs"]
+
 [dependencies]
 crossbeam.workspace = true
 num_cpus.workspace = true
 raw-cpuid.workspace = true
 rayon.workspace = true
 wasmer.workspace = true
+mgs = { path = "../mgs", optional = true }

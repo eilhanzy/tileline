@@ -7,6 +7,8 @@
 pub mod balancer;
 pub mod scheduler;
 pub mod topology;
+#[cfg(feature = "mobile")]
+pub mod mobile_bridge;
 
 pub use balancer::{CorePreference, LoadBalancer, RoutingDecision, TaskPriority};
 pub use scheduler::{
@@ -14,3 +16,5 @@ pub use scheduler::{
     SchedulerMetrics, TaskEnvelope, TaskId, TaskPayload, WasmTask,
 };
 pub use topology::{CpuClass, CpuCore, CpuTopology};
+#[cfg(feature = "mobile")]
+pub use mobile_bridge::MpsMobileAdapter;
