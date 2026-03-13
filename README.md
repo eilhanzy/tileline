@@ -4,6 +4,7 @@ Tileline is a parallel-first game engine architecture prototype focused on expli
 
 - `MPS` (Multi Processing Scaler): CPU-side task scheduling and WASM execution
 - `GMS` (Graphics Multi Scaler): GPU discovery, scoring, and asymmetric multi-GPU planning
+- `MGS` (Mobile Graphics Scheduler): mobile TBDR-aware serial fallback scheduler and tile planning
 - `NPS` (Network Packet Scaler): bit-packed UDP protocol, reliability, and MPS-offloaded packet processing
 - `ParadoxPE`: fixed-step physics foundation with SoA storage, broadphase, solver, joints, sleep, snapshot/interpolation support, and script/WASM host ABI
 - `tl-core`: engine bridge layer that synchronizes MPS and GMS
@@ -20,6 +21,7 @@ This workspace is currently in engine-foundation phase. The main goals are:
 
 - `mps/`: CPU topology detection, priority balancer, lock-free scheduler, WASM dispatch (Wasmer)
 - `gms/`: GPU inventory/scoring, multi-GPU planner, adaptive UMA buffer control, benchmark tooling
+- `mgs/`: mobile GPU family detection, TBDR tile planner, serial fallback chain, and mobile render benchmark
 - `nps/`: low-level UDP packet protocol, bit packing, reliability, authority handoff, MPS-integrated packet manager
 - `paradoxpe/`: fixed-step physics core with packed handles, SoA body storage, parallel broadphase, narrowphase/solver passes, starter joints/sleep, snapshot/interpolation buffering, and `.tlscript`-friendly host ABI
 - `tl-core/`: `MpsGmsBridge`, portable multi-GPU sync abstractions, and `.tlscript` compiler/runtime metadata layers
@@ -104,6 +106,12 @@ Stable mode (recommended for Apple Silicon UMA tests):
 
 ```bash
 cargo run -p gms --example render_benchmark -- --mode stable --vsync on --warmup 2 --duration 10 --resolution 1920x1080
+```
+
+### Run MGS Render Benchmark
+
+```bash
+cargo run -p mgs --example render_benchmark -- --mode stable --vsync on --warmup 2 --duration 10 --resolution 1280x720
 ```
 
 ### Test Core Runtime Integration

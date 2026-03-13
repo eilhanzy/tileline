@@ -1964,6 +1964,9 @@ name = "mgs"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "pollster",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
