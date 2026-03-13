@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::model::packet_semantics;
 use crate::packet::{PacketChannel, PacketFlags, PayloadKind};
 
 /// NPS peer identifier.
@@ -35,19 +36,14 @@ pub struct SendPolicy {
 impl SendPolicy {
     /// Derive a policy from channel and payload kind.
     pub fn for_payload(channel: PacketChannel, kind: PayloadKind) -> Self {
-        match (channel, kind) {
-            (PacketChannel::Physics, _) | (PacketChannel::Input, _) => Self {
-                reliability: ReliabilityMode::UnreliableSequenced,
-                sequenced: true,
+        let semantics = packet_semantics(channel, kind);
+        Self {
+            reliability: if semantics.reliable {
+                ReliabilityMode::ReliableOrdered
+            } else {
+                ReliabilityMode::UnreliableSequenced
             },
-            (PacketChannel::Lifecycle, _) | (_, PayloadKind::LifecycleEvent) => Self {
-                reliability: ReliabilityMode::ReliableOrdered,
-                sequenced: false,
-            },
-            _ => Self {
-                reliability: ReliabilityMode::ReliableOrdered,
-                sequenced: false,
-            },
+            sequenced: semantics.sequenced,
         }
     }
 
@@ -61,6 +57,71 @@ impl SendPolicy {
             flags = flags.union(PacketFlags::SEQUENCED);
         }
         flags
+    }
+}
+
+/// Best-effort peer link telemetry derived from reliable ACK flow.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PeerLinkMetrics {
+    /// Smoothed RTT estimate in milliseconds.
+    pub smoothed_rtt_ms: Option<f32>,
+    /// RFC3550-style jitter-like EWMA of RTT deltas in milliseconds.
+    pub jitter_ms: f32,
+    /// First-send reliable packet count.
+    pub reliable_sent: u64,
+    /// Reliable packets observed as acknowledged.
+    pub reliable_acked: u64,
+    /// Reliable retransmit attempts emitted.
+    pub retransmissions: u64,
+}
+
+impl PeerLinkMetrics {
+    /// Coarse loss estimate derived from retransmit pressure.
+    pub fn loss_estimate_pct(&self) -> f32 {
+        let total_attempts = self.reliable_sent.saturating_add(self.retransmissions);
+        if total_attempts == 0 {
+            0.0
+        } else {
+            (self.retransmissions as f32 / total_attempts as f32) * 100.0
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct PeerLinkTelemetry {
+    smoothed_rtt_ms: Option<f32>,
+    last_rtt_sample_ms: Option<f32>,
+    jitter_ms: f32,
+    reliable_sent: u64,
+    reliable_acked: u64,
+    retransmissions: u64,
+}
+
+impl PeerLinkTelemetry {
+    fn observe_rtt_sample(&mut self, sample_ms: f32) {
+        if let Some(previous) = self.last_rtt_sample_ms {
+            let delta = (sample_ms - previous).abs();
+            self.jitter_ms = if self.jitter_ms == 0.0 {
+                delta
+            } else {
+                self.jitter_ms + (delta - self.jitter_ms) * 0.25
+            };
+        }
+        self.last_rtt_sample_ms = Some(sample_ms);
+        self.smoothed_rtt_ms = Some(match self.smoothed_rtt_ms {
+            Some(current) => current + (sample_ms - current) * 0.125,
+            None => sample_ms,
+        });
+    }
+
+    fn snapshot(&self) -> PeerLinkMetrics {
+        PeerLinkMetrics {
+            smoothed_rtt_ms: self.smoothed_rtt_ms,
+            jitter_ms: self.jitter_ms,
+            reliable_sent: self.reliable_sent,
+            reliable_acked: self.reliable_acked,
+            retransmissions: self.retransmissions,
+        }
     }
 }
 
@@ -169,6 +230,7 @@ pub struct PeerReliabilityState {
     recv_ack_window: AckWindow,
     inflight_reliable: VecDeque<ReliableInFlight>,
     retransmit_timeout: Duration,
+    telemetry: PeerLinkTelemetry,
 }
 
 impl PeerReliabilityState {
@@ -180,6 +242,7 @@ impl PeerReliabilityState {
             recv_ack_window: AckWindow::new(),
             inflight_reliable: VecDeque::new(),
             retransmit_timeout: Duration::from_millis(40),
+            telemetry: PeerLinkTelemetry::default(),
         }
     }
 
@@ -196,9 +259,15 @@ impl PeerReliabilityState {
     }
 
     /// Register a received packet sequence and process remote acks for local in-flight packets.
-    pub fn observe_inbound(&mut self, received_seq: u16, remote_ack: u16, remote_ack_bits: u32) {
+    pub fn observe_inbound(
+        &mut self,
+        received_seq: u16,
+        remote_ack: u16,
+        remote_ack_bits: u32,
+        now: Instant,
+    ) {
         self.recv_ack_window.observe(received_seq);
-        self.ack_reliable(remote_ack, remote_ack_bits);
+        self.ack_reliable(remote_ack, remote_ack_bits, now);
     }
 
     /// Track a newly-sent reliable datagram for retransmit/ack handling.
@@ -210,6 +279,7 @@ impl PeerReliabilityState {
         datagram: std::sync::Arc<[u8]>,
         now: Instant,
     ) {
+        self.telemetry.reliable_sent = self.telemetry.reliable_sent.saturating_add(1);
         self.inflight_reliable.push_back(ReliableInFlight {
             sequence,
             channel,
@@ -222,9 +292,21 @@ impl PeerReliabilityState {
     }
 
     /// Mark acknowledged reliable packets as complete.
-    pub fn ack_reliable(&mut self, remote_ack: u16, remote_ack_bits: u32) {
-        self.inflight_reliable
-            .retain(|p| !AckWindow::is_acked_by(p.sequence, remote_ack, remote_ack_bits));
+    pub fn ack_reliable(&mut self, remote_ack: u16, remote_ack_bits: u32, now: Instant) {
+        let mut retained = VecDeque::with_capacity(self.inflight_reliable.len());
+        for packet in self.inflight_reliable.drain(..) {
+            if AckWindow::is_acked_by(packet.sequence, remote_ack, remote_ack_bits) {
+                self.telemetry.reliable_acked = self.telemetry.reliable_acked.saturating_add(1);
+                let rtt_ms = now
+                    .saturating_duration_since(packet.first_sent_at)
+                    .as_secs_f32()
+                    * 1000.0;
+                self.telemetry.observe_rtt_sample(rtt_ms);
+            } else {
+                retained.push_back(packet);
+            }
+        }
+        self.inflight_reliable = retained;
     }
 
     /// Collect reliable packets due for retransmit without blocking.
@@ -234,6 +316,7 @@ impl PeerReliabilityState {
             if now.duration_since(packet.last_sent_at) >= self.retransmit_timeout {
                 packet.last_sent_at = now;
                 packet.transmit_count = packet.transmit_count.saturating_add(1);
+                self.telemetry.retransmissions = self.telemetry.retransmissions.saturating_add(1);
                 due.push(packet.clone());
             }
         }
@@ -243,6 +326,11 @@ impl PeerReliabilityState {
     /// Number of reliable packets waiting for ACK.
     pub fn inflight_reliable_len(&self) -> usize {
         self.inflight_reliable.len()
+    }
+
+    /// Snapshot best-effort link telemetry for this peer.
+    pub fn metrics(&self) -> PeerLinkMetrics {
+        self.telemetry.snapshot()
     }
 }
 
@@ -392,8 +480,30 @@ mod tests {
             now,
         );
         assert_eq!(peer.inflight_reliable_len(), 2);
-        peer.ack_reliable(12, 1 << 0); // ack 12 and 11
+        peer.ack_reliable(12, 1 << 0, now + Duration::from_millis(25)); // ack 12 and 11
         assert_eq!(peer.inflight_reliable_len(), 0);
+    }
+
+    #[test]
+    fn peer_metrics_track_rtt_and_loss_pressure() {
+        let now = Instant::now();
+        let mut peer = PeerReliabilityState::new(1);
+        peer.track_reliable(
+            7,
+            PacketChannel::Lifecycle,
+            PayloadKind::LifecycleEvent,
+            Arc::from([1u8, 2, 3].as_slice()),
+            now,
+        );
+        let due = peer.collect_retransmit_due(now + Duration::from_millis(50));
+        assert_eq!(due.len(), 1);
+        peer.ack_reliable(7, 0, now + Duration::from_millis(75));
+        let metrics = peer.metrics();
+        assert_eq!(metrics.reliable_sent, 1);
+        assert_eq!(metrics.reliable_acked, 1);
+        assert_eq!(metrics.retransmissions, 1);
+        assert!(metrics.smoothed_rtt_ms.unwrap_or_default() >= 75.0);
+        assert!(metrics.loss_estimate_pct() > 0.0);
     }
 
     #[test]

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gms::{
-    GmsRuntimeTuningProfile, GpuInventory, MultiGpuExecutor, MultiGpuExecutorConfig,
-    MultiGpuExecutorSummary, MultiGpuInitPolicy, MultiGpuWorkloadRequest,
+    safe_default_required_limits_for_adapter, GmsRuntimeTuningProfile, GpuInventory,
+    MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary, MultiGpuInitPolicy,
+    MultiGpuWorkloadRequest,
 };
 use wgpu::{Color, CompositeAlphaMode, PresentMode, SurfaceError, TextureFormat};
 use winit::application::ApplicationHandler;
@@ -558,6 +559,14 @@ impl BenchmarkRuntime {
             .adapter_profile
             .as_ref()
             .map(|profile| profile.compute_unit_source.short_label());
+        let compute_unit_probe_note = self
+            .adapter_profile
+            .as_ref()
+            .and_then(|profile| profile.compute_unit_probe_note.clone());
+        let arm_shader_core_count = self
+            .adapter_profile
+            .as_ref()
+            .and_then(|profile| profile.arm_shader_core_count);
 
         BenchmarkSummary {
             adapter_name,
@@ -567,6 +576,8 @@ impl BenchmarkRuntime {
             compute_unit_short_label,
             compute_unit_display_label,
             compute_unit_source,
+            compute_unit_probe_note,
+            arm_shader_core_count,
             resolution: self.renderer.size,
             present_mode: self.renderer.present_mode,
             total_frames: computed.total_frames,
@@ -720,9 +731,21 @@ impl Renderer {
 
         let adapter_info = adapter.get_info();
         let runtime_tuning = GmsRuntimeTuningProfile::from_adapter_info(&adapter_info);
+        let (required_limits, limit_clamp_report) =
+            safe_default_required_limits_for_adapter(&adapter);
+        if limit_clamp_report.any_clamped() {
+            eprintln!(
+                "GMS: clamped requested device limits to adapter support (1D={} 2D={} 3D={} layers={})",
+                required_limits.max_texture_dimension_1d,
+                required_limits.max_texture_dimension_2d,
+                required_limits.max_texture_dimension_3d,
+                required_limits.max_texture_array_layers,
+            );
+        }
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("gms-render-benchmark-device"),
+                required_limits,
                 ..Default::default()
             }))?;
 
@@ -867,10 +890,11 @@ impl Renderer {
     }
 
     fn effective_work_units_per_present(&self) -> u32 {
-        self.runtime_tuning.effective_throughput_work_units_per_present(
-            self.work_units_per_present(),
-            self.presented_frames,
-        )
+        self.runtime_tuning
+            .effective_throughput_work_units_per_present(
+                self.work_units_per_present(),
+                self.presented_frames,
+            )
     }
 
     fn current_throughput_target(&mut self) -> Option<&wgpu::Texture> {
@@ -1408,6 +1432,8 @@ struct BenchmarkSummary {
     compute_unit_short_label: Option<&'static str>,
     compute_unit_display_label: Option<&'static str>,
     compute_unit_source: Option<&'static str>,
+    compute_unit_probe_note: Option<String>,
+    arm_shader_core_count: Option<u32>,
     resolution: PhysicalSize<u32>,
     present_mode: PresentMode,
     total_frames: u64,
@@ -1455,6 +1481,12 @@ fn print_summary(summary: &BenchmarkSummary) {
             "Estimated {}: {} {} (source: {})",
             display_label, units, short_label, source
         );
+        if let Some(arm_shader_cores) = summary.arm_shader_core_count {
+            println!("ARM shader cores (aux, not cluster count): {arm_shader_cores}");
+        }
+        if let Some(note) = summary.compute_unit_probe_note.as_deref() {
+            println!("Compute-unit probe note: {note}");
+        }
     }
     println!(
         "Resolution: {}x{} | Present mode: {:?}",

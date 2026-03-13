@@ -140,6 +140,62 @@ impl Default for IrScheduleHint {
     }
 }
 
+/// Canonical parallel partition domain preserved in typed IR for runtime specialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrParallelDomain {
+    /// No validated or recognized domain was attached.
+    Unknown,
+    /// Dense physics-body domain (`ParadoxPE`, transforms/AABBs/velocities).
+    Bodies,
+    /// Particle simulation/update domain.
+    Particles,
+    /// Chunk/tile/world-partition domain.
+    Chunks,
+    /// Generic entity/component domain.
+    Entities,
+}
+
+impl Default for IrParallelDomain {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// Compact bitmask of recognized effect classes used by runtime heuristics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IrEffectMask(u32);
+
+impl IrEffectMask {
+    pub const NONE: Self = Self(0);
+    pub const STATE: Self = Self(1 << 0);
+    pub const TRANSFORM: Self = Self(1 << 1);
+    pub const FORCE: Self = Self(1 << 2);
+    pub const VELOCITY: Self = Self(1 << 3);
+    pub const POSITION: Self = Self(1 << 4);
+    pub const AABB: Self = Self(1 << 5);
+    pub const CONTACT: Self = Self(1 << 6);
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
 /// Deterministic merge/reduction strategy hint for parallel functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrReduceKind {
@@ -155,6 +211,8 @@ pub enum IrReduceKind {
 pub struct TypedIrExecutionMeta {
     /// Execution policy derived from script decorators or defaults.
     pub policy: IrExecutionPolicy,
+    /// Canonical partition domain preserved for runtime specialization.
+    pub domain: IrParallelDomain,
     /// Whether the function contract requests deterministic behavior across parallel partitions.
     pub deterministic: bool,
     /// MPS scheduling preference hint.
@@ -163,6 +221,10 @@ pub struct TypedIrExecutionMeta {
     pub chunk_hint: Option<u16>,
     /// Optional deterministic reduction kind for merged outputs.
     pub reduce: Option<IrReduceKind>,
+    /// Compact recognized read-effect mask for runtime heuristics.
+    pub read_effect_mask: IrEffectMask,
+    /// Compact recognized write-effect mask for runtime heuristics.
+    pub write_effect_mask: IrEffectMask,
     /// Number of declared read-effect domains in the parallel contract (for planner heuristics).
     pub read_effect_count: u16,
     /// Number of declared write-effect domains in the parallel contract (for planner heuristics).

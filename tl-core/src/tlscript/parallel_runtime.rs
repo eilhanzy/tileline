@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::typed_ir::{
-    IrExecutionPolicy, IrReduceKind, IrScheduleHint, TypedIrExecutionMeta, TypedIrFunction,
+    IrEffectMask, IrExecutionPolicy, IrParallelDomain, IrReduceKind, IrScheduleHint,
+    TypedIrExecutionMeta, TypedIrFunction,
 };
 
 /// Runtime dispatch mode selected for a script function invocation.
@@ -38,6 +39,8 @@ pub enum ParallelRuntimeFallbackReason {
     SingleChunkOnly,
     /// Reduction requested without deterministic contract (safety fallback).
     NonDeterministicReduction,
+    /// The `bodies` domain requested writes outside the currently supported velocity-only path.
+    UnsupportedBodyWriteSet,
 }
 
 /// Planner decision for one function invocation.
@@ -102,6 +105,7 @@ pub struct ParallelDispatchPlannerMetrics {
     pub fallback_workload_too_small: u64,
     pub fallback_single_chunk_only: u64,
     pub fallback_nondeterministic_reduction: u64,
+    pub fallback_unsupported_body_write_set: u64,
 }
 
 #[derive(Debug, Default)]
@@ -115,6 +119,7 @@ struct ParallelDispatchPlannerCounters {
     fallback_workload_too_small: AtomicU64,
     fallback_single_chunk_only: AtomicU64,
     fallback_nondeterministic_reduction: AtomicU64,
+    fallback_unsupported_body_write_set: AtomicU64,
 }
 
 impl ParallelDispatchPlannerCounters {
@@ -134,6 +139,9 @@ impl ParallelDispatchPlannerCounters {
             fallback_single_chunk_only: self.fallback_single_chunk_only.load(Ordering::Relaxed),
             fallback_nondeterministic_reduction: self
                 .fallback_nondeterministic_reduction
+                .load(Ordering::Relaxed),
+            fallback_unsupported_body_write_set: self
+                .fallback_unsupported_body_write_set
                 .load(Ordering::Relaxed),
         }
     }
@@ -166,6 +174,9 @@ impl ParallelDispatchPlannerCounters {
                 ParallelRuntimeFallbackReason::SingleChunkOnly => &self.fallback_single_chunk_only,
                 ParallelRuntimeFallbackReason::NonDeterministicReduction => {
                     &self.fallback_nondeterministic_reduction
+                }
+                ParallelRuntimeFallbackReason::UnsupportedBodyWriteSet => {
+                    &self.fallback_unsupported_body_write_set
                 }
             };
             counter.fetch_add(1, Ordering::Relaxed);
@@ -243,6 +254,13 @@ impl ParallelDispatchPlanner {
             );
         }
 
+        if matches!(exec.domain, IrParallelDomain::Bodies)
+            && !body_domain_write_set_is_supported(exec.write_effect_mask)
+        {
+            return self
+                .serial_decision(exec, ParallelRuntimeFallbackReason::UnsupportedBodyWriteSet);
+        }
+
         if workload_items == 0 {
             return self.serial_decision(exec, ParallelRuntimeFallbackReason::EmptyWorkload);
         }
@@ -250,11 +268,15 @@ impl ParallelDispatchPlanner {
             return self.serial_decision(exec, ParallelRuntimeFallbackReason::WorkloadTooSmall);
         }
 
+        let min_chunk_size = match exec.domain {
+            IrParallelDomain::Bodies => self.config.min_chunk_size.max(128),
+            _ => self.config.min_chunk_size,
+        };
         let chunk_size = usize::from(
             exec.chunk_hint
                 .unwrap_or(self.config.default_chunk_size as u16),
         )
-        .max(self.config.min_chunk_size)
+        .max(min_chunk_size)
         .max(1);
         let mut chunk_count = workload_items.div_ceil(chunk_size);
         if chunk_count <= 1 {
@@ -270,7 +292,7 @@ impl ParallelDispatchPlanner {
             chunk_size: Some(adjusted_chunk_size),
             chunk_count: Some(chunk_count),
             fallback_reason: None,
-            schedule_hint: exec.schedule_hint,
+            schedule_hint: effective_schedule_hint(exec),
             deterministic: exec.deterministic,
             reduce: exec.reduce,
         }
@@ -286,10 +308,44 @@ impl ParallelDispatchPlanner {
             chunk_size: None,
             chunk_count: None,
             fallback_reason: Some(reason),
-            schedule_hint: exec.schedule_hint,
+            schedule_hint: effective_schedule_hint(exec),
             deterministic: exec.deterministic,
             reduce: exec.reduce,
         }
+    }
+}
+
+fn body_domain_write_set_is_supported(write_mask: IrEffectMask) -> bool {
+    if write_mask.is_empty() {
+        return true;
+    }
+    write_mask.contains(IrEffectMask::VELOCITY)
+        && !write_mask.intersects(
+            IrEffectMask::STATE
+                .union(IrEffectMask::TRANSFORM)
+                .union(IrEffectMask::FORCE)
+                .union(IrEffectMask::POSITION)
+                .union(IrEffectMask::AABB)
+                .union(IrEffectMask::CONTACT),
+        )
+}
+
+fn effective_schedule_hint(exec: TypedIrExecutionMeta) -> IrScheduleHint {
+    match (exec.domain, exec.schedule_hint) {
+        (IrParallelDomain::Bodies, IrScheduleHint::Auto) => IrScheduleHint::Performance,
+        _ => exec.schedule_hint,
+    }
+}
+
+trait IrEffectMaskExt {
+    fn union(self, other: IrEffectMask) -> IrEffectMask;
+}
+
+impl IrEffectMaskExt for IrEffectMask {
+    fn union(self, other: IrEffectMask) -> IrEffectMask {
+        let mut out = self;
+        out.insert(other);
+        out
     }
 }
 
@@ -303,16 +359,20 @@ impl Default for ParallelDispatchPlanner {
 mod tests {
     use super::*;
     use crate::tlscript::{
-        IrExecutionPolicy, IrReduceKind, IrScheduleHint, TypedIrExecutionMeta, TypedIrFunctionMeta,
+        IrExecutionPolicy, IrParallelDomain, IrReduceKind, IrScheduleHint, TypedIrExecutionMeta,
+        TypedIrFunctionMeta,
     };
 
     fn meta(policy: IrExecutionPolicy) -> TypedIrExecutionMeta {
         TypedIrExecutionMeta {
             policy,
+            domain: IrParallelDomain::Unknown,
             deterministic: false,
             schedule_hint: IrScheduleHint::Auto,
             chunk_hint: Some(128),
             reduce: None,
+            read_effect_mask: IrEffectMask::STATE,
+            write_effect_mask: IrEffectMask::STATE,
             read_effect_count: 1,
             write_effect_count: 1,
         }
@@ -335,7 +395,9 @@ mod tests {
     #[test]
     fn planner_selects_parallel_for_valid_workload() {
         let planner = ParallelDispatchPlanner::default();
-        let d = planner.plan_from_meta(meta(IrExecutionPolicy::ParallelSafe), 2048);
+        let mut exec = meta(IrExecutionPolicy::ParallelSafe);
+        exec.write_effect_mask = IrEffectMask::VELOCITY;
+        let d = planner.plan_from_meta(exec, 2048);
         assert_eq!(d.mode, ParallelDispatchMode::ParallelChunked);
         assert!(d.chunk_count.unwrap() > 1);
         let m = planner.metrics();
@@ -360,6 +422,7 @@ mod tests {
     fn planner_rejects_nondeterministic_reduction() {
         let planner = ParallelDispatchPlanner::default();
         let mut e = meta(IrExecutionPolicy::ParallelSafe);
+        e.write_effect_mask = IrEffectMask::VELOCITY;
         e.reduce = Some(IrReduceKind::Sum);
         e.deterministic = false;
         let d = planner.plan_from_meta(e, 4096);
@@ -367,6 +430,31 @@ mod tests {
         assert_eq!(
             d.fallback_reason,
             Some(ParallelRuntimeFallbackReason::NonDeterministicReduction)
+        );
+    }
+
+    #[test]
+    fn planner_specializes_body_domain_to_performance_and_velocity_only_writes() {
+        let planner = ParallelDispatchPlanner::default();
+        let mut exec = meta(IrExecutionPolicy::ParallelSafe);
+        exec.domain = IrParallelDomain::Bodies;
+        exec.write_effect_mask = IrEffectMask::VELOCITY;
+        let d = planner.plan_from_meta(exec, 2048);
+        assert_eq!(d.mode, ParallelDispatchMode::ParallelChunked);
+        assert_eq!(d.schedule_hint, IrScheduleHint::Performance);
+    }
+
+    #[test]
+    fn planner_rejects_unsupported_body_domain_write_sets() {
+        let planner = ParallelDispatchPlanner::default();
+        let mut exec = meta(IrExecutionPolicy::ParallelSafe);
+        exec.domain = IrParallelDomain::Bodies;
+        exec.write_effect_mask = IrEffectMask::TRANSFORM;
+        let d = planner.plan_from_meta(exec, 2048);
+        assert_eq!(d.mode, ParallelDispatchMode::Serial);
+        assert_eq!(
+            d.fallback_reason,
+            Some(ParallelRuntimeFallbackReason::UnsupportedBodyWriteSet)
         );
     }
 

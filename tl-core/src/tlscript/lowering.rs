@@ -11,6 +11,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use paradoxpe::abi::{
+    HOST_CALLS_HANDLE_ACQUIRE, HOST_CALLS_HANDLE_RELEASE, HOST_CALL_CONTACT_COUNT,
+    HOST_CALL_STEP_WORLD,
+};
+
 use super::ast::*;
 use super::semantic::{FunctionSignature, SemanticReport, SemanticType};
 use super::token::Span;
@@ -45,19 +50,44 @@ impl Default for TypedIrLoweringConfig {
         Self {
             annotate_const_folding_candidates: true,
             annotate_simd_candidates: true,
-            external_function_signatures: Vec::new(),
-            handle_acquire_call_allowlist: vec![
-                "spawn_sprite".to_string(),
-                "spawn_body".to_string(),
-                "create_sprite".to_string(),
-                "create_body".to_string(),
-                "alloc_handle".to_string(),
+            external_function_signatures: vec![
+                LoweringExternalSignature {
+                    name: HOST_CALL_CONTACT_COUNT.to_string(),
+                    result: SemanticType::Int,
+                },
+                LoweringExternalSignature {
+                    name: HOST_CALL_STEP_WORLD.to_string(),
+                    result: SemanticType::Int,
+                },
             ],
-            handle_release_call_allowlist: vec![
-                "release_handle".to_string(),
-                "destroy_handle".to_string(),
-                "free_handle".to_string(),
-            ],
+            handle_acquire_call_allowlist: {
+                let mut names = vec![
+                    "spawn_sprite".to_string(),
+                    "create_sprite".to_string(),
+                    "alloc_handle".to_string(),
+                ];
+                names.extend(
+                    HOST_CALLS_HANDLE_ACQUIRE
+                        .iter()
+                        .map(|name| (*name).to_string()),
+                );
+                names
+            },
+            handle_release_call_allowlist: {
+                let mut names = vec![
+                    "release_handle".to_string(),
+                    "destroy_handle".to_string(),
+                    "free_handle".to_string(),
+                ];
+                names.extend(
+                    HOST_CALLS_HANDLE_RELEASE
+                        .iter()
+                        .map(|name| (*name).to_string()),
+                );
+                names.sort();
+                names.dedup();
+                names
+            },
         }
     }
 }

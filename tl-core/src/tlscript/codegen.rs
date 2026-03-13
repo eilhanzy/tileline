@@ -15,6 +15,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
+use paradoxpe::abi::{
+    HOST_CALL_APPLY_FORCE, HOST_CALL_CONTACT_COUNT, HOST_CALL_CREATE_BODY,
+    HOST_CALL_CREATE_COLLIDER, HOST_CALL_DESTROY_BODY, HOST_CALL_DESTROY_COLLIDER,
+    HOST_CALL_QUERY_CONTACTS, HOST_CALL_RELEASE_HANDLE, HOST_CALL_SET_VELOCITY,
+    HOST_CALL_SPAWN_BODY, HOST_CALL_SPAWN_COLLIDER, HOST_CALL_STEP_WORLD,
+};
+
 use super::ast::*;
 use super::semantic::{FunctionSignature, SemanticReport, SemanticType};
 use super::token::Span;
@@ -87,18 +94,116 @@ impl Default for WasmCodegenConfig {
                     result: Some(SemanticType::Handle),
                 },
                 HostImportSignature {
-                    script_name: "spawn_body".to_string(),
+                    script_name: HOST_CALL_SPAWN_BODY.to_string(),
                     import_module: "tileline".to_string(),
-                    import_name: "spawn_body".to_string(),
-                    params: Vec::new(),
+                    import_name: HOST_CALL_SPAWN_BODY.to_string(),
+                    params: vec![
+                        SemanticType::Int,
+                        SemanticType::Float,
+                        SemanticType::Float,
+                        SemanticType::Float,
+                    ],
                     result: Some(SemanticType::Handle),
                 },
                 HostImportSignature {
-                    script_name: "release_handle".to_string(),
+                    script_name: HOST_CALL_CREATE_BODY.to_string(),
                     import_module: "tileline".to_string(),
-                    import_name: "release_handle".to_string(),
+                    import_name: HOST_CALL_CREATE_BODY.to_string(),
+                    params: vec![
+                        SemanticType::Int,
+                        SemanticType::Float,
+                        SemanticType::Float,
+                        SemanticType::Float,
+                    ],
+                    result: Some(SemanticType::Handle),
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_SPAWN_COLLIDER.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_SPAWN_COLLIDER.to_string(),
+                    params: vec![
+                        SemanticType::Handle,
+                        SemanticType::Int,
+                        SemanticType::Float,
+                        SemanticType::Float,
+                    ],
+                    result: Some(SemanticType::Handle),
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_CREATE_COLLIDER.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_CREATE_COLLIDER.to_string(),
+                    params: vec![
+                        SemanticType::Handle,
+                        SemanticType::Int,
+                        SemanticType::Float,
+                        SemanticType::Float,
+                    ],
+                    result: Some(SemanticType::Handle),
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_QUERY_CONTACTS.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_QUERY_CONTACTS.to_string(),
+                    params: vec![SemanticType::Handle],
+                    result: Some(SemanticType::Handle),
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_RELEASE_HANDLE.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_RELEASE_HANDLE.to_string(),
                     params: vec![SemanticType::Handle],
                     result: None,
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_DESTROY_BODY.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_DESTROY_BODY.to_string(),
+                    params: vec![SemanticType::Handle],
+                    result: None,
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_DESTROY_COLLIDER.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_DESTROY_COLLIDER.to_string(),
+                    params: vec![SemanticType::Handle],
+                    result: None,
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_APPLY_FORCE.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_APPLY_FORCE.to_string(),
+                    params: vec![
+                        SemanticType::Handle,
+                        SemanticType::Float,
+                        SemanticType::Float,
+                    ],
+                    result: None,
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_SET_VELOCITY.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_SET_VELOCITY.to_string(),
+                    params: vec![
+                        SemanticType::Handle,
+                        SemanticType::Float,
+                        SemanticType::Float,
+                    ],
+                    result: None,
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_CONTACT_COUNT.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_CONTACT_COUNT.to_string(),
+                    params: vec![SemanticType::Handle],
+                    result: Some(SemanticType::Int),
+                },
+                HostImportSignature {
+                    script_name: HOST_CALL_STEP_WORLD.to_string(),
+                    import_module: "tileline".to_string(),
+                    import_name: HOST_CALL_STEP_WORLD.to_string(),
+                    params: vec![SemanticType::Float],
+                    result: Some(SemanticType::Int),
                 },
             ],
             emit_metadata_section: true,
@@ -1951,7 +2056,14 @@ fn align4(v: u32) -> u32 {
 
 #[inline]
 fn is_handle_release_name(name: &str) -> bool {
-    matches!(name, "release_handle" | "destroy_handle" | "free_handle")
+    matches!(
+        name,
+        "release_handle"
+            | "destroy_handle"
+            | "free_handle"
+            | HOST_CALL_DESTROY_BODY
+            | HOST_CALL_DESTROY_COLLIDER
+    )
 }
 
 #[cfg(test)]

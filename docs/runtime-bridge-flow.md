@@ -8,6 +8,7 @@ stack into a `wgpu` render loop.
 - `tl-core/src/core/bridge.rs` (`MpsGmsBridge`)
 - `tl-core/src/graphics/multigpu/sync.rs` (`MultiGpuFrameSynchronizer`)
 - `runtime/src/frame_loop.rs` (`FrameLoopRuntime`)
+- `runtime/src/network_transport.rs` (`NetworkTransportRuntime`)
 - `runtime/src/wgpu_render_loop.rs` (`WgpuRenderLoopCoordinator`)
 - `runtime/src/tlscript_parallel.rs` (`TlscriptParallelRuntimeCoordinator`)
 
@@ -42,3 +43,17 @@ stack into a `wgpu` render loop.
 - `runtime`: actual frame-loop glue to real `wgpu::Queue::submit` and `present`
 
 This keeps the engine runtime path reusable and avoids benchmark-only logic leaking into the core.
+
+## NPS Runtime Path
+
+Networking follows the same rule: runtime-owned glue stays in `src/`, not examples.
+
+`NetworkTransportRuntime` currently provides:
+
+- explicit peer/address mapping for UDP
+- non-blocking socket pumping with `try_recv_from` / `try_send_to`
+- NPS manager encode/decode integration
+- runtime-owned send queue for encoded and retransmit datagrams
+- ParadoxPE snapshot cadence emission
+
+This gives NPS a canonical runtime entry point parallel to the existing MPS/GMS coordinators.

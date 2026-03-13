@@ -1,0 +1,7 @@
+# Canonical body-domain parallel contract for ParadoxPE + MPS routing.
+@export
+@parallel(domain="bodies", read="transform,force,aabb", write="velocity", chunk=128, schedule="auto")
+@deterministic
+def solve_bodies(dt: float):
+    let inv_dt: float = 1.0 / dt
+    let damping: float = inv_dt * 0.25

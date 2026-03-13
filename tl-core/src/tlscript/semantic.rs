@@ -9,6 +9,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use paradoxpe::abi::{
+    HOST_CALLS_ALLOWLIST, HOST_CALLS_HANDLE_ACQUIRE, HOST_CALLS_HANDLE_RELEASE,
+    HOST_CALL_CONTACT_COUNT, HOST_CALL_STEP_WORLD,
+};
+
 use super::ast::*;
 use super::token::Span;
 
@@ -139,6 +144,8 @@ pub struct SemanticConfig {
     pub safety: SemanticSafetyPolicy,
     /// Additional allowlisted external calls permitted under WASM sandboxing.
     pub external_call_allowlist: Vec<String>,
+    /// Static return-type hints for allowlisted external calls.
+    pub external_call_return_hints: Vec<ExternalCallReturnHint>,
     /// Intrinsics/functions that allocate or return engine handles.
     pub handle_acquire_call_allowlist: Vec<String>,
     /// Intrinsics/functions that release engine handles.
@@ -151,22 +158,60 @@ impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
             safety: SemanticSafetyPolicy::default(),
-            external_call_allowlist: Vec::new(),
-            handle_acquire_call_allowlist: vec![
-                "spawn_sprite".to_string(),
-                "spawn_body".to_string(),
-                "create_sprite".to_string(),
-                "create_body".to_string(),
-                "alloc_handle".to_string(),
+            external_call_allowlist: HOST_CALLS_ALLOWLIST
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            external_call_return_hints: vec![
+                ExternalCallReturnHint {
+                    name: HOST_CALL_CONTACT_COUNT.to_string(),
+                    result: SemanticType::Int,
+                },
+                ExternalCallReturnHint {
+                    name: HOST_CALL_STEP_WORLD.to_string(),
+                    result: SemanticType::Int,
+                },
             ],
-            handle_release_call_allowlist: vec![
-                "release_handle".to_string(),
-                "destroy_handle".to_string(),
-                "free_handle".to_string(),
-            ],
+            handle_acquire_call_allowlist: {
+                let mut names = vec![
+                    "spawn_sprite".to_string(),
+                    "create_sprite".to_string(),
+                    "alloc_handle".to_string(),
+                ];
+                names.extend(
+                    HOST_CALLS_HANDLE_ACQUIRE
+                        .iter()
+                        .map(|name| (*name).to_string()),
+                );
+                names
+            },
+            handle_release_call_allowlist: {
+                let mut names = vec![
+                    "release_handle".to_string(),
+                    "destroy_handle".to_string(),
+                    "free_handle".to_string(),
+                ];
+                names.extend(
+                    HOST_CALLS_HANDLE_RELEASE
+                        .iter()
+                        .map(|name| (*name).to_string()),
+                );
+                names.sort();
+                names.dedup();
+                names
+            },
             export_abi: ExportAbiPolicy::default(),
         }
     }
+}
+
+/// Static return-type hint for an external call that is not declared inside the script module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalCallReturnHint {
+    /// Script-visible function name.
+    pub name: String,
+    /// Semantic return type used during call inference.
+    pub result: SemanticType,
 }
 
 /// Resolved function signature used during call validation.
@@ -331,6 +376,7 @@ impl std::error::Error for SemanticError {}
 pub struct SemanticAnalyzer {
     config: SemanticConfig,
     allowlisted_calls: HashSet<String>,
+    external_return_hints: HashMap<String, SemanticType>,
     handle_acquire_calls: HashSet<String>,
     handle_release_calls: HashSet<String>,
 }
@@ -339,6 +385,11 @@ impl SemanticAnalyzer {
     /// Construct a semantic analyzer with a config.
     pub fn new(config: SemanticConfig) -> Self {
         let allowlisted_calls = config.external_call_allowlist.iter().cloned().collect();
+        let external_return_hints = config
+            .external_call_return_hints
+            .iter()
+            .map(|hint| (hint.name.clone(), hint.result))
+            .collect();
         let handle_acquire_calls = config
             .handle_acquire_call_allowlist
             .iter()
@@ -352,6 +403,7 @@ impl SemanticAnalyzer {
         Self {
             config,
             allowlisted_calls,
+            external_return_hints,
             handle_acquire_calls,
             handle_release_calls,
         }
@@ -841,6 +893,10 @@ impl SemanticAnalyzer {
 
         if self.is_handle_acquire_call(name) {
             return Ok(SemanticType::Handle);
+        }
+
+        if let Some(result) = self.external_return_hints.get(*name).copied() {
+            return Ok(result);
         }
 
         if self.config.safety.wasm_sandbox.forbid_unknown_calls

@@ -53,16 +53,18 @@ pub use parallel_runtime::{
 };
 pub use parser::{ParseError, ParseErrorKind, Parser};
 pub use semantic::{
-    BoundsCheckEnforcement, BoundsCheckPolicy, ExportAbiPolicy, FunctionSemanticSummary,
-    FunctionSignature, OwnershipLifetimePolicy, PointerPolicy, SemanticAnalyzer, SemanticConfig,
-    SemanticError, SemanticErrorKind, SemanticOutcome, SemanticReport, SemanticSafetyPolicy,
-    SemanticSafetySummary, SemanticType, SemanticWarning, SemanticWarningKind, WasmSandboxPolicy,
+    BoundsCheckEnforcement, BoundsCheckPolicy, ExportAbiPolicy, ExternalCallReturnHint,
+    FunctionSemanticSummary, FunctionSignature, OwnershipLifetimePolicy, PointerPolicy,
+    SemanticAnalyzer, SemanticConfig, SemanticError, SemanticErrorKind, SemanticOutcome,
+    SemanticReport, SemanticSafetyPolicy, SemanticSafetySummary, SemanticType, SemanticWarning,
+    SemanticWarningKind, WasmSandboxPolicy,
 };
 pub use token::{Span, Token, TokenKind};
 pub use typed_ir::{
-    IrBlockId, IrBlockKind, IrCallee, IrConstValue, IrExecutionPolicy, IrExternalCallFlavor,
-    IrFunctionId, IrInstKind, IrInstMeta, IrLocalId, IrLocalKind, IrReduceKind, IrScheduleHint,
-    IrSimdAnnotation, IrTempId, IrTerminator, IrValue, TypedIrArenaLayout, TypedIrArenaStats,
-    TypedIrBlock, TypedIrExecutionMeta, TypedIrFunction, TypedIrFunctionMeta, TypedIrInst,
-    TypedIrLocal, TypedIrModule, TypedIrModuleMeta, TypedIrOptimizationHooks, TypedIrTemp,
+    IrBlockId, IrBlockKind, IrCallee, IrConstValue, IrEffectMask, IrExecutionPolicy,
+    IrExternalCallFlavor, IrFunctionId, IrInstKind, IrInstMeta, IrLocalId, IrLocalKind,
+    IrParallelDomain, IrReduceKind, IrScheduleHint, IrSimdAnnotation, IrTempId, IrTerminator,
+    IrValue, TypedIrArenaLayout, TypedIrArenaStats, TypedIrBlock, TypedIrExecutionMeta,
+    TypedIrFunction, TypedIrFunctionMeta, TypedIrInst, TypedIrLocal, TypedIrModule,
+    TypedIrModuleMeta, TypedIrOptimizationHooks, TypedIrTemp,
 };

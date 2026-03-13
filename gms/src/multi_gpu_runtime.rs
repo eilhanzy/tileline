@@ -12,7 +12,9 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::bridge::{MultiGpuDispatchPlan, MultiGpuDispatcher, MultiGpuWorkloadRequest};
-use crate::hardware::{GpuAdapterProfile, GpuInventory, MemoryTopology};
+use crate::hardware::{
+    safe_default_required_limits_for_adapter, GpuAdapterProfile, GpuInventory, MemoryTopology,
+};
 use crate::SharedTransferKind;
 use wgpu::{Color, TextureFormat};
 
@@ -73,12 +75,12 @@ pub struct MultiGpuExecutorSummary {
     pub integrated_ring_segments: u32,
 }
 
-/// Secondary helper-lane submission result compatible with bridge tracking paths.
+/// Result of one secondary helper-lane frame submission.
 #[derive(Debug, Clone)]
 pub struct MultiGpuFrameSubmitResult {
-    /// Number of synthetic helper work units submitted for this frame.
+    /// Number of synthetic secondary work units submitted this present interval.
     pub work_units: u32,
-    /// Submission index emitted by the secondary queue (if any work was submitted).
+    /// Submission index returned by `wgpu::Queue::submit` for sync registration.
     pub submission_index: Option<wgpu::SubmissionIndex>,
 }
 
@@ -214,9 +216,11 @@ impl MultiGpuExecutor {
                 ))) as Box<dyn Error>
             })?;
 
-        // `wgpu` 28 can reject `DeviceDescriptor::default()` on some adapters due to limit
-        // negotiation quirks. Request the adapter's advertised limits explicitly.
-        let secondary_required_limits = secondary_adapter.limits();
+        // Some mobile/embedded stacks (including Panthor-class ARM drivers) can reject the
+        // default requested texture limits (notably `max_texture_dimension_3d = 2048`) even when
+        // the adapter is otherwise usable. Use a conservative default profile clamped to support.
+        let (secondary_required_limits, _secondary_limit_clamp_report) =
+            safe_default_required_limits_for_adapter(&secondary_adapter);
         let (secondary_device, secondary_queue) =
             pollster::block_on(secondary_adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("gms-multi-gpu-secondary-device"),
@@ -317,7 +321,7 @@ impl MultiGpuExecutor {
         self.submit_frame_recording_submission().work_units
     }
 
-    /// Submit a synthetic helper frame and return both work count and submission index.
+    /// Submit a synthetic secondary workload frame and return work units + submission index.
     pub fn submit_frame_recording_submission(&mut self) -> MultiGpuFrameSubmitResult {
         if self.frame_width == 0 || self.frame_height == 0 {
             return MultiGpuFrameSubmitResult {
@@ -387,16 +391,6 @@ impl MultiGpuExecutor {
         self.secondary_work_units_per_present
     }
 
-    /// Borrow the secondary helper device used by the executor.
-    pub fn secondary_device(&self) -> &wgpu::Device {
-        &self.secondary_device
-    }
-
-    /// Borrow the selected secondary GPU profile.
-    pub fn secondary_profile(&self) -> &GpuAdapterProfile {
-        &self.secondary_profile
-    }
-
     /// Access the planner result used by the runtime.
     pub fn plan(&self) -> &MultiGpuDispatchPlan {
         &self.plan
@@ -448,6 +442,16 @@ impl MultiGpuExecutor {
             integrated_encoder_pool: self.plan.sync.integrated_encoder_pool,
             integrated_ring_segments: self.plan.sync.integrated_ring_segments,
         }
+    }
+
+    /// Access the secondary device handle for explicit sync reconciliation.
+    pub fn secondary_device(&self) -> &wgpu::Device {
+        &self.secondary_device
+    }
+
+    /// Access the secondary adapter profile used by the helper lane.
+    pub fn secondary_profile(&self) -> &GpuAdapterProfile {
+        &self.secondary_profile
     }
 }
 

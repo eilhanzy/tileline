@@ -22,6 +22,7 @@ Scope of this version:
 `nps/src/`
 
 - `bitpack.rs`: zero-allocation bit writer/reader over caller-provided buffers
+- `model.rs`: canonical channel/tick/snapshot semantics used for runtime planning
 - `packet.rs`: header layout, payload codecs, quantization helpers
 - `reliability.rs`: ACK window, retransmit bookkeeping, authority table
 - `manager.rs`: `NetworkPacketManager` + MPS offload integration
@@ -146,6 +147,52 @@ Default policy mapping:
 - `Ui`, `Script` -> `ReliableOrdered` (conservative default)
 
 This can be made script-driven later via `.tlscript` `@net(...)` metadata.
+
+## Canonical Tick and Channel Model
+
+NPS now carries an explicit semantic classification layer in `nps/src/model.rs`.
+
+This avoids scattering transport policy across manager/reliability/runtime code.
+
+Current semantic lanes:
+
+- `PhysicsState`
+- `PlayerInput`
+- `LifecycleEvent`
+- `UiSync`
+- `ScriptSync`
+
+Current tick scopes:
+
+- `Simulation`
+- `Control`
+- `Heartbeat`
+
+Current snapshot modes:
+
+- `QuantizedTransformBatch`
+- `InputFrame`
+- `LifecycleEvent`
+- `None`
+
+This model is already used by `SendPolicy::for_payload(...)` so reliability/sequencing policy now
+derives from the same canonical mapping that future runtime transport code will use.
+
+## Link Telemetry
+
+NPS now exposes best-effort per-peer link telemetry derived from reliable ACK flow.
+
+Current fields:
+
+- smoothed RTT estimate
+- jitter estimate (EWMA of RTT deltas)
+- reliable sent count
+- reliable acked count
+- retransmit count
+- coarse retransmit-based loss estimate
+
+This is intentionally conservative. It is meant to give the runtime a stable diagnostics surface
+before more advanced transport estimation is added.
 
 ## `.tlscript` `@net(...)` Hook (Compiler Side)
 

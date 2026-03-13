@@ -9,10 +9,13 @@ in `src/` crates (not benchmark-only code).
 - `tlscript-parser-plan.md`: parser architecture, AST shape, and V1 grammar plan
 - `tlscript-semantic.md`: semantic rules, soft diagnostics, handles, and WASM sandbox policy
 - `tlscript-parallel-runtime.md`: parallel contracts, advisor suggestions, and runtime dispatch planning
+- `tileline-beta-roadmap.md`: phased beta roadmap, integration milestones, and deferred scope
 - `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
+- `nps-runtime-plan.md`: canonical NPS channel, tick, snapshot, and transport runtime plan
+- `paradoxpe-foundation.md`: ParadoxPE handles, SoA storage, broadphase/solver pipeline, snapshot base, and script ABI
+- `paradoxpe-tlscript-examples.md`: verified `.tlscript` examples targeting the current ParadoxPE ABI
 - `gms-dispatch-planner.md`: GPU scoring, workload assignment, and multi-GPU planning behavior
 - `runtime-bridge-flow.md`: canonical MPS -> `tl-core` -> GMS -> runtime submit/present flow
-- `pmta-payload-synthesis.md`: PMTA token decoding, AES-CTR synthesis, and dataset consistency workflow
 
 ## Documentation Style
 
