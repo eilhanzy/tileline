@@ -19,9 +19,37 @@ download_and_extract_zip() {
   unzip -q "${zip_path}" -d "${dst}"
 }
 
+resolve_jetbrains_mono_url() {
+  local api_url="https://api.github.com/repos/JetBrains/JetBrainsMono/releases/latest"
+  local api_payload=""
+  local url=""
+
+  if api_payload="$(curl -L --fail --silent --show-error "${api_url}")"; then
+    url="$(
+      printf "%s" "${api_payload}" \
+        | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*JetBrainsMono-[^"]*\.zip\)".*/\1/p' \
+        | head -n 1
+    )"
+    if [[ -n "${url}" ]]; then
+      printf "%s\n" "${url}"
+      return 0
+    fi
+  fi
+
+  # Fallback to JetBrains CDN when GitHub API is rate-limited/unavailable.
+  printf "%s\n" "https://download.jetbrains.com/fonts/JetBrainsMono-2.304.zip"
+}
+
+if [[ "${1:-}" == "--print-jetbrains-url" ]]; then
+  resolve_jetbrains_mono_url
+  exit 0
+fi
+
 echo "[alpha-assets] downloading JetBrains Mono (OFL-1.1)"
+JB_MONO_URL="$(resolve_jetbrains_mono_url)"
+echo "[alpha-assets] JetBrains Mono source: ${JB_MONO_URL}"
 download_and_extract_zip \
-  "https://github.com/JetBrains/JetBrainsMono/releases/latest/download/JetBrainsMono.zip" \
+  "${JB_MONO_URL}" \
   "${OUT_DIR}/fonts/jetbrains-mono"
 
 echo "[alpha-assets] downloading Noto Sans (OFL-1.1)"
@@ -52,4 +80,3 @@ Icons:
 EOF
 
 echo "[alpha-assets] done -> ${OUT_DIR}"
-
