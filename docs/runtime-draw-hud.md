@@ -58,3 +58,6 @@ The runtime examples now execute:
 2. upload instance/sprite buffers (`WgpuSceneRenderer::upload_draw_frame`)
 3. encode real render pass (`WgpuSceneRenderer::encode`)
 4. present to swapchain
+
+Sprite uploads now carry `SpriteKind` metadata (`generic/hud/camera/terrain`) so renderer backends
+can apply kind-aware atlas/shader behavior without per-example branching.

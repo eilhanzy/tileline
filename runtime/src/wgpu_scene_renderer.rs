@@ -9,6 +9,7 @@ use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3};
 use wgpu::util::DeviceExt;
 
 use crate::draw_path::{DrawLane, RuntimeDrawFrame};
+use crate::scene::SpriteKind;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -46,6 +47,8 @@ struct GpuSpriteInstance {
     translate_size: [f32; 4], // x, y, w, h
     rot_z: [f32; 4],          // rotation_rad, z, _, _
     color: [f32; 4],
+    atlas_rect: [f32; 4],  // u0, v0, u1, v1
+    kind_params: [f32; 4], // kind_code, texture_slot, atlas_flags, reserved
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,6 +440,13 @@ fn build_upload_plan(draw: &RuntimeDrawFrame) -> UploadPlan {
             ],
             rot_z: [sprite.rotation_rad, sprite.position[2], 0.0, 0.0],
             color: sprite.color_rgba,
+            atlas_rect: sprite_kind_atlas_rect(sprite.kind, sprite.texture_slot),
+            kind_params: [
+                sprite_kind_code(sprite.kind) as f32,
+                sprite.texture_slot as f32,
+                0.0,
+                0.0,
+            ],
         });
     }
 
@@ -545,7 +555,9 @@ fn create_sprite_pipeline(
                     attributes: &wgpu::vertex_attr_array![
                         1 => Float32x4,
                         2 => Float32x4,
-                        3 => Float32x4
+                        3 => Float32x4,
+                        4 => Float32x4,
+                        5 => Float32x4
                     ],
                 },
             ],
@@ -570,6 +582,37 @@ fn create_sprite_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+#[inline]
+fn sprite_kind_code(kind: SpriteKind) -> u32 {
+    match kind {
+        SpriteKind::Generic => 0,
+        SpriteKind::Hud => 1,
+        SpriteKind::Camera => 2,
+        SpriteKind::Terrain => 3,
+    }
+}
+
+#[inline]
+fn sprite_kind_atlas_row(kind: SpriteKind) -> u32 {
+    match kind {
+        SpriteKind::Generic => 0,
+        SpriteKind::Hud => 1,
+        SpriteKind::Camera => 2,
+        SpriteKind::Terrain => 3,
+    }
+}
+
+#[inline]
+fn sprite_kind_atlas_rect(kind: SpriteKind, texture_slot: u16) -> [f32; 4] {
+    const ATLAS_COLS: u16 = 4;
+    const INV_ATLAS: f32 = 0.25; // 1.0 / 4.0
+    let col = texture_slot % ATLAS_COLS;
+    let row = sprite_kind_atlas_row(kind);
+    let u0 = col as f32 * INV_ATLAS;
+    let v0 = row as f32 * INV_ATLAS;
+    [u0, v0, u0 + INV_ATLAS, v0 + INV_ATLAS]
 }
 
 fn create_box_mesh(device: &wgpu::Device) -> GpuMesh {
@@ -767,11 +810,16 @@ struct VSIn {
     @location(1) translate_size: vec4<f32>,
     @location(2) rot_z: vec4<f32>,
     @location(3) color: vec4<f32>,
+    @location(4) atlas_rect: vec4<f32>,
+    @location(5) kind_params: vec4<f32>,
 };
 
 struct VSOut {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) atlas_uv: vec2<f32>,
+    @location(3) kind_params: vec2<f32>,
 };
 
 @vertex
@@ -787,16 +835,56 @@ fn vs_main(input: VSIn) -> VSOut {
         scaled.x * s + scaled.y * c
     );
     let pos = rotated + input.translate_size.xy;
+    let uv = input.local_pos + vec2<f32>(0.5, 0.5);
+    let atlas_uv = mix(input.atlas_rect.xy, input.atlas_rect.zw, uv);
 
     var out: VSOut;
     out.position = vec4<f32>(pos, input.rot_z.y, 1.0);
     out.color = input.color;
+    out.uv = uv;
+    out.atlas_uv = atlas_uv;
+    out.kind_params = input.kind_params.xy;
     return out;
+}
+
+fn terrain_style(base_color: vec3<f32>, uv: vec2<f32>, atlas_uv: vec2<f32>, slot: f32) -> vec3<f32> {
+    let stripe = 0.5 + 0.5 * sin((atlas_uv.x * 64.0) + slot * 0.37);
+    let top = vec3<f32>(base_color.r * 1.06, base_color.g * 1.03, base_color.b * 0.90);
+    let bottom = vec3<f32>(base_color.r * 0.85, base_color.g * 0.92, base_color.b * 0.78);
+    let grad = mix(bottom, top, uv.y);
+    return mix(grad, grad * vec3<f32>(0.72, 0.88, 0.72), stripe * 0.35);
+}
+
+fn camera_style(base_color: vec3<f32>, uv: vec2<f32>, atlas_uv: vec2<f32>, slot: f32) -> vec3<f32> {
+    let centered = uv - vec2<f32>(0.5, 0.5);
+    let dist = length(centered);
+    let ring = 1.0 - smoothstep(0.26, 0.43, abs(dist - 0.31));
+    let lens = 1.0 - smoothstep(0.07, 0.31, dist);
+    let scan = 0.5 + 0.5 * sin((atlas_uv.y * 48.0) + slot * 0.21);
+    let ring_color = vec3<f32>(0.95, 0.98, 1.0);
+    let lens_color = mix(base_color * vec3<f32>(0.36, 0.52, 0.78), base_color, scan * 0.6);
+    return lens_color * (0.55 + lens * 0.45) + ring_color * ring * 0.55;
 }
 
 @fragment
 fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
-    return input.color;
+    let kind = i32(input.kind_params.x + 0.5);
+    let slot = input.kind_params.y;
+    var color = input.color.rgb;
+
+    if kind == 2 {
+        color = camera_style(color, input.uv, input.atlas_uv, slot);
+    } else if kind == 3 {
+        color = terrain_style(color, input.uv, input.atlas_uv, slot);
+    } else if kind == 1 {
+        let pulse = 0.93 + 0.07 * sin(input.atlas_uv.x * 28.0 + slot * 0.15);
+        color = color * pulse;
+    } else {
+        let grain = 0.98 + 0.02 * sin((input.atlas_uv.x + input.atlas_uv.y) * 32.0 + slot * 0.11);
+        color = color * grain;
+    }
+
+    return vec4<f32>(color, input.color.a);
 }
 "#;
 
@@ -806,6 +894,7 @@ mod tests {
     use crate::draw_path::{
         DrawBatch3d, DrawBatchKey, DrawFrameStats, DrawInstance3d, RuntimeDrawFrame,
     };
+    use crate::scene::{SpriteInstance, SpriteKind};
 
     #[test]
     fn upload_plan_preserves_range_counts() {
@@ -845,6 +934,42 @@ mod tests {
         assert_eq!(plan.ranges[0].count, 2);
         assert_eq!(plan.ranges[1].count, 1);
         assert_eq!(plan.ranges[1].start, 2);
+    }
+
+    #[test]
+    fn upload_plan_encodes_sprite_kind_and_virtual_atlas_rect() {
+        let draw = RuntimeDrawFrame {
+            opaque_batches: Vec::new(),
+            transparent_batches: Vec::new(),
+            sprites: vec![SpriteInstance {
+                sprite_id: 99,
+                kind: SpriteKind::Camera,
+                position: [0.0, 0.0, 0.0],
+                size: [0.2, 0.2],
+                rotation_rad: 0.0,
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
+                texture_slot: 6,
+                layer: 120,
+            }],
+            stats: DrawFrameStats {
+                opaque_instances: 0,
+                transparent_instances: 0,
+                sprite_instances: 1,
+                opaque_batches: 0,
+                transparent_batches: 0,
+                total_draw_calls: 1,
+            },
+        };
+
+        let plan = build_upload_plan(&draw);
+        assert_eq!(plan.sprites.len(), 1);
+        let sprite = plan.sprites[0];
+        assert!((sprite.kind_params[0] - 2.0).abs() < 1e-6); // camera
+        assert!((sprite.kind_params[1] - 6.0).abs() < 1e-6); // texture_slot
+        assert!((sprite.atlas_rect[0] - 0.5).abs() < 1e-6); // col 2 / 4
+        assert!((sprite.atlas_rect[1] - 0.5).abs() < 1e-6); // row 2 / 4
+        assert!((sprite.atlas_rect[2] - 0.75).abs() < 1e-6);
+        assert!((sprite.atlas_rect[3] - 0.75).abs() < 1e-6);
     }
 
     fn make_instance(id: u64) -> DrawInstance3d {

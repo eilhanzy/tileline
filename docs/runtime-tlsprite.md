@@ -101,3 +101,13 @@ Runtime now exposes precompiled pack + cache primitives:
 - Base sprite kinds (`generic`, `hud`, `camera`, `terrain`) with runtime defaults.
 - No disk I/O required in runtime core.
 - Renderer-agnostic output (`Vec<SpriteInstance>`).
+
+## Renderer Mapping Notes
+
+Current `runtime::WgpuSceneRenderer` path consumes sprite kind metadata and applies:
+
+- kind-aware virtual atlas rect selection (by `kind` + `texture_slot`)
+- camera-style shader treatment (lens/ring emphasis)
+- terrain-style shader treatment (banding/gradient emphasis)
+
+This keeps type behavior in `src/` runtime code rather than benchmark-only scripts.
