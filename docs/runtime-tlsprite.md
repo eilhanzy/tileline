@@ -66,6 +66,20 @@ Examples wired:
 - Phase 2 (implemented): `notify` file-watch backend + polling fallback.
 - Phase 3: asset pipeline integration (precompiled sprite packs + runtime cache invalidation).
 
+## Asset Pipeline (Phase 3)
+
+Runtime now exposes precompiled pack + cache primitives:
+
+- `compile_tlsprite_pack(source)` -> `TlspritePack`
+- `load_tlsprite_pack(bytes)` -> `TlspriteProgram`
+- `TlspriteProgramCache`:
+  - deduplicates programs by source hash
+  - binds cache entries by asset path
+  - supports `invalidate_path(...)` / `invalidate_all()`
+  - provides telemetry via `stats()`
+
+`TlspriteWatchReloader::reload_into_cache(...)` bridges hot reload events into cache bindings.
+
 ## Current Scope
 
 - Deterministic parser and soft diagnostics.

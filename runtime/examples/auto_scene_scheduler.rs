@@ -5,7 +5,8 @@ use runtime::{
     submit_scene_estimate_to_bridge, BounceTankSceneConfig, BounceTankSceneController,
     FrameLoopRuntime, FrameLoopRuntimeConfig, GraphicsSchedulerPath,
     MobileSceneWorkloadBridgeConfig, RenderSyncMode, SceneDispatchBridgeConfig,
-    SceneWorkloadBridgeConfig, TickRatePolicy, TlspriteHotReloadEvent, TlspriteWatchReloader,
+    SceneWorkloadBridgeConfig, TickRatePolicy, TlspriteHotReloadEvent, TlspriteProgramCache,
+    TlspriteWatchReloader,
 };
 use tl_core::MpsGmsBridgeConfig;
 use wgpu::{AdapterInfo, Backend, DeviceType};
@@ -44,12 +45,16 @@ fn main() {
     let sprite_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples/assets/bounce_hud.tlsprite");
     let mut sprite_loader = TlspriteWatchReloader::new(&sprite_path);
+    let mut sprite_cache = TlspriteProgramCache::new();
     if let Some(warn) = sprite_loader.init_warning() {
         println!("[tlsprite watch] {warn}");
     }
     println!("[tlsprite watch] backend={:?}", sprite_loader.backend());
-    print_tlsprite_event("[tlsprite boot]", sprite_loader.reload_if_needed());
-    if let Some(program) = sprite_loader.program().cloned() {
+    print_tlsprite_event(
+        "[tlsprite boot]",
+        sprite_loader.reload_into_cache(&mut sprite_cache),
+    );
+    if let Some(program) = sprite_cache.program_for_path(sprite_loader.path()).cloned() {
         scene.set_sprite_program(program);
     }
 
@@ -61,6 +66,7 @@ fn main() {
             render_dt,
             SceneWorkloadBridgeConfig::default(),
             &mut sprite_loader,
+            &mut sprite_cache,
         ),
         GraphicsSchedulerPath::Mgs => run_mgs_path(
             &mut world,
@@ -70,6 +76,7 @@ fn main() {
             MobileSceneWorkloadBridgeConfig::default(),
             decision.mobile_profile.name.clone(),
             &mut sprite_loader,
+            &mut sprite_cache,
         ),
     }
 }
@@ -81,6 +88,7 @@ fn run_gms_path(
     render_dt: f32,
     workload_cfg: SceneWorkloadBridgeConfig,
     sprite_loader: &mut TlspriteWatchReloader,
+    sprite_cache: &mut TlspriteProgramCache,
 ) {
     let mut frame_loop = FrameLoopRuntime::new(
         FrameLoopRuntimeConfig::default(),
@@ -91,7 +99,7 @@ fn run_gms_path(
     let mut published_plans = 0u64;
 
     for frame_id in 1..=total_frames {
-        maybe_reload_tlsprite(scene, sprite_loader);
+        maybe_reload_tlsprite(scene, sprite_loader, sprite_cache);
         let tick = scene.physics_tick(world);
         let _ = world.step(render_dt);
         let frame = scene.build_frame_instances(world, Some(world.interpolation_alpha()));
@@ -133,6 +141,7 @@ fn run_mgs_path(
     mobile_cfg: MobileSceneWorkloadBridgeConfig,
     adapter_name: String,
     sprite_loader: &mut TlspriteWatchReloader,
+    sprite_cache: &mut TlspriteProgramCache,
 ) {
     let bridge = MgsBridge::new(mgs::MobileGpuProfile::detect(&adapter_name));
     let mut memory_pressure_frames = 0u64;
@@ -140,7 +149,7 @@ fn run_mgs_path(
     let mut total_draws = 0u64;
 
     for frame_id in 0..total_frames {
-        maybe_reload_tlsprite(scene, sprite_loader);
+        maybe_reload_tlsprite(scene, sprite_loader, sprite_cache);
         let tick = scene.physics_tick(world);
         let _ = world.step(render_dt);
         let frame = scene.build_frame_instances(world, Some(world.interpolation_alpha()));
@@ -227,12 +236,13 @@ fn default_adapter_info() -> AdapterInfo {
 fn maybe_reload_tlsprite(
     scene: &mut BounceTankSceneController,
     loader: &mut TlspriteWatchReloader,
+    cache: &mut TlspriteProgramCache,
 ) {
-    let event = loader.reload_if_needed();
+    let event = loader.reload_into_cache(cache);
     match &event {
         TlspriteHotReloadEvent::Applied { .. } => {
             print_tlsprite_event("[tlsprite reload]", event);
-            if let Some(program) = loader.program().cloned() {
+            if let Some(program) = cache.program_for_path(loader.path()).cloned() {
                 scene.set_sprite_program(program);
             }
         }

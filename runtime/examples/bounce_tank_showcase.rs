@@ -2,7 +2,7 @@ use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
 use runtime::{
     estimate_scene_workload_requests, BounceTankSceneConfig, BounceTankSceneController,
     RenderSyncMode, SceneWorkloadBridgeConfig, TickRatePolicy, TlspriteHotReloadEvent,
-    TlspriteWatchReloader,
+    TlspriteProgramCache, TlspriteWatchReloader,
 };
 
 fn main() {
@@ -27,12 +27,16 @@ fn main() {
     let sprite_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples/assets/bounce_hud.tlsprite");
     let mut sprite_loader = TlspriteWatchReloader::new(&sprite_path);
+    let mut sprite_cache = TlspriteProgramCache::new();
     if let Some(warn) = sprite_loader.init_warning() {
         println!("[tlsprite watch] {warn}");
     }
     println!("[tlsprite watch] backend={:?}", sprite_loader.backend());
-    print_tlsprite_event("[tlsprite boot]", sprite_loader.reload_if_needed());
-    if let Some(program) = sprite_loader.program().cloned() {
+    print_tlsprite_event(
+        "[tlsprite boot]",
+        sprite_loader.reload_into_cache(&mut sprite_cache),
+    );
+    if let Some(program) = sprite_cache.program_for_path(sprite_loader.path()).cloned() {
         scene.set_sprite_program(program);
     }
     let workload_cfg = SceneWorkloadBridgeConfig {
@@ -49,11 +53,12 @@ fn main() {
     );
 
     for frame_index in 0..total_frames {
-        let event = sprite_loader.reload_if_needed();
+        let event = sprite_loader.reload_into_cache(&mut sprite_cache);
         match &event {
             TlspriteHotReloadEvent::Applied { .. } => {
                 print_tlsprite_event("[tlsprite reload]", event);
-                if let Some(program) = sprite_loader.program().cloned() {
+                if let Some(program) = sprite_cache.program_for_path(sprite_loader.path()).cloned()
+                {
                     scene.set_sprite_program(program);
                 }
             }
@@ -67,8 +72,9 @@ fn main() {
             estimate_scene_workload_requests(&frame, tick.live_balls, 1280, 720, workload_cfg);
 
         if frame_index % 30 == 0 || frame_index + 1 == total_frames {
+            let cache_stats = sprite_cache.stats();
             println!(
-                "frame={:03} spawn={} live={} substeps={} opaque={} transparent={} sprites={} gms.sampled={} gms.object={} gms.physics={} gms.ui={} gms.postfx={}",
+                "frame={:03} spawn={} live={} substeps={} opaque={} transparent={} sprites={} cache.programs={} cache.bindings={} gms.sampled={} gms.object={} gms.physics={} gms.ui={} gms.postfx={}",
                 frame_index,
                 tick.spawned_this_tick,
                 tick.live_balls,
@@ -76,6 +82,8 @@ fn main() {
                 frame.opaque_3d.len(),
                 frame.transparent_3d.len(),
                 frame.sprites.len(),
+                cache_stats.unique_programs,
+                cache_stats.path_bindings,
                 estimate.multi_gpu.sampled_processing_jobs,
                 estimate.multi_gpu.object_updates,
                 estimate.multi_gpu.physics_jobs,

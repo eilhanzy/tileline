@@ -21,7 +21,7 @@
 //! ```
 
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashMap},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -226,6 +226,10 @@ impl TlspriteHotReloader {
 
     pub fn diagnostics(&self) -> &[TlspriteDiagnostic] {
         &self.diagnostics
+    }
+
+    pub fn source_hash(&self) -> Option<u64> {
+        self.source_hash
     }
 
     /// Read source and recompile when file contents have changed.
@@ -471,6 +475,254 @@ fn build_notify_state(path: &Path) -> notify::Result<TlspriteWatchState> {
     })
 }
 
+const TLSPRITE_PACK_MAGIC: &[u8; 8] = b"TLSPK001";
+
+/// In-memory binary pack produced from a `.tlsprite` source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlspritePack {
+    pub bytes: Vec<u8>,
+    pub source_hash: u64,
+    pub sprite_count: usize,
+}
+
+/// Compile `.tlsprite` into a compact precompiled pack.
+pub fn compile_tlsprite_pack(source: &str) -> Result<TlspritePack, TlspriteCompileOutcome> {
+    let TlspriteCompileOutcome {
+        program,
+        diagnostics,
+    } = compile_tlsprite(source);
+    let program = match program {
+        Some(program) => program,
+        None => {
+            return Err(TlspriteCompileOutcome {
+                program: None,
+                diagnostics,
+            });
+        }
+    };
+    let source_hash = hash_bytes(source.as_bytes());
+    let bytes = encode_tlsprite_pack(&program, source_hash);
+    Ok(TlspritePack {
+        bytes,
+        source_hash,
+        sprite_count: program.sprites().len(),
+    })
+}
+
+/// Decode a precompiled `.tlsprite` pack.
+pub fn load_tlsprite_pack(bytes: &[u8]) -> Result<TlspriteProgram, String> {
+    decode_tlsprite_pack(bytes).map(|decoded| decoded.program)
+}
+
+#[derive(Debug, Clone)]
+struct DecodedTlspritePack {
+    program: TlspriteProgram,
+    source_hash: u64,
+}
+
+/// Source marker returned by cache loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlspriteCacheLoadSource {
+    CacheHit,
+    CompiledSource,
+    LoadedPack,
+}
+
+/// Cache load summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlspriteCacheLoadOutcome {
+    pub source: TlspriteCacheLoadSource,
+    pub source_hash: u64,
+    pub sprite_count: usize,
+}
+
+/// Cache stats for runtime telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TlspriteProgramCacheStats {
+    pub unique_programs: usize,
+    pub path_bindings: usize,
+}
+
+/// Runtime `.tlsprite` program cache with explicit invalidation.
+#[derive(Debug, Default)]
+pub struct TlspriteProgramCache {
+    by_hash: HashMap<u64, TlspriteProgram>,
+    path_hash: HashMap<PathBuf, u64>,
+    hash_refcount: HashMap<u64, usize>,
+}
+
+impl TlspriteProgramCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn load_from_source(
+        &mut self,
+        path: impl Into<PathBuf>,
+        source: &str,
+    ) -> Result<TlspriteCacheLoadOutcome, TlspriteCompileOutcome> {
+        let path = path.into();
+        let source_hash = hash_bytes(source.as_bytes());
+        if let Some(out) = self.try_cache_hit(path.as_path(), source_hash) {
+            return Ok(out);
+        }
+
+        let outcome = compile_tlsprite(source);
+        let Some(program) = outcome.program else {
+            return Err(outcome);
+        };
+        Ok(self.bind_program(
+            path.as_path(),
+            source_hash,
+            program,
+            TlspriteCacheLoadSource::CompiledSource,
+        ))
+    }
+
+    pub fn load_from_pack(
+        &mut self,
+        path: impl Into<PathBuf>,
+        bytes: &[u8],
+    ) -> Result<TlspriteCacheLoadOutcome, String> {
+        let path = path.into();
+        let decoded = decode_tlsprite_pack(bytes)?;
+        if let Some(out) = self.try_cache_hit(path.as_path(), decoded.source_hash) {
+            return Ok(out);
+        }
+        Ok(self.bind_program(
+            path.as_path(),
+            decoded.source_hash,
+            decoded.program,
+            TlspriteCacheLoadSource::LoadedPack,
+        ))
+    }
+
+    pub fn bind_runtime_program(
+        &mut self,
+        path: impl Into<PathBuf>,
+        source_hash: u64,
+        program: TlspriteProgram,
+    ) -> TlspriteCacheLoadOutcome {
+        let path = path.into();
+        self.bind_program(
+            path.as_path(),
+            source_hash,
+            program,
+            TlspriteCacheLoadSource::CompiledSource,
+        )
+    }
+
+    pub fn program_for_path(&self, path: &Path) -> Option<&TlspriteProgram> {
+        self.path_hash
+            .get(path)
+            .and_then(|hash| self.by_hash.get(hash))
+    }
+
+    pub fn invalidate_path(&mut self, path: &Path) -> bool {
+        let Some(old_hash) = self.path_hash.remove(path) else {
+            return false;
+        };
+        self.decrement_hash_ref(old_hash);
+        true
+    }
+
+    pub fn invalidate_all(&mut self) {
+        self.by_hash.clear();
+        self.path_hash.clear();
+        self.hash_refcount.clear();
+    }
+
+    pub fn stats(&self) -> TlspriteProgramCacheStats {
+        TlspriteProgramCacheStats {
+            unique_programs: self.by_hash.len(),
+            path_bindings: self.path_hash.len(),
+        }
+    }
+
+    fn try_cache_hit(&mut self, path: &Path, source_hash: u64) -> Option<TlspriteCacheLoadOutcome> {
+        if !self.by_hash.contains_key(&source_hash) {
+            return None;
+        }
+        self.rebind_path(path, source_hash);
+        let sprite_count = self
+            .by_hash
+            .get(&source_hash)
+            .map(|p| p.sprites().len())
+            .unwrap_or(0);
+        Some(TlspriteCacheLoadOutcome {
+            source: TlspriteCacheLoadSource::CacheHit,
+            source_hash,
+            sprite_count,
+        })
+    }
+
+    fn bind_program(
+        &mut self,
+        path: &Path,
+        source_hash: u64,
+        program: TlspriteProgram,
+        source: TlspriteCacheLoadSource,
+    ) -> TlspriteCacheLoadOutcome {
+        self.by_hash.insert(source_hash, program);
+        self.rebind_path(path, source_hash);
+        let sprite_count = self
+            .by_hash
+            .get(&source_hash)
+            .map(|p| p.sprites().len())
+            .unwrap_or(0);
+        TlspriteCacheLoadOutcome {
+            source,
+            source_hash,
+            sprite_count,
+        }
+    }
+
+    fn rebind_path(&mut self, path: &Path, new_hash: u64) {
+        if let Some(old_hash) = self.path_hash.insert(path.to_path_buf(), new_hash) {
+            if old_hash == new_hash {
+                return;
+            }
+            self.decrement_hash_ref(old_hash);
+        }
+        *self.hash_refcount.entry(new_hash).or_insert(0) += 1;
+    }
+
+    fn decrement_hash_ref(&mut self, hash: u64) {
+        let should_remove = if let Some(count) = self.hash_refcount.get_mut(&hash) {
+            *count = count.saturating_sub(1);
+            *count == 0
+        } else {
+            false
+        };
+        if should_remove {
+            self.hash_refcount.remove(&hash);
+            self.by_hash.remove(&hash);
+        }
+    }
+}
+
+impl TlspriteWatchReloader {
+    /// Reload and store applied programs in cache keyed by this loader path.
+    pub fn reload_into_cache(
+        &mut self,
+        cache: &mut TlspriteProgramCache,
+    ) -> TlspriteHotReloadEvent {
+        let event = self.reload_if_needed();
+        if matches!(event, TlspriteHotReloadEvent::Applied { .. }) {
+            if let (Some(hash), Some(program)) =
+                (self.inner.source_hash(), self.inner.program().cloned())
+            {
+                let _ = cache.bind_runtime_program(self.inner.path().to_path_buf(), hash, program);
+            }
+        }
+        event
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+}
+
 /// Compile `.tlsprite` source from memory.
 pub fn compile_tlsprite(source: &str) -> TlspriteCompileOutcome {
     let mut diagnostics = Vec::new();
@@ -557,6 +809,199 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+fn encode_tlsprite_pack(program: &TlspriteProgram, source_hash: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + program.sprites().len() * 96);
+    out.extend_from_slice(TLSPRITE_PACK_MAGIC);
+    out.extend_from_slice(&source_hash.to_le_bytes());
+    out.extend_from_slice(&(program.sprites().len() as u32).to_le_bytes());
+    for def in program.sprites() {
+        write_len_prefixed_str(&mut out, &def.name);
+        out.extend_from_slice(&def.sprite.sprite_id.to_le_bytes());
+        out.extend_from_slice(&def.sprite.texture_slot.to_le_bytes());
+        out.extend_from_slice(&def.sprite.layer.to_le_bytes());
+        write_f32s(&mut out, &def.sprite.position);
+        write_f32s(&mut out, &def.sprite.size);
+        out.extend_from_slice(&def.sprite.rotation_rad.to_le_bytes());
+        write_f32s(&mut out, &def.sprite.color_rgba);
+        match def.dynamic_scale {
+            Some(scale) => {
+                out.push(1);
+                out.push(match scale.axis {
+                    TlspriteScaleAxis::X => 0,
+                    TlspriteScaleAxis::Y => 1,
+                });
+                out.push(match scale.source {
+                    TlspriteScaleSource::SpawnProgress => 0,
+                    TlspriteScaleSource::SpawnRemaining => 1,
+                    TlspriteScaleSource::LiveBallRatio => 2,
+                });
+                out.extend_from_slice(&scale.min_factor.to_le_bytes());
+                out.extend_from_slice(&scale.max_factor.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+    out
+}
+
+fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
+    let mut rd = ByteReader::new(bytes);
+    rd.expect_magic(TLSPRITE_PACK_MAGIC)?;
+    let source_hash = rd.read_u64()?;
+    let sprite_count = rd.read_u32()? as usize;
+    let mut sprites = Vec::with_capacity(sprite_count);
+    for _ in 0..sprite_count {
+        let name = rd.read_string()?;
+        let sprite_id = rd.read_u64()?;
+        let texture_slot = rd.read_u16()?;
+        let layer = rd.read_i16()?;
+        let position = rd.read_f32_array::<3>()?;
+        let size = rd.read_f32_array::<2>()?;
+        let rotation_rad = rd.read_f32()?;
+        let color_rgba = rd.read_f32_array::<4>()?;
+        let has_scale = rd.read_u8()?;
+        let dynamic_scale = if has_scale == 0 {
+            None
+        } else {
+            let axis = match rd.read_u8()? {
+                0 => TlspriteScaleAxis::X,
+                1 => TlspriteScaleAxis::Y,
+                other => return Err(format!("invalid packed scale axis tag {other}")),
+            };
+            let source = match rd.read_u8()? {
+                0 => TlspriteScaleSource::SpawnProgress,
+                1 => TlspriteScaleSource::SpawnRemaining,
+                2 => TlspriteScaleSource::LiveBallRatio,
+                other => return Err(format!("invalid packed scale source tag {other}")),
+            };
+            let min_factor = rd.read_f32()?;
+            let max_factor = rd.read_f32()?;
+            Some(TlspriteDynamicScale {
+                axis,
+                source,
+                min_factor,
+                max_factor,
+            })
+        };
+        sprites.push(TlspriteSpriteDef {
+            name,
+            sprite: SpriteInstance {
+                sprite_id,
+                position,
+                size,
+                rotation_rad,
+                color_rgba,
+                texture_slot,
+                layer,
+            },
+            dynamic_scale,
+        });
+    }
+    if rd.remaining() != 0 {
+        return Err("packed data contains trailing bytes".to_string());
+    }
+
+    Ok(DecodedTlspritePack {
+        program: TlspriteProgram { sprites },
+        source_hash,
+    })
+}
+
+fn write_len_prefixed_str(out: &mut Vec<u8>, text: &str) {
+    let bytes = text.as_bytes();
+    let len = bytes.len().min(u16::MAX as usize) as u16;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&bytes[..len as usize]);
+}
+
+fn write_f32s<const N: usize>(out: &mut Vec<u8>, values: &[f32; N]) {
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+struct ByteReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn expect_magic(&mut self, magic: &[u8]) -> Result<(), String> {
+        let got = self.read_bytes(magic.len())?;
+        if got != magic {
+            return Err("invalid tlsprite pack magic/version".to_string());
+        }
+        Ok(())
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], String> {
+        if self.remaining() < len {
+            return Err("unexpected EOF while decoding tlsprite pack".to_string());
+        }
+        let start = self.offset;
+        self.offset += len;
+        Ok(&self.bytes[start..self.offset])
+    }
+
+    fn read_u8(&mut self) -> Result<u8, String> {
+        Ok(self.read_bytes(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16, String> {
+        let mut buf = [0u8; 2];
+        buf.copy_from_slice(self.read_bytes(2)?);
+        Ok(u16::from_le_bytes(buf))
+    }
+
+    fn read_i16(&mut self) -> Result<i16, String> {
+        let mut buf = [0u8; 2];
+        buf.copy_from_slice(self.read_bytes(2)?);
+        Ok(i16::from_le_bytes(buf))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, String> {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(self.read_bytes(4)?);
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, String> {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(self.read_bytes(8)?);
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    fn read_f32(&mut self) -> Result<f32, String> {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(self.read_bytes(4)?);
+        Ok(f32::from_le_bytes(buf))
+    }
+
+    fn read_f32_array<const N: usize>(&mut self) -> Result<[f32; N], String> {
+        let mut out = [0.0f32; N];
+        for slot in &mut out {
+            *slot = self.read_f32()?;
+        }
+        Ok(out)
+    }
+
+    fn read_string(&mut self) -> Result<String, String> {
+        let len = self.read_u16()? as usize;
+        let bytes = self.read_bytes(len)?;
+        std::str::from_utf8(bytes)
+            .map(|s| s.to_string())
+            .map_err(|err| format!("invalid UTF-8 string in pack: {err}"))
+    }
 }
 
 fn event_can_change_source(kind: &EventKind) -> bool {
@@ -935,6 +1380,52 @@ mod tests {
     }
 
     #[test]
+    fn pack_roundtrip_preserves_program_shape() {
+        let src = concat!(
+            "tlsprite_v1\n",
+            "[hud]\n",
+            "sprite_id = 88\n",
+            "texture_slot = 2\n",
+            "layer = 12\n",
+            "position = 0.1, 0.2, 0.0\n",
+            "size = 0.5, 0.04\n",
+            "rotation_rad = 0.0\n",
+            "color = 0.2, 0.9, 0.3, 0.7\n",
+            "scale_axis = x\n",
+            "scale_source = spawn_progress\n",
+            "scale_min = 0.1\n",
+            "scale_max = 0.9\n",
+        );
+
+        let pack = compile_tlsprite_pack(src).expect("pack compile");
+        let program = load_tlsprite_pack(&pack.bytes).expect("pack decode");
+        assert_eq!(pack.sprite_count, 1);
+        assert_eq!(program.sprites().len(), 1);
+        assert_eq!(program.sprites()[0].sprite.sprite_id, 88);
+    }
+
+    #[test]
+    fn program_cache_hits_and_invalidation_work() {
+        let source = concat!("tlsprite_v1\n", "[a]\n", "sprite_id = 3\n");
+        let mut cache = TlspriteProgramCache::new();
+        let path = PathBuf::from("/tmp/a.tlsprite");
+
+        let first = cache
+            .load_from_source(path.clone(), source)
+            .expect("first compile");
+        assert_eq!(first.source, TlspriteCacheLoadSource::CompiledSource);
+        let second = cache
+            .load_from_source(path.clone(), source)
+            .expect("cached load");
+        assert_eq!(second.source, TlspriteCacheLoadSource::CacheHit);
+        assert!(cache.program_for_path(path.as_path()).is_some());
+
+        assert!(cache.invalidate_path(path.as_path()));
+        assert!(cache.program_for_path(path.as_path()).is_none());
+        assert_eq!(cache.stats().path_bindings, 0);
+    }
+
+    #[test]
     fn hot_reloader_applies_and_tracks_changes() {
         let path = temp_tlsprite_path("reload");
         fs::write(&path, concat!("tlsprite_v1\n", "[s]\n", "sprite_id = 1\n",))
@@ -1044,6 +1535,31 @@ mod tests {
                 .map(|s| s.sprite.sprite_id),
             Some(6)
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn watch_reloader_populates_runtime_cache() {
+        let path = temp_tlsprite_path("watch_cache");
+        fs::write(
+            &path,
+            concat!("tlsprite_v1\n", "[hud]\n", "sprite_id = 11\n",),
+        )
+        .expect("write initial");
+
+        let mut loader = TlspriteWatchReloader::with_configs(
+            &path,
+            TlspriteHotReloadConfig::default(),
+            TlspriteWatchConfig {
+                prefer_notify_backend: false,
+                poll_interval_ms: 1,
+            },
+        );
+        let mut cache = TlspriteProgramCache::new();
+        let event = loader.reload_into_cache(&mut cache);
+        assert!(matches!(event, TlspriteHotReloadEvent::Applied { .. }));
+        assert!(cache.program_for_path(loader.path()).is_some());
 
         let _ = fs::remove_file(path);
     }

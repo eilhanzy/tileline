@@ -67,10 +67,12 @@ pub use tlscript_showcase::{
     TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
 };
 pub use tlsprite::{
-    compile_tlsprite, TlspriteCompileOutcome, TlspriteDiagnostic, TlspriteDiagnosticLevel,
+    compile_tlsprite, compile_tlsprite_pack, load_tlsprite_pack, TlspriteCacheLoadOutcome,
+    TlspriteCacheLoadSource, TlspriteCompileOutcome, TlspriteDiagnostic, TlspriteDiagnosticLevel,
     TlspriteFrameContext, TlspriteHotReloadConfig, TlspriteHotReloadEvent, TlspriteHotReloader,
-    TlspriteProgram, TlspriteScaleAxis, TlspriteScaleSource, TlspriteSpriteDef,
-    TlspriteWatchBackend, TlspriteWatchConfig, TlspriteWatchReloader,
+    TlspritePack, TlspriteProgram, TlspriteProgramCache, TlspriteProgramCacheStats,
+    TlspriteScaleAxis, TlspriteScaleSource, TlspriteSpriteDef, TlspriteWatchBackend,
+    TlspriteWatchConfig, TlspriteWatchReloader,
 };
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,
