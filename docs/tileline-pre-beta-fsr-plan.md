@@ -52,6 +52,11 @@ Trade-off:
 - Apple Silicon (Metal/UMA)
 - Panthor/RK3588 class (Vulkan)
 
+6. Packaging and Distribution
+- add `.pak` asset packaging flow for demo/runtime content
+- provide `pack/list/unpack` tooling for CI + release scripts
+- validate deterministic pack output and checksum verification on unpack
+
 ## Current Gaps Before Pre-Beta Freeze
 
 - FSR 1.0 pass is not yet integrated into `runtime/src/wgpu_scene_renderer.rs`.
@@ -59,6 +64,7 @@ Trade-off:
 - Gamepad haptics and remapping UI are not present.
 - Graphics quality presets are not yet surfaced in `.tlscript` / `.tlsprite` APIs.
 - Networked input prediction/reconciliation is pending for NPS-driven multiplayer scenarios.
+- `.pak` loading is not yet wired into TLApp runtime asset resolver (tooling exists, runtime mounting pending).
 
 ## Exit Criteria (Pre-Beta)
 

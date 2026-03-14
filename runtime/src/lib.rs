@@ -7,6 +7,7 @@
 //! - `frame_loop`: bridge pumping and frame-plan queue management
 //! - `mobile_scene_workload`: scene->MGS hint synthesis helpers
 //! - `mas`: Multi Audio Scheduler (MAS) primitives integrated with MPS
+//! - `pak`: deterministic `.pak` asset packaging/list/unpack support
 //! - `pre_alpha_loop`: canonical pre-alpha runtime phase ordering
 //! - `scheduler_path`: automatic runtime selection policy for GMS vs MGS
 //! - `scene`: runtime scene/sprite payloads and bounce showcase orchestration helpers
@@ -27,6 +28,7 @@ mod frame_loop;
 mod mas;
 mod mobile_scene_workload;
 mod network_transport;
+mod pak;
 mod pre_alpha_loop;
 mod scene;
 mod scene_dispatch;
@@ -62,6 +64,10 @@ pub use network_transport::{
     NetworkPeerMetrics, NetworkPeerSessionState, NetworkPumpResult, NetworkSessionPhase,
     NetworkTransportConfig, NetworkTransportMetrics, NetworkTransportRuntime,
     SnapshotCadenceConfig,
+};
+pub use pak::{
+    create_pak_from_dir, list_pak, read_file_from_pak, unpack_pak, PakBuildReport, PakEntry,
+    PakIndex, PakUnpackReport,
 };
 pub use pre_alpha_loop::{
     RuntimeFramePhase, RuntimePhaseOrderMetrics, RuntimePhaseOrderTracker, RuntimePhaseViolation,

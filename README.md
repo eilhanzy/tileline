@@ -52,6 +52,7 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/runtime-scene-workload.md`: runtime scene/sprite density to GMS workload mapping
 - `docs/runtime-scheduler-path.md`: runtime auto-selection policy for `GMS` vs `MGS`
 - `docs/runtime-draw-hud.md`: runtime draw-batch compiler + telemetry HUD overlay integration
+- `docs/runtime-pak.md`: `.pak` asset packaging/list/unpack support for pre-beta distribution
 - `docs/runtime-tlsprite.md`: `.tlsprite` parser and runtime sprite-program integration flow
 - `docs/runtime-tljoint.md`: scene-based multi `.tlscript` + `.tlsprite` binding manifest for runtime composition
 - `docs/runtime-mas.md`: MAS audio scheduler design and MPS integration path
@@ -156,6 +157,12 @@ cargo run -p runtime --example tlapp -- --fps-cap 60 --vsync auto
 
 ```bash
 cargo run -p nps --example starter_packet
+```
+
+### Package Pre-Beta Assets (`.pak`)
+
+```bash
+./scripts/package_prebeta_pak.sh
 ```
 
 ## Canonical Runtime Flow (Non-Benchmark)
