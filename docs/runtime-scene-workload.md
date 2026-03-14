@@ -6,6 +6,7 @@ planner requests without relying on benchmark-only code.
 ## Source Files
 
 - `gms/src/scene_workload.rs`
+- `runtime/src/scene_dispatch.rs`
 - `runtime/src/scene_workload.rs`
 - `runtime/examples/bounce_tank_showcase.rs`
 
@@ -23,7 +24,9 @@ planner requests without relying on benchmark-only code.
 3. `gms::estimate_scene_workload(...)` outputs:
    - `WorkloadRequest` (single-GPU planner input)
    - `MultiGpuWorkloadRequest` (multi-GPU planner input)
-4. Runtime can forward these requests into bridge/dispatcher logic.
+4. Runtime can submit these estimates into the bridge via
+   `runtime::submit_scene_estimate_to_bridge(...)` or
+   `WgpuRenderLoopCoordinator::submit_scene_workload_for_frame(...)`.
 
 ## Tick/FPS Decoupling
 

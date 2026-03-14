@@ -11,7 +11,9 @@ stack into a `wgpu` render loop.
 - `runtime/src/network_transport.rs` (`NetworkTransportRuntime`)
 - `runtime/src/pre_alpha_loop.rs` (`RuntimePhaseOrderTracker`)
 - `runtime/src/scene.rs` (`BounceTankSceneController`, scene/sprite payloads, tick-rate policy)
+- `runtime/src/scene_dispatch.rs` (scene workload estimate -> bridge task submission + frame seal)
 - `runtime/src/scene_workload.rs` (scene density -> GMS planner request synthesis)
+- `runtime/src/mobile_scene_workload.rs` (scene density -> MGS bridge hint synthesis)
 - `runtime/src/wgpu_render_loop.rs` (`WgpuRenderLoopCoordinator`)
 - `runtime/src/tlscript_parallel.rs` (`TlscriptParallelRuntimeCoordinator`)
 

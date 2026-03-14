@@ -5,15 +5,19 @@
 //!
 //! Modules:
 //! - `frame_loop`: bridge pumping and frame-plan queue management
+//! - `mobile_scene_workload`: scene->MGS hint synthesis helpers
 //! - `pre_alpha_loop`: canonical pre-alpha runtime phase ordering
 //! - `scene`: runtime scene/sprite payloads and bounce showcase orchestration helpers
+//! - `scene_dispatch`: scene workload -> bridge task submission helpers
 //! - `scene_workload`: scene->GMS workload synthesis helpers
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
 mod frame_loop;
+mod mobile_scene_workload;
 mod network_transport;
 mod pre_alpha_loop;
 mod scene;
+mod scene_dispatch;
 mod scene_workload;
 mod tlscript_parallel;
 mod wgpu_render_loop;
@@ -21,6 +25,9 @@ mod wgpu_render_loop;
 pub use frame_loop::{
     FrameLoopRuntime, FrameLoopRuntimeConfig, FrameLoopRuntimeMetrics, FrameSubmissionRecordResult,
     RuntimeTickResult,
+};
+pub use mobile_scene_workload::{
+    build_mobile_scene_snapshot, estimate_mobile_workload_hint, MobileSceneWorkloadBridgeConfig,
 };
 pub use network_transport::{
     LaneTrafficCounter, NetworkLaneMetrics, NetworkPeerMetrics, NetworkPumpResult,
@@ -35,6 +42,10 @@ pub use scene::{
     BounceTankSceneConfig, BounceTankSceneController, BounceTankTickMetrics, RenderSyncMode,
     SceneFrameInstances, SceneInstance3d, SceneMaterial, ScenePrimitive3d, SceneTransform3d,
     ShadingModel, SpriteInstance, TickRatePolicy,
+};
+pub use scene_dispatch::{
+    submit_scene_estimate_to_bridge, SceneDispatchBridgeConfig, SceneDispatchLaneSummary,
+    SceneDispatchSubmission,
 };
 pub use scene_workload::{
     build_scene_workload_snapshot, estimate_scene_workload_requests, SceneWorkloadBridgeConfig,

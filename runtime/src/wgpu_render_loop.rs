@@ -17,8 +17,11 @@ use crate::network_transport::{NetworkPumpResult, NetworkTransportRuntime};
 use crate::pre_alpha_loop::{
     RuntimeFramePhase, RuntimePhaseOrderMetrics, RuntimePhaseOrderTracker, PRE_ALPHA_PHASE_ORDER,
 };
+use crate::scene_dispatch::{
+    submit_scene_estimate_to_bridge, SceneDispatchBridgeConfig, SceneDispatchSubmission,
+};
 use crate::tlscript_parallel::TlscriptParallelRuntimeCoordinator;
-use gms::{MultiGpuExecutor, MultiGpuFrameSubmitResult};
+use gms::{MultiGpuExecutor, MultiGpuFrameSubmitResult, SceneWorkloadEstimate};
 use nps::DecodedPacketEvent;
 use paradoxpe::PhysicsWorld;
 use tl_core::{
@@ -257,6 +260,18 @@ impl WgpuRenderLoopCoordinator {
         self.active_frames.insert(plan.frame_id, state);
         self.plans_begun = self.plans_begun.saturating_add(1);
         Some(plan)
+    }
+
+    /// Submit scene-derived workload estimates into bridge queues for one frame.
+    ///
+    /// This is the runtime-owned path for scene->bridge integration without benchmark glue.
+    pub fn submit_scene_workload_for_frame(
+        &mut self,
+        frame_id: BridgeFrameId,
+        estimate: &SceneWorkloadEstimate,
+        config: SceneDispatchBridgeConfig,
+    ) -> SceneDispatchSubmission {
+        submit_scene_estimate_to_bridge(self.frame_loop_mut(), frame_id, estimate, config)
     }
 
     /// Execute one canonical pre-alpha frame in fixed order:

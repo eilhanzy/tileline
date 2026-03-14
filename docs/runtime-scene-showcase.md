@@ -71,3 +71,6 @@ instance payloads into the active renderer backend.
 
 `runtime::estimate_scene_workload_requests(...)` can be used to translate scene/sprite density into
 `gms::WorkloadRequest` and `gms::MultiGpuWorkloadRequest` for planner-driven dispatch.
+
+For mobile/serial fallback paths, `runtime::estimate_mobile_workload_hint(...)` converts the same
+scene payload into `mgs::MpsWorkloadHint`.

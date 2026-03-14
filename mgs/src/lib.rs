@@ -12,10 +12,11 @@ pub mod fallback;
 pub mod hardware;
 pub mod render_benchmark;
 pub mod runtime;
+pub mod scene_workload;
 pub mod tile_planner;
 pub mod tuning;
 
-pub use bridge::MgsBridge;
+pub use bridge::{MgsBridge, MgsBridgePlan, MpsWorkloadHint};
 pub use fallback::FallbackChain;
 pub use hardware::{GfxBackend, MobileGpuFamily, MobileGpuProfile, TbdrArchitecture};
 pub use runtime::{
@@ -23,6 +24,9 @@ pub use runtime::{
     recommended_min_frame_interval, select_present_mode, select_throughput_burst, startup_ramp,
     AdaptiveBurstController, AggressiveNoVsyncPolicy, RuntimeMode, RuntimePacingMode,
     ThroughputMemoryPolicy, VsyncMode,
+};
+pub use scene_workload::{
+    estimate_mps_workload_hint, plan_scene_with_bridge, MobileSceneSnapshot, MobileSceneTuning,
 };
 pub use tile_planner::MgsPlanner;
 pub use tuning::{

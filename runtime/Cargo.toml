@@ -7,6 +7,7 @@ edition = "2021"
 tl-core = { path = "../tl-core" }
 wgpu.workspace = true
 gms = { path = "../gms" }
+mgs = { path = "../mgs" }
 mps = { path = "../mps" }
 nps = { path = "../nps" }
 paradoxpe = { path = "../paradoxpe" }
