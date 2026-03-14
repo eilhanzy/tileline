@@ -12,6 +12,9 @@ use crate::frame_loop::{
     FrameLoopRuntime, FrameLoopRuntimeConfig, FrameLoopRuntimeMetrics, FrameSubmissionRecordResult,
     RuntimeTickResult,
 };
+use crate::pre_alpha_loop::{
+    RuntimeFramePhase, RuntimePhaseOrderMetrics, RuntimePhaseOrderTracker, PRE_ALPHA_PHASE_ORDER,
+};
 use gms::{MultiGpuExecutor, MultiGpuFrameSubmitResult};
 use tl_core::{
     AdaptiveBufferDecision, AdaptiveFrameTelemetry, BridgeFrameId, BridgeFramePlan,
@@ -50,6 +53,25 @@ pub struct SecondaryHelperSubmitOutcome {
     pub recorded_to_bridge: bool,
 }
 
+/// Result snapshot from one canonical pre-alpha frame execution.
+#[derive(Debug, Clone)]
+pub struct PreAlphaFrameExecution {
+    /// Monotonic sequence assigned by the runtime phase-order tracker.
+    pub frame_sequence: u64,
+    /// Canonical order applied for this execution.
+    pub phase_order: [RuntimeFramePhase; 5],
+    /// `tick_bridge()` result collected during RenderPlan phase.
+    pub tick_result: RuntimeTickResult,
+    /// Frame id from `begin_next_frame_plan()`, when a bridge plan was available.
+    pub planned_frame_id: Option<BridgeFrameId>,
+    /// Whether render submission callback was run for this frame.
+    pub render_plan_executed: bool,
+    /// Present reconcile result at the end of the frame.
+    pub present_state: Option<ComposeBarrierState>,
+    /// `true` when the phase tracker observed no ordering violation.
+    pub phase_order_valid: bool,
+}
+
 /// Runtime-level counters for the `wgpu` integration glue.
 #[derive(Debug, Clone)]
 pub struct WgpuRenderLoopMetrics {
@@ -79,6 +101,12 @@ pub struct WgpuRenderLoopMetrics {
     pub apple_uma_reconciles: u64,
     /// Last Apple UMA adaptive decision emitted by the bridge sync layer.
     pub apple_uma_last_decision: Option<AdaptiveBufferDecision>,
+    /// Number of frames executed through `run_pre_alpha_frame(...)`.
+    pub pre_alpha_frame_calls: u64,
+    /// Number of pre-alpha frame executions that had a bridge frame plan to render.
+    pub pre_alpha_frames_with_plan: u64,
+    /// Snapshot of canonical runtime phase-order tracking.
+    pub phase_order: RuntimePhaseOrderMetrics,
     /// Snapshot of `tl-core` bridge metrics.
     pub frame_loop: tl_core::MpsGmsBridgeMetrics,
     /// Snapshot of `runtime::frame_loop` orchestration metrics.
@@ -119,8 +147,11 @@ pub struct WgpuRenderLoopCoordinator {
     present_reconcile_calls: u64,
     present_reconcile_ready: u64,
     present_reconcile_timeouts: u64,
+    pre_alpha_frame_calls: u64,
+    pre_alpha_frames_with_plan: u64,
     apple_uma_reconciles: u64,
     apple_uma_last_decision: Option<AdaptiveBufferDecision>,
+    phase_order: RuntimePhaseOrderTracker,
 }
 
 impl WgpuRenderLoopCoordinator {
@@ -148,8 +179,11 @@ impl WgpuRenderLoopCoordinator {
             present_reconcile_calls: 0,
             present_reconcile_ready: 0,
             present_reconcile_timeouts: 0,
+            pre_alpha_frame_calls: 0,
+            pre_alpha_frames_with_plan: 0,
             apple_uma_reconciles: 0,
             apple_uma_last_decision: None,
+            phase_order: RuntimePhaseOrderTracker::default(),
         }
     }
 
@@ -198,6 +232,80 @@ impl WgpuRenderLoopCoordinator {
         self.active_frames.insert(plan.frame_id, state);
         self.plans_begun = self.plans_begun.saturating_add(1);
         Some(plan)
+    }
+
+    /// Execute one canonical pre-alpha frame in fixed order:
+    /// `network -> script -> physics -> render_plan -> present`.
+    ///
+    /// This API is the runtime-owned integration path intended to reduce ordering regressions
+    /// during the pre-alpha phase. Existing lower-level methods remain available for advanced use.
+    pub fn run_pre_alpha_frame<NetworkPhase, ScriptPhase, PhysicsPhase, RenderPhase>(
+        &mut self,
+        primary_device: &wgpu::Device,
+        transfer_device: Option<&wgpu::Device>,
+        mut network_phase: NetworkPhase,
+        mut script_phase: ScriptPhase,
+        mut physics_phase: PhysicsPhase,
+        mut render_phase: RenderPhase,
+    ) -> PreAlphaFrameExecution
+    where
+        NetworkPhase: FnMut(&mut Self),
+        ScriptPhase: FnMut(&mut Self),
+        PhysicsPhase: FnMut(&mut Self),
+        RenderPhase: FnMut(&BridgeFramePlan, &mut Self),
+    {
+        self.pre_alpha_frame_calls = self.pre_alpha_frame_calls.saturating_add(1);
+        let frame_sequence = self.phase_order.begin_frame();
+        let mut phase_order_valid = true;
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::Network)
+            .is_ok();
+        network_phase(self);
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::Script)
+            .is_ok();
+        script_phase(self);
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::Physics)
+            .is_ok();
+        physics_phase(self);
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::RenderPlan)
+            .is_ok();
+        let tick_result = self.tick_bridge();
+        let mut planned_frame_id = None;
+        let mut render_plan_executed = false;
+        if let Some(plan) = self.begin_next_frame_plan() {
+            planned_frame_id = Some(plan.frame_id);
+            render_phase(&plan, self);
+            render_plan_executed = true;
+            self.pre_alpha_frames_with_plan = self.pre_alpha_frames_with_plan.saturating_add(1);
+        }
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::Present)
+            .is_ok();
+        let present_state = self.reconcile_present(primary_device, transfer_device);
+        phase_order_valid &= self.phase_order.finish_frame();
+
+        PreAlphaFrameExecution {
+            frame_sequence,
+            phase_order: PRE_ALPHA_PHASE_ORDER,
+            tick_result,
+            planned_frame_id,
+            render_plan_executed,
+            present_state,
+            phase_order_valid,
+        }
     }
 
     /// Record a primary queue submission for a frame.
@@ -396,6 +504,9 @@ impl WgpuRenderLoopCoordinator {
             present_reconcile_calls: self.present_reconcile_calls,
             present_reconcile_ready: self.present_reconcile_ready,
             present_reconcile_timeouts: self.present_reconcile_timeouts,
+            pre_alpha_frame_calls: self.pre_alpha_frame_calls,
+            pre_alpha_frames_with_plan: self.pre_alpha_frames_with_plan,
+            phase_order: self.phase_order.metrics(),
             apple_uma_reconciles: self.apple_uma_reconciles,
             apple_uma_last_decision: self.apple_uma_last_decision,
             frame_loop: self.frame_loop.bridge().metrics(),

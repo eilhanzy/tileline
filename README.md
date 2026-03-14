@@ -140,6 +140,11 @@ The intended engine-side `wgpu` frame flow is:
 
 This keeps synchronization policy inside `src/` crates instead of benchmark/example code.
 
+For pre-alpha integration freeze, prefer:
+
+1. `runtime::WgpuRenderLoopCoordinator::run_pre_alpha_frame(...)`
+2. with canonical phase order: `network -> script -> physics -> render_plan -> present`
+
 ## Platform Notes
 
 ### NVIDIA / AMD / Apple GPU Unit Counts

@@ -9,6 +9,7 @@ stack into a `wgpu` render loop.
 - `tl-core/src/graphics/multigpu/sync.rs` (`MultiGpuFrameSynchronizer`)
 - `runtime/src/frame_loop.rs` (`FrameLoopRuntime`)
 - `runtime/src/network_transport.rs` (`NetworkTransportRuntime`)
+- `runtime/src/pre_alpha_loop.rs` (`RuntimePhaseOrderTracker`)
 - `runtime/src/wgpu_render_loop.rs` (`WgpuRenderLoopCoordinator`)
 - `runtime/src/tlscript_parallel.rs` (`TlscriptParallelRuntimeCoordinator`)
 
@@ -23,17 +24,21 @@ stack into a `wgpu` render loop.
 
 1. Submit CPU-side preprocessing/simulation work through `MpsGmsBridge`
 2. Seal the frame (`seal_frame`) once all expected CPU tasks for that frame are queued
-3. Pump the bridge (`pump`) to drain MPS completions and publish frame plans
-4. Runtime drains published `BridgeFramePlan` objects into a render-thread local queue
-5. Render loop submits primary GPU work and records `SubmissionIndex`
-6. Optional secondary/helper GPU work is submitted and recorded
-7. Optional transfer/copy queue work is submitted and recorded
-8. Present reconcile checks queue completion state with bounded waits
-9. Present proceeds when ready, or times out/spillback policy applies
-10. Apple UMA telemetry feeds adaptive buffer decisions (when active)
-11. Script-side workloads (when present) can be planned/routed through
+3. Runtime executes pre-alpha phase order in `runtime/src`:
+   `network -> script -> physics -> render_plan -> present`
+4. RenderPlan phase pumps the bridge (`pump`) to drain MPS completions and publish frame plans
+5. Runtime drains published `BridgeFramePlan` objects into a render-thread local queue
+6. Render loop submits primary GPU work and records `SubmissionIndex`
+7. Optional secondary/helper GPU work is submitted and recorded
+8. Optional transfer/copy queue work is submitted and recorded
+9. Present reconcile checks queue completion state with bounded waits
+10. Present proceeds when ready, or times out/spillback policy applies
+11. Apple UMA telemetry feeds adaptive buffer decisions (when active)
+12. Script-side workloads (when present) can be planned/routed through
     `TlscriptParallelRuntimeCoordinator` before MPS submission so `.tlscript` parallel contracts
     and fallback telemetry are preserved in the runtime path
+
+`WgpuRenderLoopCoordinator::run_pre_alpha_frame(...)` is the canonical entrypoint for this order.
 
 ## Why This Is Split Across Crates
 
