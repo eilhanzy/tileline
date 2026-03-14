@@ -39,6 +39,7 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/tlscript-semantic.md`: `.tlscript` semantic analyzer (types, handles, WASM sandboxing)
 - `docs/tlscript-parallel-runtime.md`: `.tlscript` parallel contracts, advisor, and runtime dispatch planning
 - `docs/tileline-pre-alpha-transition.md`: immediate Foundation -> Pre-Alpha transition gates and sprint plan
+- `docs/tileline-alpha-plan.md`: Alpha A1 scope (`.tlsprite` list editor + MAS scaffold + dark lavender theme baseline)
 - `docs/tileline-pre-beta-fsr-plan.md`: pre-beta FSR 1.0, adaptive quality, and input accessibility plan
 - `docs/tileline-beta-roadmap.md`: phased plan from foundation state to a usable beta
 - `docs/nps-protocol.md`: NPS packet format, reliability, authority handoff, and MPS integration
@@ -52,7 +53,9 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/runtime-scheduler-path.md`: runtime auto-selection policy for `GMS` vs `MGS`
 - `docs/runtime-draw-hud.md`: runtime draw-batch compiler + telemetry HUD overlay integration
 - `docs/runtime-tlsprite.md`: `.tlsprite` parser and runtime sprite-program integration flow
+- `docs/runtime-mas.md`: MAS audio scheduler design and MPS integration path
 - `docs/runtime-tlscript-showcase.md`: runtime `.tlscript` compile/evaluate bootstrap and safe patch application flow
+- `docs/alpha-foss-ui-assets.md`: FOSS icon/font candidates and asset policy for Alpha editor UI
 - `docs/mgs-scene-workload.md`: runtime/mobile scene/sprite density to MGS hint and tile planning mapping
 - `docs/demos/README.md`: show/demo documentation area (`docs/demos/*`)
 

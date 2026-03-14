@@ -19,6 +19,7 @@ tokio = { workspace = true, features = ["net", "time", "rt", "macros"] }
 nalgebra.workspace = true
 rayon.workspace = true
 num_cpus.workspace = true
+crossbeam.workspace = true
 notify = "6.1.1"
 bytemuck = { version = "1.17.1", features = ["derive"] }
 winit.workspace = true

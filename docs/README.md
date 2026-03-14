@@ -10,6 +10,7 @@ in `src/` crates (not benchmark-only code).
 - `tlscript-semantic.md`: semantic rules, soft diagnostics, handles, and WASM sandbox policy
 - `tlscript-parallel-runtime.md`: parallel contracts, advisor suggestions, and runtime dispatch planning
 - `tileline-pre-alpha-transition.md`: immediate Foundation -> Pre-Alpha gates, sprint plan, and validation checks
+- `tileline-alpha-plan.md`: Alpha A1 scope for `.tlsprite` list editor, MAS scaffold, and theme baseline
 - `tileline-pre-beta-fsr-plan.md`: pre-beta milestones with FSR 1.0, adaptive quality, and full input accessibility
 - `tileline-beta-roadmap.md`: phased beta roadmap, integration milestones, and deferred scope
 - `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
@@ -23,6 +24,8 @@ in `src/` crates (not benchmark-only code).
 - `runtime-scheduler-path.md`: runtime automatic scheduler path selection (`GMS` vs `MGS`)
 - `runtime-draw-hud.md`: `SceneFrameInstances` -> draw-batch compile path and telemetry HUD overlay flow
 - `runtime-tlsprite.md`: `.tlsprite` parser, runtime sprite program flow, and HUD scaling signals
+- `runtime-mas.md`: MAS audio scheduler flow and MPS integration contract
+- `alpha-foss-ui-assets.md`: candidate FOSS icon/font packs and asset policy
 - `examples/tlsprite/runtime_basic_types.tlsprite`: starter `.tlsprite` asset with `hud`, `camera`, and `terrain` kinds
 - `runtime-tlscript-showcase.md`: `.tlscript` showcase compile/evaluate bootstrap for scene control
 - `mgs-scene-workload.md`: runtime/mobile scene density to MGS bridge hint and tile planning mapping

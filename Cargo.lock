@@ -3176,6 +3176,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "crossbeam",
  "fbx",
  "gilrs",
  "gms",

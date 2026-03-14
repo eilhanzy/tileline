@@ -6,6 +6,7 @@
 //! Modules:
 //! - `frame_loop`: bridge pumping and frame-plan queue management
 //! - `mobile_scene_workload`: scene->MGS hint synthesis helpers
+//! - `mas`: Multi Audio Scheduler (MAS) primitives integrated with MPS
 //! - `pre_alpha_loop`: canonical pre-alpha runtime phase ordering
 //! - `scheduler_path`: automatic runtime selection policy for GMS vs MGS
 //! - `scene`: runtime scene/sprite payloads and bounce showcase orchestration helpers
@@ -16,11 +17,13 @@
 //! - `tlapp_app`: canonical TLApp runtime entry moved from examples into core runtime
 //! - `tlsprite`: `.tlsprite` sprite program parser and frame emitter
 //! - `tlscript_showcase`: `.tlscript` showcase compile/evaluate bootstrap
+//! - `tlsprite_editor`: list-mode `.tlsprite` editor model + lavender Alpha theme
 //! - `wgpu_scene_renderer`: backend implementation for draw-path + HUD sprite rendering
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
 mod draw_path;
 mod frame_loop;
+mod mas;
 mod mobile_scene_workload;
 mod network_transport;
 mod pre_alpha_loop;
@@ -33,6 +36,7 @@ mod tlapp_app;
 mod tlscript_parallel;
 mod tlscript_showcase;
 mod tlsprite;
+mod tlsprite_editor;
 mod wgpu_render_loop;
 mod wgpu_scene_renderer;
 
@@ -43,6 +47,10 @@ pub use draw_path::{
 pub use frame_loop::{
     FrameLoopRuntime, FrameLoopRuntimeConfig, FrameLoopRuntimeMetrics, FrameSubmissionRecordResult,
     RuntimeTickResult,
+};
+pub use mas::{
+    AudioBufferBlock, MasConfig, MasCoreAffinity, MasMetrics, MasPriority, MasSubmission,
+    MultiAudioScheduler,
 };
 pub use mobile_scene_workload::{
     build_mobile_scene_snapshot, estimate_mobile_workload_hint, MobileSceneWorkloadBridgeConfig,
@@ -91,6 +99,9 @@ pub use tlsprite::{
     TlspritePack, TlspriteProgram, TlspriteProgramCache, TlspriteProgramCacheStats,
     TlspriteScaleAxis, TlspriteScaleSource, TlspriteSpriteDef, TlspriteWatchBackend,
     TlspriteWatchConfig, TlspriteWatchReloader,
+};
+pub use tlsprite_editor::{
+    TlspriteEditorPalette, TlspriteEditorTheme, TlspriteListDocument, TlspriteListRow,
 };
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,

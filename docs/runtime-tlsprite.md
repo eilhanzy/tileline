@@ -5,6 +5,7 @@ This note documents the first `.tlsprite` integration path for runtime-managed s
 ## Implementation Location
 
 - `runtime/src/tlsprite.rs`
+- `runtime/src/tlsprite_editor.rs` (Alpha list-mode editor model)
 - `runtime/src/scene.rs` (`BounceTankSceneController::set_sprite_program`)
 - `docs/demos/tlapp/bounce_hud.tlsprite`
 
@@ -74,6 +75,7 @@ Examples wired:
 - `runtime/examples/bounce_tank_showcase.rs`
 - `runtime/examples/auto_scene_scheduler.rs`
 - `runtime/examples/tlapp.rs`
+- `runtime/examples/tlsprite_list_editor.rs` (Alpha list inspector/editor scaffold)
 
 ## 3-Phase Plan
 
