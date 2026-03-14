@@ -123,6 +123,7 @@ pub struct WgpuSceneRenderer {
     sprite_instance_capacity_bytes: usize,
     ranges: Vec<GpuBatchRange>,
     sprite_count: u32,
+    force_full_fbx_sphere: bool,
 }
 
 impl WgpuSceneRenderer {
@@ -272,6 +273,7 @@ impl WgpuSceneRenderer {
             sprite_instance_capacity_bytes: std::mem::size_of::<GpuSpriteInstance>(),
             ranges: Vec::new(),
             sprite_count: 0,
+            force_full_fbx_sphere: false,
         };
         renderer.update_camera(queue, surface_width.max(1), surface_height.max(1));
         renderer
@@ -329,10 +331,14 @@ impl WgpuSceneRenderer {
 
         self.ranges = plan.ranges;
         self.sprite_count = plan.sprites.len() as u32;
-        self.sphere_lod_mode = select_sphere_lod_mode(
-            self.sphere_lod_mode,
-            count_sphere_instances(self.ranges.as_slice()),
-        );
+        if self.force_full_fbx_sphere {
+            self.sphere_lod_mode = SphereLodMode::High;
+        } else {
+            self.sphere_lod_mode = select_sphere_lod_mode(
+                self.sphere_lod_mode,
+                count_sphere_instances(self.ranges.as_slice()),
+            );
+        }
 
         let opaque_draw_calls = self
             .ranges
@@ -354,6 +360,16 @@ impl WgpuSceneRenderer {
                 + usize::from(self.sprite_count > 0),
             instance_3d_count: draw.stats.opaque_instances + draw.stats.transparent_instances,
             sprite_count: draw.stats.sprite_instances,
+        }
+    }
+
+    /// Force all sphere primitives to render with the full FBX mesh.
+    ///
+    /// When enabled, adaptive low-LOD sphere fallback is disabled.
+    pub fn set_force_full_fbx_sphere(&mut self, force: bool) {
+        self.force_full_fbx_sphere = force;
+        if force {
+            self.sphere_lod_mode = SphereLodMode::High;
         }
     }
 

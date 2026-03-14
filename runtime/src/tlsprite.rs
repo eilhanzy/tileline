@@ -115,6 +115,8 @@ struct TlspriteDynamicScale {
 pub struct TlspriteSpriteDef {
     pub name: String,
     pub sprite: SpriteInstance,
+    /// Original FBX path from source (if any). Used by runtime policy hooks.
+    pub fbx_source: Option<String>,
     dynamic_scale: Option<TlspriteDynamicScale>,
 }
 
@@ -127,6 +129,16 @@ pub struct TlspriteProgram {
 impl TlspriteProgram {
     pub fn sprites(&self) -> &[TlspriteSpriteDef] {
         &self.sprites
+    }
+
+    /// Returns `true` when at least one sprite section requests FBX-derived behavior.
+    ///
+    /// The renderer uses this as a policy signal to keep full FBX sphere rendering enabled and
+    /// avoid adaptive low-poly fallback in showcase paths.
+    pub fn requires_full_fbx_render(&self) -> bool {
+        self.sprites
+            .iter()
+            .any(|sprite| sprite.fbx_source.as_deref().is_some())
     }
 
     /// Emit frame-local sprite instances into `out`.
@@ -915,6 +927,7 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
                 texture_slot,
                 layer,
             },
+            fbx_source: None,
             dynamic_scale,
         });
     }
@@ -1260,6 +1273,7 @@ impl PendingSprite {
                     .unwrap_or(defaults.texture_slot),
                 layer: self.layer.unwrap_or(defaults.layer),
             },
+            fbx_source: self.fbx,
             dynamic_scale,
         })
     }

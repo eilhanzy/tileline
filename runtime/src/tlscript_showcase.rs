@@ -20,7 +20,7 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 8] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 9] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_linear_damping",
@@ -29,6 +29,7 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 8] = [
     "set_initial_speed",
     "set_initial_speed_min",
     "set_initial_speed_max",
+    "set_fbx_full_render",
 ];
 
 /// Showcase script compiler settings.
@@ -81,6 +82,7 @@ pub struct TlscriptShowcaseFrameInput {
 #[derive(Debug, Clone)]
 pub struct TlscriptShowcaseFrameOutput {
     pub patch: BounceTankRuntimePatch,
+    pub force_full_fbx_sphere: Option<bool>,
     pub dispatch_decision: Option<ParallelDispatchDecision>,
     pub warnings: Vec<String>,
     pub aborted_early: bool,
@@ -151,6 +153,7 @@ impl<'src> TlscriptShowcaseProgram<'src> {
 
         TlscriptShowcaseFrameOutput {
             patch: state.patch,
+            force_full_fbx_sphere: state.force_full_fbx_sphere,
             dispatch_decision,
             warnings: state.warnings,
             aborted_early: state.aborted_early,
@@ -366,6 +369,7 @@ impl<'src> TlscriptShowcaseProgram<'src> {
 struct EvalState {
     vars: HashMap<String, DemoValue>,
     patch: BounceTankRuntimePatch,
+    force_full_fbx_sphere: Option<bool>,
     warnings: Vec<String>,
     steps: usize,
     max_steps: usize,
@@ -378,6 +382,7 @@ impl EvalState {
         Self {
             vars: HashMap::new(),
             patch: BounceTankRuntimePatch::default(),
+            force_full_fbx_sphere: None,
             warnings: Vec::new(),
             steps: 0,
             max_steps: max_steps.max(1),
@@ -517,6 +522,10 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
         "set_initial_speed_max" => match args {
             [v] => state.patch.initial_speed_max = Some(v.to_f64() as f32),
             _ => state.warn("set_initial_speed_max expects 1 arg"),
+        },
+        "set_fbx_full_render" => match args {
+            [v] => state.force_full_fbx_sphere = Some(v.to_bool()),
+            _ => state.warn("set_fbx_full_render expects 1 arg"),
         },
         _ => state.warn(format!("unknown showcase builtin '{name}'")),
     }
@@ -721,5 +730,23 @@ mod tests {
         let outcome = compile_tlscript_showcase(src, Default::default());
         assert!(outcome.program.is_none());
         assert!(!outcome.errors.is_empty());
+    }
+
+    #[test]
+    fn supports_full_fbx_render_builtin_toggle() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_fbx_full_render(true)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty());
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+        });
+        assert_eq!(out.force_full_fbx_sphere, Some(true));
     }
 }

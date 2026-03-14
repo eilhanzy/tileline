@@ -114,6 +114,7 @@ struct ShowcaseRuntime {
     renderer: WgpuSceneRenderer,
     sprite_loader: TlspriteWatchReloader,
     sprite_cache: TlspriteProgramCache,
+    force_full_fbx_from_sprite: bool,
     script_program: TlscriptShowcaseProgram<'static>,
     script_last_spawned: usize,
     script_frame_index: u64,
@@ -199,7 +200,7 @@ impl ShowcaseRuntime {
             .program
             .expect("showcase script must compile without errors");
 
-        let renderer =
+        let mut renderer =
             WgpuSceneRenderer::new(&device, &queue, config.format, size.width, size.height);
         let draw_compiler = DrawPathCompiler::new();
         let hud = TelemetryHudComposer::new(Default::default());
@@ -215,9 +216,12 @@ impl ShowcaseRuntime {
         let event = sprite_loader.reload_into_cache(&mut sprite_cache);
         print_tlsprite_event("[tlsprite boot]", event);
         let mut scene = scene;
+        let mut force_full_fbx_from_sprite = false;
         if let Some(program) = sprite_cache.program_for_path(sprite_loader.path()).cloned() {
+            force_full_fbx_from_sprite = program.requires_full_fbx_render();
             scene.set_sprite_program(program);
         }
+        renderer.set_force_full_fbx_sphere(force_full_fbx_from_sprite);
 
         let now = Instant::now();
         Ok(Self {
@@ -235,6 +239,7 @@ impl ShowcaseRuntime {
             renderer,
             sprite_loader,
             sprite_cache,
+            force_full_fbx_from_sprite,
             script_program,
             script_last_spawned: 0,
             script_frame_index: 0,
@@ -289,6 +294,7 @@ impl ShowcaseRuntime {
                     .program_for_path(self.sprite_loader.path())
                     .cloned()
                 {
+                    self.force_full_fbx_from_sprite = program.requires_full_fbx_render();
                     self.scene.set_sprite_program(program);
                 }
             }
@@ -309,6 +315,10 @@ impl ShowcaseRuntime {
             .as_ref()
             .map(|d| d.is_parallel())
             .unwrap_or(false);
+        let force_full_fbx = frame_eval
+            .force_full_fbx_sphere
+            .unwrap_or(self.force_full_fbx_from_sprite);
+        self.renderer.set_force_full_fbx_sphere(force_full_fbx);
 
         // Respect @parallel readiness and current physics pressure to avoid long-run collapse.
         let mut runtime_patch = frame_eval.patch;

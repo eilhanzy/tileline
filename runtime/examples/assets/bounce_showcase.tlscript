@@ -2,6 +2,7 @@
 @parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=128, schedule="performance")
 @deterministic
 def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):
+    set_fbx_full_render(true)
     let burst: int = 300
     if frame < 45:
         burst = 420
