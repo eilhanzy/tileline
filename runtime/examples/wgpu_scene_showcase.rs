@@ -2,6 +2,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
 
+use nalgebra::Vector3;
 use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
 use runtime::{
     compile_tlscript_showcase, BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler,
@@ -11,10 +12,10 @@ use runtime::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
@@ -64,17 +65,17 @@ impl ApplicationHandler for ShowcaseApp {
                 self.exit_requested = true;
                 event_loop.exit();
             }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key: Key::Named(NamedKey::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => {
-                self.exit_requested = true;
-                event_loop.exit();
+            WindowEvent::KeyboardInput { event, .. } => {
+                runtime.on_keyboard_input(&event);
+                if matches!(event.logical_key, Key::Named(NamedKey::Escape))
+                    && event.state == ElementState::Pressed
+                {
+                    self.exit_requested = true;
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                runtime.on_mouse_button(state, button);
             }
             WindowEvent::Resized(size) => runtime.resize(size),
             WindowEvent::RedrawRequested => {
@@ -85,6 +86,17 @@ impl ApplicationHandler for ShowcaseApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.on_device_event(event);
         }
     }
 
@@ -112,6 +124,7 @@ struct ShowcaseRuntime {
     draw_compiler: DrawPathCompiler,
     hud: TelemetryHudComposer,
     renderer: WgpuSceneRenderer,
+    camera: FreeCameraController,
     sprite_loader: TlspriteWatchReloader,
     sprite_cache: TlspriteProgramCache,
     force_full_fbx_from_sprite: bool,
@@ -202,6 +215,9 @@ impl ShowcaseRuntime {
 
         let mut renderer =
             WgpuSceneRenderer::new(&device, &queue, config.format, size.width, size.height);
+        let camera = FreeCameraController::default();
+        let (eye, target) = camera.eye_target();
+        renderer.set_camera_view(&queue, size.width.max(1), size.height.max(1), eye, target);
         let draw_compiler = DrawPathCompiler::new();
         let hud = TelemetryHudComposer::new(Default::default());
 
@@ -237,6 +253,7 @@ impl ShowcaseRuntime {
             draw_compiler,
             hud,
             renderer,
+            camera,
             sprite_loader,
             sprite_cache,
             force_full_fbx_from_sprite,
@@ -271,12 +288,38 @@ impl ShowcaseRuntime {
         );
     }
 
+    fn on_keyboard_input(&mut self, event: &KeyEvent) {
+        self.camera.on_keyboard_input(event);
+    }
+
+    fn on_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+        if button == MouseButton::Right {
+            let active = state == ElementState::Pressed;
+            self.camera.set_look_active(&self.window, active);
+        }
+    }
+
+    fn on_device_event(&mut self, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            self.camera.on_mouse_delta(delta.0 as f32, delta.1 as f32);
+        }
+    }
+
     fn render_frame(&mut self) -> Result<(), Box<dyn Error>> {
         let now = Instant::now();
         let dt = (now - self.frame_started_at)
             .as_secs_f32()
             .clamp(1.0 / 500.0, 1.0 / 20.0);
         self.frame_started_at = now;
+        self.camera.update(dt);
+        let (eye, target) = self.camera.eye_target();
+        self.renderer.set_camera_view(
+            &self.queue,
+            self.size.width.max(1),
+            self.size.height.max(1),
+            eye,
+            target,
+        );
         self.frames_in_window = self.frames_in_window.saturating_add(1);
         let fps_window = (now - self.fps_window_started_at).as_secs_f32();
         if fps_window >= 0.5 {
@@ -416,6 +459,154 @@ impl ShowcaseRuntime {
         self.queue.submit(Some(encoder.finish()));
         output.present();
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CameraInputState {
+    forward: bool,
+    backward: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    sprint: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FreeCameraController {
+    position: Vector3<f32>,
+    yaw_rad: f32,
+    pitch_rad: f32,
+    move_speed: f32,
+    sprint_multiplier: f32,
+    mouse_sensitivity: f32,
+    look_active: bool,
+    input: CameraInputState,
+}
+
+impl Default for FreeCameraController {
+    fn default() -> Self {
+        Self {
+            position: Vector3::new(0.0, 12.0, 36.0),
+            yaw_rad: 0.0,
+            pitch_rad: -0.321_750_55, // ~-18.43 deg (points towards tank center)
+            move_speed: 18.0,
+            sprint_multiplier: 2.5,
+            mouse_sensitivity: 0.0018,
+            look_active: false,
+            input: CameraInputState::default(),
+        }
+    }
+}
+
+impl FreeCameraController {
+    fn on_keyboard_input(&mut self, event: &KeyEvent) {
+        let pressed = event.state == ElementState::Pressed;
+        match event.physical_key {
+            PhysicalKey::Code(KeyCode::KeyW) => self.input.forward = pressed,
+            PhysicalKey::Code(KeyCode::KeyS) => self.input.backward = pressed,
+            PhysicalKey::Code(KeyCode::KeyA) => self.input.left = pressed,
+            PhysicalKey::Code(KeyCode::KeyD) => self.input.right = pressed,
+            PhysicalKey::Code(KeyCode::Space) => self.input.up = pressed,
+            PhysicalKey::Code(KeyCode::ShiftLeft) | PhysicalKey::Code(KeyCode::ShiftRight) => {
+                self.input.down = pressed
+            }
+            PhysicalKey::Code(KeyCode::ControlLeft) | PhysicalKey::Code(KeyCode::ControlRight) => {
+                self.input.sprint = pressed
+            }
+            _ => {}
+        }
+    }
+
+    fn set_look_active(&mut self, window: &Window, active: bool) {
+        if self.look_active == active {
+            return;
+        }
+        self.look_active = active;
+
+        if active {
+            let grab_result = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            if let Err(err) = grab_result {
+                eprintln!("[camera] cursor grab failed: {err}");
+            }
+            window.set_cursor_visible(false);
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+    }
+
+    fn on_mouse_delta(&mut self, dx: f32, dy: f32) {
+        if !self.look_active {
+            return;
+        }
+        self.yaw_rad += dx * self.mouse_sensitivity;
+        self.pitch_rad -= dy * self.mouse_sensitivity;
+        self.pitch_rad = self.pitch_rad.clamp(-1.553_343, 1.553_343); // +/-89 deg
+    }
+
+    fn update(&mut self, dt: f32) {
+        let forward = self.forward_vector();
+        let horizontal_forward = Vector3::new(forward.x, 0.0, forward.z);
+        let forward_len = horizontal_forward.norm();
+        let forward_flat = if forward_len > 1e-5 {
+            horizontal_forward / forward_len
+        } else {
+            Vector3::new(0.0, 0.0, -1.0)
+        };
+        let right = Vector3::new(-forward_flat.z, 0.0, forward_flat.x);
+
+        let mut move_dir = Vector3::zeros();
+        if self.input.forward {
+            move_dir += forward_flat;
+        }
+        if self.input.backward {
+            move_dir -= forward_flat;
+        }
+        if self.input.right {
+            move_dir += right;
+        }
+        if self.input.left {
+            move_dir -= right;
+        }
+        if self.input.up {
+            move_dir.y += 1.0;
+        }
+        if self.input.down {
+            move_dir.y -= 1.0;
+        }
+
+        let len = move_dir.norm();
+        if len > 1e-5 {
+            let move_dir = move_dir / len;
+            let speed = self.move_speed
+                * if self.input.sprint {
+                    self.sprint_multiplier
+                } else {
+                    1.0
+                };
+            self.position += move_dir * speed * dt.max(0.0);
+        }
+    }
+
+    fn eye_target(&self) -> ([f32; 3], [f32; 3]) {
+        let forward = self.forward_vector();
+        let eye = [self.position.x, self.position.y, self.position.z];
+        let target = [
+            self.position.x + forward.x,
+            self.position.y + forward.y,
+            self.position.z + forward.z,
+        ];
+        (eye, target)
+    }
+
+    fn forward_vector(&self) -> Vector3<f32> {
+        let (sin_yaw, cos_yaw) = self.yaw_rad.sin_cos();
+        let (sin_pitch, cos_pitch) = self.pitch_rad.sin_cos();
+        Vector3::new(sin_yaw * cos_pitch, sin_pitch, -cos_yaw * cos_pitch)
     }
 }
 

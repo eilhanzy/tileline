@@ -124,6 +124,8 @@ pub struct WgpuSceneRenderer {
     ranges: Vec<GpuBatchRange>,
     sprite_count: u32,
     force_full_fbx_sphere: bool,
+    camera_eye: [f32; 3],
+    camera_target: [f32; 3],
 }
 
 impl WgpuSceneRenderer {
@@ -252,7 +254,7 @@ impl WgpuSceneRenderer {
             mapped_at_creation: false,
         });
 
-        let mut renderer = Self {
+        let renderer = Self {
             camera_buffer,
             camera_bind_group,
             pipeline_opaque,
@@ -274,17 +276,33 @@ impl WgpuSceneRenderer {
             ranges: Vec::new(),
             sprite_count: 0,
             force_full_fbx_sphere: false,
+            camera_eye: [0.0, 12.0, 36.0],
+            camera_target: [0.0, 0.0, 0.0],
         };
-        renderer.update_camera(queue, surface_width.max(1), surface_height.max(1));
+        renderer.write_camera_uniform(queue, surface_width.max(1), surface_height.max(1));
         renderer
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
-        self.update_camera(queue, width.max(1), height.max(1));
+        self.write_camera_uniform(queue, width.max(1), height.max(1));
         let (depth_texture, depth_view) =
             create_depth_resources(device, width.max(1), height.max(1), "runtime-scene-depth");
         self._depth_texture = depth_texture;
         self.depth_view = depth_view;
+    }
+
+    /// Overrides the active camera transform used by scene rendering.
+    pub fn set_camera_view(
+        &mut self,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        eye: [f32; 3],
+        target: [f32; 3],
+    ) {
+        self.camera_eye = eye;
+        self.camera_target = target;
+        self.write_camera_uniform(queue, width.max(1), height.max(1));
     }
 
     pub fn upload_draw_frame(
@@ -448,12 +466,16 @@ impl WgpuSceneRenderer {
         }
     }
 
-    fn update_camera(&mut self, queue: &wgpu::Queue, width: u32, height: u32) {
+    fn write_camera_uniform(&self, queue: &wgpu::Queue, width: u32, height: u32) {
         let aspect = (width.max(1) as f32) / (height.max(1) as f32);
         let proj = Perspective3::new(aspect.max(0.1), 60f32.to_radians(), 0.1, 500.0);
         let view = Isometry3::look_at_rh(
-            &Point3::new(0.0, 12.0, 36.0),
-            &Point3::new(0.0, 0.0, 0.0),
+            &Point3::new(self.camera_eye[0], self.camera_eye[1], self.camera_eye[2]),
+            &Point3::new(
+                self.camera_target[0],
+                self.camera_target[1],
+                self.camera_target[2],
+            ),
             &Vector3::new(0.0, 1.0, 0.0),
         );
         let view_proj: Matrix4<f32> = proj.to_homogeneous() * view.to_homogeneous();
@@ -1255,6 +1277,9 @@ struct VSOut {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) emissive: vec3<f32>,
+    @location(2) world_pos: vec3<f32>,
+    @location(3) local_pos: vec3<f32>,
+    @location(4) primitive_code: f32,
 };
 
 @vertex
@@ -1271,13 +1296,35 @@ fn vs_main(input: VSIn) -> VSOut {
     out.position = u_camera.view_proj * world_pos;
     out.color = input.base_color;
     out.emissive = input.emissive.xyz;
+    out.world_pos = world_pos.xyz;
+    out.local_pos = input.position;
+    out.primitive_code = input.material_params.w;
     return out;
 }
 
 @fragment
-fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
-    let lit = input.color.rgb + input.emissive;
-    return vec4<f32>(lit, input.color.a);
+fn fs_main(input: VSOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
+    let dpx = dpdx(input.world_pos);
+    let dpy = dpdy(input.world_pos);
+    var normal = normalize(cross(dpx, dpy));
+    if !is_front {
+        normal = -normal;
+    }
+
+    let light_dir = normalize(vec3<f32>(0.42, 0.74, 0.52));
+    let ambient = 0.24;
+    let diffuse = max(dot(normal, light_dir), 0.0) * 0.76;
+    var lit = input.color.rgb * (ambient + diffuse) + input.emissive;
+    var alpha = input.color.a;
+
+    // Box primitives get extra edge contrast so the tank keeps a clear prism silhouette.
+    if input.primitive_code > 0.5 {
+        let edge = max(max(abs(input.local_pos.x), abs(input.local_pos.y)), abs(input.local_pos.z));
+        let edge_boost = smoothstep(0.38, 0.50, edge);
+        lit += vec3<f32>(0.08, 0.12, 0.18) * edge_boost;
+        alpha = clamp(alpha + edge_boost * 0.32, 0.0, 1.0);
+    }
+    return vec4<f32>(lit, alpha);
 }
 "#;
 

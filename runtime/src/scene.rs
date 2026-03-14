@@ -389,6 +389,7 @@ impl BounceTankSceneController {
     ) -> SceneFrameInstances {
         let mut frame = SceneFrameInstances::default();
         frame.transparent_3d.push(self.container_visual_instance());
+        self.append_container_edge_instances(&mut frame.opaque_3d);
 
         let alpha = interpolation_alpha.unwrap_or(1.0).clamp(0.0, 1.0);
         for ball in &self.balls {
@@ -631,6 +632,147 @@ impl BounceTankSceneController {
             },
             casts_shadow: false,
             receives_shadow: true,
+        }
+    }
+
+    /// Adds 12 thin edge prisms so the tank silhouette remains readable from every camera angle.
+    fn append_container_edge_instances(&self, out: &mut Vec<SceneInstance3d>) {
+        let hx = self.config.container_half_extents[0] * 2.0;
+        let hy = self.config.container_half_extents[1] * 2.0;
+        let hz = self.config.container_half_extents[2] * 2.0;
+        let edge = self.config.wall_thickness.max(0.03) * 0.30;
+
+        // X-axis edges (y/z corners).
+        let x_edges = [
+            (
+                [
+                    0.0,
+                    self.config.container_half_extents[1],
+                    self.config.container_half_extents[2],
+                ],
+                [hx, edge, edge],
+            ),
+            (
+                [
+                    0.0,
+                    self.config.container_half_extents[1],
+                    -self.config.container_half_extents[2],
+                ],
+                [hx, edge, edge],
+            ),
+            (
+                [
+                    0.0,
+                    -self.config.container_half_extents[1],
+                    self.config.container_half_extents[2],
+                ],
+                [hx, edge, edge],
+            ),
+            (
+                [
+                    0.0,
+                    -self.config.container_half_extents[1],
+                    -self.config.container_half_extents[2],
+                ],
+                [hx, edge, edge],
+            ),
+        ];
+        // Y-axis edges (x/z corners).
+        let y_edges = [
+            (
+                [
+                    self.config.container_half_extents[0],
+                    0.0,
+                    self.config.container_half_extents[2],
+                ],
+                [edge, hy, edge],
+            ),
+            (
+                [
+                    self.config.container_half_extents[0],
+                    0.0,
+                    -self.config.container_half_extents[2],
+                ],
+                [edge, hy, edge],
+            ),
+            (
+                [
+                    -self.config.container_half_extents[0],
+                    0.0,
+                    self.config.container_half_extents[2],
+                ],
+                [edge, hy, edge],
+            ),
+            (
+                [
+                    -self.config.container_half_extents[0],
+                    0.0,
+                    -self.config.container_half_extents[2],
+                ],
+                [edge, hy, edge],
+            ),
+        ];
+        // Z-axis edges (x/y corners).
+        let z_edges = [
+            (
+                [
+                    self.config.container_half_extents[0],
+                    self.config.container_half_extents[1],
+                    0.0,
+                ],
+                [edge, edge, hz],
+            ),
+            (
+                [
+                    self.config.container_half_extents[0],
+                    -self.config.container_half_extents[1],
+                    0.0,
+                ],
+                [edge, edge, hz],
+            ),
+            (
+                [
+                    -self.config.container_half_extents[0],
+                    self.config.container_half_extents[1],
+                    0.0,
+                ],
+                [edge, edge, hz],
+            ),
+            (
+                [
+                    -self.config.container_half_extents[0],
+                    -self.config.container_half_extents[1],
+                    0.0,
+                ],
+                [edge, edge, hz],
+            ),
+        ];
+
+        let mut edge_index: u64 = 0;
+        for (translation, scale) in x_edges
+            .into_iter()
+            .chain(y_edges.into_iter())
+            .chain(z_edges.into_iter())
+        {
+            out.push(SceneInstance3d {
+                instance_id: (u64::MAX - 20).saturating_sub(edge_index),
+                primitive: ScenePrimitive3d::Box,
+                transform: SceneTransform3d {
+                    translation,
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    scale,
+                },
+                material: SceneMaterial {
+                    base_color_rgba: [0.90, 0.96, 1.0, 0.72],
+                    roughness: 0.06,
+                    metallic: 0.0,
+                    emissive_rgb: [0.06, 0.09, 0.12],
+                    shading: ShadingModel::LitPbr,
+                },
+                casts_shadow: false,
+                receives_shadow: false,
+            });
+            edge_index = edge_index.saturating_add(1);
         }
     }
 

@@ -170,6 +170,10 @@ fn pack_draw_instance(instance: &SceneInstance3d) -> DrawInstance3d {
     let model = compose_model_matrix(instance);
     let emissive = instance.material.emissive_rgb;
     let emissive_strength = emissive[0].max(emissive[1]).max(emissive[2]);
+    let primitive_code = match instance.primitive {
+        ScenePrimitive3d::Sphere => 0.0,
+        ScenePrimitive3d::Box => 1.0,
+    };
     DrawInstance3d {
         instance_id: instance.instance_id,
         model_cols: matrix_to_cols(&model),
@@ -178,7 +182,7 @@ fn pack_draw_instance(instance: &SceneInstance3d) -> DrawInstance3d {
             instance.material.roughness,
             instance.material.metallic,
             emissive_strength,
-            0.0,
+            primitive_code,
         ],
         emissive_rgb: emissive,
     }
