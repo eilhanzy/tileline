@@ -35,5 +35,12 @@ The frame path:
 - `set_initial_speed(min, max)`
 - `set_initial_speed_min(v)`
 - `set_initial_speed_max(v)`
+- `set_ball_mesh_slot(slot)`
+- `set_container_mesh_slot(slot)`
+- `set_fbx_full_render(bool)`
+- `set_camera_move_speed(v)`
+- `set_camera_look_sensitivity(v)`
+- `set_camera_pose(ex, ey, ez, tx, ty, tz)`
 
-All values are clamped during patch application to keep the simulation safe.
+All values are soft-validated and clamped during patch application to keep simulation and runtime
+controls safe.

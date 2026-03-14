@@ -1,0 +1,31 @@
+@export
+@parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=128, schedule="performance")
+@deterministic
+def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):
+    # Keep high-fidelity mesh rendering and bind ball primitive to FBX slot 2.
+    set_fbx_full_render(true)
+    set_ball_mesh_slot(2)
+
+    # Camera defaults are now script-driven.
+    if frame == 0:
+        set_camera_pose(0.0, 12.0, 36.0, 0.0, 0.0, 0.0)
+    set_camera_move_speed(18.0)
+    set_camera_look_sensitivity(0.0018)
+
+    let burst: int = 300
+    if frame < 45:
+        burst = 420
+    if live_balls > 3000:
+        burst = 120
+    if live_balls > 6000:
+        burst = 72
+    set_spawn_per_tick(burst)
+
+    if spawned_this_tick == 0 && live_balls > 1200:
+        set_linear_damping(0.014)
+    else:
+        set_linear_damping(0.008)
+
+    if frame % 120 == 0:
+        set_ball_restitution(0.94)
+        set_wall_restitution(0.95)

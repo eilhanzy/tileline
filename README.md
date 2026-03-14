@@ -134,10 +134,10 @@ cargo test -p tl-core
 cargo test -p runtime
 ```
 
-### Run Runtime WGPU Scene Showcase
+### Run Runtime TLApp Demo
 
 ```bash
-cargo run -p runtime --example wgpu_scene_showcase
+cargo run -p runtime --example tlapp -- --fps-cap 60 --vsync auto
 ```
 
 ### Run NPS Starter Packet Example

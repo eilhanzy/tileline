@@ -22,6 +22,10 @@ use crate::tlsprite::{TlspriteFrameContext, TlspriteProgram};
 pub enum ScenePrimitive3d {
     Sphere,
     Box,
+    /// Custom FBX mesh bound into the renderer slot table.
+    Mesh {
+        slot: u8,
+    },
 }
 
 /// Material shading model hint for runtime/renderer integration.
@@ -232,6 +236,8 @@ pub struct BounceTankRuntimePatch {
     pub wall_restitution: Option<f32>,
     pub initial_speed_min: Option<f32>,
     pub initial_speed_max: Option<f32>,
+    pub ball_mesh_slot: Option<u8>,
+    pub container_mesh_slot: Option<u8>,
 }
 
 /// Result summary for one runtime patch application.
@@ -259,6 +265,8 @@ pub struct BounceTankSceneController {
     walls: Vec<BodyHandle>,
     balls: Vec<BallVisual>,
     sprite_program: Option<TlspriteProgram>,
+    ball_mesh_slot: Option<u8>,
+    container_mesh_slot: Option<u8>,
 }
 
 impl BounceTankSceneController {
@@ -269,6 +277,8 @@ impl BounceTankSceneController {
             walls: Vec::with_capacity(6),
             balls: Vec::new(),
             sprite_program: None,
+            ball_mesh_slot: None,
+            container_mesh_slot: None,
         }
     }
 
@@ -361,6 +371,18 @@ impl BounceTankSceneController {
             self.config.initial_speed_max = self.config.initial_speed_min;
             updated = true;
         }
+        if let Some(slot) = patch.ball_mesh_slot {
+            if self.ball_mesh_slot != Some(slot) {
+                self.ball_mesh_slot = Some(slot);
+                updated = true;
+            }
+        }
+        if let Some(slot) = patch.container_mesh_slot {
+            if self.container_mesh_slot != Some(slot) {
+                self.container_mesh_slot = Some(slot);
+                updated = true;
+            }
+        }
 
         BounceTankPatchMetrics {
             config_updated: updated,
@@ -408,7 +430,10 @@ impl BounceTankSceneController {
             let q = rotation.quaternion();
             frame.opaque_3d.push(SceneInstance3d {
                 instance_id: ball.body.raw() as u64,
-                primitive: ScenePrimitive3d::Sphere,
+                primitive: self
+                    .ball_mesh_slot
+                    .map(|slot| ScenePrimitive3d::Mesh { slot })
+                    .unwrap_or(ScenePrimitive3d::Sphere),
                 transform: SceneTransform3d {
                     translation: [position.x, position.y, position.z],
                     rotation_xyzw: [q.i, q.j, q.k, q.w],
@@ -613,7 +638,10 @@ impl BounceTankSceneController {
     fn container_visual_instance(&self) -> SceneInstance3d {
         SceneInstance3d {
             instance_id: u64::MAX - 1,
-            primitive: ScenePrimitive3d::Box,
+            primitive: self
+                .container_mesh_slot
+                .map(|slot| ScenePrimitive3d::Mesh { slot })
+                .unwrap_or(ScenePrimitive3d::Box),
             transform: SceneTransform3d {
                 translation: [0.0, 0.0, 0.0],
                 rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
@@ -920,6 +948,40 @@ mod tests {
         assert!(cfg.linear_damping <= 0.95);
         assert!(cfg.initial_speed_max >= cfg.initial_speed_min);
         assert!(metrics.config_updated);
+    }
+
+    #[test]
+    fn runtime_patch_can_switch_ball_and_container_mesh_slots() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 64,
+            spawn_per_tick: 64,
+            ..BounceTankSceneConfig::default()
+        });
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+
+        let _ = scene.apply_runtime_patch(
+            &mut world,
+            BounceTankRuntimePatch {
+                ball_mesh_slot: Some(5),
+                container_mesh_slot: Some(2),
+                ..BounceTankRuntimePatch::default()
+            },
+        );
+
+        let frame = scene.build_frame_instances(&world, Some(1.0));
+        assert!(matches!(
+            frame.transparent_3d.first().map(|i| i.primitive),
+            Some(ScenePrimitive3d::Mesh { slot: 2 })
+        ));
+        assert!(frame
+            .opaque_3d
+            .iter()
+            .any(|i| matches!(i.primitive, ScenePrimitive3d::Mesh { slot: 5 })));
     }
 
     #[test]

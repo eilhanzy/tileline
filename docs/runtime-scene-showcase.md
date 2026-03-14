@@ -24,7 +24,7 @@ This note documents the pre-alpha scene orchestration foundation added for the u
 - `SceneInstance3d`: primitive + transform + material + shadow flags
 - `SpriteInstance`: overlay/sprite payload (HUD/progress/etc.)
 - `SceneFrameInstances`: `opaque_3d`, `transparent_3d`, `sprites`
-- `ScenePrimitive3d`: `Sphere` / `Box`
+- `ScenePrimitive3d`: `Sphere` / `Box` / `Mesh { slot }`
 - `SceneMaterial` + `ShadingModel`
 - `set_sprite_program(...)` hook for compiled `.tlsprite` overlays
 
@@ -38,8 +38,11 @@ This note documents the pre-alpha scene orchestration foundation added for the u
 - deterministic color/material variation per ball
 - render payload emission (`build_frame_instances`)
 
-The transparent tank is emitted as one `transparent_3d` box instance; balls are emitted as
-`opaque_3d` sphere instances.
+The transparent tank is emitted as one `transparent_3d` box instance plus thin edge prisms for
+silhouette clarity; balls are emitted as `opaque_3d` spheres by default.
+
+When `.tlscript` sets `set_ball_mesh_slot(...)` or `set_container_mesh_slot(...)`, the same scene
+path can emit `ScenePrimitive3d::Mesh { slot }` and consume FBX bindings loaded from `.tlsprite`.
 
 ## Tick/FPS Decoupling
 

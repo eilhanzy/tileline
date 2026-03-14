@@ -5,7 +5,7 @@
 //! - transparent 3D batches
 //! - sprite overlays (including telemetry HUD sprites)
 
-use std::io::Cursor;
+use std::{collections::BTreeMap, fs, io::Cursor, path::Path};
 
 use fbx::Property as FbxProperty;
 use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3};
@@ -126,6 +126,7 @@ pub struct WgpuSceneRenderer {
     force_full_fbx_sphere: bool,
     camera_eye: [f32; 3],
     camera_target: [f32; 3],
+    custom_mesh_slots: BTreeMap<u8, GpuMesh>,
 }
 
 impl WgpuSceneRenderer {
@@ -278,6 +279,7 @@ impl WgpuSceneRenderer {
             force_full_fbx_sphere: false,
             camera_eye: [0.0, 12.0, 36.0],
             camera_target: [0.0, 0.0, 0.0],
+            custom_mesh_slots: BTreeMap::new(),
         };
         renderer.write_camera_uniform(queue, surface_width.max(1), surface_height.max(1));
         renderer
@@ -303,6 +305,38 @@ impl WgpuSceneRenderer {
         self.camera_eye = eye;
         self.camera_target = target;
         self.write_camera_uniform(queue, width.max(1), height.max(1));
+    }
+
+    /// Bind an FBX mesh into a runtime mesh slot.
+    ///
+    /// Slots are consumed by `ScenePrimitive3d::Mesh { slot }` and mapped in draw batching.
+    pub fn bind_fbx_mesh_slot_from_bytes(
+        &mut self,
+        device: &wgpu::Device,
+        slot: u8,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let mesh_data = parse_first_mesh_from_fbx(bytes)?;
+        let mesh = create_mesh(
+            device,
+            &format!("runtime-scene-fbx-slot-{slot}"),
+            &mesh_data.vertices,
+            &mesh_data.indices,
+        );
+        self.custom_mesh_slots.insert(slot, mesh);
+        Ok(())
+    }
+
+    /// Bind an FBX mesh from disk into a runtime mesh slot.
+    pub fn bind_fbx_mesh_slot_from_path(
+        &mut self,
+        device: &wgpu::Device,
+        slot: u8,
+        path: &Path,
+    ) -> Result<(), String> {
+        let bytes = fs::read(path)
+            .map_err(|err| format!("failed to read FBX '{}': {err}", path.display()))?;
+        self.bind_fbx_mesh_slot_from_bytes(device, slot, &bytes)
     }
 
     pub fn upload_draw_frame(
@@ -431,6 +465,7 @@ impl WgpuSceneRenderer {
                     &self.box_mesh,
                     &self.sphere_mesh_high,
                     &self.sphere_mesh_low,
+                    &self.custom_mesh_slots,
                     self.sphere_lod_mode,
                     &self.instance_3d_buffer,
                     range,
@@ -448,6 +483,7 @@ impl WgpuSceneRenderer {
                     &self.box_mesh,
                     &self.sphere_mesh_high,
                     &self.sphere_mesh_low,
+                    &self.custom_mesh_slots,
                     self.sphere_lod_mode,
                     &self.instance_3d_buffer,
                     range,
@@ -581,17 +617,21 @@ fn draw_3d_range(
     box_mesh: &GpuMesh,
     sphere_mesh_high: &GpuMesh,
     sphere_mesh_low: &GpuMesh,
+    custom_mesh_slots: &BTreeMap<u8, GpuMesh>,
     sphere_lod_mode: SphereLodMode,
     instance_buffer: &wgpu::Buffer,
     range: &GpuBatchRange,
 ) {
-    let mesh = if range.primitive_code == 0 {
-        match sphere_lod_mode {
+    let mesh = match range.primitive_code {
+        0 => match sphere_lod_mode {
             SphereLodMode::High => sphere_mesh_high,
             SphereLodMode::Low => sphere_mesh_low,
+        },
+        1 => box_mesh,
+        code => {
+            let slot = code.saturating_sub(2);
+            custom_mesh_slots.get(&slot).unwrap_or(sphere_mesh_high)
         }
-    } else {
-        box_mesh
     };
     pass.set_vertex_buffer(0, mesh.vertex.slice(..));
     let bytes_per_instance = std::mem::size_of::<GpuInstance3d>() as u64;

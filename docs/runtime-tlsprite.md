@@ -6,7 +6,7 @@ This note documents the first `.tlsprite` integration path for runtime-managed s
 
 - `runtime/src/tlsprite.rs`
 - `runtime/src/scene.rs` (`BounceTankSceneController::set_sprite_program`)
-- `runtime/examples/assets/bounce_hud.tlsprite`
+- `docs/demos/tlapp/bounce_hud.tlsprite`
 
 ## Format (`tlsprite_v1`)
 
@@ -40,7 +40,7 @@ not specified, so minimal sections can be authored quickly.
 
 ## Runtime Flow
 
-1. Load source as in-memory string (`include_str!` or engine asset loader).
+1. Load source as in-memory string (engine asset loader or `std::fs` at app layer).
 2. Compile with `runtime::compile_tlsprite(...)`.
 3. Inspect diagnostics.
 4. Pass resulting `TlspriteProgram` to scene controller:
@@ -73,6 +73,7 @@ Examples wired:
 
 - `runtime/examples/bounce_tank_showcase.rs`
 - `runtime/examples/auto_scene_scheduler.rs`
+- `runtime/examples/tlapp.rs`
 
 ## 3-Phase Plan
 
@@ -111,3 +112,14 @@ Current `runtime::WgpuSceneRenderer` path consumes sprite kind metadata and appl
 - terrain-style shader treatment (banding/gradient emphasis)
 
 This keeps type behavior in `src/` runtime code rather than benchmark-only scripts.
+
+## FBX Mesh Slot Binding
+
+`TlspriteProgram::mesh_fbx_bindings()` exports unique `(slot, path)` pairs inferred from sprite
+sections that define `fbx = ...`:
+
+- `texture_slot` is reused as mesh slot id (0..255)
+- first declaration per slot wins
+
+`TLApp` uses this to call `WgpuSceneRenderer::bind_fbx_mesh_slot_from_path(...)`, which enables
+runtime `ScenePrimitive3d::Mesh { slot }` rendering via external FBX assets.

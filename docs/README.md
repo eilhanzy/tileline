@@ -25,6 +25,7 @@ in `src/` crates (not benchmark-only code).
 - `examples/tlsprite/runtime_basic_types.tlsprite`: starter `.tlsprite` asset with `hud`, `camera`, and `terrain` kinds
 - `runtime-tlscript-showcase.md`: `.tlscript` showcase compile/evaluate bootstrap for scene control
 - `mgs-scene-workload.md`: runtime/mobile scene density to MGS bridge hint and tile planning mapping
+- `demos/tlapp/*`: TLApp show-scene assets (`bounce_showcase.tlscript`, `bounce_hud.tlsprite`)
 - `demos/`: demo-specific flow notes and show scripts (`docs/demos/*`)
 
 ## Documentation Style

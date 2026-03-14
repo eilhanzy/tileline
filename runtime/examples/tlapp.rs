@@ -2,8 +2,5 @@
 mod tlapp_app;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!(
-        "[deprecated] 'wgpu_scene_showcase' is kept for compatibility. Use '--example tlapp'."
-    );
     tlapp_app::run_from_env()
 }

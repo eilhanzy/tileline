@@ -20,7 +20,7 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 9] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 14] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_linear_damping",
@@ -29,7 +29,12 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 9] = [
     "set_initial_speed",
     "set_initial_speed_min",
     "set_initial_speed_max",
+    "set_ball_mesh_slot",
+    "set_container_mesh_slot",
     "set_fbx_full_render",
+    "set_camera_move_speed",
+    "set_camera_look_sensitivity",
+    "set_camera_pose",
 ];
 
 /// Showcase script compiler settings.
@@ -83,6 +88,9 @@ pub struct TlscriptShowcaseFrameInput {
 pub struct TlscriptShowcaseFrameOutput {
     pub patch: BounceTankRuntimePatch,
     pub force_full_fbx_sphere: Option<bool>,
+    pub camera_move_speed: Option<f32>,
+    pub camera_look_sensitivity: Option<f32>,
+    pub camera_pose: Option<([f32; 3], [f32; 3])>,
     pub dispatch_decision: Option<ParallelDispatchDecision>,
     pub warnings: Vec<String>,
     pub aborted_early: bool,
@@ -154,6 +162,9 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         TlscriptShowcaseFrameOutput {
             patch: state.patch,
             force_full_fbx_sphere: state.force_full_fbx_sphere,
+            camera_move_speed: state.camera_move_speed,
+            camera_look_sensitivity: state.camera_look_sensitivity,
+            camera_pose: state.camera_pose,
             dispatch_decision,
             warnings: state.warnings,
             aborted_early: state.aborted_early,
@@ -370,6 +381,9 @@ struct EvalState {
     vars: HashMap<String, DemoValue>,
     patch: BounceTankRuntimePatch,
     force_full_fbx_sphere: Option<bool>,
+    camera_move_speed: Option<f32>,
+    camera_look_sensitivity: Option<f32>,
+    camera_pose: Option<([f32; 3], [f32; 3])>,
     warnings: Vec<String>,
     steps: usize,
     max_steps: usize,
@@ -383,6 +397,9 @@ impl EvalState {
             vars: HashMap::new(),
             patch: BounceTankRuntimePatch::default(),
             force_full_fbx_sphere: None,
+            camera_move_speed: None,
+            camera_look_sensitivity: None,
+            camera_pose: None,
             warnings: Vec::new(),
             steps: 0,
             max_steps: max_steps.max(1),
@@ -523,9 +540,34 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
             [v] => state.patch.initial_speed_max = Some(v.to_f64() as f32),
             _ => state.warn("set_initial_speed_max expects 1 arg"),
         },
+        "set_ball_mesh_slot" => match args {
+            [v] => state.patch.ball_mesh_slot = Some(v.to_i64().clamp(0, 255) as u8),
+            _ => state.warn("set_ball_mesh_slot expects 1 arg"),
+        },
+        "set_container_mesh_slot" => match args {
+            [v] => state.patch.container_mesh_slot = Some(v.to_i64().clamp(0, 255) as u8),
+            _ => state.warn("set_container_mesh_slot expects 1 arg"),
+        },
         "set_fbx_full_render" => match args {
             [v] => state.force_full_fbx_sphere = Some(v.to_bool()),
             _ => state.warn("set_fbx_full_render expects 1 arg"),
+        },
+        "set_camera_move_speed" => match args {
+            [v] => state.camera_move_speed = Some(v.to_f64() as f32),
+            _ => state.warn("set_camera_move_speed expects 1 arg"),
+        },
+        "set_camera_look_sensitivity" => match args {
+            [v] => state.camera_look_sensitivity = Some(v.to_f64() as f32),
+            _ => state.warn("set_camera_look_sensitivity expects 1 arg"),
+        },
+        "set_camera_pose" => match args {
+            [ex, ey, ez, tx, ty, tz] => {
+                state.camera_pose = Some((
+                    [ex.to_f64() as f32, ey.to_f64() as f32, ez.to_f64() as f32],
+                    [tx.to_f64() as f32, ty.to_f64() as f32, tz.to_f64() as f32],
+                ));
+            }
+            _ => state.warn("set_camera_pose expects 6 args"),
         },
         _ => state.warn(format!("unknown showcase builtin '{name}'")),
     }
@@ -748,5 +790,31 @@ mod tests {
             spawned_this_tick: 0,
         });
         assert_eq!(out.force_full_fbx_sphere, Some(true));
+    }
+
+    #[test]
+    fn supports_mesh_slots_and_camera_controls() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_ball_mesh_slot(3)\n",
+            "    set_container_mesh_slot(1)\n",
+            "    set_camera_move_speed(22.0)\n",
+            "    set_camera_look_sensitivity(0.002)\n",
+            "    set_camera_pose(0.0, 10.0, 30.0, 0.0, 0.0, 0.0)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty());
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+        });
+        assert_eq!(out.patch.ball_mesh_slot, Some(3));
+        assert_eq!(out.patch.container_mesh_slot, Some(1));
+        assert!(out.camera_move_speed.unwrap_or(0.0) > 0.0);
+        assert!(out.camera_look_sensitivity.unwrap_or(0.0) > 0.0);
+        assert!(out.camera_pose.is_some());
     }
 }

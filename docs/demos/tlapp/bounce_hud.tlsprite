@@ -1,0 +1,35 @@
+tlsprite_v1
+
+[spawn.progress_backdrop]
+sprite_id = 100
+kind = hud
+texture_slot = 1
+layer = 110
+position = -0.86, 0.90, 0.0
+size = 0.40, 0.035
+rotation_rad = 0.0
+color = 0.08, 0.08, 0.08, 0.55
+
+[spawn.progress_fill]
+sprite_id = 101
+kind = hud
+texture_slot = 0
+layer = 120
+position = -0.86, 0.90, 0.0
+size = 0.40, 0.035
+rotation_rad = 0.0
+color = 0.10, 0.84, 0.62, 0.92
+scale_axis = x
+scale_source = spawn_progress
+scale_min = 0.02
+scale_max = 1.0
+
+[scene.mesh_ball]
+sprite_id = 102
+kind = camera
+texture_slot = 2
+fbx = ../sphere.fbx
+layer = 150
+position = 0.88, 0.84, 0.0
+rotation_rad = 0.0
+color = 0.76, 0.90, 1.0, 0.92

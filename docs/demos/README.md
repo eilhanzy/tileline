@@ -5,6 +5,7 @@ This folder hosts design notes and scripted flow definitions for user-facing dem
 ## Planned Demos
 
 - `tlscript-first-demo.md`: first `.tlscript`-driven gameplay/physics presentation.
+- `tlapp/*`: runtime show-scene assets (`.tlscript` + `.tlsprite` + FBX bindings).
 
 ## Scope Rule
 

@@ -33,6 +33,7 @@ impl DrawBatchKey {
         let primitive_code = match instance.primitive {
             ScenePrimitive3d::Sphere => 0,
             ScenePrimitive3d::Box => 1,
+            ScenePrimitive3d::Mesh { slot } => slot.saturating_add(2),
         };
         let shading_code = match instance.material.shading {
             ShadingModel::LitPbr => 0,
@@ -54,7 +55,7 @@ pub struct DrawInstance3d {
     pub instance_id: u64,
     pub model_cols: [[f32; 4]; 4],
     pub base_color_rgba: [f32; 4],
-    pub material_params: [f32; 4], // roughness, metallic, emissive_strength, reserved
+    pub material_params: [f32; 4], // roughness, metallic, emissive_strength, primitive_code
     pub emissive_rgb: [f32; 3],
 }
 
@@ -173,6 +174,7 @@ fn pack_draw_instance(instance: &SceneInstance3d) -> DrawInstance3d {
     let primitive_code = match instance.primitive {
         ScenePrimitive3d::Sphere => 0.0,
         ScenePrimitive3d::Box => 1.0,
+        ScenePrimitive3d::Mesh { .. } => 2.0,
     };
     DrawInstance3d {
         instance_id: instance.instance_id,
@@ -300,5 +302,19 @@ mod tests {
         assert!((packed.model_cols[3][0] - 2.0).abs() < 1e-6);
         assert!((packed.model_cols[3][1] + 3.0).abs() < 1e-6);
         assert!((packed.model_cols[3][2] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn custom_mesh_primitive_maps_to_slot_encoded_batch_key() {
+        let instance = SceneInstance3d {
+            instance_id: 42,
+            primitive: ScenePrimitive3d::Mesh { slot: 7 },
+            transform: SceneTransform3d::default(),
+            material: SceneMaterial::default(),
+            casts_shadow: true,
+            receives_shadow: true,
+        };
+        let key = DrawBatchKey::from_instance(&instance);
+        assert_eq!(key.primitive_code, 9);
     }
 }

@@ -141,6 +141,26 @@ impl TlspriteProgram {
             .any(|sprite| sprite.fbx_source.as_deref().is_some())
     }
 
+    /// Returns unique FBX mesh bindings inferred from sprite sections.
+    ///
+    /// Convention:
+    /// - `texture_slot` is reused as mesh slot id for runtime 3D mesh binding.
+    /// - first declaration for a slot wins (deterministic by section order).
+    pub fn mesh_fbx_bindings(&self) -> Vec<(u8, &str)> {
+        let mut out = Vec::new();
+        for sprite in &self.sprites {
+            let Some(path) = sprite.fbx_source.as_deref() else {
+                continue;
+            };
+            let slot = sprite.sprite.texture_slot.min(u8::MAX as u16) as u8;
+            if out.iter().any(|(existing_slot, _)| *existing_slot == slot) {
+                continue;
+            }
+            out.push((slot, path));
+        }
+        out
+    }
+
     /// Emit frame-local sprite instances into `out`.
     pub fn emit_instances(&self, ctx: TlspriteFrameContext, out: &mut Vec<SpriteInstance>) {
         out.reserve(self.sprites.len());
@@ -1726,6 +1746,26 @@ mod tests {
             .diagnostics
             .iter()
             .any(|d| d.level == TlspriteDiagnosticLevel::Warning && d.message.contains("fbx")));
+    }
+
+    #[test]
+    fn mesh_fbx_bindings_dedup_by_slot() {
+        let src = concat!(
+            "tlsprite_v1\n",
+            "[a]\n",
+            "sprite_id = 10\n",
+            "texture_slot = 4\n",
+            "fbx = docs/demos/sphere.fbx\n",
+            "[b]\n",
+            "sprite_id = 11\n",
+            "texture_slot = 4\n",
+            "fbx = docs/demos/other.fbx\n",
+        );
+        let out = compile_tlsprite(src);
+        let program = out.program.expect("program");
+        let bindings = program.mesh_fbx_bindings();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].0, 4);
     }
 
     #[test]
