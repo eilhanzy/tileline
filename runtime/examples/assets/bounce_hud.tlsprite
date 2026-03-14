@@ -2,6 +2,7 @@ tlsprite_v1
 
 [spawn.progress_backdrop]
 sprite_id = 100
+kind = hud
 texture_slot = 1
 layer = 110
 position = -0.86, 0.90, 0.0
@@ -11,6 +12,7 @@ color = 0.08, 0.08, 0.08, 0.55
 
 [spawn.progress_fill]
 sprite_id = 101
+kind = hud
 texture_slot = 0
 layer = 120
 position = -0.86, 0.90, 0.0

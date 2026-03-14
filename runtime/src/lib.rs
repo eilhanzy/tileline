@@ -59,7 +59,7 @@ pub use scene::{
     BounceTankPatchMetrics, BounceTankRuntimePatch, BounceTankSceneConfig,
     BounceTankSceneController, BounceTankTickMetrics, RenderSyncMode, SceneFrameInstances,
     SceneInstance3d, SceneMaterial, ScenePrimitive3d, SceneTransform3d, ShadingModel,
-    SpriteInstance, TickRatePolicy,
+    SpriteInstance, SpriteKind, TickRatePolicy,
 };
 pub use scene_dispatch::{
     submit_scene_estimate_to_bridge, SceneDispatchBridgeConfig, SceneDispatchLaneSummary,

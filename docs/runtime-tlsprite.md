@@ -16,6 +16,7 @@ This note documents the first `.tlsprite` integration path for runtime-managed s
 tlsprite_v1
 [name]
 sprite_id = 1
+kind = generic | hud | camera | terrain
 texture_slot = 0
 layer = 100
 position = x, y, z
@@ -28,6 +29,15 @@ scale_min = 0.02
 scale_max = 1.0
 ```
 
+`kind` defaults:
+
+- explicit `kind` wins
+- if omitted and `layer >= 100`, runtime infers `hud`
+- otherwise runtime uses `generic`
+
+`camera` and `terrain` kinds provide sensible defaults (position/size/layer/color) when fields are
+not specified, so minimal sections can be authored quickly.
+
 ## Runtime Flow
 
 1. Load source as in-memory string (`include_str!` or engine asset loader).
@@ -38,6 +48,10 @@ scale_max = 1.0
 5. Per-frame emission is done during `build_frame_instances(...)`.
 
 If no program is installed (or emitted list is empty), runtime keeps the built-in fallback progress sprite.
+
+Reference starter file for sprite kinds:
+
+- `docs/examples/tlsprite/runtime_basic_types.tlsprite`
 
 ## Hot Reload (Phase 1 + Phase 2)
 
@@ -84,5 +98,6 @@ Runtime now exposes precompiled pack + cache primitives:
 
 - Deterministic parser and soft diagnostics.
 - Dynamic axis scaling from runtime signals for HUD bars.
+- Base sprite kinds (`generic`, `hud`, `camera`, `terrain`) with runtime defaults.
 - No disk I/O required in runtime core.
 - Renderer-agnostic output (`Vec<SpriteInstance>`).

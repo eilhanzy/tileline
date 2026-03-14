@@ -3,7 +3,7 @@
 //! This module appends deterministic HUD sprites directly onto `SceneFrameInstances::sprites`.
 //! It is renderer-agnostic and can be consumed by either GMS/MGS draw paths.
 
-use crate::scene::SpriteInstance;
+use crate::scene::{SpriteInstance, SpriteKind};
 
 /// Input telemetry for HUD composition.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -78,6 +78,7 @@ impl TelemetryHudComposer {
         // Panel backdrop.
         sprites.push(SpriteInstance {
             sprite_id: cfg.base_sprite_id,
+            kind: SpriteKind::Hud,
             position: [
                 cfg.anchor_top_left[0] + cfg.width * 0.5,
                 cfg.anchor_top_left[1] - 0.075,
@@ -163,6 +164,7 @@ impl TelemetryHudComposer {
 
         sprites.push(SpriteInstance {
             sprite_id: cfg.base_sprite_id + track_id_offset,
+            kind: SpriteKind::Hud,
             position: [x + meter_width * 0.5, y, 0.0],
             size: [meter_width, 0.016],
             rotation_rad: 0.0,
@@ -173,6 +175,7 @@ impl TelemetryHudComposer {
 
         sprites.push(SpriteInstance {
             sprite_id: cfg.base_sprite_id + fill_id_offset + 100,
+            kind: SpriteKind::Hud,
             position: [x + meter_width * 0.5 * fill, y, 0.0],
             size: [meter_width * fill.max(0.02), 0.013],
             rotation_rad: 0.0,

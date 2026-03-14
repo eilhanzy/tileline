@@ -8,6 +8,7 @@
 //! tlsprite_v1
 //! [progress_bar]
 //! sprite_id = 1
+//! kind = hud
 //! texture_slot = 0
 //! layer = 100
 //! position = -0.86, 0.90, 0.0
@@ -33,7 +34,7 @@ use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 
-use crate::scene::SpriteInstance;
+use crate::scene::{SpriteInstance, SpriteKind};
 
 /// Input bindings consumed while emitting runtime sprite instances.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -475,7 +476,9 @@ fn build_notify_state(path: &Path) -> notify::Result<TlspriteWatchState> {
     })
 }
 
-const TLSPRITE_PACK_MAGIC: &[u8; 8] = b"TLSPK001";
+const TLSPRITE_PACK_MAGIC_V1: &[u8; 8] = b"TLSPK001";
+const TLSPRITE_PACK_MAGIC_V2: &[u8; 8] = b"TLSPK002";
+const TLSPRITE_PACK_MAGIC: &[u8; 8] = TLSPRITE_PACK_MAGIC_V2;
 
 /// In-memory binary pack produced from a `.tlsprite` source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,6 +521,12 @@ pub fn load_tlsprite_pack(bytes: &[u8]) -> Result<TlspriteProgram, String> {
 struct DecodedTlspritePack {
     program: TlspriteProgram,
     source_hash: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlspritePackVersion {
+    V1,
+    V2,
 }
 
 /// Source marker returned by cache loads.
@@ -821,6 +830,7 @@ fn encode_tlsprite_pack(program: &TlspriteProgram, source_hash: u64) -> Vec<u8> 
         out.extend_from_slice(&def.sprite.sprite_id.to_le_bytes());
         out.extend_from_slice(&def.sprite.texture_slot.to_le_bytes());
         out.extend_from_slice(&def.sprite.layer.to_le_bytes());
+        out.push(sprite_kind_to_tag(def.sprite.kind));
         write_f32s(&mut out, &def.sprite.position);
         write_f32s(&mut out, &def.sprite.size);
         out.extend_from_slice(&def.sprite.rotation_rad.to_le_bytes());
@@ -848,7 +858,7 @@ fn encode_tlsprite_pack(program: &TlspriteProgram, source_hash: u64) -> Vec<u8> 
 
 fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
     let mut rd = ByteReader::new(bytes);
-    rd.expect_magic(TLSPRITE_PACK_MAGIC)?;
+    let version = rd.expect_pack_version()?;
     let source_hash = rd.read_u64()?;
     let sprite_count = rd.read_u32()? as usize;
     let mut sprites = Vec::with_capacity(sprite_count);
@@ -857,6 +867,11 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
         let sprite_id = rd.read_u64()?;
         let texture_slot = rd.read_u16()?;
         let layer = rd.read_i16()?;
+        let kind = match version {
+            TlspritePackVersion::V1 => infer_sprite_kind(None, Some(layer)),
+            TlspritePackVersion::V2 => sprite_kind_from_tag(rd.read_u8()?)
+                .ok_or_else(|| "invalid packed sprite kind tag".to_string())?,
+        };
         let position = rd.read_f32_array::<3>()?;
         let size = rd.read_f32_array::<2>()?;
         let rotation_rad = rd.read_f32()?;
@@ -889,6 +904,7 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
             name,
             sprite: SpriteInstance {
                 sprite_id,
+                kind,
                 position,
                 size,
                 rotation_rad,
@@ -936,12 +952,15 @@ impl<'a> ByteReader<'a> {
         self.bytes.len().saturating_sub(self.offset)
     }
 
-    fn expect_magic(&mut self, magic: &[u8]) -> Result<(), String> {
-        let got = self.read_bytes(magic.len())?;
-        if got != magic {
-            return Err("invalid tlsprite pack magic/version".to_string());
+    fn expect_pack_version(&mut self) -> Result<TlspritePackVersion, String> {
+        let got = self.read_bytes(8)?;
+        if got == TLSPRITE_PACK_MAGIC_V2 {
+            Ok(TlspritePackVersion::V2)
+        } else if got == TLSPRITE_PACK_MAGIC_V1 {
+            Ok(TlspritePackVersion::V1)
+        } else {
+            Err("invalid tlsprite pack magic/version".to_string())
         }
-        Ok(())
     }
 
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], String> {
@@ -1049,6 +1068,7 @@ struct PendingSprite {
     name: String,
     line_started: usize,
     sprite_id: Option<u64>,
+    kind: Option<SpriteKind>,
     texture_slot: Option<u16>,
     layer: Option<i16>,
     position: Option<[f32; 3]>,
@@ -1067,6 +1087,7 @@ impl PendingSprite {
             name,
             line_started,
             sprite_id: None,
+            kind: None,
             texture_slot: None,
             layer: None,
             position: None,
@@ -1090,6 +1111,9 @@ impl PendingSprite {
         match key {
             "sprite_id" => {
                 self.sprite_id = parse_scalar::<u64>(value, line, key, diagnostics);
+            }
+            "kind" => {
+                self.kind = parse_sprite_kind(value, line, diagnostics);
             }
             "texture_slot" => {
                 self.texture_slot = parse_scalar::<u16>(value, line, key, diagnostics);
@@ -1142,11 +1166,14 @@ impl PendingSprite {
             return None;
         };
 
-        let mut color = self.color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        let kind = infer_sprite_kind(self.kind, self.layer);
+        let defaults = sprite_kind_defaults(kind);
+
+        let mut color = self.color.unwrap_or(defaults.color_rgba);
         for c in &mut color {
             *c = c.clamp(0.0, 1.0);
         }
-        let mut size = self.size.unwrap_or([0.1, 0.1]);
+        let mut size = self.size.unwrap_or(defaults.size);
         size[0] = size[0].max(0.001);
         size[1] = size[1].max(0.001);
 
@@ -1185,15 +1212,116 @@ impl PendingSprite {
             name: self.name,
             sprite: SpriteInstance {
                 sprite_id,
-                position: self.position.unwrap_or([0.0, 0.0, 0.0]),
+                kind,
+                position: self.position.unwrap_or(defaults.position),
                 size,
-                rotation_rad: self.rotation_rad.unwrap_or(0.0),
+                rotation_rad: self.rotation_rad.unwrap_or(defaults.rotation_rad),
                 color_rgba: color,
-                texture_slot: self.texture_slot.unwrap_or(0),
-                layer: self.layer.unwrap_or(0),
+                texture_slot: self.texture_slot.unwrap_or(defaults.texture_slot),
+                layer: self.layer.unwrap_or(defaults.layer),
             },
             dynamic_scale,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpriteKindDefaults {
+    position: [f32; 3],
+    size: [f32; 2],
+    rotation_rad: f32,
+    color_rgba: [f32; 4],
+    texture_slot: u16,
+    layer: i16,
+}
+
+fn infer_sprite_kind(explicit: Option<SpriteKind>, layer: Option<i16>) -> SpriteKind {
+    if let Some(kind) = explicit {
+        return kind;
+    }
+    if layer.unwrap_or(0) >= 100 {
+        SpriteKind::Hud
+    } else {
+        SpriteKind::Generic
+    }
+}
+
+fn sprite_kind_defaults(kind: SpriteKind) -> SpriteKindDefaults {
+    match kind {
+        SpriteKind::Generic => SpriteKindDefaults {
+            position: [0.0, 0.0, 0.0],
+            size: [0.1, 0.1],
+            rotation_rad: 0.0,
+            color_rgba: [1.0, 1.0, 1.0, 1.0],
+            texture_slot: 0,
+            layer: 0,
+        },
+        SpriteKind::Hud => SpriteKindDefaults {
+            position: [0.0, 0.0, 0.0],
+            size: [0.1, 0.1],
+            rotation_rad: 0.0,
+            color_rgba: [1.0, 1.0, 1.0, 1.0],
+            texture_slot: 0,
+            layer: 100,
+        },
+        SpriteKind::Camera => SpriteKindDefaults {
+            position: [0.88, 0.84, 0.0],
+            size: [0.11, 0.11],
+            rotation_rad: 0.0,
+            color_rgba: [0.62, 0.82, 1.0, 0.92],
+            texture_slot: 2,
+            layer: 150,
+        },
+        SpriteKind::Terrain => SpriteKindDefaults {
+            position: [0.0, -0.92, 0.0],
+            size: [1.62, 0.14],
+            rotation_rad: 0.0,
+            color_rgba: [0.23, 0.70, 0.28, 0.95],
+            texture_slot: 3,
+            layer: -40,
+        },
+    }
+}
+
+fn sprite_kind_to_tag(kind: SpriteKind) -> u8 {
+    match kind {
+        SpriteKind::Generic => 0,
+        SpriteKind::Hud => 1,
+        SpriteKind::Camera => 2,
+        SpriteKind::Terrain => 3,
+    }
+}
+
+fn sprite_kind_from_tag(tag: u8) -> Option<SpriteKind> {
+    match tag {
+        0 => Some(SpriteKind::Generic),
+        1 => Some(SpriteKind::Hud),
+        2 => Some(SpriteKind::Camera),
+        3 => Some(SpriteKind::Terrain),
+        _ => None,
+    }
+}
+
+fn parse_sprite_kind(
+    value: &str,
+    line: usize,
+    diagnostics: &mut Vec<TlspriteDiagnostic>,
+) -> Option<SpriteKind> {
+    match value.trim() {
+        "generic" => Some(SpriteKind::Generic),
+        "hud" | "ui" => Some(SpriteKind::Hud),
+        "camera" => Some(SpriteKind::Camera),
+        "terrain" => Some(SpriteKind::Terrain),
+        other => {
+            diagnostics.push(TlspriteDiagnostic {
+                level: TlspriteDiagnosticLevel::Error,
+                line,
+                message: format!(
+                    "invalid kind '{other}', expected 'generic', 'hud', 'camera', or 'terrain'"
+                ),
+            });
+            None
+        }
     }
 }
 
@@ -1331,6 +1459,7 @@ mod tests {
             "tlsprite_v1\n",
             "[progress]\n",
             "sprite_id = 7\n",
+            "kind = hud\n",
             "texture_slot = 2\n",
             "layer = 100\n",
             "position = -0.5, 0.8, 0.0\n",
@@ -1358,6 +1487,28 @@ mod tests {
         );
         assert_eq!(instances.len(), 1);
         assert!((instances[0].size[0] - 0.2).abs() < 1e-6);
+        assert_eq!(instances[0].kind, SpriteKind::Hud);
+    }
+
+    #[test]
+    fn parses_camera_and_terrain_kinds_with_defaults() {
+        let src = concat!(
+            "tlsprite_v1\n",
+            "[camera.icon]\n",
+            "sprite_id = 12\n",
+            "kind = camera\n",
+            "[terrain.bar]\n",
+            "sprite_id = 13\n",
+            "kind = terrain\n",
+        );
+        let out = compile_tlsprite(src);
+        assert!(!out.has_errors());
+        let program = out.program.expect("program");
+        assert_eq!(program.sprites().len(), 2);
+        assert_eq!(program.sprites()[0].sprite.kind, SpriteKind::Camera);
+        assert_eq!(program.sprites()[1].sprite.kind, SpriteKind::Terrain);
+        assert!(program.sprites()[0].sprite.layer > 0);
+        assert!(program.sprites()[1].sprite.layer < 0);
     }
 
     #[test]
@@ -1385,6 +1536,7 @@ mod tests {
             "tlsprite_v1\n",
             "[hud]\n",
             "sprite_id = 88\n",
+            "kind = hud\n",
             "texture_slot = 2\n",
             "layer = 12\n",
             "position = 0.1, 0.2, 0.0\n",
@@ -1402,6 +1554,28 @@ mod tests {
         assert_eq!(pack.sprite_count, 1);
         assert_eq!(program.sprites().len(), 1);
         assert_eq!(program.sprites()[0].sprite.sprite_id, 88);
+        assert_eq!(program.sprites()[0].sprite.kind, SpriteKind::Hud);
+    }
+
+    #[test]
+    fn decodes_legacy_v1_pack_and_infers_kind() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(TLSPRITE_PACK_MAGIC_V1);
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        write_len_prefixed_str(&mut bytes, "legacy");
+        bytes.extend_from_slice(&5u64.to_le_bytes()); // sprite_id
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // texture_slot
+        bytes.extend_from_slice(&120i16.to_le_bytes()); // layer (HUD-like)
+        write_f32s(&mut bytes, &[0.0f32, 0.0, 0.0]); // position
+        write_f32s(&mut bytes, &[0.4f32, 0.04]); // size
+        bytes.extend_from_slice(&0.0f32.to_le_bytes()); // rotation
+        write_f32s(&mut bytes, &[1.0f32, 1.0, 1.0, 1.0]); // color
+        bytes.push(0); // no dynamic scale
+
+        let program = load_tlsprite_pack(&bytes).expect("v1 decode");
+        assert_eq!(program.sprites().len(), 1);
+        assert_eq!(program.sprites()[0].sprite.kind, SpriteKind::Hud);
     }
 
     #[test]

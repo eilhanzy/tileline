@@ -1,0 +1,22 @@
+tlsprite_v1
+
+[hud.spawn_bar]
+sprite_id = 100
+kind = hud
+position = -0.86, 0.90, 0.0
+size = 0.40, 0.035
+color = 0.10, 0.84, 0.62, 0.92
+scale_axis = x
+scale_source = spawn_progress
+scale_min = 0.02
+scale_max = 1.0
+
+[camera.marker]
+sprite_id = 200
+kind = camera
+# Uses camera defaults for position/size/layer/color when omitted.
+
+[terrain.band]
+sprite_id = 300
+kind = terrain
+# Uses terrain defaults for position/size/layer/color when omitted.

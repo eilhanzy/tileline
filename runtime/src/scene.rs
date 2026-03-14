@@ -83,9 +83,25 @@ pub struct SceneInstance3d {
 }
 
 /// One sprite instance (HUD/overlay/billboard path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpriteKind {
+    Generic,
+    Hud,
+    Camera,
+    Terrain,
+}
+
+impl Default for SpriteKind {
+    fn default() -> Self {
+        Self::Generic
+    }
+}
+
+/// One sprite instance (HUD/overlay/billboard path).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpriteInstance {
     pub sprite_id: u64,
+    pub kind: SpriteKind,
     pub position: [f32; 3],
     pub size: [f32; 2],
     pub rotation_rad: f32,
@@ -430,6 +446,7 @@ impl BounceTankSceneController {
         if frame.sprites.is_empty() {
             frame.sprites.push(SpriteInstance {
                 sprite_id: 1,
+                kind: SpriteKind::Hud,
                 position: [-0.86, 0.90, 0.0],
                 size: [0.40 * progress.max(0.02), 0.035],
                 rotation_rad: 0.0,
@@ -799,5 +816,6 @@ mod tests {
         assert_eq!(frame.sprites.len(), 1);
         assert_eq!(frame.sprites[0].sprite_id, 77);
         assert_eq!(frame.sprites[0].texture_slot, 3);
+        assert_eq!(frame.sprites[0].kind, SpriteKind::Hud);
     }
 }

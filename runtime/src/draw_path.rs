@@ -10,6 +10,7 @@ use nalgebra::{Matrix4, Quaternion, Translation3, UnitQuaternion, Vector3};
 
 use crate::scene::{
     SceneFrameInstances, SceneInstance3d, ScenePrimitive3d, ShadingModel, SpriteInstance,
+    SpriteKind,
 };
 
 /// Batched draw lane.
@@ -139,8 +140,13 @@ impl DrawPathCompiler {
         }
 
         self.sprite_scratch.extend(frame.sprites.iter().cloned());
-        self.sprite_scratch
-            .sort_by_key(|sprite| (sprite.layer, sprite.sprite_id));
+        self.sprite_scratch.sort_by_key(|sprite| {
+            (
+                sprite.layer,
+                sprite_kind_sort_rank(sprite.kind),
+                sprite.sprite_id,
+            )
+        });
 
         let stats = DrawFrameStats {
             opaque_instances: frame.opaque_3d.len(),
@@ -201,10 +207,20 @@ fn matrix_to_cols(m: &Matrix4<f32>) -> [[f32; 4]; 4] {
     ]
 }
 
+#[inline]
+fn sprite_kind_sort_rank(kind: SpriteKind) -> u8 {
+    match kind {
+        SpriteKind::Terrain => 0,
+        SpriteKind::Generic => 1,
+        SpriteKind::Camera => 2,
+        SpriteKind::Hud => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::{SceneMaterial, SceneTransform3d};
+    use crate::scene::{SceneMaterial, SceneTransform3d, SpriteKind};
 
     #[test]
     fn compile_groups_instances_into_deterministic_batches() {
@@ -235,6 +251,7 @@ mod tests {
         });
         frame.sprites.push(SpriteInstance {
             sprite_id: 9,
+            kind: SpriteKind::Generic,
             position: [0.0, 0.0, 0.0],
             size: [0.1, 0.1],
             rotation_rad: 0.0,
@@ -244,6 +261,7 @@ mod tests {
         });
         frame.sprites.push(SpriteInstance {
             sprite_id: 1,
+            kind: SpriteKind::Generic,
             position: [0.0, 0.0, 0.0],
             size: [0.1, 0.1],
             rotation_rad: 0.0,
