@@ -259,6 +259,32 @@ impl BodyRegistry {
         true
     }
 
+    /// Update linear damping for one body.
+    pub fn set_linear_damping(&mut self, body: BodyHandle, damping: f32) -> bool {
+        let Some(dense) = self.dense_index(body) else {
+            return false;
+        };
+        self.linear_dampings[dense] = damping.clamp(0.0, 0.95);
+        if self.kinds[dense] != BodyKind::Static {
+            self.wake_dense(dense);
+        }
+        true
+    }
+
+    /// Update linear damping for all dynamic bodies.
+    pub fn set_linear_damping_all_dynamic(&mut self, damping: f32) -> usize {
+        let damping = damping.clamp(0.0, 0.95);
+        let mut updated = 0usize;
+        for dense in 0..self.handles.len() {
+            if self.kinds[dense] == BodyKind::Dynamic {
+                self.linear_dampings[dense] = damping;
+                self.wake_dense(dense);
+                updated += 1;
+            }
+        }
+        updated
+    }
+
     pub fn integrate(&mut self, dt: f32, gravity: Vector3<f32>) {
         for dense in 0..self.handles.len() {
             match self.kinds[dense] {

@@ -360,6 +360,14 @@ impl PhysicsWorld {
         self.bodies.set_velocity(body, velocity)
     }
 
+    pub fn set_linear_damping(&mut self, body: BodyHandle, damping: f32) -> bool {
+        self.bodies.set_linear_damping(body, damping)
+    }
+
+    pub fn set_linear_damping_all_dynamic(&mut self, damping: f32) -> usize {
+        self.bodies.set_linear_damping_all_dynamic(damping)
+    }
+
     pub fn contacts(&self) -> &[ContactPair] {
         &self.contacts
     }

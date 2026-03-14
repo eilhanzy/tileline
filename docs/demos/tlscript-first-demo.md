@@ -26,6 +26,16 @@ Deliver the first `.tlscript`-driven demo after the current runtime scene/GMS in
 
 ## Ready Checklist
 
-- [ ] Runtime-to-render path consumes `SceneFrameInstances` end-to-end.
-- [ ] `.tlscript` call path can mutate scene/physics parameters safely.
+- [x] Runtime-to-render path consumes `SceneFrameInstances` end-to-end.
+- [x] `.tlscript` call path can mutate scene/physics parameters safely.
 - [ ] Telemetry export format is stable enough for show capture.
+
+## Current Bootstrap (Implemented)
+
+- `runtime/src/tlscript_showcase.rs`:
+  - in-memory `.tlscript` compile path (`Lexer` -> `Parser` -> `SemanticAnalyzer` -> `ParallelHookAnalyzer`)
+  - safe subset evaluator producing `BounceTankRuntimePatch`
+  - per-frame parallel dispatch decision export for `@parallel(domain="bodies")`
+- `runtime/examples/tlscript_first_demo.rs`:
+  - scripted spawn-burst + damping control
+  - dynamic patch application into bounce scene + ParadoxPE world

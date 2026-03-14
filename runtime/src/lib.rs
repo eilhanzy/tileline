@@ -11,6 +11,7 @@
 //! - `scene`: runtime scene/sprite payloads and bounce showcase orchestration helpers
 //! - `scene_dispatch`: scene workload -> bridge task submission helpers
 //! - `scene_workload`: scene->GMS workload synthesis helpers
+//! - `tlscript_showcase`: `.tlscript` showcase compile/evaluate bootstrap
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
 mod frame_loop;
@@ -22,6 +23,7 @@ mod scene_dispatch;
 mod scene_workload;
 mod scheduler_path;
 mod tlscript_parallel;
+mod tlscript_showcase;
 mod wgpu_render_loop;
 
 pub use frame_loop::{
@@ -41,9 +43,10 @@ pub use pre_alpha_loop::{
     PRE_ALPHA_PHASE_ORDER,
 };
 pub use scene::{
-    BounceTankSceneConfig, BounceTankSceneController, BounceTankTickMetrics, RenderSyncMode,
-    SceneFrameInstances, SceneInstance3d, SceneMaterial, ScenePrimitive3d, SceneTransform3d,
-    ShadingModel, SpriteInstance, TickRatePolicy,
+    BounceTankPatchMetrics, BounceTankRuntimePatch, BounceTankSceneConfig,
+    BounceTankSceneController, BounceTankTickMetrics, RenderSyncMode, SceneFrameInstances,
+    SceneInstance3d, SceneMaterial, ScenePrimitive3d, SceneTransform3d, ShadingModel,
+    SpriteInstance, TickRatePolicy,
 };
 pub use scene_dispatch::{
     submit_scene_estimate_to_bridge, SceneDispatchBridgeConfig, SceneDispatchLaneSummary,
@@ -56,6 +59,10 @@ pub use scheduler_path::{choose_scheduler_path, GraphicsSchedulerDecision, Graph
 pub use tlscript_parallel::{
     TlscriptDispatchSubmission, TlscriptMpsDispatchConfig, TlscriptParallelRuntimeCoordinator,
     TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,
+};
+pub use tlscript_showcase::{
+    compile_tlscript_showcase, TlscriptShowcaseCompileOutcome, TlscriptShowcaseConfig,
+    TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
 };
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,

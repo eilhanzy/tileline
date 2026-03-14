@@ -204,6 +204,25 @@ pub struct BounceTankTickMetrics {
     pub fully_spawned: bool,
 }
 
+/// Runtime-safe patch set for `.tlscript` or gameplay controllers.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BounceTankRuntimePatch {
+    pub target_ball_count: Option<usize>,
+    pub spawn_per_tick: Option<usize>,
+    pub linear_damping: Option<f32>,
+    pub ball_restitution: Option<f32>,
+    pub wall_restitution: Option<f32>,
+    pub initial_speed_min: Option<f32>,
+    pub initial_speed_max: Option<f32>,
+}
+
+/// Result summary for one runtime patch application.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BounceTankPatchMetrics {
+    pub config_updated: bool,
+    pub dynamic_bodies_retuned: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct BallVisual {
     body: BodyHandle,
@@ -243,6 +262,76 @@ impl BounceTankSceneController {
 
     pub fn wall_count(&self) -> usize {
         self.walls.len()
+    }
+
+    /// Apply a bounded runtime patch and propagate dynamic damping changes to existing bodies.
+    pub fn apply_runtime_patch(
+        &mut self,
+        world: &mut PhysicsWorld,
+        patch: BounceTankRuntimePatch,
+    ) -> BounceTankPatchMetrics {
+        let mut updated = false;
+        let mut retuned = 0usize;
+
+        if let Some(target) = patch.target_ball_count {
+            let clamped = target.clamp(1, 200_000);
+            if self.config.target_ball_count != clamped {
+                self.config.target_ball_count = clamped;
+                updated = true;
+            }
+        }
+        if let Some(spawn) = patch.spawn_per_tick {
+            let clamped = spawn.clamp(1, 8_192);
+            if self.config.spawn_per_tick != clamped {
+                self.config.spawn_per_tick = clamped;
+                updated = true;
+            }
+        }
+        if let Some(damping) = patch.linear_damping {
+            let clamped = damping.clamp(0.0, 0.95);
+            if (self.config.linear_damping - clamped).abs() > f32::EPSILON {
+                self.config.linear_damping = clamped;
+                retuned = world.set_linear_damping_all_dynamic(clamped);
+                updated = true;
+            }
+        }
+        if let Some(restitution) = patch.ball_restitution {
+            let clamped = restitution.clamp(0.0, 1.25);
+            if (self.config.ball_restitution - clamped).abs() > f32::EPSILON {
+                self.config.ball_restitution = clamped;
+                updated = true;
+            }
+        }
+        if let Some(restitution) = patch.wall_restitution {
+            let clamped = restitution.clamp(0.0, 1.25);
+            if (self.config.wall_restitution - clamped).abs() > f32::EPSILON {
+                self.config.wall_restitution = clamped;
+                updated = true;
+            }
+        }
+        if let Some(min_speed) = patch.initial_speed_min {
+            let clamped = min_speed.clamp(0.0, 32.0);
+            if (self.config.initial_speed_min - clamped).abs() > f32::EPSILON {
+                self.config.initial_speed_min = clamped;
+                updated = true;
+            }
+        }
+        if let Some(max_speed) = patch.initial_speed_max {
+            let clamped = max_speed.clamp(0.0, 64.0);
+            if (self.config.initial_speed_max - clamped).abs() > f32::EPSILON {
+                self.config.initial_speed_max = clamped;
+                updated = true;
+            }
+        }
+        if self.config.initial_speed_max < self.config.initial_speed_min {
+            self.config.initial_speed_max = self.config.initial_speed_min;
+            updated = true;
+        }
+
+        BounceTankPatchMetrics {
+            config_updated: updated,
+            dynamic_bodies_retuned: retuned,
+        }
     }
 
     /// Ensure static physics walls exist and then spawn a progressive ball batch.
@@ -607,5 +696,36 @@ mod tests {
         assert_eq!(frame.transparent_3d.len(), 1);
         assert!(!frame.sprites.is_empty());
         assert!(!frame.opaque_3d.is_empty());
+    }
+
+    #[test]
+    fn runtime_patch_clamps_values_and_retunes_dynamic_bodies() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 128,
+            spawn_per_tick: 128,
+            ..BounceTankSceneConfig::default()
+        });
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(1.0 / 120.0);
+
+        let metrics = scene.apply_runtime_patch(
+            &mut world,
+            BounceTankRuntimePatch {
+                spawn_per_tick: Some(0),
+                linear_damping: Some(2.0),
+                initial_speed_min: Some(3.0),
+                initial_speed_max: Some(1.0),
+                ..BounceTankRuntimePatch::default()
+            },
+        );
+        let cfg = scene.config();
+        assert_eq!(cfg.spawn_per_tick, 1);
+        assert!(cfg.linear_damping <= 0.95);
+        assert!(cfg.initial_speed_max >= cfg.initial_speed_min);
+        assert!(metrics.config_updated);
     }
 }
