@@ -7,11 +7,12 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use crate::{
-    compile_tlscript_showcase, BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler,
-    RenderSyncMode, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
+    compile_tljoint_scene_from_path, compile_tlscript_showcase, BounceTankSceneConfig,
+    BounceTankSceneController, DrawPathCompiler, RenderSyncMode, TelemetryHudComposer,
+    TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle,
     TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
-    TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache,
-    TlspriteWatchReloader, WgpuSceneRenderer,
+    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram,
+    TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer,
 };
 use nalgebra::Vector3;
 use paradoxpe::{
@@ -78,6 +79,8 @@ struct CliOptions {
     fps_cap: Option<f32>,
     tick_profile: TickProfile,
     fps_report_interval: Duration,
+    joint_path: Option<PathBuf>,
+    joint_scene: String,
     script_path: PathBuf,
     sprite_path: PathBuf,
 }
@@ -90,6 +93,8 @@ impl Default for CliOptions {
             fps_cap: Some(60.0),
             tick_profile: TickProfile::Max,
             fps_report_interval: Duration::from_secs_f32(1.0),
+            joint_path: None,
+            joint_scene: "main".to_string(),
             script_path: PathBuf::from("docs/demos/tlapp/bounce_showcase.tlscript"),
             sprite_path: PathBuf::from("docs/demos/tlapp/bounce_hud.tlsprite"),
         }
@@ -127,6 +132,14 @@ impl CliOptions {
                     let value = next_arg(&mut args, "--fps-report")?;
                     options.fps_report_interval = parse_seconds_arg(&value, "--fps-report")?;
                 }
+                "--joint" => {
+                    let value = next_arg(&mut args, "--joint")?;
+                    options.joint_path = Some(PathBuf::from(value));
+                }
+                "--scene" => {
+                    let value = next_arg(&mut args, "--scene")?;
+                    options.joint_scene = value.trim().to_string();
+                }
                 "--script" => {
                     let value = next_arg(&mut args, "--script")?;
                     options.script_path = PathBuf::from(value);
@@ -148,6 +161,9 @@ impl CliOptions {
         }
         if options.fps_report_interval.is_zero() {
             return Err("--fps-report must be > 0".into());
+        }
+        if options.joint_scene.is_empty() {
+            return Err("--scene cannot be empty".into());
         }
 
         Ok(options)
@@ -249,6 +265,8 @@ fn print_usage() {
     println!("  --fps-cap <N|off>         Frame cap target (default: 60)");
     println!("  --tick-profile <mode>     Physics tick planner: balanced|max (default: max)");
     println!("  --fps-report <sec>        CLI FPS report cadence (default: 1.0)");
+    println!("  --joint <path>            .tljoint manifest path (overrides --script/--sprite)");
+    println!("  --scene <name>            Scene id inside .tljoint (default: main)");
     println!(
         "  --script <path>           .tlscript path (default: docs/demos/tlapp/bounce_showcase.tlscript)"
     );
@@ -387,10 +405,10 @@ struct TlAppRuntime {
     hud: TelemetryHudComposer,
     renderer: WgpuSceneRenderer,
     camera: FreeCameraController,
-    sprite_loader: TlspriteWatchReloader,
-    sprite_cache: TlspriteProgramCache,
+    sprite_loader: Option<TlspriteWatchReloader>,
+    sprite_cache: Option<TlspriteProgramCache>,
     force_full_fbx_from_sprite: bool,
-    script_program: TlscriptShowcaseProgram<'static>,
+    script_runtime: ScriptRuntime<'static>,
     script_last_spawned: usize,
     script_frame_index: u64,
     script_key_f_keyboard: bool,
@@ -417,6 +435,24 @@ struct TlAppRuntime {
     frame_cap_interval: Option<Duration>,
     next_redraw_at: Instant,
     fps_tracker: FpsTracker,
+}
+
+enum ScriptRuntime<'src> {
+    Single(TlscriptShowcaseProgram<'src>),
+    Joint(TljointSceneBundle),
+}
+
+impl<'src> ScriptRuntime<'src> {
+    fn evaluate_frame(
+        &self,
+        input: TlscriptShowcaseFrameInput,
+        controls: TlscriptShowcaseControlInput,
+    ) -> TlscriptShowcaseFrameOutput {
+        match self {
+            Self::Single(program) => program.evaluate_frame_with_controls(input, controls),
+            Self::Joint(bundle) => bundle.evaluate_frame(input, controls),
+        }
+    }
 }
 
 impl TlAppRuntime {
@@ -458,29 +494,73 @@ impl TlAppRuntime {
         };
         surface.configure(&device, &config);
 
-        let script_source_owned = fs::read_to_string(&options.script_path).map_err(|err| {
-            format!(
-                "failed to read script '{}': {err}",
-                options.script_path.display()
-            )
-        })?;
-        let script_source: &'static str = Box::leak(script_source_owned.into_boxed_str());
-        let script_compile =
-            compile_tlscript_showcase(script_source, TlscriptShowcaseConfig::default());
-        for warning in &script_compile.warnings {
-            eprintln!("[tlscript warning] {warning}");
+        let mut script_runtime = None;
+        let mut joint_merged_sprite_program: Option<TlspriteProgram> = None;
+        if let Some(joint_path) = &options.joint_path {
+            let joint_compile = compile_tljoint_scene_from_path(
+                joint_path,
+                &options.joint_scene,
+                TlscriptShowcaseConfig::default(),
+            );
+            for diagnostic in &joint_compile.diagnostics {
+                match diagnostic.level {
+                    TljointDiagnosticLevel::Warning => {
+                        eprintln!("[tljoint warning] {}", diagnostic.message);
+                    }
+                    TljointDiagnosticLevel::Error => {
+                        eprintln!("[tljoint error] {}", diagnostic.message);
+                    }
+                }
+            }
+            if joint_compile.has_errors() {
+                return Err(format!(
+                    "failed to compile .tljoint '{}' scene '{}'",
+                    joint_path.display(),
+                    options.joint_scene
+                )
+                .into());
+            }
+            let bundle = joint_compile.bundle.ok_or_else(|| {
+                format!(
+                    "no bundle returned for .tljoint '{}' scene '{}'",
+                    joint_path.display(),
+                    options.joint_scene
+                )
+            })?;
+            joint_merged_sprite_program = bundle.merged_sprite_program.clone();
+            script_runtime = Some(ScriptRuntime::Joint(bundle));
+            eprintln!(
+                "[tljoint] active manifest='{}' scene='{}'",
+                joint_path.display(),
+                options.joint_scene
+            );
         }
-        if !script_compile.errors.is_empty() {
-            return Err(format!(
-                "failed to compile script '{}': {}",
-                options.script_path.display(),
-                script_compile.errors.join(" | ")
-            )
-            .into());
+        if script_runtime.is_none() {
+            let script_source_owned = fs::read_to_string(&options.script_path).map_err(|err| {
+                format!(
+                    "failed to read script '{}': {err}",
+                    options.script_path.display()
+                )
+            })?;
+            let script_source: &'static str = Box::leak(script_source_owned.into_boxed_str());
+            let script_compile =
+                compile_tlscript_showcase(script_source, TlscriptShowcaseConfig::default());
+            for warning in &script_compile.warnings {
+                eprintln!("[tlscript warning] {warning}");
+            }
+            if !script_compile.errors.is_empty() {
+                return Err(format!(
+                    "failed to compile script '{}': {}",
+                    options.script_path.display(),
+                    script_compile.errors.join(" | ")
+                )
+                .into());
+            }
+            let script_program = script_compile
+                .program
+                .expect("showcase script should compile without errors");
+            script_runtime = Some(ScriptRuntime::Single(script_program));
         }
-        let script_program = script_compile
-            .program
-            .expect("showcase script should compile without errors");
 
         let logical_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -587,27 +667,36 @@ impl TlAppRuntime {
 
         let draw_compiler = DrawPathCompiler::new();
         let hud = TelemetryHudComposer::new(Default::default());
-        let mut sprite_loader = TlspriteWatchReloader::new(&options.sprite_path);
-        let mut sprite_cache = TlspriteProgramCache::new();
-        if let Some(warn) = sprite_loader.init_warning() {
-            eprintln!("[tlsprite watch] {warn}");
-        }
-        eprintln!("[tlsprite watch] backend={:?}", sprite_loader.backend());
-        let event = sprite_loader.reload_into_cache(&mut sprite_cache);
-        print_tlsprite_event("[tlsprite boot]", event);
-
         let mut scene = scene;
         let mut force_full_fbx_from_sprite = false;
-        if let Some(program) = sprite_cache.program_for_path(sprite_loader.path()).cloned() {
+        let (sprite_loader, sprite_cache) = if let Some(program) = joint_merged_sprite_program {
             force_full_fbx_from_sprite = program.requires_full_fbx_render();
             scene.set_sprite_program(program.clone());
-            bind_renderer_meshes_from_tlsprite(
-                &mut renderer,
-                &device,
-                sprite_loader.path(),
-                &program,
-            );
-        }
+            if let Some(joint_path) = &options.joint_path {
+                bind_renderer_meshes_from_tlsprite(&mut renderer, &device, joint_path, &program);
+            }
+            (None, None)
+        } else {
+            let mut sprite_loader = TlspriteWatchReloader::new(&options.sprite_path);
+            let mut sprite_cache = TlspriteProgramCache::new();
+            if let Some(warn) = sprite_loader.init_warning() {
+                eprintln!("[tlsprite watch] {warn}");
+            }
+            eprintln!("[tlsprite watch] backend={:?}", sprite_loader.backend());
+            let event = sprite_loader.reload_into_cache(&mut sprite_cache);
+            print_tlsprite_event("[tlsprite boot]", event);
+            if let Some(program) = sprite_cache.program_for_path(sprite_loader.path()).cloned() {
+                force_full_fbx_from_sprite = program.requires_full_fbx_render();
+                scene.set_sprite_program(program.clone());
+                bind_renderer_meshes_from_tlsprite(
+                    &mut renderer,
+                    &device,
+                    sprite_loader.path(),
+                    &program,
+                );
+            }
+            (Some(sprite_loader), Some(sprite_cache))
+        };
         renderer.set_force_full_fbx_sphere(force_full_fbx_from_sprite);
 
         let now = Instant::now();
@@ -633,7 +722,7 @@ impl TlAppRuntime {
             sprite_loader,
             sprite_cache,
             force_full_fbx_from_sprite,
-            script_program,
+            script_runtime: script_runtime.expect("script runtime must be initialized"),
             script_last_spawned: 0,
             script_frame_index: 0,
             script_key_f_keyboard: false,
@@ -841,30 +930,32 @@ impl TlAppRuntime {
         self.poll_input_devices();
         let script_camera_input = self.script_camera_input(view_dt);
 
-        let event = self.sprite_loader.reload_into_cache(&mut self.sprite_cache);
-        match &event {
-            TlspriteHotReloadEvent::Applied { .. } => {
-                print_tlsprite_event("[tlsprite reload]", event);
-                if let Some(program) = self
-                    .sprite_cache
-                    .program_for_path(self.sprite_loader.path())
-                    .cloned()
-                {
-                    self.force_full_fbx_from_sprite = program.requires_full_fbx_render();
-                    self.scene.set_sprite_program(program.clone());
-                    bind_renderer_meshes_from_tlsprite(
-                        &mut self.renderer,
-                        &self.device,
-                        self.sprite_loader.path(),
-                        &program,
-                    );
+        if let (Some(sprite_loader), Some(sprite_cache)) =
+            (self.sprite_loader.as_mut(), self.sprite_cache.as_mut())
+        {
+            let event = sprite_loader.reload_into_cache(sprite_cache);
+            match &event {
+                TlspriteHotReloadEvent::Applied { .. } => {
+                    print_tlsprite_event("[tlsprite reload]", event);
+                    if let Some(program) =
+                        sprite_cache.program_for_path(sprite_loader.path()).cloned()
+                    {
+                        self.force_full_fbx_from_sprite = program.requires_full_fbx_render();
+                        self.scene.set_sprite_program(program.clone());
+                        bind_renderer_meshes_from_tlsprite(
+                            &mut self.renderer,
+                            &self.device,
+                            sprite_loader.path(),
+                            &program,
+                        );
+                    }
                 }
+                TlspriteHotReloadEvent::Unchanged => {}
+                _ => print_tlsprite_event("[tlsprite reload]", event),
             }
-            TlspriteHotReloadEvent::Unchanged => {}
-            _ => print_tlsprite_event("[tlsprite reload]", event),
         }
 
-        let frame_eval = self.script_program.evaluate_frame_with_controls(
+        let frame_eval = self.script_runtime.evaluate_frame(
             TlscriptShowcaseFrameInput {
                 frame_index: self.script_frame_index,
                 live_balls: self.scene.live_ball_count(),

@@ -12,6 +12,14 @@ cargo run -p runtime --example tlapp -- \
   --sprite docs/demos/tlapp/bounce_hud.tlsprite
 ```
 
+Run TLApp directly from `.tljoint`:
+
+```bash
+cargo run -p runtime --bin tlapp -- \
+  --joint docs/demos/tlapp/bounce_showcase.tljoint \
+  --scene main
+```
+
 Preview `.tljoint` scene composition:
 
 ```bash
