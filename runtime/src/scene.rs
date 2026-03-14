@@ -623,10 +623,10 @@ impl BounceTankSceneController {
                 ],
             },
             material: SceneMaterial {
-                base_color_rgba: [0.58, 0.72, 0.98, 0.12],
+                base_color_rgba: [0.58, 0.72, 0.98, 0.30],
                 roughness: 0.04,
                 metallic: 0.0,
-                emissive_rgb: [0.0, 0.0, 0.0],
+                emissive_rgb: [0.05, 0.06, 0.08],
                 shading: ShadingModel::LitPbr,
             },
             casts_shadow: false,

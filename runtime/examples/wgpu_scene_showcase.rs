@@ -217,8 +217,12 @@ impl ShowcaseRuntime {
         self.config.width = new_size.width;
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
-        self.renderer
-            .resize(&self.queue, new_size.width.max(1), new_size.height.max(1));
+        self.renderer.resize(
+            &self.device,
+            &self.queue,
+            new_size.width.max(1),
+            new_size.height.max(1),
+        );
     }
 
     fn render_frame(&mut self) -> Result<(), Box<dyn Error>> {

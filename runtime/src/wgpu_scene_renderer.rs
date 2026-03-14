@@ -13,6 +13,7 @@ use crate::scene::SpriteKind;
 
 const SPRITE_ATLAS_GRID_DIM: u32 = 4;
 const SPRITE_ATLAS_TILE_SIZE: u32 = 64;
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -93,6 +94,8 @@ pub struct WgpuSceneRenderer {
     pipeline_opaque: wgpu::RenderPipeline,
     pipeline_transparent: wgpu::RenderPipeline,
     pipeline_sprite: wgpu::RenderPipeline,
+    _depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
     _sprite_atlas_texture: wgpu::Texture,
     sprite_atlas_bind_group: wgpu::BindGroup,
     box_mesh: GpuMesh,
@@ -190,6 +193,8 @@ impl WgpuSceneRenderer {
             &shader_3d,
             color_format,
             Some(wgpu::BlendState::REPLACE),
+            true,
+            Some(wgpu::Face::Back),
             "runtime-scene-opaque-pipeline",
         );
         let pipeline_transparent = create_3d_pipeline(
@@ -198,10 +203,18 @@ impl WgpuSceneRenderer {
             &shader_3d,
             color_format,
             Some(wgpu::BlendState::ALPHA_BLENDING),
+            false,
+            None,
             "runtime-scene-transparent-pipeline",
         );
         let pipeline_sprite =
             create_sprite_pipeline(device, &layout_sprite, &shader_sprite, color_format);
+        let (depth_texture, depth_view) = create_depth_resources(
+            device,
+            surface_width.max(1),
+            surface_height.max(1),
+            "runtime-scene-depth",
+        );
         let (sprite_atlas_texture, sprite_atlas_bind_group) =
             create_default_sprite_atlas_resources(device, queue, &sprite_bgl);
 
@@ -227,6 +240,8 @@ impl WgpuSceneRenderer {
             pipeline_opaque,
             pipeline_transparent,
             pipeline_sprite,
+            _depth_texture: depth_texture,
+            depth_view,
             _sprite_atlas_texture: sprite_atlas_texture,
             sprite_atlas_bind_group,
             box_mesh,
@@ -243,8 +258,12 @@ impl WgpuSceneRenderer {
         renderer
     }
 
-    pub fn resize(&mut self, queue: &wgpu::Queue, width: u32, height: u32) {
+    pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
         self.update_camera(queue, width.max(1), height.max(1));
+        let (depth_texture, depth_view) =
+            create_depth_resources(device, width.max(1), height.max(1), "runtime-scene-depth");
+        self._depth_texture = depth_texture;
+        self.depth_view = depth_view;
     }
 
     pub fn upload_draw_frame(
@@ -332,7 +351,14 @@ impl WgpuSceneRenderer {
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
@@ -512,6 +538,8 @@ fn create_3d_pipeline(
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
     blend: Option<wgpu::BlendState>,
+    depth_write_enabled: bool,
+    cull_mode: Option<wgpu::Face>,
     label: &str,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -554,9 +582,16 @@ fn create_3d_pipeline(
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode,
             ..Default::default()
         },
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -609,7 +644,13 @@ fn create_sprite_pipeline(
             topology: wgpu::PrimitiveTopology::TriangleList,
             ..Default::default()
         },
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -785,6 +826,30 @@ fn ensure_buffer_capacity(
         mapped_at_creation: false,
     });
     *capacity_bytes = new_capacity;
+}
+
+fn create_depth_resources(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 fn create_default_sprite_atlas_resources(

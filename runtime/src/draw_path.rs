@@ -120,8 +120,7 @@ impl DrawPathCompiler {
         }
 
         let mut opaque_batches = Vec::with_capacity(self.opaque_map.len());
-        for (key, mut instances) in std::mem::take(&mut self.opaque_map) {
-            instances.sort_by_key(|i| i.instance_id);
+        for (key, instances) in std::mem::take(&mut self.opaque_map) {
             opaque_batches.push(DrawBatch3d {
                 lane: DrawLane::Opaque,
                 key,
@@ -130,8 +129,7 @@ impl DrawPathCompiler {
         }
 
         let mut transparent_batches = Vec::with_capacity(self.transparent_map.len());
-        for (key, mut instances) in std::mem::take(&mut self.transparent_map) {
-            instances.sort_by_key(|i| i.instance_id);
+        for (key, instances) in std::mem::take(&mut self.transparent_map) {
             transparent_batches.push(DrawBatch3d {
                 lane: DrawLane::Transparent,
                 key,
@@ -274,8 +272,8 @@ mod tests {
         let out = compiler.compile(&frame);
         assert_eq!(out.stats.opaque_batches, 1);
         assert_eq!(out.stats.transparent_batches, 1);
-        assert_eq!(out.opaque_batches[0].instances[0].instance_id, 2);
-        assert_eq!(out.opaque_batches[0].instances[1].instance_id, 5);
+        assert_eq!(out.opaque_batches[0].instances[0].instance_id, 5);
+        assert_eq!(out.opaque_batches[0].instances[1].instance_id, 2);
         assert_eq!(out.sprites[0].layer, 10);
         assert_eq!(out.stats.total_draw_calls, 4);
     }
