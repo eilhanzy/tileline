@@ -49,6 +49,7 @@ order.
 For integrated runtime systems, use
 `WgpuRenderLoopCoordinator::run_pre_alpha_frame_with_systems(...)`, which wires:
 
+- automatic bootstrap queueing (`begin_bootstrap_for_all_peers`) before network pump
 - `NetworkTransportRuntime::pump_nonblocking(...)`
 - `TlscriptParallelRuntimeCoordinator` script phase callback
 - `PhysicsWorld::step(...)` + snapshot cadence queueing

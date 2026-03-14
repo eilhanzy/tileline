@@ -94,6 +94,8 @@ pub struct PreAlphaSystemsExecution {
     pub decode_failures: usize,
     /// Number of encode failures drained during network phase.
     pub encode_failures: usize,
+    /// Number of bootstrap hello packets queued during network phase.
+    pub bootstrap_packets_queued: usize,
     /// Number of ParadoxPE fixed substeps executed in physics phase.
     pub physics_substeps: u32,
     /// Number of authoritative snapshot packets queued in physics phase.
@@ -380,6 +382,13 @@ impl WgpuRenderLoopCoordinator {
             .enter_phase(RuntimeFramePhase::Network)
             .is_ok();
 
+        let bootstrap_tick = physics_world
+            .fixed_step_clock()
+            .tick()
+            .min(u64::from(u32::MAX));
+        let bootstrap_packets_queued =
+            network_transport.begin_bootstrap_for_all_peers(bootstrap_tick as u32);
+
         let network_pump = match network_transport.pump_nonblocking(network_socket) {
             Ok(pump) => pump,
             Err(err) => {
@@ -441,6 +450,7 @@ impl WgpuRenderLoopCoordinator {
             decoded_events: decoded_event_count,
             decode_failures,
             encode_failures,
+            bootstrap_packets_queued,
             physics_substeps,
             snapshot_packets_queued,
         })

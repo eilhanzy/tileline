@@ -405,6 +405,12 @@ impl NetworkTransportRuntime {
         if !self.peer_addrs.contains_key(&peer) {
             return false;
         }
+        {
+            let session = self.peer_sessions.entry(peer).or_default();
+            if session.phase != NetworkSessionPhase::Connecting {
+                return false;
+            }
+        }
 
         let salt = self.next_bootstrap_salt(peer);
         self.manager.queue_bootstrap_hello(
@@ -975,6 +981,7 @@ mod tests {
             runtime.peer_session_state(8).unwrap().phase,
             NetworkSessionPhase::Negotiating
         );
+        assert!(!runtime.begin_bootstrap_for_peer(8, 0));
 
         runtime.manager_mut().submit_outbound_encode_jobs(4);
         let hello_packets = runtime.manager_mut().drain_encoded_datagrams(4);
@@ -1012,6 +1019,38 @@ mod tests {
             NetworkSessionPhase::Ready
         );
         assert_eq!(runtime.peer_session_state(8).unwrap().session_id, Some(77));
+    }
+
+    #[test]
+    fn begin_bootstrap_for_all_peers_only_queues_connecting_peers() {
+        let mut runtime = NetworkTransportRuntime::new(
+            NetworkTransportConfig {
+                bootstrap: NetworkBootstrapConfig {
+                    enabled: true,
+                    role: NetworkBootstrapRole::Client,
+                    tick_hz: 120,
+                    capability_bits: 0b1,
+                    build_hash: 0x10,
+                    max_datagram_bytes: 1200,
+                },
+                ..NetworkTransportConfig::default()
+            },
+            NetworkPacketConfig::default(),
+        );
+        runtime.register_peer(1, "127.0.0.1:32201".parse().unwrap());
+        runtime.register_peer(2, "127.0.0.1:32202".parse().unwrap());
+
+        assert_eq!(runtime.begin_bootstrap_for_all_peers(0), 2);
+        assert_eq!(
+            runtime.peer_session_state(1).unwrap().phase,
+            NetworkSessionPhase::Negotiating
+        );
+        assert_eq!(
+            runtime.peer_session_state(2).unwrap().phase,
+            NetworkSessionPhase::Negotiating
+        );
+        // Repeated call should not requeue while peers are already negotiating.
+        assert_eq!(runtime.begin_bootstrap_for_all_peers(1), 0);
     }
 
     #[test]
