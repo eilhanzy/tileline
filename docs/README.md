@@ -24,6 +24,7 @@ in `src/` crates (not benchmark-only code).
 - `runtime-scheduler-path.md`: runtime automatic scheduler path selection (`GMS` vs `MGS`)
 - `runtime-draw-hud.md`: `SceneFrameInstances` -> draw-batch compile path and telemetry HUD overlay flow
 - `runtime-pak.md`: `.pak` archive format and pack/list/unpack runtime toolchain
+- `runtime-tlpfile-gui.md`: `.tlpfile` project manifest + general-purpose runtime GUI shell
 - `runtime-tlsprite.md`: `.tlsprite` parser, runtime sprite program flow, and HUD scaling signals
 - `runtime-tljoint.md`: scene-based multi `.tlscript` + multi `.tlsprite` composition manifest
 - `runtime-mas.md`: MAS audio scheduler flow and MPS integration contract

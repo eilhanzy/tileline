@@ -16,6 +16,8 @@
 //! - `draw_path`: scene payload -> deterministic backend draw batches
 //! - `telemetry_hud`: telemetry -> HUD sprite overlay composition
 //! - `tlapp_app`: canonical TLApp runtime entry moved from examples into core runtime
+//! - `tlpfile`: project manifest that unifies `.tlscript` / `.tlsprite` / `.tljoint`
+//! - `tlpfile_gui`: general-purpose GUI shell driven by `.tlpfile`
 //! - `tljoint`: scene-based multi `.tlscript` + multi `.tlsprite` binding manifest
 //! - `tlsprite`: `.tlsprite` sprite program parser and frame emitter
 //! - `tlsprite_editor_cli`: runtime-owned CLI entry for list-mode `.tlsprite` editing
@@ -38,6 +40,8 @@ mod scheduler_path;
 mod telemetry_hud;
 mod tlapp_app;
 mod tljoint;
+mod tlpfile;
+mod tlpfile_gui;
 mod tlscript_parallel;
 mod tlscript_showcase;
 mod tlsprite;
@@ -98,6 +102,12 @@ pub use tljoint::{
     TljointDiagnosticLevel, TljointManifest, TljointParseOutcome, TljointSceneBinding,
     TljointSceneBundle, TljointSceneCompileOutcome,
 };
+pub use tlpfile::{
+    compile_tlpfile_scene_from_path, load_tlpfile, parse_tlpfile, TlpfileDiagnostic,
+    TlpfileDiagnosticLevel, TlpfileParseOutcome, TlpfileProject, TlpfileSceneBinding,
+    TlpfileSceneBundle, TlpfileSceneCompileOutcome,
+};
+pub use tlpfile_gui::run_from_env as run_tlproject_gui_from_env;
 pub use tlscript_parallel::{
     TlscriptDispatchSubmission, TlscriptMpsDispatchConfig, TlscriptParallelRuntimeCoordinator,
     TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,
@@ -108,12 +118,12 @@ pub use tlscript_showcase::{
     TlscriptShowcaseProgram,
 };
 pub use tlsprite::{
-    compile_tlsprite, compile_tlsprite_pack, load_tlsprite_pack, TlspriteCacheLoadOutcome,
-    TlspriteCacheLoadSource, TlspriteCompileOutcome, TlspriteDiagnostic, TlspriteDiagnosticLevel,
-    TlspriteFrameContext, TlspriteHotReloadConfig, TlspriteHotReloadEvent, TlspriteHotReloader,
-    TlspritePack, TlspriteProgram, TlspriteProgramCache, TlspriteProgramCacheStats,
-    TlspriteScaleAxis, TlspriteScaleSource, TlspriteSpriteDef, TlspriteWatchBackend,
-    TlspriteWatchConfig, TlspriteWatchReloader,
+    compile_tlsprite, compile_tlsprite_pack, compile_tlsprite_with_extra_roots, load_tlsprite_pack,
+    TlspriteCacheLoadOutcome, TlspriteCacheLoadSource, TlspriteCompileOutcome, TlspriteDiagnostic,
+    TlspriteDiagnosticLevel, TlspriteFrameContext, TlspriteHotReloadConfig, TlspriteHotReloadEvent,
+    TlspriteHotReloader, TlspritePack, TlspriteProgram, TlspriteProgramCache,
+    TlspriteProgramCacheStats, TlspriteScaleAxis, TlspriteScaleSource, TlspriteSpriteDef,
+    TlspriteWatchBackend, TlspriteWatchConfig, TlspriteWatchReloader,
 };
 pub use tlsprite_editor::{
     TlspriteEditorPalette, TlspriteEditorTheme, TlspriteListDocument, TlspriteListRow,

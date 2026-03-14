@@ -53,6 +53,7 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/runtime-scheduler-path.md`: runtime auto-selection policy for `GMS` vs `MGS`
 - `docs/runtime-draw-hud.md`: runtime draw-batch compiler + telemetry HUD overlay integration
 - `docs/runtime-pak.md`: `.pak` asset packaging/list/unpack support for pre-beta distribution
+- `docs/runtime-tlpfile-gui.md`: `.tlpfile` project manifest and general-purpose runtime GUI shell
 - `docs/runtime-tlsprite.md`: `.tlsprite` parser and runtime sprite-program integration flow
 - `docs/runtime-tljoint.md`: scene-based multi `.tlscript` + `.tlsprite` binding manifest for runtime composition
 - `docs/runtime-mas.md`: MAS audio scheduler design and MPS integration path
@@ -151,6 +152,12 @@ cargo run -p runtime --bin tlapp -- --fps-cap 60 --vsync auto
 
 ```bash
 cargo run -p runtime --bin tlsprite_editor -- --file docs/demos/tlapp/bounce_hud.tlsprite
+```
+
+### Run Project GUI (`.tlpfile`)
+
+```bash
+cargo run -p runtime --bin tlproject_gui -- --project docs/demos/tlapp/tlapp_project.tlpfile
 ```
 
 Legacy example entrypoint remains available:

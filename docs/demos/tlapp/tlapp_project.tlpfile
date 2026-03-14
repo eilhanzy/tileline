@@ -1,0 +1,9 @@
+tlpfile_v1
+
+[project]
+name = TLApp Showcase Project
+default_scene = main
+
+[scene.main]
+tljoint = bounce_showcase.tljoint
+tljoint_scene = main

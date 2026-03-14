@@ -3,6 +3,7 @@
 - `bounce_showcase.tlscript`: runtime control logic (spawn, damping, camera, mesh-slot mapping)
 - `bounce_hud.tlsprite`: HUD sprites + FBX mesh slot bindings
 - `bounce_showcase.tljoint`: scene manifest binding script/sprite groups
+- `tlapp_project.tlpfile`: project-level manifest that unifies scene bindings for GUI/tools
 
 Run with:
 
@@ -26,4 +27,11 @@ Preview `.tljoint` scene composition:
 cargo run -p runtime --example tljoint_runner -- \
   --joint docs/demos/tlapp/bounce_showcase.tljoint \
   --scene main
+```
+
+Open project GUI from `.tlpfile`:
+
+```bash
+cargo run -p runtime --bin tlproject_gui -- \
+  --project docs/demos/tlapp/tlapp_project.tlpfile
 ```
