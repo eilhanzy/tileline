@@ -1,8 +1,9 @@
 use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
 use runtime::{
-    estimate_scene_workload_requests, BounceTankSceneConfig, BounceTankSceneController,
-    DrawPathCompiler, RenderSyncMode, SceneWorkloadBridgeConfig, TelemetryHudComposer,
-    TelemetryHudSample, TickRatePolicy, TlspriteHotReloadEvent, TlspriteProgramCache,
+    compile_tlscript_showcase, estimate_scene_workload_requests, BounceTankSceneConfig,
+    BounceTankSceneController, DrawPathCompiler, RenderSyncMode, SceneWorkloadBridgeConfig,
+    TelemetryHudComposer, TelemetryHudSample, TickRatePolicy, TlscriptShowcaseConfig,
+    TlscriptShowcaseFrameInput, TlspriteHotReloadEvent, TlspriteProgramCache,
     TlspriteWatchReloader,
 };
 
@@ -10,11 +11,27 @@ fn main() {
     let render_sync_mode = RenderSyncMode::Vsync { display_hz: 60.0 };
     let measured_render_fps = Some(60.0);
     let tick_policy = TickRatePolicy {
-        ticks_per_render_frame: 2.0,
+        ticks_per_render_frame: 3.0,
         ..TickRatePolicy::default()
     };
     let fixed_dt = tick_policy.resolve_fixed_dt_seconds(render_sync_mode, measured_render_fps);
     let render_dt = 1.0 / 60.0;
+
+    let script_source = include_str!("assets/bounce_showcase.tlscript");
+    let script_compile =
+        compile_tlscript_showcase(script_source, TlscriptShowcaseConfig::default());
+    for warning in &script_compile.warnings {
+        println!("[tlscript warning] {warning}");
+    }
+    if !script_compile.errors.is_empty() {
+        for error in &script_compile.errors {
+            eprintln!("[tlscript error] {error}");
+        }
+        std::process::exit(1);
+    }
+    let script = script_compile
+        .program
+        .expect("showcase script must compile without errors");
 
     let mut world = PhysicsWorld::new(PhysicsWorldConfig {
         fixed_dt,
@@ -46,13 +63,16 @@ fn main() {
     };
     let mut draw_compiler = DrawPathCompiler::new();
     let telemetry_hud = TelemetryHudComposer::new(Default::default());
+    let mut last_spawned = 0usize;
 
     let total_frames = 60 * 6;
     println!(
-        "[Showcase] render_dt={:.4}ms | physics_fixed_dt={:.4}ms | target_frames={}",
+        "[Showcase] render_dt={:.4}ms | physics_fixed_dt={:.4}ms | target_frames={} | tlscript_entry={} parallel_contract={}",
         render_dt * 1_000.0,
         fixed_dt * 1_000.0,
-        total_frames
+        total_frames,
+        script.entry_function_name(),
+        script.has_parallel_contract()
     );
 
     for frame_index in 0..total_frames {
@@ -68,7 +88,14 @@ fn main() {
             TlspriteHotReloadEvent::Unchanged => {}
             _ => print_tlsprite_event("[tlsprite reload]", event),
         }
+        let frame_eval = script.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: frame_index as u64,
+            live_balls: scene.live_ball_count(),
+            spawned_this_tick: last_spawned,
+        });
+        let _patch_metrics = scene.apply_runtime_patch(&mut world, frame_eval.patch);
         let tick = scene.physics_tick(&mut world);
+        last_spawned = tick.spawned_this_tick;
         let substeps = world.step(render_dt);
         let mut frame = scene.build_frame_instances(&world, Some(world.interpolation_alpha()));
         let estimate =
@@ -96,7 +123,7 @@ fn main() {
         if frame_index % 30 == 0 || frame_index + 1 == total_frames {
             let cache_stats = sprite_cache.stats();
             println!(
-                "frame={:03} spawn={} live={} substeps={} opaque={} transparent={} sprites={} draw_calls={} hud_sprites={} cache.programs={} cache.bindings={} gms.sampled={} gms.object={} gms.physics={} gms.ui={} gms.postfx={}",
+                "frame={:03} spawn={} live={} substeps={} opaque={} transparent={} sprites={} draw_calls={} hud_sprites={} cache.programs={} cache.bindings={} dispatch_mode={:?} chunk={:?} gms.sampled={} gms.object={} gms.physics={} gms.ui={} gms.postfx={}",
                 frame_index,
                 tick.spawned_this_tick,
                 tick.live_balls,
@@ -108,12 +135,17 @@ fn main() {
                 hud.appended_sprites,
                 cache_stats.unique_programs,
                 cache_stats.path_bindings,
+                frame_eval.dispatch_decision.as_ref().map(|d| d.mode),
+                frame_eval.dispatch_decision.as_ref().and_then(|d| d.chunk_size),
                 estimate.multi_gpu.sampled_processing_jobs,
                 estimate.multi_gpu.object_updates,
                 estimate.multi_gpu.physics_jobs,
                 estimate.multi_gpu.ui_jobs,
                 estimate.multi_gpu.post_fx_jobs
             );
+            for warning in frame_eval.warnings.iter().take(2) {
+                println!("  script warning: {warning}");
+            }
         }
     }
 }

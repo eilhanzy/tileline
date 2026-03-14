@@ -15,6 +15,7 @@
 //! size = 0.40, 0.035
 //! rotation_rad = 0.0
 //! color = 0.10, 0.84, 0.62, 0.92
+//! fbx = docs/demos/sphere.fbx
 //! scale_axis = x
 //! scale_source = spawn_progress
 //! scale_min = 0.02
@@ -25,11 +26,13 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     fs,
     hash::{Hash, Hasher},
+    io::Cursor,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 
+use fbx::Property as FbxProperty;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
@@ -1069,6 +1072,7 @@ struct PendingSprite {
     line_started: usize,
     sprite_id: Option<u64>,
     kind: Option<SpriteKind>,
+    fbx: Option<String>,
     texture_slot: Option<u16>,
     layer: Option<i16>,
     position: Option<[f32; 3]>,
@@ -1088,6 +1092,7 @@ impl PendingSprite {
             line_started,
             sprite_id: None,
             kind: None,
+            fbx: None,
             texture_slot: None,
             layer: None,
             position: None,
@@ -1114,6 +1119,18 @@ impl PendingSprite {
             }
             "kind" => {
                 self.kind = parse_sprite_kind(value, line, diagnostics);
+            }
+            "fbx" => {
+                let raw = value.trim();
+                if raw.is_empty() {
+                    diagnostics.push(TlspriteDiagnostic {
+                        level: TlspriteDiagnosticLevel::Warning,
+                        line,
+                        message: "key 'fbx' is empty and will be ignored".to_string(),
+                    });
+                } else {
+                    self.fbx = Some(raw.to_string());
+                }
             }
             "texture_slot" => {
                 self.texture_slot = parse_scalar::<u16>(value, line, key, diagnostics);
@@ -1168,12 +1185,32 @@ impl PendingSprite {
 
         let kind = infer_sprite_kind(self.kind, self.layer);
         let defaults = sprite_kind_defaults(kind);
+        let fbx_hints = self.fbx.as_deref().and_then(|raw_path| {
+            match infer_sprite_hints_from_fbx_path(raw_path) {
+                Ok(hints) => Some(hints),
+                Err(err) => {
+                    diagnostics.push(TlspriteDiagnostic {
+                        level: TlspriteDiagnosticLevel::Warning,
+                        line: self.line_started,
+                        message: format!(
+                            "section '{}' failed to parse fbx '{}': {err}; using sprite defaults",
+                            self.name, raw_path
+                        ),
+                    });
+                    None
+                }
+            }
+        });
 
         let mut color = self.color.unwrap_or(defaults.color_rgba);
         for c in &mut color {
             *c = c.clamp(0.0, 1.0);
         }
-        let mut size = self.size.unwrap_or(defaults.size);
+        let mut size = self.size.unwrap_or_else(|| {
+            fbx_hints
+                .map(|h| h.suggested_size(defaults.size))
+                .unwrap_or(defaults.size)
+        });
         size[0] = size[0].max(0.001);
         size[1] = size[1].max(0.001);
 
@@ -1217,7 +1254,10 @@ impl PendingSprite {
                 size,
                 rotation_rad: self.rotation_rad.unwrap_or(defaults.rotation_rad),
                 color_rgba: color,
-                texture_slot: self.texture_slot.unwrap_or(defaults.texture_slot),
+                texture_slot: self
+                    .texture_slot
+                    .or_else(|| fbx_hints.map(|h| h.texture_slot))
+                    .unwrap_or(defaults.texture_slot),
                 layer: self.layer.unwrap_or(defaults.layer),
             },
             dynamic_scale,
@@ -1300,6 +1340,130 @@ fn sprite_kind_from_tag(tag: u8) -> Option<SpriteKind> {
         3 => Some(SpriteKind::Terrain),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FbxSpriteHints {
+    aspect: f32,
+    texture_slot: u16,
+}
+
+impl FbxSpriteHints {
+    fn suggested_size(self, base: [f32; 2]) -> [f32; 2] {
+        let aspect = self.aspect.clamp(0.25, 4.0);
+        let mut out = if aspect >= 1.0 {
+            [base[0] * aspect, base[1]]
+        } else {
+            [base[0], base[1] / aspect.max(1e-3)]
+        };
+        out[0] = out[0].clamp(0.001, 2.0);
+        out[1] = out[1].clamp(0.001, 2.0);
+        out
+    }
+}
+
+fn infer_sprite_hints_from_fbx_path(raw_path: &str) -> Result<FbxSpriteHints, String> {
+    let path = resolve_fbx_path(raw_path)?;
+    let bytes =
+        fs::read(&path).map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
+    let file = fbx::File::read_from(Cursor::new(bytes))
+        .map_err(|err| format!("failed to parse '{}': {err}", path.display()))?;
+    let vertices = first_fbx_mesh_vertices(&file)
+        .ok_or_else(|| format!("no mesh vertices found in '{}'", path.display()))?;
+    if vertices.len() < 9 || vertices.len() % 3 != 0 {
+        return Err("mesh vertices are malformed".to_string());
+    }
+
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+    for p in vertices.chunks_exact(3) {
+        min_x = min_x.min(p[0]);
+        min_y = min_y.min(p[1]);
+        min_z = min_z.min(p[2]);
+        max_x = max_x.max(p[0]);
+        max_y = max_y.max(p[1]);
+        max_z = max_z.max(p[2]);
+    }
+
+    let extent_x = (max_x - min_x).abs() as f32;
+    let extent_y = (max_y - min_y).abs() as f32;
+    let extent_z = (max_z - min_z).abs() as f32;
+    let horizontal_extent = extent_x.max(extent_z).max(1e-5);
+    let vertical_extent = extent_y.max(1e-5);
+    let aspect = (horizontal_extent / vertical_extent).clamp(0.25, 4.0);
+
+    let mut hasher = DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    let texture_slot = (hasher.finish() % 4) as u16;
+
+    Ok(FbxSpriteHints {
+        aspect,
+        texture_slot,
+    })
+}
+
+fn resolve_fbx_path(raw_path: &str) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(raw_path);
+    if candidate.is_absolute() {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        return Err(format!("path '{}' does not exist", candidate.display()));
+    }
+
+    let mut candidates = Vec::with_capacity(4);
+    candidates.push(candidate.clone());
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(&candidate));
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(manifest_dir.join(&candidate));
+    candidates.push(manifest_dir.join("..").join(&candidate));
+
+    for path in candidates {
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(format!("path '{}' does not exist in known roots", raw_path))
+}
+
+fn first_fbx_mesh_vertices(file: &fbx::File) -> Option<&[f64]> {
+    let objects = file.children.iter().find(|node| node.name == "Objects")?;
+    for geometry in objects
+        .children
+        .iter()
+        .filter(|node| node.name == "Geometry")
+    {
+        let kind = geometry
+            .properties
+            .get(2)
+            .and_then(|prop| match prop {
+                FbxProperty::String(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if kind != "Mesh" {
+            continue;
+        }
+        let vertices = geometry
+            .children
+            .iter()
+            .find(|node| node.name == "Vertices")
+            .and_then(|node| node.properties.first())
+            .and_then(|prop| match prop {
+                FbxProperty::F64Array(values) => Some(values.as_slice()),
+                _ => None,
+            });
+        if vertices.is_some() {
+            return vertices;
+        }
+    }
+    None
 }
 
 fn parse_sprite_kind(
@@ -1509,6 +1673,45 @@ mod tests {
         assert_eq!(program.sprites()[1].sprite.kind, SpriteKind::Terrain);
         assert!(program.sprites()[0].sprite.layer > 0);
         assert!(program.sprites()[1].sprite.layer < 0);
+    }
+
+    #[test]
+    fn fbx_key_infers_sprite_hints_when_available() {
+        let fbx_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/demos/sphere.fbx")
+            .canonicalize()
+            .expect("sphere.fbx should exist");
+        let src = format!(
+            "tlsprite_v1\n[mesh.preview]\nsprite_id = 777\nkind = generic\nfbx = {}\n",
+            fbx_path.display()
+        );
+        let out = compile_tlsprite(&src);
+        assert!(out.program.is_some());
+        assert!(out
+            .diagnostics
+            .iter()
+            .all(|d| d.level != TlspriteDiagnosticLevel::Error));
+        let program = out.program.expect("program");
+        let sprite = &program.sprites()[0].sprite;
+        assert!((0..=3).contains(&sprite.texture_slot));
+        assert!(sprite.size[0] > 0.0 && sprite.size[1] > 0.0);
+    }
+
+    #[test]
+    fn invalid_fbx_path_warns_and_uses_defaults() {
+        let src = concat!(
+            "tlsprite_v1\n",
+            "[mesh.bad]\n",
+            "sprite_id = 778\n",
+            "kind = generic\n",
+            "fbx = /this/path/does/not/exist/model.fbx\n",
+        );
+        let out = compile_tlsprite(src);
+        assert!(out.program.is_some());
+        assert!(out
+            .diagnostics
+            .iter()
+            .any(|d| d.level == TlspriteDiagnosticLevel::Warning && d.message.contains("fbx")));
     }
 
     #[test]

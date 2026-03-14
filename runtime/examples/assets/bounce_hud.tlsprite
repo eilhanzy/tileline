@@ -23,3 +23,12 @@ scale_axis = x
 scale_source = spawn_progress
 scale_min = 0.02
 scale_max = 1.0
+
+[scene.mesh_preview]
+sprite_id = 102
+kind = camera
+fbx = docs/demos/sphere.fbx
+layer = 150
+position = 0.88, 0.84, 0.0
+rotation_rad = 0.0
+color = 0.76, 0.90, 1.0, 0.92

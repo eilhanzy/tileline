@@ -1,0 +1,21 @@
+@export
+@parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=128, schedule="performance")
+@deterministic
+def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):
+    let burst: int = 300
+    if frame < 45:
+        burst = 420
+    if live_balls > 3000:
+        burst = 120
+    if live_balls > 6000:
+        burst = 72
+    set_spawn_per_tick(burst)
+
+    if spawned_this_tick == 0 && live_balls > 1200:
+        set_linear_damping(0.014)
+    else:
+        set_linear_damping(0.008)
+
+    if frame % 120 == 0:
+        set_ball_restitution(0.94)
+        set_wall_restitution(0.95)

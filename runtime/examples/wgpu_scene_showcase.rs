@@ -4,9 +4,10 @@ use std::time::Instant;
 
 use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
 use runtime::{
-    BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler, RenderSyncMode,
-    TelemetryHudComposer, TelemetryHudSample, TickRatePolicy, TlspriteHotReloadEvent,
-    TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer,
+    compile_tlscript_showcase, BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler,
+    RenderSyncMode, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
+    TlscriptShowcaseConfig, TlscriptShowcaseFrameInput, TlscriptShowcaseProgram,
+    TlspriteHotReloadEvent, TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -113,6 +114,9 @@ struct ShowcaseRuntime {
     renderer: WgpuSceneRenderer,
     sprite_loader: TlspriteWatchReloader,
     sprite_cache: TlspriteProgramCache,
+    script_program: TlscriptShowcaseProgram<'static>,
+    script_last_spawned: usize,
+    script_frame_index: u64,
     frame_started_at: Instant,
     fps_window_started_at: Instant,
     frames_in_window: u32,
@@ -151,7 +155,7 @@ impl ShowcaseRuntime {
         surface.configure(&device, &config);
 
         let tick_policy = TickRatePolicy {
-            ticks_per_render_frame: 2.0,
+            ticks_per_render_frame: 3.0,
             ..TickRatePolicy::default()
         };
         let fixed_dt = tick_policy
@@ -165,6 +169,26 @@ impl ShowcaseRuntime {
             spawn_per_tick: 280,
             ..BounceTankSceneConfig::default()
         });
+
+        let script_source = include_str!("assets/bounce_showcase.tlscript");
+        let script_compile =
+            compile_tlscript_showcase(script_source, TlscriptShowcaseConfig::default());
+        for warning in &script_compile.warnings {
+            eprintln!("[tlscript warning] {warning}");
+        }
+        if !script_compile.errors.is_empty() {
+            let mut details = String::new();
+            for err in &script_compile.errors {
+                if !details.is_empty() {
+                    details.push_str(" | ");
+                }
+                details.push_str(err);
+            }
+            return Err(format!("failed to compile showcase .tlscript: {details}").into());
+        }
+        let script_program = script_compile
+            .program
+            .expect("showcase script must compile without errors");
 
         let renderer =
             WgpuSceneRenderer::new(&device, &queue, config.format, size.width, size.height);
@@ -202,6 +226,9 @@ impl ShowcaseRuntime {
             renderer,
             sprite_loader,
             sprite_cache,
+            script_program,
+            script_last_spawned: 0,
+            script_frame_index: 0,
             frame_started_at: now,
             fps_window_started_at: now,
             frames_in_window: 0,
@@ -253,7 +280,19 @@ impl ShowcaseRuntime {
             _ => print_tlsprite_event("[tlsprite reload]", event),
         }
 
+        let frame_eval = self
+            .script_program
+            .evaluate_frame(TlscriptShowcaseFrameInput {
+                frame_index: self.script_frame_index,
+                live_balls: self.scene.live_ball_count(),
+                spawned_this_tick: self.script_last_spawned,
+            });
+        let _patch_metrics = self
+            .scene
+            .apply_runtime_patch(&mut self.world, frame_eval.patch);
         let tick = self.scene.physics_tick(&mut self.world);
+        self.script_last_spawned = tick.spawned_this_tick;
+        self.script_frame_index = self.script_frame_index.saturating_add(1);
         let substeps = self.world.step(dt);
         let mut frame = self
             .scene

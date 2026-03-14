@@ -141,10 +141,10 @@ pub struct TickRatePolicy {
 impl Default for TickRatePolicy {
     fn default() -> Self {
         Self {
-            min_tick_hz: 30.0,
-            max_tick_hz: 300.0,
-            ticks_per_render_frame: 2.0,
-            default_tick_hz: 120.0,
+            min_tick_hz: 60.0,
+            max_tick_hz: 360.0,
+            ticks_per_render_frame: 3.0,
+            default_tick_hz: 180.0,
         }
     }
 }
@@ -684,7 +684,7 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
 
 fn quantize_tick_hz(target: f32) -> f32 {
     const CANDIDATES: &[f32] = &[
-        30.0, 48.0, 60.0, 72.0, 90.0, 100.0, 120.0, 144.0, 165.0, 180.0, 200.0, 240.0, 300.0,
+        30.0, 48.0, 60.0, 72.0, 90.0, 100.0, 120.0, 144.0, 165.0, 180.0, 200.0, 240.0, 300.0, 360.0,
     ];
     let target = target.max(1.0);
     CANDIDATES

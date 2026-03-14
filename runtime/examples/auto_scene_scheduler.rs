@@ -26,7 +26,7 @@ fn main() {
 
     let render_sync_mode = RenderSyncMode::Vsync { display_hz: 60.0 };
     let tick_policy = TickRatePolicy {
-        ticks_per_render_frame: 2.0,
+        ticks_per_render_frame: 3.0,
         ..TickRatePolicy::default()
     };
     let fixed_dt = tick_policy.resolve_fixed_dt_seconds(render_sync_mode, Some(60.0));

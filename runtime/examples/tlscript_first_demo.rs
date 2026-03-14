@@ -6,25 +6,7 @@ use runtime::{
 };
 
 fn main() {
-    let script = concat!(
-        "@export\n",
-        "@parallel(domain=\"bodies\", read=\"transform,aabb\", write=\"velocity\", chunk=128, schedule=\"performance\")\n",
-        "@deterministic\n",
-        "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
-        "    let burst: int = 320\n",
-        "    if frame < 45:\n",
-        "        burst = 420\n",
-        "    if live_balls > 3000:\n",
-        "        burst = 96\n",
-        "    set_spawn_per_tick(burst)\n",
-        "    if spawned_this_tick == 0 && live_balls > 1000:\n",
-        "        set_linear_damping(0.014)\n",
-        "    else:\n",
-        "        set_linear_damping(0.008)\n",
-        "    if frame % 120 == 0:\n",
-        "        set_ball_restitution(0.95)\n",
-        "        set_wall_restitution(0.95)\n",
-    );
+    let script = include_str!("assets/bounce_showcase.tlscript");
 
     let compile = compile_tlscript_showcase(script, TlscriptShowcaseConfig::default());
     for warning in &compile.warnings {
@@ -39,7 +21,7 @@ fn main() {
     let program = compile.program.expect("program must exist without errors");
 
     let tick_policy = TickRatePolicy {
-        ticks_per_render_frame: 2.0,
+        ticks_per_render_frame: 3.0,
         ..TickRatePolicy::default()
     };
     let fixed_dt = tick_policy
