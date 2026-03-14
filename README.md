@@ -147,6 +147,12 @@ cargo test -p runtime
 cargo run -p runtime --bin tlapp -- --fps-cap 60 --vsync auto
 ```
 
+### Run `.tlsprite` Editor (List Mode)
+
+```bash
+cargo run -p runtime --bin tlsprite_editor -- --file docs/demos/tlapp/bounce_hud.tlsprite
+```
+
 Legacy example entrypoint remains available:
 
 ```bash

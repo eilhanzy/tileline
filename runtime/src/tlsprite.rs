@@ -782,6 +782,14 @@ impl TlspriteWatchReloader {
 
 /// Compile `.tlsprite` source from memory.
 pub fn compile_tlsprite(source: &str) -> TlspriteCompileOutcome {
+    compile_tlsprite_with_extra_roots(source, &[])
+}
+
+/// Compile `.tlsprite` source with additional root directories for relative `fbx` paths.
+pub fn compile_tlsprite_with_extra_roots(
+    source: &str,
+    extra_roots: &[PathBuf],
+) -> TlspriteCompileOutcome {
     let mut diagnostics = Vec::new();
     let mut sprites = Vec::new();
     let mut header_checked = false;
@@ -809,7 +817,7 @@ pub fn compile_tlsprite(source: &str) -> TlspriteCompileOutcome {
 
         if let Some(section) = parse_section_name(line) {
             if let Some(curr) = pending.take() {
-                if let Some(def) = curr.finish(&mut diagnostics) {
+                if let Some(def) = curr.finish(&mut diagnostics, extra_roots) {
                     sprites.push(def);
                 }
             }
@@ -840,7 +848,7 @@ pub fn compile_tlsprite(source: &str) -> TlspriteCompileOutcome {
     }
 
     if let Some(curr) = pending.take() {
-        if let Some(def) = curr.finish(&mut diagnostics) {
+        if let Some(def) = curr.finish(&mut diagnostics, extra_roots) {
             sprites.push(def);
         }
     }
@@ -1216,7 +1224,11 @@ impl PendingSprite {
         }
     }
 
-    fn finish(self, diagnostics: &mut Vec<TlspriteDiagnostic>) -> Option<TlspriteSpriteDef> {
+    fn finish(
+        self,
+        diagnostics: &mut Vec<TlspriteDiagnostic>,
+        extra_roots: &[PathBuf],
+    ) -> Option<TlspriteSpriteDef> {
         let Some(sprite_id) = self.sprite_id else {
             diagnostics.push(TlspriteDiagnostic {
                 level: TlspriteDiagnosticLevel::Error,
@@ -1232,7 +1244,7 @@ impl PendingSprite {
         let kind = infer_sprite_kind(self.kind, self.layer);
         let defaults = sprite_kind_defaults(kind);
         let fbx_hints = self.fbx.as_deref().and_then(|raw_path| {
-            match infer_sprite_hints_from_fbx_path(raw_path) {
+            match infer_sprite_hints_from_fbx_path(raw_path, extra_roots) {
                 Ok(hints) => Some(hints),
                 Err(err) => {
                     diagnostics.push(TlspriteDiagnostic {
@@ -1409,8 +1421,11 @@ impl FbxSpriteHints {
     }
 }
 
-fn infer_sprite_hints_from_fbx_path(raw_path: &str) -> Result<FbxSpriteHints, String> {
-    let path = resolve_fbx_path(raw_path)?;
+fn infer_sprite_hints_from_fbx_path(
+    raw_path: &str,
+    extra_roots: &[PathBuf],
+) -> Result<FbxSpriteHints, String> {
+    let path = resolve_fbx_path(raw_path, extra_roots)?;
     let bytes =
         fs::read(&path).map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
     let file = fbx::File::read_from(Cursor::new(bytes))
@@ -1453,7 +1468,7 @@ fn infer_sprite_hints_from_fbx_path(raw_path: &str) -> Result<FbxSpriteHints, St
     })
 }
 
-fn resolve_fbx_path(raw_path: &str) -> Result<PathBuf, String> {
+fn resolve_fbx_path(raw_path: &str, extra_roots: &[PathBuf]) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(raw_path);
     if candidate.is_absolute() {
         if candidate.exists() {
@@ -1466,6 +1481,9 @@ fn resolve_fbx_path(raw_path: &str) -> Result<PathBuf, String> {
     candidates.push(candidate.clone());
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join(&candidate));
+    }
+    for root in extra_roots {
+        candidates.push(root.join(&candidate));
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     candidates.push(manifest_dir.join(&candidate));

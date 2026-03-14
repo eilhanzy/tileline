@@ -7,8 +7,8 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::tlsprite::{
-    compile_tlsprite, TlspriteCompileOutcome, TlspriteDiagnostic, TlspriteDiagnosticLevel,
-    TlspriteProgram, TlspriteSpriteDef,
+    compile_tlsprite, compile_tlsprite_with_extra_roots, TlspriteCompileOutcome,
+    TlspriteDiagnostic, TlspriteDiagnosticLevel, TlspriteProgram, TlspriteSpriteDef,
 };
 use crate::SpriteKind;
 
@@ -94,7 +94,12 @@ impl TlspriteListDocument {
     pub fn from_path(path: &Path) -> Result<Self, String> {
         let source = std::fs::read_to_string(path)
             .map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
-        Ok(Self::from_source(source))
+        let mut roots = Vec::new();
+        if let Some(parent) = path.parent() {
+            roots.push(parent.to_path_buf());
+        }
+        let outcome = compile_tlsprite_with_extra_roots(&source, &roots);
+        Ok(Self::from_outcome(source, outcome))
     }
 
     /// Replace source text and recompile.
@@ -202,6 +207,7 @@ fn row_from_sprite(index: usize, def: &TlspriteSpriteDef) -> TlspriteListRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_rows_and_builds_markdown_table() {
@@ -224,5 +230,19 @@ mod tests {
         assert_eq!(document.rows().len(), 1);
         assert_eq!(document.rows()[0].kind_label(), "camera");
         assert!(document.to_markdown_table().contains("camera.icon"));
+    }
+
+    #[test]
+    fn from_path_resolves_relative_fbx_against_file_directory() {
+        let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/demos/tlapp/bounce_hud.tlsprite");
+        let document = TlspriteListDocument::from_path(&file).expect("load tlsprite path");
+        assert!(
+            !document
+                .diagnostics()
+                .iter()
+                .any(|d| d.message.contains("failed to parse fbx")),
+            "relative fbx should resolve from source directory"
+        );
     }
 }

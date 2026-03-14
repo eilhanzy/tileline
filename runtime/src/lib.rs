@@ -18,6 +18,7 @@
 //! - `tlapp_app`: canonical TLApp runtime entry moved from examples into core runtime
 //! - `tljoint`: scene-based multi `.tlscript` + multi `.tlsprite` binding manifest
 //! - `tlsprite`: `.tlsprite` sprite program parser and frame emitter
+//! - `tlsprite_editor_cli`: runtime-owned CLI entry for list-mode `.tlsprite` editing
 //! - `tlscript_showcase`: `.tlscript` showcase compile/evaluate bootstrap
 //! - `tlsprite_editor`: list-mode `.tlsprite` editor model + lavender Alpha theme
 //! - `wgpu_scene_renderer`: backend implementation for draw-path + HUD sprite rendering
@@ -41,6 +42,7 @@ mod tlscript_parallel;
 mod tlscript_showcase;
 mod tlsprite;
 mod tlsprite_editor;
+mod tlsprite_editor_cli;
 mod wgpu_render_loop;
 mod wgpu_scene_renderer;
 
@@ -116,6 +118,7 @@ pub use tlsprite::{
 pub use tlsprite_editor::{
     TlspriteEditorPalette, TlspriteEditorTheme, TlspriteListDocument, TlspriteListRow,
 };
+pub use tlsprite_editor_cli::run_from_env as run_tlsprite_editor_from_env;
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,
     SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,
