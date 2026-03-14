@@ -232,11 +232,11 @@ Current limits:
 
 - no UDP socket loop in `nps` (transport remains runtime-owned)
 - no delta compression yet (`on_change` metadata is extracted but not encoded into transport flow)
-- no encryption/authentication/session handshake yet
+- no cryptographic authentication/session security layer yet
 
 Recommended next steps:
 
-1. `runtime` transport loop (`tokio::UdpSocket`) + NPS queue integration
+1. harden runtime bootstrap/session lifecycle (`Connecting -> Negotiating -> Ready`) across reconnects
 2. channel bandwidth budgeting and delta compression
 3. snapshot interpolation/rollback hooks for `ParadoxPE`
 4. telemetry surfaces (`rtt`, `loss`, `jitter`, resend ratios)

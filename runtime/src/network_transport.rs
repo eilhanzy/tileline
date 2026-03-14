@@ -18,9 +18,10 @@ use std::sync::Arc;
 
 use mps::MpsScheduler;
 use nps::{
-    packet_semantics, DecodedPacketEvent, EncodedDatagram, NetworkPacketConfig,
-    NetworkPacketManager, NetworkPacketMetrics, PacketDecodeFailure, PacketEncodeFailure,
-    PacketLane, PeerId, PeerLinkMetrics, NPS_HEADER_BYTES,
+    packet_semantics, BootstrapHello, BootstrapWelcome, DecodedPacketEvent, DecodedPayload,
+    EncodedDatagram, NetworkPacketConfig, NetworkPacketManager, NetworkPacketMetrics,
+    PacketDecodeFailure, PacketEncodeFailure, PacketLane, PeerId, PeerLinkMetrics,
+    NPS_HEADER_BYTES,
 };
 use paradoxpe::PhysicsWorld;
 use tokio::net::{ToSocketAddrs, UdpSocket};
@@ -43,6 +44,94 @@ impl Default for SnapshotCadenceConfig {
     }
 }
 
+/// Bootstrap role for NPS startup negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkBootstrapRole {
+    /// Do not send/consume bootstrap packets for state transitions.
+    Disabled,
+    /// Initiates bootstrap with `BootstrapHello` and waits for `BootstrapWelcome`.
+    Client,
+    /// Accepts `BootstrapHello` and responds with `BootstrapWelcome`.
+    Server,
+    /// Supports both initiation and response paths.
+    Symmetric,
+}
+
+impl NetworkBootstrapRole {
+    #[inline]
+    const fn can_initiate(self) -> bool {
+        matches!(self, Self::Client | Self::Symmetric)
+    }
+
+    #[inline]
+    const fn can_respond(self) -> bool {
+        matches!(self, Self::Server | Self::Symmetric)
+    }
+}
+
+/// Runtime bootstrap/handshake policy for peer session readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkBootstrapConfig {
+    /// Enable startup packet flow (`BootstrapHello` / `BootstrapWelcome`).
+    pub enabled: bool,
+    /// Endpoint role in bootstrap negotiation.
+    pub role: NetworkBootstrapRole,
+    /// Requested or accepted simulation tick rate.
+    pub tick_hz: u16,
+    /// Capability bitmask announced in `BootstrapHello`.
+    pub capability_bits: u16,
+    /// Build fingerprint announced in `BootstrapHello`.
+    pub build_hash: u32,
+    /// Datagram budget announced in `BootstrapWelcome`.
+    pub max_datagram_bytes: u16,
+}
+
+impl Default for NetworkBootstrapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            role: NetworkBootstrapRole::Disabled,
+            tick_hz: 60,
+            capability_bits: 0,
+            build_hash: 0,
+            max_datagram_bytes: 1200,
+        }
+    }
+}
+
+/// Per-peer NPS session phase derived from bootstrap packet flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkSessionPhase {
+    /// Peer is registered, no startup negotiation yet.
+    Connecting,
+    /// Startup negotiation is in progress.
+    Negotiating,
+    /// Peer is session-ready for regular state/input flow.
+    Ready,
+}
+
+/// Snapshot of peer bootstrap/session state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkPeerSessionState {
+    pub phase: NetworkSessionPhase,
+    pub session_id: Option<u32>,
+    pub client_salt: Option<u32>,
+    pub server_salt: Option<u32>,
+    pub agreed_tick_hz: Option<u16>,
+}
+
+impl Default for NetworkPeerSessionState {
+    fn default() -> Self {
+        Self {
+            phase: NetworkSessionPhase::Connecting,
+            session_id: None,
+            client_salt: None,
+            server_salt: None,
+            agreed_tick_hz: None,
+        }
+    }
+}
+
 /// Runtime transport pump limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetworkTransportConfig {
@@ -60,6 +149,8 @@ pub struct NetworkTransportConfig {
     pub recv_buffer_bytes: usize,
     /// Authoritative physics snapshot cadence.
     pub snapshot_cadence: SnapshotCadenceConfig,
+    /// Optional startup handshake policy.
+    pub bootstrap: NetworkBootstrapConfig,
 }
 
 impl Default for NetworkTransportConfig {
@@ -72,6 +163,7 @@ impl Default for NetworkTransportConfig {
             max_retransmits_per_pump: 32,
             recv_buffer_bytes: 2048,
             snapshot_cadence: SnapshotCadenceConfig::default(),
+            bootstrap: NetworkBootstrapConfig::default(),
         }
     }
 }
@@ -158,9 +250,16 @@ pub struct NetworkTransportMetrics {
     pub snapshot_queued_packets: u64,
     pub snapshot_skipped_cadence: u64,
     pub snapshot_skipped_duplicate_tick: u64,
+    pub snapshot_skipped_not_ready: u64,
     pub last_snapshot_tick: Option<u64>,
     pub known_peers: usize,
+    pub ready_peers: usize,
     pub pending_send_queue_len: usize,
+    pub bootstrap_hello_queued: u64,
+    pub bootstrap_hello_received: u64,
+    pub bootstrap_welcome_queued: u64,
+    pub bootstrap_welcome_received: u64,
+    pub bootstrap_ready_transitions: u64,
     pub sent_by_lane: NetworkLaneMetrics,
     pub received_by_lane: NetworkLaneMetrics,
     pub peers: Vec<NetworkPeerMetrics>,
@@ -173,6 +272,7 @@ pub struct NetworkTransportRuntime {
     manager: NetworkPacketManager,
     peer_addrs: HashMap<PeerId, SocketAddr>,
     peer_by_addr: HashMap<SocketAddr, PeerId>,
+    peer_sessions: HashMap<PeerId, NetworkPeerSessionState>,
     recv_buffer: Vec<u8>,
     pending_send: VecDeque<EncodedDatagram>,
     pump_calls: u64,
@@ -188,7 +288,14 @@ pub struct NetworkTransportRuntime {
     snapshot_queued_packets: u64,
     snapshot_skipped_cadence: u64,
     snapshot_skipped_duplicate_tick: u64,
+    snapshot_skipped_not_ready: u64,
     last_snapshot_tick: Option<u64>,
+    bootstrap_hello_queued: u64,
+    bootstrap_hello_received: u64,
+    bootstrap_welcome_queued: u64,
+    bootstrap_welcome_received: u64,
+    bootstrap_ready_transitions: u64,
+    bootstrap_nonce: u32,
     sent_by_lane: NetworkLaneMetrics,
     received_by_lane: NetworkLaneMetrics,
 }
@@ -211,6 +318,7 @@ impl NetworkTransportRuntime {
             manager: NetworkPacketManager::with_mps(packet_config, mps),
             peer_addrs: HashMap::new(),
             peer_by_addr: HashMap::new(),
+            peer_sessions: HashMap::new(),
             pending_send: VecDeque::new(),
             pump_calls: 0,
             recv_datagrams: 0,
@@ -225,7 +333,14 @@ impl NetworkTransportRuntime {
             snapshot_queued_packets: 0,
             snapshot_skipped_cadence: 0,
             snapshot_skipped_duplicate_tick: 0,
+            snapshot_skipped_not_ready: 0,
             last_snapshot_tick: None,
+            bootstrap_hello_queued: 0,
+            bootstrap_hello_received: 0,
+            bootstrap_welcome_queued: 0,
+            bootstrap_welcome_received: 0,
+            bootstrap_ready_transitions: 0,
+            bootstrap_nonce: 0xC0DE_A11E,
             sent_by_lane: NetworkLaneMetrics::default(),
             received_by_lane: NetworkLaneMetrics::default(),
         }
@@ -252,6 +367,7 @@ impl NetworkTransportRuntime {
             self.peer_by_addr.remove(&old_addr);
         }
         self.peer_by_addr.insert(addr, peer);
+        self.peer_sessions.entry(peer).or_default();
         self.manager.set_peer_addr(peer, addr);
     }
 
@@ -259,12 +375,68 @@ impl NetworkTransportRuntime {
     pub fn unregister_peer(&mut self, peer: PeerId) -> Option<SocketAddr> {
         let addr = self.peer_addrs.remove(&peer)?;
         self.peer_by_addr.remove(&addr);
+        self.peer_sessions.remove(&peer);
         Some(addr)
     }
 
     /// Number of datagrams waiting in the runtime-owned send queue.
     pub fn pending_send_queue_len(&self) -> usize {
         self.pending_send.len()
+    }
+
+    /// Return the current bootstrap/session state for one peer.
+    pub fn peer_session_state(&self, peer: PeerId) -> Option<NetworkPeerSessionState> {
+        self.peer_sessions.get(&peer).copied()
+    }
+
+    /// Return whether a peer is currently session-ready.
+    pub fn is_peer_ready(&self, peer: PeerId) -> bool {
+        matches!(
+            self.peer_sessions.get(&peer).map(|s| s.phase),
+            Some(NetworkSessionPhase::Ready)
+        )
+    }
+
+    /// Queue a bootstrap hello packet for one peer and move it into negotiating state.
+    pub fn begin_bootstrap_for_peer(&mut self, peer: PeerId, tick: u32) -> bool {
+        if !self.bootstrap_active() || !self.config.bootstrap.role.can_initiate() {
+            return false;
+        }
+        if !self.peer_addrs.contains_key(&peer) {
+            return false;
+        }
+
+        let salt = self.next_bootstrap_salt(peer);
+        self.manager.queue_bootstrap_hello(
+            peer,
+            tick,
+            BootstrapHello {
+                client_salt: salt,
+                requested_tick_hz: self.config.bootstrap.tick_hz.max(1),
+                capability_bits: self.config.bootstrap.capability_bits,
+                build_hash: self.config.bootstrap.build_hash,
+            },
+        );
+        let session = self.peer_sessions.entry(peer).or_default();
+        session.phase = NetworkSessionPhase::Negotiating;
+        session.client_salt = Some(salt);
+        if session.agreed_tick_hz.is_none() {
+            session.agreed_tick_hz = Some(self.config.bootstrap.tick_hz.max(1));
+        }
+        self.bootstrap_hello_queued = self.bootstrap_hello_queued.saturating_add(1);
+        true
+    }
+
+    /// Queue bootstrap hello packets for all registered peers.
+    pub fn begin_bootstrap_for_all_peers(&mut self, tick: u32) -> usize {
+        let peers = self.peer_addrs.keys().copied().collect::<Vec<_>>();
+        let mut queued = 0usize;
+        for peer in peers {
+            if self.begin_bootstrap_for_peer(peer, tick) {
+                queued += 1;
+            }
+        }
+        queued
     }
 
     /// Queue an authoritative ParadoxPE snapshot for all registered peers if the cadence allows it.
@@ -291,6 +463,15 @@ impl NetworkTransportRuntime {
         let snapshot = world.capture_snapshot();
         let mut queued = 0usize;
         for &peer in self.peer_addrs.keys() {
+            if self.bootstrap_active()
+                && !matches!(
+                    self.peer_sessions.get(&peer).map(|s| s.phase),
+                    Some(NetworkSessionPhase::Ready)
+                )
+            {
+                self.snapshot_skipped_not_ready = self.snapshot_skipped_not_ready.saturating_add(1);
+                continue;
+            }
             self.manager
                 .queue_physics_snapshot(peer, tick as u32, &snapshot);
             queued += 1;
@@ -364,6 +545,7 @@ impl NetworkTransportRuntime {
             let payload_bytes = usize::from(event.header.payload_bits).div_ceil(8);
             self.received_by_lane
                 .record(semantics.lane, NPS_HEADER_BYTES + payload_bytes);
+            self.apply_bootstrap_event(event);
         }
         self.decoded_events_drained = self
             .decoded_events_drained
@@ -401,9 +583,20 @@ impl NetworkTransportRuntime {
             snapshot_queued_packets: self.snapshot_queued_packets,
             snapshot_skipped_cadence: self.snapshot_skipped_cadence,
             snapshot_skipped_duplicate_tick: self.snapshot_skipped_duplicate_tick,
+            snapshot_skipped_not_ready: self.snapshot_skipped_not_ready,
             last_snapshot_tick: self.last_snapshot_tick,
             known_peers: self.peer_addrs.len(),
+            ready_peers: self
+                .peer_sessions
+                .values()
+                .filter(|state| state.phase == NetworkSessionPhase::Ready)
+                .count(),
             pending_send_queue_len: self.pending_send.len(),
+            bootstrap_hello_queued: self.bootstrap_hello_queued,
+            bootstrap_hello_received: self.bootstrap_hello_received,
+            bootstrap_welcome_queued: self.bootstrap_welcome_queued,
+            bootstrap_welcome_received: self.bootstrap_welcome_received,
+            bootstrap_ready_transitions: self.bootstrap_ready_transitions,
             sent_by_lane: self.sent_by_lane,
             received_by_lane: self.received_by_lane,
             peers: self
@@ -418,6 +611,88 @@ impl NetworkTransportRuntime {
                 .collect(),
             manager: self.manager.metrics(),
         }
+    }
+
+    fn apply_bootstrap_event(&mut self, event: &DecodedPacketEvent) {
+        if !self.bootstrap_active() {
+            return;
+        }
+        match event.payload {
+            DecodedPayload::BootstrapHello(hello) => {
+                self.bootstrap_hello_received = self.bootstrap_hello_received.saturating_add(1);
+                let agreed_tick = hello
+                    .requested_tick_hz
+                    .min(self.config.bootstrap.tick_hz.max(1));
+                {
+                    let session = self.peer_sessions.entry(event.peer).or_default();
+                    if session.phase == NetworkSessionPhase::Connecting {
+                        session.phase = NetworkSessionPhase::Negotiating;
+                    }
+                    session.client_salt = Some(hello.client_salt);
+                    session.agreed_tick_hz = Some(agreed_tick);
+                }
+
+                if self.config.bootstrap.role.can_respond() {
+                    let server_salt = self.next_bootstrap_salt(event.peer);
+                    let session_id = self.compute_session_id(event.peer, hello.client_salt);
+                    let accepted_tick_hz = self
+                        .peer_sessions
+                        .get(&event.peer)
+                        .and_then(|s| s.agreed_tick_hz)
+                        .unwrap_or(60)
+                        .max(1);
+                    let welcome = BootstrapWelcome {
+                        session_id,
+                        server_salt,
+                        accepted_tick_hz,
+                        max_datagram_bytes: self.config.bootstrap.max_datagram_bytes.max(256),
+                    };
+                    self.manager
+                        .queue_bootstrap_welcome(event.peer, event.header.tick, welcome);
+                    self.bootstrap_welcome_queued = self.bootstrap_welcome_queued.saturating_add(1);
+                    let session = self.peer_sessions.entry(event.peer).or_default();
+                    session.server_salt = Some(server_salt);
+                    session.session_id = Some(session_id);
+                    self.transition_peer_ready(event.peer);
+                }
+            }
+            DecodedPayload::BootstrapWelcome(welcome) => {
+                self.bootstrap_welcome_received = self.bootstrap_welcome_received.saturating_add(1);
+                let session = self.peer_sessions.entry(event.peer).or_default();
+                session.server_salt = Some(welcome.server_salt);
+                session.session_id = Some(welcome.session_id);
+                session.agreed_tick_hz = Some(welcome.accepted_tick_hz.max(1));
+                self.transition_peer_ready(event.peer);
+            }
+            _ => {}
+        }
+    }
+
+    fn transition_peer_ready(&mut self, peer: PeerId) {
+        let session = self.peer_sessions.entry(peer).or_default();
+        if session.phase != NetworkSessionPhase::Ready {
+            session.phase = NetworkSessionPhase::Ready;
+            self.bootstrap_ready_transitions = self.bootstrap_ready_transitions.saturating_add(1);
+        }
+    }
+
+    fn next_bootstrap_salt(&mut self, peer: PeerId) -> u32 {
+        self.bootstrap_nonce = self
+            .bootstrap_nonce
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223)
+            ^ u32::from(peer);
+        self.bootstrap_nonce
+    }
+
+    fn compute_session_id(&self, peer: PeerId, client_salt: u32) -> u32 {
+        (u32::from(peer) << 16) ^ client_salt.rotate_left(7) ^ 0x544C_5345
+    }
+
+    #[inline]
+    fn bootstrap_active(&self) -> bool {
+        self.config.bootstrap.enabled
+            && self.config.bootstrap.role != NetworkBootstrapRole::Disabled
     }
 
     fn recv_from_socket(&mut self, socket: &UdpSocket) -> io::Result<(usize, usize, usize)> {
@@ -482,7 +757,7 @@ impl NetworkTransportRuntime {
 mod tests {
     use std::time::Duration;
 
-    use nps::{DecodedPayload, InputFrame};
+    use nps::{BootstrapHello, BootstrapWelcome, DecodedPayload, InputFrame, PayloadKind};
     use paradoxpe::{BodyDesc, BodyKind, PhysicsWorldConfig};
     use tokio::task::yield_now;
     use tokio::time::timeout;
@@ -612,5 +887,181 @@ mod tests {
 
         let _ = world.step(world.config().fixed_dt);
         assert_eq!(runtime.queue_paradox_snapshot_if_due(&world), 1);
+    }
+
+    #[test]
+    fn bootstrap_server_role_queues_welcome_and_marks_peer_ready() {
+        let mut runtime = NetworkTransportRuntime::new(
+            NetworkTransportConfig {
+                bootstrap: NetworkBootstrapConfig {
+                    enabled: true,
+                    role: NetworkBootstrapRole::Server,
+                    tick_hz: 60,
+                    capability_bits: 0,
+                    build_hash: 0,
+                    max_datagram_bytes: 1200,
+                },
+                ..NetworkTransportConfig::default()
+            },
+            NetworkPacketConfig::default(),
+        );
+        runtime.register_peer(5, "127.0.0.1:32105".parse().unwrap());
+
+        let mut remote = NetworkPacketManager::new(NetworkPacketConfig::default());
+        remote.queue_bootstrap_hello(
+            5,
+            0,
+            BootstrapHello {
+                client_salt: 0x1122_3344,
+                requested_tick_hz: 120,
+                capability_bits: 0b11,
+                build_hash: 0xCAFE_BABE,
+            },
+        );
+        remote.submit_outbound_encode_jobs(4);
+        let outbound = remote.drain_encoded_datagrams(4);
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].header.kind, PayloadKind::BootstrapHello);
+
+        runtime.manager_mut().enqueue_inbound_datagram(
+            5,
+            Some("127.0.0.1:32105".parse().unwrap()),
+            Arc::clone(&outbound[0].bytes),
+        );
+        runtime.manager_mut().submit_inbound_decode_jobs(4);
+        let decoded = runtime.drain_decoded_packets(4);
+        assert_eq!(decoded.len(), 1);
+        assert!(matches!(
+            decoded[0].payload,
+            DecodedPayload::BootstrapHello(_)
+        ));
+
+        runtime.manager_mut().submit_outbound_encode_jobs(4);
+        let welcome = runtime.manager_mut().drain_encoded_datagrams(4);
+        assert_eq!(welcome.len(), 1);
+        assert_eq!(welcome[0].header.kind, PayloadKind::BootstrapWelcome);
+        assert!(runtime.is_peer_ready(5));
+
+        let metrics = runtime.metrics();
+        assert_eq!(metrics.bootstrap_hello_received, 1);
+        assert_eq!(metrics.bootstrap_welcome_queued, 1);
+        assert_eq!(metrics.bootstrap_ready_transitions, 1);
+        assert_eq!(metrics.ready_peers, 1);
+    }
+
+    #[test]
+    fn bootstrap_client_role_transitions_to_ready_after_welcome() {
+        let mut runtime = NetworkTransportRuntime::new(
+            NetworkTransportConfig {
+                bootstrap: NetworkBootstrapConfig {
+                    enabled: true,
+                    role: NetworkBootstrapRole::Client,
+                    tick_hz: 120,
+                    capability_bits: 0b101,
+                    build_hash: 0x1020_3040,
+                    max_datagram_bytes: 1200,
+                },
+                ..NetworkTransportConfig::default()
+            },
+            NetworkPacketConfig::default(),
+        );
+        runtime.register_peer(8, "127.0.0.1:32108".parse().unwrap());
+        assert_eq!(
+            runtime.peer_session_state(8).unwrap().phase,
+            NetworkSessionPhase::Connecting
+        );
+        assert!(runtime.begin_bootstrap_for_peer(8, 0));
+        assert_eq!(
+            runtime.peer_session_state(8).unwrap().phase,
+            NetworkSessionPhase::Negotiating
+        );
+
+        runtime.manager_mut().submit_outbound_encode_jobs(4);
+        let hello_packets = runtime.manager_mut().drain_encoded_datagrams(4);
+        assert_eq!(hello_packets.len(), 1);
+        assert_eq!(hello_packets[0].header.kind, PayloadKind::BootstrapHello);
+
+        let mut remote = NetworkPacketManager::new(NetworkPacketConfig::default());
+        remote.queue_bootstrap_welcome(
+            8,
+            0,
+            BootstrapWelcome {
+                session_id: 77,
+                server_salt: 0xABCD_1234,
+                accepted_tick_hz: 60,
+                max_datagram_bytes: 1200,
+            },
+        );
+        remote.submit_outbound_encode_jobs(4);
+        let outbound = remote.drain_encoded_datagrams(4);
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].header.kind, PayloadKind::BootstrapWelcome);
+
+        runtime
+            .manager_mut()
+            .enqueue_inbound_datagram(8, None, Arc::clone(&outbound[0].bytes));
+        runtime.manager_mut().submit_inbound_decode_jobs(4);
+        let decoded = runtime.drain_decoded_packets(4);
+        assert_eq!(decoded.len(), 1);
+        assert!(matches!(
+            decoded[0].payload,
+            DecodedPayload::BootstrapWelcome(_)
+        ));
+        assert_eq!(
+            runtime.peer_session_state(8).unwrap().phase,
+            NetworkSessionPhase::Ready
+        );
+        assert_eq!(runtime.peer_session_state(8).unwrap().session_id, Some(77));
+    }
+
+    #[test]
+    fn paradox_snapshot_waits_for_ready_peer_when_bootstrap_enabled() {
+        let mut runtime = NetworkTransportRuntime::new(
+            NetworkTransportConfig {
+                bootstrap: NetworkBootstrapConfig {
+                    enabled: true,
+                    role: NetworkBootstrapRole::Server,
+                    tick_hz: 60,
+                    capability_bits: 0,
+                    build_hash: 0,
+                    max_datagram_bytes: 1200,
+                },
+                ..NetworkTransportConfig::default()
+            },
+            NetworkPacketConfig::default(),
+        );
+        runtime.register_peer(2, "127.0.0.1:32102".parse().unwrap());
+
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
+        let _body = world.spawn_body(BodyDesc {
+            kind: BodyKind::Dynamic,
+            mass: 1.0,
+            ..BodyDesc::default()
+        });
+
+        assert_eq!(runtime.queue_paradox_snapshot_if_due(&world), 0);
+
+        let mut remote = NetworkPacketManager::new(NetworkPacketConfig::default());
+        remote.queue_bootstrap_hello(
+            2,
+            0,
+            BootstrapHello {
+                client_salt: 0x9988_7766,
+                requested_tick_hz: 60,
+                capability_bits: 0,
+                build_hash: 1,
+            },
+        );
+        remote.submit_outbound_encode_jobs(4);
+        let outbound = remote.drain_encoded_datagrams(4);
+        runtime
+            .manager_mut()
+            .enqueue_inbound_datagram(2, None, Arc::clone(&outbound[0].bytes));
+        runtime.manager_mut().submit_inbound_decode_jobs(4);
+        let _ = runtime.drain_decoded_packets(4);
+
+        assert!(runtime.is_peer_ready(2));
+        assert_eq!(runtime.queue_paradox_snapshot_if_due(&world), 1);
+        assert!(runtime.metrics().snapshot_skipped_not_ready >= 1);
     }
 }

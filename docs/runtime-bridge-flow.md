@@ -74,5 +74,7 @@ Networking follows the same rule: runtime-owned glue stays in `src/`, not exampl
 - NPS manager encode/decode integration
 - runtime-owned send queue for encoded and retransmit datagrams
 - ParadoxPE snapshot cadence emission
+- optional bootstrap session-state flow (`Connecting -> Negotiating -> Ready`) using
+  `BootstrapHello` / `BootstrapWelcome`
 
 This gives NPS a canonical runtime entry point parallel to the existing MPS/GMS coordinators.

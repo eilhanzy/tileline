@@ -16,7 +16,9 @@ This plan covers:
 - MPS offload points
 - ParadoxPE integration boundaries
 
-It does not yet define encryption, matchmaking, or session/authentication flow.
+It does not yet define encryption or matchmaking. A lightweight bootstrap session flow now exists
+(`BootstrapHello` / `BootstrapWelcome`) and feeds runtime peer states
+(`Connecting -> Negotiating -> Ready`).
 
 ## Canonical Channel Model
 
@@ -285,20 +287,21 @@ Current implementation:
 - transport-level telemetry surface
 - lane-level send/receive counters
 - per-peer RTT/jitter/loss telemetry snapshots
+- bootstrap startup packets and runtime session-state transitions
 
 Still missing:
 
 - long-lived `tokio` service wrapper / worker task orchestration
 - lane-level bandwidth budget enforcement
 - RTT/jitter/loss estimation
-- session/auth lifecycle
+- authenticated session lifecycle hardening
 - delta snapshot transport
 
 ## Beta Non-Goals
 
 These should not block the first NPS beta milestone:
 
-- encryption/auth handshake
+- encryption/auth handshake hardening
 - NAT traversal
 - voice/chat stack
 - generalized replication system for every engine subsystem

@@ -46,7 +46,8 @@ pub use mobile_scene_workload::{
     build_mobile_scene_snapshot, estimate_mobile_workload_hint, MobileSceneWorkloadBridgeConfig,
 };
 pub use network_transport::{
-    LaneTrafficCounter, NetworkLaneMetrics, NetworkPeerMetrics, NetworkPumpResult,
+    LaneTrafficCounter, NetworkBootstrapConfig, NetworkBootstrapRole, NetworkLaneMetrics,
+    NetworkPeerMetrics, NetworkPeerSessionState, NetworkPumpResult, NetworkSessionPhase,
     NetworkTransportConfig, NetworkTransportMetrics, NetworkTransportRuntime,
     SnapshotCadenceConfig,
 };
