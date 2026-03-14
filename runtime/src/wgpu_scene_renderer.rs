@@ -18,6 +18,9 @@ const SPRITE_ATLAS_GRID_DIM: u32 = 4;
 const SPRITE_ATLAS_TILE_SIZE: u32 = 64;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const DEFAULT_SPHERE_FBX_BYTES: &[u8] = include_bytes!("../../docs/demos/sphere.fbx");
+// Hysteresis avoids rapid mesh-mode flapping when instance counts hover around thresholds.
+const SPHERE_LOD_ENABLE_THRESHOLD: usize = 2_500;
+const SPHERE_LOD_DISABLE_THRESHOLD: usize = 1_800;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -91,6 +94,13 @@ struct GpuMesh {
     index_count: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SphereLodMode {
+    #[default]
+    High,
+    Low,
+}
+
 /// Runtime `wgpu` renderer for `RuntimeDrawFrame`.
 pub struct WgpuSceneRenderer {
     camera_buffer: wgpu::Buffer,
@@ -103,7 +113,9 @@ pub struct WgpuSceneRenderer {
     _sprite_atlas_texture: wgpu::Texture,
     sprite_atlas_bind_group: wgpu::BindGroup,
     box_mesh: GpuMesh,
-    sphere_mesh: GpuMesh,
+    sphere_mesh_high: GpuMesh,
+    sphere_mesh_low: GpuMesh,
+    sphere_lod_mode: SphereLodMode,
     sprite_vertex_buffer: wgpu::Buffer,
     instance_3d_buffer: wgpu::Buffer,
     instance_3d_capacity_bytes: usize,
@@ -223,7 +235,8 @@ impl WgpuSceneRenderer {
             create_default_sprite_atlas_resources(device, queue, &sprite_bgl);
 
         let box_mesh = create_box_mesh(device);
-        let sphere_mesh = create_sphere_mesh(device);
+        let sphere_mesh_high = create_sphere_mesh(device);
+        let sphere_mesh_low = create_octa_sphere_mesh(device);
         let sprite_vertex_buffer = create_sprite_quad_vertex_buffer(device);
         let instance_3d_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("runtime-scene-3d-instance-buffer"),
@@ -249,7 +262,9 @@ impl WgpuSceneRenderer {
             _sprite_atlas_texture: sprite_atlas_texture,
             sprite_atlas_bind_group,
             box_mesh,
-            sphere_mesh,
+            sphere_mesh_high,
+            sphere_mesh_low,
+            sphere_lod_mode: SphereLodMode::High,
             sprite_vertex_buffer,
             instance_3d_buffer,
             instance_3d_capacity_bytes: std::mem::size_of::<GpuInstance3d>(),
@@ -314,6 +329,10 @@ impl WgpuSceneRenderer {
 
         self.ranges = plan.ranges;
         self.sprite_count = plan.sprites.len() as u32;
+        self.sphere_lod_mode = select_sphere_lod_mode(
+            self.sphere_lod_mode,
+            count_sphere_instances(self.ranges.as_slice()),
+        );
 
         let opaque_draw_calls = self
             .ranges
@@ -376,7 +395,9 @@ impl WgpuSceneRenderer {
                 draw_3d_range(
                     &mut pass,
                     &self.box_mesh,
-                    &self.sphere_mesh,
+                    &self.sphere_mesh_high,
+                    &self.sphere_mesh_low,
+                    self.sphere_lod_mode,
                     &self.instance_3d_buffer,
                     range,
                 );
@@ -391,7 +412,9 @@ impl WgpuSceneRenderer {
                 draw_3d_range(
                     &mut pass,
                     &self.box_mesh,
-                    &self.sphere_mesh,
+                    &self.sphere_mesh_high,
+                    &self.sphere_mesh_low,
+                    self.sphere_lod_mode,
                     &self.instance_3d_buffer,
                     range,
                 );
@@ -518,12 +541,17 @@ fn build_upload_plan(draw: &RuntimeDrawFrame) -> UploadPlan {
 fn draw_3d_range(
     pass: &mut wgpu::RenderPass<'_>,
     box_mesh: &GpuMesh,
-    sphere_mesh: &GpuMesh,
+    sphere_mesh_high: &GpuMesh,
+    sphere_mesh_low: &GpuMesh,
+    sphere_lod_mode: SphereLodMode,
     instance_buffer: &wgpu::Buffer,
     range: &GpuBatchRange,
 ) {
     let mesh = if range.primitive_code == 0 {
-        sphere_mesh
+        match sphere_lod_mode {
+            SphereLodMode::High => sphere_mesh_high,
+            SphereLodMode::Low => sphere_mesh_low,
+        }
     } else {
         box_mesh
     };
@@ -534,6 +562,33 @@ fn draw_3d_range(
     pass.set_vertex_buffer(1, instance_buffer.slice(start..end));
     pass.set_index_buffer(mesh.index.slice(..), wgpu::IndexFormat::Uint16);
     pass.draw_indexed(0..mesh.index_count, 0, 0..range.count);
+}
+
+fn count_sphere_instances(ranges: &[GpuBatchRange]) -> usize {
+    ranges
+        .iter()
+        .filter(|range| range.primitive_code == 0)
+        .map(|range| range.count as usize)
+        .sum()
+}
+
+fn select_sphere_lod_mode(current: SphereLodMode, sphere_instances: usize) -> SphereLodMode {
+    match current {
+        SphereLodMode::High => {
+            if sphere_instances >= SPHERE_LOD_ENABLE_THRESHOLD {
+                SphereLodMode::Low
+            } else {
+                SphereLodMode::High
+            }
+        }
+        SphereLodMode::Low => {
+            if sphere_instances <= SPHERE_LOD_DISABLE_THRESHOLD {
+                SphereLodMode::High
+            } else {
+                SphereLodMode::Low
+            }
+        }
+    }
 }
 
 fn create_3d_pipeline(
@@ -1370,6 +1425,48 @@ mod tests {
         assert_eq!(mesh.indices.len() % 3, 0);
         let max_index = mesh.indices.iter().copied().max().unwrap_or(0) as usize;
         assert!(max_index < mesh.vertices.len());
+    }
+
+    #[test]
+    fn sphere_lod_hysteresis_switches_without_flapping() {
+        let mut mode = SphereLodMode::High;
+        mode = select_sphere_lod_mode(mode, SPHERE_LOD_ENABLE_THRESHOLD - 1);
+        assert_eq!(mode, SphereLodMode::High);
+
+        mode = select_sphere_lod_mode(mode, SPHERE_LOD_ENABLE_THRESHOLD);
+        assert_eq!(mode, SphereLodMode::Low);
+
+        // Between thresholds we should keep the current mode.
+        mode = select_sphere_lod_mode(mode, SPHERE_LOD_DISABLE_THRESHOLD + 120);
+        assert_eq!(mode, SphereLodMode::Low);
+
+        mode = select_sphere_lod_mode(mode, SPHERE_LOD_DISABLE_THRESHOLD);
+        assert_eq!(mode, SphereLodMode::High);
+    }
+
+    #[test]
+    fn sphere_instance_counter_ignores_non_sphere_batches() {
+        let ranges = vec![
+            GpuBatchRange {
+                lane: DrawLane::Opaque,
+                primitive_code: 0,
+                start: 0,
+                count: 120,
+            },
+            GpuBatchRange {
+                lane: DrawLane::Opaque,
+                primitive_code: 1,
+                start: 120,
+                count: 44,
+            },
+            GpuBatchRange {
+                lane: DrawLane::Transparent,
+                primitive_code: 0,
+                start: 164,
+                count: 36,
+            },
+        ];
+        assert_eq!(count_sphere_instances(ranges.as_slice()), 156);
     }
 
     fn make_instance(id: u64) -> DrawInstance3d {
