@@ -11,10 +11,13 @@
 //! - `scene`: runtime scene/sprite payloads and bounce showcase orchestration helpers
 //! - `scene_dispatch`: scene workload -> bridge task submission helpers
 //! - `scene_workload`: scene->GMS workload synthesis helpers
+//! - `draw_path`: scene payload -> deterministic backend draw batches
+//! - `telemetry_hud`: telemetry -> HUD sprite overlay composition
 //! - `tlsprite`: `.tlsprite` sprite program parser and frame emitter
 //! - `tlscript_showcase`: `.tlscript` showcase compile/evaluate bootstrap
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
+mod draw_path;
 mod frame_loop;
 mod mobile_scene_workload;
 mod network_transport;
@@ -23,11 +26,16 @@ mod scene;
 mod scene_dispatch;
 mod scene_workload;
 mod scheduler_path;
+mod telemetry_hud;
 mod tlscript_parallel;
 mod tlscript_showcase;
 mod tlsprite;
 mod wgpu_render_loop;
 
+pub use draw_path::{
+    DrawBatch3d, DrawBatchKey, DrawFrameStats, DrawInstance3d, DrawLane, DrawPathCompiler,
+    RuntimeDrawFrame,
+};
 pub use frame_loop::{
     FrameLoopRuntime, FrameLoopRuntimeConfig, FrameLoopRuntimeMetrics, FrameSubmissionRecordResult,
     RuntimeTickResult,
@@ -58,6 +66,9 @@ pub use scene_workload::{
     build_scene_workload_snapshot, estimate_scene_workload_requests, SceneWorkloadBridgeConfig,
 };
 pub use scheduler_path::{choose_scheduler_path, GraphicsSchedulerDecision, GraphicsSchedulerPath};
+pub use telemetry_hud::{
+    TelemetryHudComposer, TelemetryHudConfig, TelemetryHudMetrics, TelemetryHudSample,
+};
 pub use tlscript_parallel::{
     TlscriptDispatchSubmission, TlscriptMpsDispatchConfig, TlscriptParallelRuntimeCoordinator,
     TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,

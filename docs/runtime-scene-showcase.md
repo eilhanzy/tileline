@@ -70,6 +70,10 @@ Use `WgpuRenderLoopCoordinator::run_pre_alpha_frame_with_systems(...)` for canon
 The render phase can consume `BounceTankSceneController::build_frame_instances(...)` and forward
 instance payloads into the active renderer backend.
 
+For deterministic backend batching, runtime now exposes `DrawPathCompiler` and `RuntimeDrawFrame`
+(`runtime/src/draw_path.rs`), plus `TelemetryHudComposer` for overlay meters
+(`runtime/src/telemetry_hud.rs`).
+
 `runtime::estimate_scene_workload_requests(...)` can be used to translate scene/sprite density into
 `gms::WorkloadRequest` and `gms::MultiGpuWorkloadRequest` for planner-driven dispatch.
 

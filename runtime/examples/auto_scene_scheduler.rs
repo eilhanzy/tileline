@@ -3,10 +3,10 @@ use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
 use runtime::{
     choose_scheduler_path, estimate_mobile_workload_hint, estimate_scene_workload_requests,
     submit_scene_estimate_to_bridge, BounceTankSceneConfig, BounceTankSceneController,
-    FrameLoopRuntime, FrameLoopRuntimeConfig, GraphicsSchedulerPath,
+    DrawPathCompiler, FrameLoopRuntime, FrameLoopRuntimeConfig, GraphicsSchedulerPath,
     MobileSceneWorkloadBridgeConfig, RenderSyncMode, SceneDispatchBridgeConfig,
-    SceneWorkloadBridgeConfig, TickRatePolicy, TlspriteHotReloadEvent, TlspriteProgramCache,
-    TlspriteWatchReloader,
+    SceneWorkloadBridgeConfig, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
+    TlspriteHotReloadEvent, TlspriteProgramCache, TlspriteWatchReloader,
 };
 use tl_core::MpsGmsBridgeConfig;
 use wgpu::{AdapterInfo, Backend, DeviceType};
@@ -94,6 +94,8 @@ fn run_gms_path(
         FrameLoopRuntimeConfig::default(),
         MpsGmsBridgeConfig::default(),
     );
+    let mut draw_compiler = DrawPathCompiler::new();
+    let telemetry_hud = TelemetryHudComposer::new(Default::default());
     let dispatch_cfg = SceneDispatchBridgeConfig::default();
     let mut submitted_tasks = 0u64;
     let mut published_plans = 0u64;
@@ -101,8 +103,26 @@ fn run_gms_path(
     for frame_id in 1..=total_frames {
         maybe_reload_tlsprite(scene, sprite_loader, sprite_cache);
         let tick = scene.physics_tick(world);
-        let _ = world.step(render_dt);
-        let frame = scene.build_frame_instances(world, Some(world.interpolation_alpha()));
+        let substeps = world.step(render_dt);
+        let mut frame = scene.build_frame_instances(world, Some(world.interpolation_alpha()));
+        let fps = if render_dt > f32::EPSILON {
+            1.0 / render_dt
+        } else {
+            0.0
+        };
+        let _hud = telemetry_hud.append_to_sprites(
+            TelemetryHudSample {
+                fps,
+                frame_time_ms: render_dt * 1_000.0,
+                physics_substeps: substeps,
+                live_balls: tick.live_balls,
+                draw_calls: frame.opaque_3d.len()
+                    + frame.transparent_3d.len()
+                    + frame.sprites.len(),
+            },
+            &mut frame.sprites,
+        );
+        let draw = draw_compiler.compile(&frame);
         let estimate =
             estimate_scene_workload_requests(&frame, tick.live_balls, 1280, 720, workload_cfg);
         let dispatch =
@@ -112,6 +132,17 @@ fn run_gms_path(
         let _ = frame_loop.tick();
         if frame_loop.pop_next_frame_plan().is_some() {
             published_plans = published_plans.saturating_add(1);
+        }
+
+        if frame_id % 30 == 0 || frame_id == total_frames {
+            println!(
+                "[GMS DrawPath] frame={} draw_calls={} opaque_batches={} transparent_batches={} sprites={}",
+                frame_id,
+                draw.stats.total_draw_calls,
+                draw.stats.opaque_batches,
+                draw.stats.transparent_batches,
+                draw.stats.sprite_instances
+            );
         }
     }
 
@@ -144,6 +175,8 @@ fn run_mgs_path(
     sprite_cache: &mut TlspriteProgramCache,
 ) {
     let bridge = MgsBridge::new(mgs::MobileGpuProfile::detect(&adapter_name));
+    let mut draw_compiler = DrawPathCompiler::new();
+    let telemetry_hud = TelemetryHudComposer::new(Default::default());
     let mut memory_pressure_frames = 0u64;
     let mut total_tiles = 0u64;
     let mut total_draws = 0u64;
@@ -151,8 +184,26 @@ fn run_mgs_path(
     for frame_id in 0..total_frames {
         maybe_reload_tlsprite(scene, sprite_loader, sprite_cache);
         let tick = scene.physics_tick(world);
-        let _ = world.step(render_dt);
-        let frame = scene.build_frame_instances(world, Some(world.interpolation_alpha()));
+        let substeps = world.step(render_dt);
+        let mut frame = scene.build_frame_instances(world, Some(world.interpolation_alpha()));
+        let fps = if render_dt > f32::EPSILON {
+            1.0 / render_dt
+        } else {
+            0.0
+        };
+        let _hud = telemetry_hud.append_to_sprites(
+            TelemetryHudSample {
+                fps,
+                frame_time_ms: render_dt * 1_000.0,
+                physics_substeps: substeps,
+                live_balls: tick.live_balls,
+                draw_calls: frame.opaque_3d.len()
+                    + frame.transparent_3d.len()
+                    + frame.sprites.len(),
+            },
+            &mut frame.sprites,
+        );
+        let draw = draw_compiler.compile(&frame);
         let hint = estimate_mobile_workload_hint(&frame, tick.live_balls, 1280, 720, mobile_cfg);
         let plan = bridge.translate(hint);
         if plan.memory_pressure {
@@ -169,13 +220,15 @@ fn run_mgs_path(
 
         if frame_id % 30 == 0 || frame_id + 1 == total_frames {
             println!(
-                "frame={:03} hint.transfer_kb={} hint.objects={} fallback={:?} tiles={} mem_pressure={}",
+                "frame={:03} hint.transfer_kb={} hint.objects={} fallback={:?} tiles={} mem_pressure={} draw_calls={} sprites={}",
                 frame_id,
                 hint.transfer_size_kb,
                 hint.object_count,
                 plan.resolved_fallback,
                 plan.tile_plan.assignments.len(),
-                plan.memory_pressure
+                plan.memory_pressure,
+                draw.stats.total_draw_calls,
+                draw.stats.sprite_instances
             );
         }
     }

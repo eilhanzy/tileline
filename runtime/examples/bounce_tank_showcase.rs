@@ -1,8 +1,9 @@
 use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
 use runtime::{
     estimate_scene_workload_requests, BounceTankSceneConfig, BounceTankSceneController,
-    RenderSyncMode, SceneWorkloadBridgeConfig, TickRatePolicy, TlspriteHotReloadEvent,
-    TlspriteProgramCache, TlspriteWatchReloader,
+    DrawPathCompiler, RenderSyncMode, SceneWorkloadBridgeConfig, TelemetryHudComposer,
+    TelemetryHudSample, TickRatePolicy, TlspriteHotReloadEvent, TlspriteProgramCache,
+    TlspriteWatchReloader,
 };
 
 fn main() {
@@ -43,6 +44,8 @@ fn main() {
         target_frame_budget_ms: 16.67,
         ..SceneWorkloadBridgeConfig::default()
     };
+    let mut draw_compiler = DrawPathCompiler::new();
+    let telemetry_hud = TelemetryHudComposer::new(Default::default());
 
     let total_frames = 60 * 6;
     println!(
@@ -67,21 +70,42 @@ fn main() {
         }
         let tick = scene.physics_tick(&mut world);
         let substeps = world.step(render_dt);
-        let frame = scene.build_frame_instances(&world, Some(world.interpolation_alpha()));
+        let mut frame = scene.build_frame_instances(&world, Some(world.interpolation_alpha()));
         let estimate =
             estimate_scene_workload_requests(&frame, tick.live_balls, 1280, 720, workload_cfg);
+        let fps = if render_dt > f32::EPSILON {
+            1.0 / render_dt
+        } else {
+            0.0
+        };
+        let frame_time_ms = render_dt * 1_000.0;
+        let hud = telemetry_hud.append_to_sprites(
+            TelemetryHudSample {
+                fps,
+                frame_time_ms,
+                physics_substeps: substeps,
+                live_balls: tick.live_balls,
+                draw_calls: frame.opaque_3d.len()
+                    + frame.transparent_3d.len()
+                    + frame.sprites.len(),
+            },
+            &mut frame.sprites,
+        );
+        let draw = draw_compiler.compile(&frame);
 
         if frame_index % 30 == 0 || frame_index + 1 == total_frames {
             let cache_stats = sprite_cache.stats();
             println!(
-                "frame={:03} spawn={} live={} substeps={} opaque={} transparent={} sprites={} cache.programs={} cache.bindings={} gms.sampled={} gms.object={} gms.physics={} gms.ui={} gms.postfx={}",
+                "frame={:03} spawn={} live={} substeps={} opaque={} transparent={} sprites={} draw_calls={} hud_sprites={} cache.programs={} cache.bindings={} gms.sampled={} gms.object={} gms.physics={} gms.ui={} gms.postfx={}",
                 frame_index,
                 tick.spawned_this_tick,
                 tick.live_balls,
                 substeps,
-                frame.opaque_3d.len(),
-                frame.transparent_3d.len(),
-                frame.sprites.len(),
+                draw.stats.opaque_instances,
+                draw.stats.transparent_instances,
+                draw.stats.sprite_instances,
+                draw.stats.total_draw_calls,
+                hud.appended_sprites,
                 cache_stats.unique_programs,
                 cache_stats.path_bindings,
                 estimate.multi_gpu.sampled_processing_jobs,
