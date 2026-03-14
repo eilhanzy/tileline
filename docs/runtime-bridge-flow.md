@@ -38,7 +38,16 @@ stack into a `wgpu` render loop.
     `TlscriptParallelRuntimeCoordinator` before MPS submission so `.tlscript` parallel contracts
     and fallback telemetry are preserved in the runtime path
 
-`WgpuRenderLoopCoordinator::run_pre_alpha_frame(...)` is the canonical entrypoint for this order.
+`WgpuRenderLoopCoordinator::run_pre_alpha_frame(...)` is the generic canonical entrypoint for this
+order.
+
+For integrated runtime systems, use
+`WgpuRenderLoopCoordinator::run_pre_alpha_frame_with_systems(...)`, which wires:
+
+- `NetworkTransportRuntime::pump_nonblocking(...)`
+- `TlscriptParallelRuntimeCoordinator` script phase callback
+- `PhysicsWorld::step(...)` + snapshot cadence queueing
+- render-plan callback + present reconcile
 
 ## Why This Is Split Across Crates
 

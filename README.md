@@ -144,6 +144,7 @@ For pre-alpha integration freeze, prefer:
 
 1. `runtime::WgpuRenderLoopCoordinator::run_pre_alpha_frame(...)`
 2. with canonical phase order: `network -> script -> physics -> render_plan -> present`
+3. when wiring real systems, use `run_pre_alpha_frame_with_systems(...)`
 
 ## Platform Notes
 

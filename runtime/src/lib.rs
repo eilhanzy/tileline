@@ -32,6 +32,6 @@ pub use tlscript_parallel::{
     TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,
 };
 pub use wgpu_render_loop::{
-    FrameExecutionTelemetry, PreAlphaFrameExecution, SecondaryHelperSubmitOutcome,
-    WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,
+    FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,
+    SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,
 };

@@ -6,20 +6,26 @@
 //! reconcile step.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::time::Instant;
 
 use crate::frame_loop::{
     FrameLoopRuntime, FrameLoopRuntimeConfig, FrameLoopRuntimeMetrics, FrameSubmissionRecordResult,
     RuntimeTickResult,
 };
+use crate::network_transport::{NetworkPumpResult, NetworkTransportRuntime};
 use crate::pre_alpha_loop::{
     RuntimeFramePhase, RuntimePhaseOrderMetrics, RuntimePhaseOrderTracker, PRE_ALPHA_PHASE_ORDER,
 };
+use crate::tlscript_parallel::TlscriptParallelRuntimeCoordinator;
 use gms::{MultiGpuExecutor, MultiGpuFrameSubmitResult};
+use nps::DecodedPacketEvent;
+use paradoxpe::PhysicsWorld;
 use tl_core::{
     AdaptiveBufferDecision, AdaptiveFrameTelemetry, BridgeFrameId, BridgeFramePlan,
     ComposeBarrierState, MpsGmsBridgeConfig,
 };
+use tokio::net::UdpSocket;
 
 /// Per-frame runtime execution hints and counters used for telemetry and sync decisions.
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +76,25 @@ pub struct PreAlphaFrameExecution {
     pub present_state: Option<ComposeBarrierState>,
     /// `true` when the phase tracker observed no ordering violation.
     pub phase_order_valid: bool,
+}
+
+/// Result snapshot for pre-alpha frame execution with runtime systems attached.
+#[derive(Debug, Clone)]
+pub struct PreAlphaSystemsExecution {
+    /// Canonical pre-alpha frame execution result.
+    pub frame: PreAlphaFrameExecution,
+    /// Network transport pump counters for the network phase.
+    pub network_pump: NetworkPumpResult,
+    /// Number of decoded packet events drained during network phase.
+    pub decoded_events: usize,
+    /// Number of decode failures drained during network phase.
+    pub decode_failures: usize,
+    /// Number of encode failures drained during network phase.
+    pub encode_failures: usize,
+    /// Number of ParadoxPE fixed substeps executed in physics phase.
+    pub physics_substeps: u32,
+    /// Number of authoritative snapshot packets queued in physics phase.
+    pub snapshot_packets_queued: usize,
 }
 
 /// Runtime-level counters for the `wgpu` integration glue.
@@ -306,6 +331,104 @@ impl WgpuRenderLoopCoordinator {
             present_state,
             phase_order_valid,
         }
+    }
+
+    /// Execute one canonical pre-alpha frame with runtime-owned systems:
+    /// network transport -> `.tlscript` routing -> ParadoxPE fixed step -> render plan -> present.
+    pub fn run_pre_alpha_frame_with_systems<ScriptPhase, RenderPhase>(
+        &mut self,
+        primary_device: &wgpu::Device,
+        transfer_device: Option<&wgpu::Device>,
+        network_transport: &mut NetworkTransportRuntime,
+        network_socket: &UdpSocket,
+        tlscript_runtime: &mut TlscriptParallelRuntimeCoordinator,
+        physics_world: &mut PhysicsWorld,
+        frame_dt: f32,
+        mut script_phase: ScriptPhase,
+        mut render_phase: RenderPhase,
+    ) -> io::Result<PreAlphaSystemsExecution>
+    where
+        ScriptPhase: FnMut(
+            &mut TlscriptParallelRuntimeCoordinator,
+            &mut PhysicsWorld,
+            &[DecodedPacketEvent],
+            &mut Self,
+        ),
+        RenderPhase: FnMut(&BridgeFramePlan, &mut Self, &PhysicsWorld),
+    {
+        self.pre_alpha_frame_calls = self.pre_alpha_frame_calls.saturating_add(1);
+        let frame_sequence = self.phase_order.begin_frame();
+        let mut phase_order_valid = true;
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::Network)
+            .is_ok();
+
+        let network_pump = match network_transport.pump_nonblocking(network_socket) {
+            Ok(pump) => pump,
+            Err(err) => {
+                let _ = self.phase_order.finish_frame();
+                return Err(err);
+            }
+        };
+        let decoded_events = network_transport.drain_decoded_packets(256);
+        let decode_failures = network_transport.drain_decode_failures(128).len();
+        let encode_failures = network_transport.drain_encode_failures(128).len();
+        let decoded_event_count = decoded_events.len();
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::Script)
+            .is_ok();
+        script_phase(tlscript_runtime, physics_world, &decoded_events, self);
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::Physics)
+            .is_ok();
+        let physics_substeps = physics_world.step(frame_dt.max(0.0));
+        let snapshot_packets_queued =
+            network_transport.queue_paradox_snapshot_if_due(physics_world);
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::RenderPlan)
+            .is_ok();
+        let tick_result = self.tick_bridge();
+        let mut planned_frame_id = None;
+        let mut render_plan_executed = false;
+        if let Some(plan) = self.begin_next_frame_plan() {
+            planned_frame_id = Some(plan.frame_id);
+            render_phase(&plan, self, physics_world);
+            render_plan_executed = true;
+            self.pre_alpha_frames_with_plan = self.pre_alpha_frames_with_plan.saturating_add(1);
+        }
+
+        phase_order_valid &= self
+            .phase_order
+            .enter_phase(RuntimeFramePhase::Present)
+            .is_ok();
+        let present_state = self.reconcile_present(primary_device, transfer_device);
+        phase_order_valid &= self.phase_order.finish_frame();
+
+        Ok(PreAlphaSystemsExecution {
+            frame: PreAlphaFrameExecution {
+                frame_sequence,
+                phase_order: PRE_ALPHA_PHASE_ORDER,
+                tick_result,
+                planned_frame_id,
+                render_plan_executed,
+                present_state,
+                phase_order_valid,
+            },
+            network_pump,
+            decoded_events: decoded_event_count,
+            decode_failures,
+            encode_failures,
+            physics_substeps,
+            snapshot_packets_queued,
+        })
     }
 
     /// Record a primary queue submission for a frame.
