@@ -233,6 +233,12 @@ Build/package artifacts:
 ./scripts/release_v0.1.0.sh
 ```
 
+Cross-target toolchain doctor/setup:
+
+```bash
+./scripts/setup_cross_toolchains.sh --target all
+```
+
 Release notes:
 
 - `docs/releases/v0.1.0.md`
