@@ -14,6 +14,8 @@ paradoxpe = { path = "../paradoxpe" }
 tokio = { workspace = true, features = ["net", "time", "rt", "macros"] }
 nalgebra.workspace = true
 notify = "6.1.1"
+bytemuck = { version = "1.17.1", features = ["derive"] }
+winit.workspace = true
 
 [dev-dependencies]
 pollster = "0.4.0"

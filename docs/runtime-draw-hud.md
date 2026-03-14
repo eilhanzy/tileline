@@ -7,8 +7,10 @@ telemetry HUD overlay sprites.
 
 - `runtime/src/draw_path.rs`
 - `runtime/src/telemetry_hud.rs`
+- `runtime/src/wgpu_scene_renderer.rs`
 - `runtime/examples/bounce_tank_showcase.rs`
 - `runtime/examples/auto_scene_scheduler.rs`
+- `runtime/examples/wgpu_scene_showcase.rs`
 
 ## Draw Path
 
@@ -49,3 +51,10 @@ The runtime examples now execute:
 3. telemetry HUD append
 4. draw path compile
 5. GMS/MGS workload estimation + bridge submission
+
+`runtime/examples/wgpu_scene_showcase.rs` additionally runs an end-to-end windowed `wgpu` path:
+
+1. compile draw frame
+2. upload instance/sprite buffers (`WgpuSceneRenderer::upload_draw_frame`)
+3. encode real render pass (`WgpuSceneRenderer::encode`)
+4. present to swapchain

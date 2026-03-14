@@ -134,6 +134,12 @@ cargo test -p tl-core
 cargo test -p runtime
 ```
 
+### Run Runtime WGPU Scene Showcase
+
+```bash
+cargo run -p runtime --example wgpu_scene_showcase
+```
+
 ## Canonical Runtime Flow (Non-Benchmark)
 
 The intended engine-side `wgpu` frame flow is:

@@ -15,6 +15,7 @@
 //! - `telemetry_hud`: telemetry -> HUD sprite overlay composition
 //! - `tlsprite`: `.tlsprite` sprite program parser and frame emitter
 //! - `tlscript_showcase`: `.tlscript` showcase compile/evaluate bootstrap
+//! - `wgpu_scene_renderer`: backend implementation for draw-path + HUD sprite rendering
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
 mod draw_path;
@@ -31,6 +32,7 @@ mod tlscript_parallel;
 mod tlscript_showcase;
 mod tlsprite;
 mod wgpu_render_loop;
+mod wgpu_scene_renderer;
 
 pub use draw_path::{
     DrawBatch3d, DrawBatchKey, DrawFrameStats, DrawInstance3d, DrawLane, DrawPathCompiler,
@@ -89,3 +91,4 @@ pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,
     SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,
 };
+pub use wgpu_scene_renderer::{WgpuSceneRenderer, WgpuSceneRendererUploadStats};

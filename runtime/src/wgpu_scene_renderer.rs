@@ -1,0 +1,864 @@
+//! Minimal `wgpu` scene renderer for runtime draw frames.
+//!
+//! This backend consumes `RuntimeDrawFrame` and issues real render-pass draw calls for:
+//! - opaque 3D batches
+//! - transparent 3D batches
+//! - sprite overlays (including telemetry HUD sprites)
+
+use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3};
+use wgpu::util::DeviceExt;
+
+use crate::draw_path::{DrawLane, RuntimeDrawFrame};
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+struct GpuVertex3d {
+    position: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+struct GpuInstance3d {
+    model_col0: [f32; 4],
+    model_col1: [f32; 4],
+    model_col2: [f32; 4],
+    model_col3: [f32; 4],
+    base_color: [f32; 4],
+    material_params: [f32; 4],
+    emissive: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+struct GpuCameraUniform {
+    view_proj: [f32; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+struct GpuSpriteVertex {
+    local_pos: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+struct GpuSpriteInstance {
+    translate_size: [f32; 4], // x, y, w, h
+    rot_z: [f32; 4],          // rotation_rad, z, _, _
+    color: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GpuBatchRange {
+    lane: DrawLane,
+    primitive_code: u8,
+    start: u32,
+    count: u32,
+}
+
+#[derive(Default)]
+struct UploadPlan {
+    instances_3d: Vec<GpuInstance3d>,
+    ranges: Vec<GpuBatchRange>,
+    sprites: Vec<GpuSpriteInstance>,
+}
+
+/// Upload summary for one frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WgpuSceneRendererUploadStats {
+    pub opaque_draw_calls: usize,
+    pub transparent_draw_calls: usize,
+    pub sprite_draw_calls: usize,
+    pub total_draw_calls: usize,
+    pub instance_3d_count: usize,
+    pub sprite_count: usize,
+}
+
+struct GpuMesh {
+    vertex: wgpu::Buffer,
+    index: wgpu::Buffer,
+    index_count: u32,
+}
+
+/// Runtime `wgpu` renderer for `RuntimeDrawFrame`.
+pub struct WgpuSceneRenderer {
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    pipeline_opaque: wgpu::RenderPipeline,
+    pipeline_transparent: wgpu::RenderPipeline,
+    pipeline_sprite: wgpu::RenderPipeline,
+    box_mesh: GpuMesh,
+    sphere_mesh: GpuMesh,
+    sprite_vertex_buffer: wgpu::Buffer,
+    instance_3d_buffer: wgpu::Buffer,
+    instance_3d_capacity_bytes: usize,
+    sprite_instance_buffer: wgpu::Buffer,
+    sprite_instance_capacity_bytes: usize,
+    ranges: Vec<GpuBatchRange>,
+    sprite_count: u32,
+}
+
+impl WgpuSceneRenderer {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        color_format: wgpu::TextureFormat,
+        surface_width: u32,
+        surface_height: u32,
+    ) -> Self {
+        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("runtime-scene-camera-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("runtime-scene-camera-buffer"),
+            size: std::mem::size_of::<GpuCameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("runtime-scene-camera-bg"),
+            layout: &camera_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        let shader_3d = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("runtime-scene-3d-shader"),
+            source: wgpu::ShaderSource::Wgsl(SCENE_3D_WGSL.into()),
+        });
+        let shader_sprite = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("runtime-scene-sprite-shader"),
+            source: wgpu::ShaderSource::Wgsl(SCENE_SPRITE_WGSL.into()),
+        });
+
+        let layout_3d = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("runtime-scene-3d-layout"),
+            bind_group_layouts: &[&camera_bgl],
+            immediate_size: 0,
+        });
+        let layout_sprite = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("runtime-scene-sprite-layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+
+        let pipeline_opaque = create_3d_pipeline(
+            device,
+            &layout_3d,
+            &shader_3d,
+            color_format,
+            Some(wgpu::BlendState::REPLACE),
+            "runtime-scene-opaque-pipeline",
+        );
+        let pipeline_transparent = create_3d_pipeline(
+            device,
+            &layout_3d,
+            &shader_3d,
+            color_format,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            "runtime-scene-transparent-pipeline",
+        );
+        let pipeline_sprite =
+            create_sprite_pipeline(device, &layout_sprite, &shader_sprite, color_format);
+
+        let box_mesh = create_box_mesh(device);
+        let sphere_mesh = create_octa_sphere_mesh(device);
+        let sprite_vertex_buffer = create_sprite_quad_vertex_buffer(device);
+        let instance_3d_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("runtime-scene-3d-instance-buffer"),
+            size: std::mem::size_of::<GpuInstance3d>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sprite_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("runtime-scene-sprite-instance-buffer"),
+            size: std::mem::size_of::<GpuSpriteInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut renderer = Self {
+            camera_buffer,
+            camera_bind_group,
+            pipeline_opaque,
+            pipeline_transparent,
+            pipeline_sprite,
+            box_mesh,
+            sphere_mesh,
+            sprite_vertex_buffer,
+            instance_3d_buffer,
+            instance_3d_capacity_bytes: std::mem::size_of::<GpuInstance3d>(),
+            sprite_instance_buffer,
+            sprite_instance_capacity_bytes: std::mem::size_of::<GpuSpriteInstance>(),
+            ranges: Vec::new(),
+            sprite_count: 0,
+        };
+        renderer.update_camera(queue, surface_width.max(1), surface_height.max(1));
+        renderer
+    }
+
+    pub fn resize(&mut self, queue: &wgpu::Queue, width: u32, height: u32) {
+        self.update_camera(queue, width.max(1), height.max(1));
+    }
+
+    pub fn upload_draw_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        draw: &RuntimeDrawFrame,
+    ) -> WgpuSceneRendererUploadStats {
+        let plan = build_upload_plan(draw);
+        let required_3d_bytes = plan.instances_3d.len() * std::mem::size_of::<GpuInstance3d>();
+        let required_sprite_bytes = plan.sprites.len() * std::mem::size_of::<GpuSpriteInstance>();
+
+        ensure_buffer_capacity(
+            device,
+            &mut self.instance_3d_buffer,
+            &mut self.instance_3d_capacity_bytes,
+            required_3d_bytes.max(std::mem::size_of::<GpuInstance3d>()),
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            "runtime-scene-3d-instance-buffer",
+        );
+        ensure_buffer_capacity(
+            device,
+            &mut self.sprite_instance_buffer,
+            &mut self.sprite_instance_capacity_bytes,
+            required_sprite_bytes.max(std::mem::size_of::<GpuSpriteInstance>()),
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            "runtime-scene-sprite-instance-buffer",
+        );
+
+        if !plan.instances_3d.is_empty() {
+            queue.write_buffer(
+                &self.instance_3d_buffer,
+                0,
+                bytemuck::cast_slice(plan.instances_3d.as_slice()),
+            );
+        }
+        if !plan.sprites.is_empty() {
+            queue.write_buffer(
+                &self.sprite_instance_buffer,
+                0,
+                bytemuck::cast_slice(plan.sprites.as_slice()),
+            );
+        }
+
+        self.ranges = plan.ranges;
+        self.sprite_count = plan.sprites.len() as u32;
+
+        let opaque_draw_calls = self
+            .ranges
+            .iter()
+            .filter(|r| r.lane == DrawLane::Opaque)
+            .count();
+        let transparent_draw_calls = self
+            .ranges
+            .iter()
+            .filter(|r| r.lane == DrawLane::Transparent)
+            .count();
+
+        WgpuSceneRendererUploadStats {
+            opaque_draw_calls,
+            transparent_draw_calls,
+            sprite_draw_calls: usize::from(self.sprite_count > 0),
+            total_draw_calls: opaque_draw_calls
+                + transparent_draw_calls
+                + usize::from(self.sprite_count > 0),
+            instance_3d_count: draw.stats.opaque_instances + draw.stats.transparent_instances,
+            sprite_count: draw.stats.sprite_instances,
+        }
+    }
+
+    pub fn encode(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        clear: wgpu::Color,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("runtime-scene-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        if !self.ranges.is_empty() {
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+
+            pass.set_pipeline(&self.pipeline_opaque);
+            for range in self.ranges.iter().filter(|r| r.lane == DrawLane::Opaque) {
+                draw_3d_range(
+                    &mut pass,
+                    &self.box_mesh,
+                    &self.sphere_mesh,
+                    &self.instance_3d_buffer,
+                    range,
+                );
+            }
+
+            pass.set_pipeline(&self.pipeline_transparent);
+            for range in self
+                .ranges
+                .iter()
+                .filter(|r| r.lane == DrawLane::Transparent)
+            {
+                draw_3d_range(
+                    &mut pass,
+                    &self.box_mesh,
+                    &self.sphere_mesh,
+                    &self.instance_3d_buffer,
+                    range,
+                );
+            }
+        }
+
+        if self.sprite_count > 0 {
+            pass.set_pipeline(&self.pipeline_sprite);
+            pass.set_vertex_buffer(0, self.sprite_vertex_buffer.slice(..));
+            let sprite_bytes =
+                (self.sprite_count as usize * std::mem::size_of::<GpuSpriteInstance>()) as u64;
+            pass.set_vertex_buffer(1, self.sprite_instance_buffer.slice(0..sprite_bytes));
+            pass.draw(0..6, 0..self.sprite_count);
+        }
+    }
+
+    fn update_camera(&mut self, queue: &wgpu::Queue, width: u32, height: u32) {
+        let aspect = (width.max(1) as f32) / (height.max(1) as f32);
+        let proj = Perspective3::new(aspect.max(0.1), 60f32.to_radians(), 0.1, 500.0);
+        let view = Isometry3::look_at_rh(
+            &Point3::new(0.0, 12.0, 36.0),
+            &Point3::new(0.0, 0.0, 0.0),
+            &Vector3::new(0.0, 1.0, 0.0),
+        );
+        let view_proj: Matrix4<f32> = proj.to_homogeneous() * view.to_homogeneous();
+        let mut uniform = GpuCameraUniform {
+            view_proj: [0.0; 16],
+        };
+        uniform.view_proj.copy_from_slice(view_proj.as_slice());
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+}
+
+fn build_upload_plan(draw: &RuntimeDrawFrame) -> UploadPlan {
+    let mut plan = UploadPlan::default();
+    plan.instances_3d
+        .reserve(draw.stats.opaque_instances + draw.stats.transparent_instances);
+    plan.sprites.reserve(draw.stats.sprite_instances);
+    plan.ranges
+        .reserve(draw.opaque_batches.len() + draw.transparent_batches.len());
+
+    for batch in &draw.opaque_batches {
+        let start = plan.instances_3d.len() as u32;
+        for instance in &batch.instances {
+            plan.instances_3d.push(GpuInstance3d {
+                model_col0: instance.model_cols[0],
+                model_col1: instance.model_cols[1],
+                model_col2: instance.model_cols[2],
+                model_col3: instance.model_cols[3],
+                base_color: instance.base_color_rgba,
+                material_params: instance.material_params,
+                emissive: [
+                    instance.emissive_rgb[0],
+                    instance.emissive_rgb[1],
+                    instance.emissive_rgb[2],
+                    0.0,
+                ],
+            });
+        }
+        let count = (plan.instances_3d.len() as u32).saturating_sub(start);
+        if count > 0 {
+            plan.ranges.push(GpuBatchRange {
+                lane: DrawLane::Opaque,
+                primitive_code: batch.key.primitive_code,
+                start,
+                count,
+            });
+        }
+    }
+
+    for batch in &draw.transparent_batches {
+        let start = plan.instances_3d.len() as u32;
+        for instance in &batch.instances {
+            plan.instances_3d.push(GpuInstance3d {
+                model_col0: instance.model_cols[0],
+                model_col1: instance.model_cols[1],
+                model_col2: instance.model_cols[2],
+                model_col3: instance.model_cols[3],
+                base_color: instance.base_color_rgba,
+                material_params: instance.material_params,
+                emissive: [
+                    instance.emissive_rgb[0],
+                    instance.emissive_rgb[1],
+                    instance.emissive_rgb[2],
+                    0.0,
+                ],
+            });
+        }
+        let count = (plan.instances_3d.len() as u32).saturating_sub(start);
+        if count > 0 {
+            plan.ranges.push(GpuBatchRange {
+                lane: DrawLane::Transparent,
+                primitive_code: batch.key.primitive_code,
+                start,
+                count,
+            });
+        }
+    }
+
+    for sprite in &draw.sprites {
+        plan.sprites.push(GpuSpriteInstance {
+            translate_size: [
+                sprite.position[0],
+                sprite.position[1],
+                sprite.size[0],
+                sprite.size[1],
+            ],
+            rot_z: [sprite.rotation_rad, sprite.position[2], 0.0, 0.0],
+            color: sprite.color_rgba,
+        });
+    }
+
+    plan
+}
+
+fn draw_3d_range(
+    pass: &mut wgpu::RenderPass<'_>,
+    box_mesh: &GpuMesh,
+    sphere_mesh: &GpuMesh,
+    instance_buffer: &wgpu::Buffer,
+    range: &GpuBatchRange,
+) {
+    let mesh = if range.primitive_code == 0 {
+        sphere_mesh
+    } else {
+        box_mesh
+    };
+    pass.set_vertex_buffer(0, mesh.vertex.slice(..));
+    let bytes_per_instance = std::mem::size_of::<GpuInstance3d>() as u64;
+    let start = range.start as u64 * bytes_per_instance;
+    let end = (range.start as u64 + range.count as u64) * bytes_per_instance;
+    pass.set_vertex_buffer(1, instance_buffer.slice(start..end));
+    pass.set_index_buffer(mesh.index.slice(..), wgpu::IndexFormat::Uint16);
+    pass.draw_indexed(0..mesh.index_count, 0, 0..range.count);
+}
+
+fn create_3d_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuVertex3d>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuInstance3d>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        1 => Float32x4,
+                        2 => Float32x4,
+                        3 => Float32x4,
+                        4 => Float32x4,
+                        5 => Float32x4,
+                        6 => Float32x4,
+                        7 => Float32x4
+                    ],
+                },
+            ],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_sprite_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("runtime-scene-sprite-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuSpriteVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuSpriteInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        1 => Float32x4,
+                        2 => Float32x4,
+                        3 => Float32x4
+                    ],
+                },
+            ],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_box_mesh(device: &wgpu::Device) -> GpuMesh {
+    let vertices = [
+        GpuVertex3d {
+            position: [-0.5, -0.5, -0.5],
+        },
+        GpuVertex3d {
+            position: [0.5, -0.5, -0.5],
+        },
+        GpuVertex3d {
+            position: [0.5, 0.5, -0.5],
+        },
+        GpuVertex3d {
+            position: [-0.5, 0.5, -0.5],
+        },
+        GpuVertex3d {
+            position: [-0.5, -0.5, 0.5],
+        },
+        GpuVertex3d {
+            position: [0.5, -0.5, 0.5],
+        },
+        GpuVertex3d {
+            position: [0.5, 0.5, 0.5],
+        },
+        GpuVertex3d {
+            position: [-0.5, 0.5, 0.5],
+        },
+    ];
+    let indices: [u16; 36] = [
+        0, 1, 2, 2, 3, 0, // back
+        4, 6, 5, 6, 4, 7, // front
+        0, 4, 5, 5, 1, 0, // bottom
+        3, 2, 6, 6, 7, 3, // top
+        1, 5, 6, 6, 2, 1, // right
+        0, 3, 7, 7, 4, 0, // left
+    ];
+    create_mesh(device, "runtime-scene-box", &vertices, &indices)
+}
+
+fn create_octa_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
+    let vertices = [
+        GpuVertex3d {
+            position: [1.0, 0.0, 0.0],
+        },
+        GpuVertex3d {
+            position: [-1.0, 0.0, 0.0],
+        },
+        GpuVertex3d {
+            position: [0.0, 1.0, 0.0],
+        },
+        GpuVertex3d {
+            position: [0.0, -1.0, 0.0],
+        },
+        GpuVertex3d {
+            position: [0.0, 0.0, 1.0],
+        },
+        GpuVertex3d {
+            position: [0.0, 0.0, -1.0],
+        },
+    ];
+    let indices: [u16; 24] = [
+        0, 2, 4, 4, 2, 1, 1, 2, 5, 5, 2, 0, 4, 3, 0, 1, 3, 4, 5, 3, 1, 0, 3, 5,
+    ];
+    create_mesh(device, "runtime-scene-sphere", &vertices, &indices)
+}
+
+fn create_mesh(
+    device: &wgpu::Device,
+    label: &str,
+    vertices: &[GpuVertex3d],
+    indices: &[u16],
+) -> GpuMesh {
+    let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&format!("{label}-vb")),
+        contents: bytemuck::cast_slice(vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&format!("{label}-ib")),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    GpuMesh {
+        vertex,
+        index,
+        index_count: indices.len() as u32,
+    }
+}
+
+fn create_sprite_quad_vertex_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    let vertices = [
+        GpuSpriteVertex {
+            local_pos: [-0.5, -0.5],
+        },
+        GpuSpriteVertex {
+            local_pos: [0.5, -0.5],
+        },
+        GpuSpriteVertex {
+            local_pos: [0.5, 0.5],
+        },
+        GpuSpriteVertex {
+            local_pos: [-0.5, -0.5],
+        },
+        GpuSpriteVertex {
+            local_pos: [0.5, 0.5],
+        },
+        GpuSpriteVertex {
+            local_pos: [-0.5, 0.5],
+        },
+    ];
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("runtime-scene-sprite-quad-vb"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    })
+}
+
+fn ensure_buffer_capacity(
+    device: &wgpu::Device,
+    buffer: &mut wgpu::Buffer,
+    capacity_bytes: &mut usize,
+    required_bytes: usize,
+    usage: wgpu::BufferUsages,
+    label: &str,
+) {
+    if required_bytes <= *capacity_bytes {
+        return;
+    }
+    let mut new_capacity = (*capacity_bytes).max(256);
+    while new_capacity < required_bytes {
+        new_capacity = new_capacity.saturating_mul(2);
+    }
+    *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: new_capacity as u64,
+        usage,
+        mapped_at_creation: false,
+    });
+    *capacity_bytes = new_capacity;
+}
+
+const SCENE_3D_WGSL: &str = r#"
+struct Camera {
+    view_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> u_camera: Camera;
+
+struct VSIn {
+    @location(0) position: vec3<f32>,
+    @location(1) model_col0: vec4<f32>,
+    @location(2) model_col1: vec4<f32>,
+    @location(3) model_col2: vec4<f32>,
+    @location(4) model_col3: vec4<f32>,
+    @location(5) base_color: vec4<f32>,
+    @location(6) material_params: vec4<f32>,
+    @location(7) emissive: vec4<f32>,
+};
+
+struct VSOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) emissive: vec3<f32>,
+};
+
+@vertex
+fn vs_main(input: VSIn) -> VSOut {
+    let model = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3
+    );
+    let world_pos = model * vec4<f32>(input.position, 1.0);
+
+    var out: VSOut;
+    out.position = u_camera.view_proj * world_pos;
+    out.color = input.base_color;
+    out.emissive = input.emissive.xyz;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
+    let lit = input.color.rgb + input.emissive;
+    return vec4<f32>(lit, input.color.a);
+}
+"#;
+
+const SCENE_SPRITE_WGSL: &str = r#"
+struct VSIn {
+    @location(0) local_pos: vec2<f32>,
+    @location(1) translate_size: vec4<f32>,
+    @location(2) rot_z: vec4<f32>,
+    @location(3) color: vec4<f32>,
+};
+
+struct VSOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VSIn) -> VSOut {
+    let c = cos(input.rot_z.x);
+    let s = sin(input.rot_z.x);
+    let scaled = vec2<f32>(
+        input.local_pos.x * input.translate_size.z,
+        input.local_pos.y * input.translate_size.w
+    );
+    let rotated = vec2<f32>(
+        scaled.x * c - scaled.y * s,
+        scaled.x * s + scaled.y * c
+    );
+    let pos = rotated + input.translate_size.xy;
+
+    var out: VSOut;
+    out.position = vec4<f32>(pos, input.rot_z.y, 1.0);
+    out.color = input.color;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
+    return input.color;
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::draw_path::{
+        DrawBatch3d, DrawBatchKey, DrawFrameStats, DrawInstance3d, RuntimeDrawFrame,
+    };
+
+    #[test]
+    fn upload_plan_preserves_range_counts() {
+        let draw = RuntimeDrawFrame {
+            opaque_batches: vec![DrawBatch3d {
+                lane: DrawLane::Opaque,
+                key: DrawBatchKey {
+                    primitive_code: 1,
+                    shading_code: 0,
+                    shadow_flags: 3,
+                },
+                instances: vec![make_instance(1), make_instance(2)],
+            }],
+            transparent_batches: vec![DrawBatch3d {
+                lane: DrawLane::Transparent,
+                key: DrawBatchKey {
+                    primitive_code: 0,
+                    shading_code: 0,
+                    shadow_flags: 0,
+                },
+                instances: vec![make_instance(3)],
+            }],
+            sprites: Vec::new(),
+            stats: DrawFrameStats {
+                opaque_instances: 2,
+                transparent_instances: 1,
+                sprite_instances: 0,
+                opaque_batches: 1,
+                transparent_batches: 1,
+                total_draw_calls: 2,
+            },
+        };
+
+        let plan = build_upload_plan(&draw);
+        assert_eq!(plan.instances_3d.len(), 3);
+        assert_eq!(plan.ranges.len(), 2);
+        assert_eq!(plan.ranges[0].count, 2);
+        assert_eq!(plan.ranges[1].count, 1);
+        assert_eq!(plan.ranges[1].start, 2);
+    }
+
+    fn make_instance(id: u64) -> DrawInstance3d {
+        DrawInstance3d {
+            instance_id: id,
+            model_cols: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            base_color_rgba: [1.0, 1.0, 1.0, 1.0],
+            material_params: [0.5, 0.0, 0.0, 0.0],
+            emissive_rgb: [0.0, 0.0, 0.0],
+        }
+    }
+}
