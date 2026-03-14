@@ -1,0 +1,64 @@
+use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
+use runtime::{
+    estimate_scene_workload_requests, BounceTankSceneConfig, BounceTankSceneController,
+    RenderSyncMode, SceneWorkloadBridgeConfig, TickRatePolicy,
+};
+
+fn main() {
+    let render_sync_mode = RenderSyncMode::Vsync { display_hz: 60.0 };
+    let measured_render_fps = Some(60.0);
+    let tick_policy = TickRatePolicy {
+        ticks_per_render_frame: 2.0,
+        ..TickRatePolicy::default()
+    };
+    let fixed_dt = tick_policy.resolve_fixed_dt_seconds(render_sync_mode, measured_render_fps);
+    let render_dt = 1.0 / 60.0;
+
+    let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+        fixed_dt,
+        ..PhysicsWorldConfig::default()
+    });
+    let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+        target_ball_count: 8_000,
+        spawn_per_tick: 280,
+        ..BounceTankSceneConfig::default()
+    });
+    let workload_cfg = SceneWorkloadBridgeConfig {
+        target_frame_budget_ms: 16.67,
+        ..SceneWorkloadBridgeConfig::default()
+    };
+
+    let total_frames = 60 * 6;
+    println!(
+        "[Showcase] render_dt={:.4}ms | physics_fixed_dt={:.4}ms | target_frames={}",
+        render_dt * 1_000.0,
+        fixed_dt * 1_000.0,
+        total_frames
+    );
+
+    for frame_index in 0..total_frames {
+        let tick = scene.physics_tick(&mut world);
+        let substeps = world.step(render_dt);
+        let frame = scene.build_frame_instances(&world, Some(world.interpolation_alpha()));
+        let estimate =
+            estimate_scene_workload_requests(&frame, tick.live_balls, 1280, 720, workload_cfg);
+
+        if frame_index % 30 == 0 || frame_index + 1 == total_frames {
+            println!(
+                "frame={:03} spawn={} live={} substeps={} opaque={} transparent={} sprites={} gms.sampled={} gms.object={} gms.physics={} gms.ui={} gms.postfx={}",
+                frame_index,
+                tick.spawned_this_tick,
+                tick.live_balls,
+                substeps,
+                frame.opaque_3d.len(),
+                frame.transparent_3d.len(),
+                frame.sprites.len(),
+                estimate.multi_gpu.sampled_processing_jobs,
+                estimate.multi_gpu.object_updates,
+                estimate.multi_gpu.physics_jobs,
+                estimate.multi_gpu.ui_jobs,
+                estimate.multi_gpu.post_fx_jobs
+            );
+        }
+    }
+}

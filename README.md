@@ -46,6 +46,8 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/gms-dispatch-planner.md`: GMS workload planning and multi-GPU dispatch notes
 - `docs/runtime-bridge-flow.md`: canonical MPS -> GMS -> runtime synchronization flow
 - `docs/runtime-scene-showcase.md`: runtime scene/sprite payload model and bounce-tank showcase scaffolding
+- `docs/runtime-scene-workload.md`: runtime scene/sprite density to GMS workload mapping
+- `docs/demos/README.md`: show/demo documentation area (`docs/demos/*`)
 
 ## Current Architecture
 

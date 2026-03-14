@@ -13,6 +13,7 @@ pub mod bridge;
 pub mod hardware;
 pub mod multi_gpu_runtime;
 pub mod render_benchmark;
+pub mod scene_workload;
 pub mod tuning;
 
 pub use adaptive_buffer::{
@@ -34,5 +35,8 @@ pub use hardware::{
 pub use multi_gpu_runtime::{
     MultiGpuExecutor, MultiGpuExecutorConfig, MultiGpuExecutorSummary, MultiGpuFrameSubmitResult,
     MultiGpuInitPolicy,
+};
+pub use scene_workload::{
+    estimate_scene_workload, SceneWorkloadEstimate, SceneWorkloadSnapshot, SceneWorkloadTuning,
 };
 pub use tuning::GmsRuntimeTuningProfile;
