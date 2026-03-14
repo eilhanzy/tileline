@@ -11,6 +11,9 @@ use wgpu::util::DeviceExt;
 use crate::draw_path::{DrawLane, RuntimeDrawFrame};
 use crate::scene::SpriteKind;
 
+const SPRITE_ATLAS_GRID_DIM: u32 = 4;
+const SPRITE_ATLAS_TILE_SIZE: u32 = 64;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct GpuVertex3d {
@@ -90,6 +93,8 @@ pub struct WgpuSceneRenderer {
     pipeline_opaque: wgpu::RenderPipeline,
     pipeline_transparent: wgpu::RenderPipeline,
     pipeline_sprite: wgpu::RenderPipeline,
+    _sprite_atlas_texture: wgpu::Texture,
+    sprite_atlas_bind_group: wgpu::BindGroup,
     box_mesh: GpuMesh,
     sphere_mesh: GpuMesh,
     sprite_vertex_buffer: wgpu::Buffer,
@@ -146,6 +151,28 @@ impl WgpuSceneRenderer {
             source: wgpu::ShaderSource::Wgsl(SCENE_SPRITE_WGSL.into()),
         });
 
+        let sprite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("runtime-scene-sprite-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         let layout_3d = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("runtime-scene-3d-layout"),
             bind_group_layouts: &[&camera_bgl],
@@ -153,7 +180,7 @@ impl WgpuSceneRenderer {
         });
         let layout_sprite = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("runtime-scene-sprite-layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[&sprite_bgl],
             immediate_size: 0,
         });
 
@@ -175,6 +202,8 @@ impl WgpuSceneRenderer {
         );
         let pipeline_sprite =
             create_sprite_pipeline(device, &layout_sprite, &shader_sprite, color_format);
+        let (sprite_atlas_texture, sprite_atlas_bind_group) =
+            create_default_sprite_atlas_resources(device, queue, &sprite_bgl);
 
         let box_mesh = create_box_mesh(device);
         let sphere_mesh = create_octa_sphere_mesh(device);
@@ -198,6 +227,8 @@ impl WgpuSceneRenderer {
             pipeline_opaque,
             pipeline_transparent,
             pipeline_sprite,
+            _sprite_atlas_texture: sprite_atlas_texture,
+            sprite_atlas_bind_group,
             box_mesh,
             sphere_mesh,
             sprite_vertex_buffer,
@@ -339,6 +370,7 @@ impl WgpuSceneRenderer {
 
         if self.sprite_count > 0 {
             pass.set_pipeline(&self.pipeline_sprite);
+            pass.set_bind_group(0, &self.sprite_atlas_bind_group, &[]);
             pass.set_vertex_buffer(0, self.sprite_vertex_buffer.slice(..));
             let sprite_bytes =
                 (self.sprite_count as usize * std::mem::size_of::<GpuSpriteInstance>()) as u64;
@@ -755,6 +787,113 @@ fn ensure_buffer_capacity(
     *capacity_bytes = new_capacity;
 }
 
+fn create_default_sprite_atlas_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    bind_group_layout: &wgpu::BindGroupLayout,
+) -> (wgpu::Texture, wgpu::BindGroup) {
+    let width = SPRITE_ATLAS_GRID_DIM * SPRITE_ATLAS_TILE_SIZE;
+    let height = SPRITE_ATLAS_GRID_DIM * SPRITE_ATLAS_TILE_SIZE;
+    let pixels = build_default_sprite_atlas_pixels(width, height);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("runtime-scene-sprite-atlas"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("runtime-scene-sprite-atlas-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("runtime-scene-sprite-atlas-bg"),
+        layout: bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    (texture, bind_group)
+}
+
+fn build_default_sprite_atlas_pixels(width: u32, height: u32) -> Vec<u8> {
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    let tile = SPRITE_ATLAS_TILE_SIZE.max(1);
+
+    for y in 0..height {
+        for x in 0..width {
+            let tile_x = (x / tile).min(SPRITE_ATLAS_GRID_DIM - 1);
+            let tile_y = (y / tile).min(SPRITE_ATLAS_GRID_DIM - 1);
+            let u = (x % tile) as f32 / (tile - 1) as f32;
+            let v = (y % tile) as f32 / (tile - 1) as f32;
+            let rgba = atlas_tile_rgba(tile_x, tile_y, u, v);
+            let idx = ((y * width + x) * 4) as usize;
+            pixels[idx] = rgba[0];
+            pixels[idx + 1] = rgba[1];
+            pixels[idx + 2] = rgba[2];
+            pixels[idx + 3] = rgba[3];
+        }
+    }
+    pixels
+}
+
+fn atlas_tile_rgba(tile_x: u32, tile_y: u32, u: f32, v: f32) -> [u8; 4] {
+    let base_r = 40.0 + tile_x as f32 * 44.0;
+    let base_g = 56.0 + tile_y as f32 * 40.0;
+    let base_b = 72.0 + (tile_x ^ tile_y) as f32 * 30.0;
+
+    let band = 0.82 + 0.18 * ((u * 14.0 + v * 12.0 + tile_x as f32).sin() * 0.5 + 0.5);
+    let vignette = (1.0 - ((u - 0.5).abs() + (v - 0.5).abs()) * 0.6).clamp(0.65, 1.0);
+    let shade = band * vignette;
+
+    let r = (base_r * shade).clamp(0.0, 255.0) as u8;
+    let g = (base_g * shade).clamp(0.0, 255.0) as u8;
+    let b = (base_b * shade).clamp(0.0, 255.0) as u8;
+    [r, g, b, 255]
+}
+
 const SCENE_3D_WGSL: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -822,6 +961,9 @@ struct VSOut {
     @location(3) kind_params: vec2<f32>,
 };
 
+@group(0) @binding(0) var sprite_tex: texture_2d<f32>;
+@group(0) @binding(1) var sprite_smp: sampler;
+
 @vertex
 fn vs_main(input: VSIn) -> VSOut {
     let c = cos(input.rot_z.x);
@@ -870,7 +1012,9 @@ fn camera_style(base_color: vec3<f32>, uv: vec2<f32>, atlas_uv: vec2<f32>, slot:
 fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
     let kind = i32(input.kind_params.x + 0.5);
     let slot = input.kind_params.y;
-    var color = input.color.rgb;
+    let sampled = textureSample(sprite_tex, sprite_smp, input.atlas_uv);
+    var color = input.color.rgb * sampled.rgb;
+    let alpha = input.color.a * sampled.a;
 
     if kind == 2 {
         color = camera_style(color, input.uv, input.atlas_uv, slot);
@@ -884,7 +1028,7 @@ fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
         color = color * grain;
     }
 
-    return vec4<f32>(color, input.color.a);
+    return vec4<f32>(color, alpha);
 }
 "#;
 
@@ -970,6 +1114,18 @@ mod tests {
         assert!((sprite.atlas_rect[1] - 0.5).abs() < 1e-6); // row 2 / 4
         assert!((sprite.atlas_rect[2] - 0.75).abs() < 1e-6);
         assert!((sprite.atlas_rect[3] - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn default_sprite_atlas_pixels_are_non_uniform() {
+        let width = SPRITE_ATLAS_GRID_DIM * SPRITE_ATLAS_TILE_SIZE;
+        let height = SPRITE_ATLAS_GRID_DIM * SPRITE_ATLAS_TILE_SIZE;
+        let pixels = build_default_sprite_atlas_pixels(width, height);
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+        let first = &pixels[0..4];
+        let second = &pixels
+            [(SPRITE_ATLAS_TILE_SIZE as usize * 4)..(SPRITE_ATLAS_TILE_SIZE as usize * 4 + 4)];
+        assert_ne!(first, second);
     }
 
     fn make_instance(id: u64) -> DrawInstance3d {
