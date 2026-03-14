@@ -24,6 +24,7 @@ in `src/` crates (not benchmark-only code).
 - `runtime-scheduler-path.md`: runtime automatic scheduler path selection (`GMS` vs `MGS`)
 - `runtime-draw-hud.md`: `SceneFrameInstances` -> draw-batch compile path and telemetry HUD overlay flow
 - `runtime-tlsprite.md`: `.tlsprite` parser, runtime sprite program flow, and HUD scaling signals
+- `runtime-tljoint.md`: scene-based multi `.tlscript` + multi `.tlsprite` composition manifest
 - `runtime-mas.md`: MAS audio scheduler flow and MPS integration contract
 - `alpha-foss-ui-assets.md`: candidate FOSS icon/font packs and asset policy
 - `examples/tlsprite/runtime_basic_types.tlsprite`: starter `.tlsprite` asset with `hud`, `camera`, and `terrain` kinds

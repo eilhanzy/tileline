@@ -94,6 +94,9 @@ Runtime now exposes precompiled pack + cache primitives:
   - binds cache entries by asset path
   - supports `invalidate_path(...)` / `invalidate_all()`
   - provides telemetry via `stats()`
+- `TlspriteProgram::merge_programs(...)`:
+  - appends multiple compiled `.tlsprite` programs in deterministic order
+  - used by `.tljoint` scene bundles for multi-file composition
 
 `TlspriteWatchReloader::reload_into_cache(...)` bridges hot reload events into cache bindings.
 

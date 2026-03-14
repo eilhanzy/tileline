@@ -53,6 +53,7 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/runtime-scheduler-path.md`: runtime auto-selection policy for `GMS` vs `MGS`
 - `docs/runtime-draw-hud.md`: runtime draw-batch compiler + telemetry HUD overlay integration
 - `docs/runtime-tlsprite.md`: `.tlsprite` parser and runtime sprite-program integration flow
+- `docs/runtime-tljoint.md`: scene-based multi `.tlscript` + `.tlsprite` binding manifest for runtime composition
 - `docs/runtime-mas.md`: MAS audio scheduler design and MPS integration path
 - `docs/runtime-tlscript-showcase.md`: runtime `.tlscript` compile/evaluate bootstrap and safe patch application flow
 - `docs/alpha-foss-ui-assets.md`: FOSS icon/font candidates and asset policy for Alpha editor UI

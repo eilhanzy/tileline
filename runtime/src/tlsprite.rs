@@ -192,6 +192,19 @@ impl TlspriteProgram {
             out.push(instance);
         }
     }
+
+    /// Merge multiple compiled programs into one deterministic emission order.
+    ///
+    /// Programs are appended in slice order and each program's internal sprite order is preserved.
+    /// This enables `.tljoint` scene bundles to compose multiple `.tlsprite` files.
+    pub fn merge_programs(programs: &[TlspriteProgram]) -> TlspriteProgram {
+        let total = programs.iter().map(|program| program.sprites.len()).sum();
+        let mut sprites = Vec::with_capacity(total);
+        for program in programs {
+            sprites.extend(program.sprites.iter().cloned());
+        }
+        TlspriteProgram { sprites }
+    }
 }
 
 /// Hot-reload behavior knobs for `.tlsprite` disk sources.

@@ -15,6 +15,7 @@
 //! - `draw_path`: scene payload -> deterministic backend draw batches
 //! - `telemetry_hud`: telemetry -> HUD sprite overlay composition
 //! - `tlapp_app`: canonical TLApp runtime entry moved from examples into core runtime
+//! - `tljoint`: scene-based multi `.tlscript` + multi `.tlsprite` binding manifest
 //! - `tlsprite`: `.tlsprite` sprite program parser and frame emitter
 //! - `tlscript_showcase`: `.tlscript` showcase compile/evaluate bootstrap
 //! - `tlsprite_editor`: list-mode `.tlsprite` editor model + lavender Alpha theme
@@ -33,6 +34,7 @@ mod scene_workload;
 mod scheduler_path;
 mod telemetry_hud;
 mod tlapp_app;
+mod tljoint;
 mod tlscript_parallel;
 mod tlscript_showcase;
 mod tlsprite;
@@ -83,6 +85,11 @@ pub use telemetry_hud::{
     TelemetryHudComposer, TelemetryHudConfig, TelemetryHudMetrics, TelemetryHudSample,
 };
 pub use tlapp_app::run_from_env as run_tlapp_from_env;
+pub use tljoint::{
+    compile_tljoint_scene_from_path, load_tljoint, parse_tljoint, TljointDiagnostic,
+    TljointDiagnosticLevel, TljointManifest, TljointParseOutcome, TljointSceneBinding,
+    TljointSceneBundle, TljointSceneCompileOutcome,
+};
 pub use tlscript_parallel::{
     TlscriptDispatchSubmission, TlscriptMpsDispatchConfig, TlscriptParallelRuntimeCoordinator,
     TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,

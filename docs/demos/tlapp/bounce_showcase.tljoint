@@ -1,0 +1,6 @@
+tljoint_v1
+
+[scene.main]
+tlscripts = bounce_showcase.tlscript
+tlsprites = bounce_hud.tlsprite
+
