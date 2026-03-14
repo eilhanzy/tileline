@@ -47,6 +47,25 @@ Anything below that is still a foundation or prototype milestone, not beta.
 - Add observability before aggressive optimization where possible.
 - Define a narrow beta scope. Do not try to ship a general-purpose AAA engine in beta one.
 
+## Phase A: Pre-Alpha Transition (Current Focus)
+
+This phase bridges foundation work into one runtime-owned vertical path. It should be treated as
+the active phase before broad beta feature expansion.
+
+### Exit Criteria
+
+- canonical runtime update order is frozen: net -> script -> physics -> render plan -> present
+- `.tlscript` compile/cache/submit path is live in runtime
+- ParadoxPE state mutation/query path is exercised from script host ABI in runtime loop
+- NPS input + snapshot loops run without blocking render/present
+- telemetry surface is stable enough to explain cross-subsystem regressions
+
+### Work Items
+
+- implement and validate pre-alpha gates listed in `docs/tileline-pre-alpha-transition.md`
+- keep multi-GPU and mobile fallback behavior in `gms/src` and `mgs/src` aligned with runtime flow
+- prioritize integration bugs over new subsystem scope
+
 ## Phase 0: Foundation Hardening
 
 This phase is partially complete. The remaining work is mostly stabilization.

@@ -10,12 +10,14 @@ Tileline is a parallel-first game engine architecture prototype focused on expli
 - `tl-core`: engine bridge layer that synchronizes MPS and GMS
 - `runtime`: render-loop integration glue for `wgpu` submit/present flows and NPS UDP transport/telemetry pumping
 
-This workspace is currently in engine-foundation phase. The main goals are:
+This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alpha). The main goals are:
 
 - lock-free task flow between CPU and GPU planning stages
 - explicit multi-GPU orchestration (primary throughput GPU + secondary latency/helper GPU)
 - Apple Silicon / UMA-aware stability controls
 - WASM-based scripting/runtime integration path (MPS-targeted)
+- one canonical runtime-owned scene loop (script + physics + render + network)
+- telemetry-first regression visibility across MPS/GMS/ParadoxPE/NPS
 
 ## Workspace Layout
 
@@ -35,6 +37,7 @@ This workspace is currently in engine-foundation phase. The main goals are:
 - `docs/tlscript-parser-plan.md`: `.tlscript` parser/AST roadmap and V1 grammar
 - `docs/tlscript-semantic.md`: `.tlscript` semantic analyzer (types, handles, WASM sandboxing)
 - `docs/tlscript-parallel-runtime.md`: `.tlscript` parallel contracts, advisor, and runtime dispatch planning
+- `docs/tileline-pre-alpha-transition.md`: immediate Foundation -> Pre-Alpha transition gates and sprint plan
 - `docs/tileline-beta-roadmap.md`: phased plan from foundation state to a usable beta
 - `docs/nps-protocol.md`: NPS packet format, reliability, authority handoff, and MPS integration
 - `docs/nps-runtime-plan.md`: NPS channel/tick/snapshot runtime plan for the beta transport path
