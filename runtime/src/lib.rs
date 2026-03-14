@@ -104,8 +104,8 @@ pub use tljoint::{
 };
 pub use tlpfile::{
     compile_tlpfile_scene_from_path, load_tlpfile, parse_tlpfile, TlpfileDiagnostic,
-    TlpfileDiagnosticLevel, TlpfileParseOutcome, TlpfileProject, TlpfileSceneBinding,
-    TlpfileSceneBundle, TlpfileSceneCompileOutcome,
+    TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlpfileParseOutcome, TlpfileProject,
+    TlpfileSceneBinding, TlpfileSceneBundle, TlpfileSceneCompileOutcome,
 };
 pub use tlpfile_gui::run_from_env as run_tlproject_gui_from_env;
 pub use tlscript_parallel::{
@@ -113,9 +113,9 @@ pub use tlscript_parallel::{
     TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,
 };
 pub use tlscript_showcase::{
-    compile_tlscript_showcase, TlscriptShowcaseCompileOutcome, TlscriptShowcaseConfig,
-    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
-    TlscriptShowcaseProgram,
+    compile_tlscript_showcase, TlscriptCoordinateSpace, TlscriptShowcaseCompileOutcome,
+    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
+    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
 };
 pub use tlsprite::{
     compile_tlsprite, compile_tlsprite_pack, compile_tlsprite_with_extra_roots, load_tlsprite_pack,

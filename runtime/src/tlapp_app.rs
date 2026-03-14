@@ -7,12 +7,14 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use crate::{
-    compile_tljoint_scene_from_path, compile_tlscript_showcase, BounceTankSceneConfig,
-    BounceTankSceneController, DrawPathCompiler, RenderSyncMode, TelemetryHudComposer,
-    TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle,
-    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
-    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram,
-    TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer,
+    compile_tljoint_scene_from_path, compile_tlpfile_scene_from_path, compile_tlscript_showcase,
+    BounceTankRuntimePatch, BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler,
+    RenderSyncMode, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
+    TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
+    TlscriptCoordinateSpace, TlscriptShowcaseConfig, TlscriptShowcaseControlInput,
+    TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
+    TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader,
+    WgpuSceneRenderer,
 };
 use nalgebra::Vector3;
 use paradoxpe::{
@@ -79,6 +81,7 @@ struct CliOptions {
     fps_cap: Option<f32>,
     tick_profile: TickProfile,
     fps_report_interval: Duration,
+    project_path: Option<PathBuf>,
     joint_path: Option<PathBuf>,
     joint_scene: String,
     script_path: PathBuf,
@@ -93,6 +96,7 @@ impl Default for CliOptions {
             fps_cap: Some(60.0),
             tick_profile: TickProfile::Max,
             fps_report_interval: Duration::from_secs_f32(1.0),
+            project_path: None,
             joint_path: None,
             joint_scene: "main".to_string(),
             script_path: PathBuf::from("docs/demos/tlapp/bounce_showcase.tlscript"),
@@ -131,6 +135,10 @@ impl CliOptions {
                 "--fps-report" => {
                     let value = next_arg(&mut args, "--fps-report")?;
                     options.fps_report_interval = parse_seconds_arg(&value, "--fps-report")?;
+                }
+                "--project" => {
+                    let value = next_arg(&mut args, "--project")?;
+                    options.project_path = Some(PathBuf::from(value));
                 }
                 "--joint" => {
                     let value = next_arg(&mut args, "--joint")?;
@@ -265,8 +273,9 @@ fn print_usage() {
     println!("  --fps-cap <N|off>         Frame cap target (default: 60)");
     println!("  --tick-profile <mode>     Physics tick planner: balanced|max (default: max)");
     println!("  --fps-report <sec>        CLI FPS report cadence (default: 1.0)");
+    println!("  --project <path>          .tlpfile manifest (GMS required for TLApp runtime)");
     println!("  --joint <path>            .tljoint manifest path (overrides --script/--sprite)");
-    println!("  --scene <name>            Scene id inside .tljoint (default: main)");
+    println!("  --scene <name>            Scene id inside .tlpfile/.tljoint (default: main)");
     println!(
         "  --script <path>           .tlscript path (default: docs/demos/tlapp/bounce_showcase.tlscript)"
     );
@@ -440,6 +449,7 @@ struct TlAppRuntime {
 enum ScriptRuntime<'src> {
     Single(TlscriptShowcaseProgram<'src>),
     Joint(TljointSceneBundle),
+    MultiScripts(Vec<TlscriptShowcaseProgram<'src>>),
 }
 
 impl<'src> ScriptRuntime<'src> {
@@ -451,7 +461,141 @@ impl<'src> ScriptRuntime<'src> {
         match self {
             Self::Single(program) => program.evaluate_frame_with_controls(input, controls),
             Self::Joint(bundle) => bundle.evaluate_frame(input, controls),
+            Self::MultiScripts(programs) => {
+                let mut merged = empty_showcase_output();
+                for (index, program) in programs.iter().enumerate() {
+                    let output = program.evaluate_frame_with_controls(input, controls);
+                    merge_showcase_output(&mut merged, output, index);
+                }
+                merged
+            }
         }
+    }
+}
+
+fn empty_showcase_output() -> TlscriptShowcaseFrameOutput {
+    TlscriptShowcaseFrameOutput {
+        patch: BounceTankRuntimePatch::default(),
+        force_full_fbx_sphere: None,
+        camera_move_speed: None,
+        camera_look_sensitivity: None,
+        camera_pose: None,
+        camera_coordinate_space: None,
+        camera_translate_delta: None,
+        camera_rotate_delta_deg: None,
+        camera_move_axis: None,
+        camera_look_delta: None,
+        camera_sprint: None,
+        camera_look_active: None,
+        camera_reset_pose: false,
+        dispatch_decision: None,
+        warnings: Vec::new(),
+        aborted_early: false,
+    }
+}
+
+fn merge_showcase_output(
+    merged: &mut TlscriptShowcaseFrameOutput,
+    mut next: TlscriptShowcaseFrameOutput,
+    script_index: usize,
+) {
+    merge_runtime_patch(&mut merged.patch, next.patch);
+    if next.force_full_fbx_sphere.is_some() {
+        merged.force_full_fbx_sphere = next.force_full_fbx_sphere;
+    }
+    if next.camera_move_speed.is_some() {
+        merged.camera_move_speed = next.camera_move_speed;
+    }
+    if next.camera_look_sensitivity.is_some() {
+        merged.camera_look_sensitivity = next.camera_look_sensitivity;
+    }
+    if next.camera_pose.is_some() {
+        merged.camera_pose = next.camera_pose;
+    }
+    if next.camera_coordinate_space.is_some() {
+        merged.camera_coordinate_space = next.camera_coordinate_space;
+    }
+    if next.camera_translate_delta.is_some() {
+        merged.camera_translate_delta = next.camera_translate_delta;
+    }
+    if next.camera_rotate_delta_deg.is_some() {
+        merged.camera_rotate_delta_deg = next.camera_rotate_delta_deg;
+    }
+    if next.camera_move_axis.is_some() {
+        merged.camera_move_axis = next.camera_move_axis;
+    }
+    if next.camera_look_delta.is_some() {
+        merged.camera_look_delta = next.camera_look_delta;
+    }
+    if next.camera_sprint.is_some() {
+        merged.camera_sprint = next.camera_sprint;
+    }
+    if next.camera_look_active.is_some() {
+        merged.camera_look_active = next.camera_look_active;
+    }
+    merged.camera_reset_pose |= next.camera_reset_pose;
+
+    merged.dispatch_decision = match (merged.dispatch_decision, next.dispatch_decision) {
+        (None, right) => right,
+        (left, None) => left,
+        (Some(existing), Some(candidate)) => {
+            if candidate.is_parallel() {
+                Some(candidate)
+            } else {
+                Some(existing)
+            }
+        }
+    };
+
+    merged.aborted_early |= next.aborted_early;
+    if !next.warnings.is_empty() {
+        for warning in next.warnings.drain(..) {
+            merged
+                .warnings
+                .push(format!("script[{script_index}] {warning}"));
+        }
+    }
+}
+
+fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatch) {
+    if patch.target_ball_count.is_some() {
+        target.target_ball_count = patch.target_ball_count;
+    }
+    if patch.spawn_per_tick.is_some() {
+        target.spawn_per_tick = patch.spawn_per_tick;
+    }
+    if patch.linear_damping.is_some() {
+        target.linear_damping = patch.linear_damping;
+    }
+    if patch.gravity.is_some() {
+        target.gravity = patch.gravity;
+    }
+    if patch.contact_guard.is_some() {
+        target.contact_guard = patch.contact_guard;
+    }
+    if patch.ball_restitution.is_some() {
+        target.ball_restitution = patch.ball_restitution;
+    }
+    if patch.wall_restitution.is_some() {
+        target.wall_restitution = patch.wall_restitution;
+    }
+    if patch.initial_speed_min.is_some() {
+        target.initial_speed_min = patch.initial_speed_min;
+    }
+    if patch.initial_speed_max.is_some() {
+        target.initial_speed_max = patch.initial_speed_max;
+    }
+    if patch.scatter_interval_ticks.is_some() {
+        target.scatter_interval_ticks = patch.scatter_interval_ticks;
+    }
+    if patch.scatter_strength.is_some() {
+        target.scatter_strength = patch.scatter_strength;
+    }
+    if patch.ball_mesh_slot.is_some() {
+        target.ball_mesh_slot = patch.ball_mesh_slot;
+    }
+    if patch.container_mesh_slot.is_some() {
+        target.container_mesh_slot = patch.container_mesh_slot;
     }
 }
 
@@ -496,7 +640,92 @@ impl TlAppRuntime {
 
         let mut script_runtime = None;
         let mut joint_merged_sprite_program: Option<TlspriteProgram> = None;
-        if let Some(joint_path) = &options.joint_path {
+        let mut bundle_sprite_root: Option<PathBuf> = None;
+        if let Some(project_path) = &options.project_path {
+            let project_compile = compile_tlpfile_scene_from_path(
+                project_path,
+                Some(&options.joint_scene),
+                TlscriptShowcaseConfig::default(),
+            );
+            for diagnostic in &project_compile.diagnostics {
+                match diagnostic.level {
+                    TlpfileDiagnosticLevel::Warning => {
+                        eprintln!("[tlpfile warning] {}", diagnostic.message);
+                    }
+                    TlpfileDiagnosticLevel::Error => {
+                        eprintln!("[tlpfile error] {}", diagnostic.message);
+                    }
+                }
+            }
+            if project_compile.has_errors() {
+                return Err(format!(
+                    "failed to compile .tlpfile '{}' scene '{}'",
+                    project_path.display(),
+                    options.joint_scene
+                )
+                .into());
+            }
+
+            let bundle = project_compile.bundle.ok_or_else(|| {
+                format!(
+                    "no bundle returned for .tlpfile '{}' scene '{}'",
+                    project_path.display(),
+                    options.joint_scene
+                )
+            })?;
+
+            if bundle.scheduler != TlpfileGraphicsScheduler::Gms {
+                return Err(format!(
+                    "TLApp runtime requires scheduler=gms, but project '{}' scene '{}' resolved to '{}'",
+                    project_path.display(),
+                    bundle.scene_name,
+                    bundle.scheduler.as_str()
+                )
+                .into());
+            }
+
+            if bundle.scene_name == "main" {
+                let main_joint_ok = bundle
+                    .selected_joint_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .map(|name| name == "main.tljoint")
+                    .unwrap_or(false);
+                if !main_joint_ok {
+                    return Err(format!(
+                        "scene 'main' in '{}' must resolve to main.tljoint",
+                        project_path.display()
+                    )
+                    .into());
+                }
+            }
+
+            let scene_name = bundle.scene_name.clone();
+            let script_count = bundle.scripts.len();
+            let sprite_count = bundle.sprite_count();
+            let scheduler_name = bundle.scheduler.as_str();
+            let joint_label = bundle
+                .selected_joint_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| String::from("none"));
+            bundle_sprite_root = bundle
+                .selected_joint_path
+                .clone()
+                .or_else(|| Some(bundle.project_path.clone()));
+            joint_merged_sprite_program = bundle.merged_sprite_program.clone();
+            script_runtime = Some(ScriptRuntime::MultiScripts(bundle.scripts));
+            eprintln!(
+                "[tlpfile] project='{}' scene='{}' scheduler={} scripts={} sprites={} joint={}",
+                project_path.display(),
+                scene_name,
+                scheduler_name,
+                script_count,
+                sprite_count,
+                joint_label
+            );
+        } else if let Some(joint_path) = &options.joint_path {
             let joint_compile = compile_tljoint_scene_from_path(
                 joint_path,
                 &options.joint_scene,
@@ -527,6 +756,7 @@ impl TlAppRuntime {
                     options.joint_scene
                 )
             })?;
+            bundle_sprite_root = Some(joint_path.clone());
             joint_merged_sprite_program = bundle.merged_sprite_program.clone();
             script_runtime = Some(ScriptRuntime::Joint(bundle));
             eprintln!(
@@ -672,8 +902,8 @@ impl TlAppRuntime {
         let (sprite_loader, sprite_cache) = if let Some(program) = joint_merged_sprite_program {
             force_full_fbx_from_sprite = program.requires_full_fbx_render();
             scene.set_sprite_program(program.clone());
-            if let Some(joint_path) = &options.joint_path {
-                bind_renderer_meshes_from_tlsprite(&mut renderer, &device, joint_path, &program);
+            if let Some(root_hint) = bundle_sprite_root.as_deref() {
+                bind_renderer_meshes_from_tlsprite(&mut renderer, &device, root_hint, &program);
             }
             (None, None)
         } else {
@@ -979,6 +1209,15 @@ impl TlAppRuntime {
         }
         if let Some((camera_eye, camera_target)) = frame_eval.camera_pose {
             self.camera.set_pose(camera_eye, camera_target);
+        }
+        if let Some(space) = frame_eval.camera_coordinate_space {
+            self.camera.set_script_coordinate_space(space);
+        }
+        if let Some(delta) = frame_eval.camera_translate_delta {
+            self.camera.apply_script_translate_delta(delta);
+        }
+        if let Some(delta_deg) = frame_eval.camera_rotate_delta_deg {
+            self.camera.apply_script_rotate_delta_deg(delta_deg);
         }
         self.camera.set_script_move_axis(
             frame_eval.camera_move_axis.unwrap_or([0.0, 0.0, 0.0]),
@@ -1326,6 +1565,7 @@ struct FreeCameraController {
     mouse_sensitivity: f32,
     look_active: bool,
     gamepad: GamepadCameraState,
+    script_coordinate_space: TlscriptCoordinateSpace,
 }
 
 impl Default for FreeCameraController {
@@ -1339,6 +1579,7 @@ impl Default for FreeCameraController {
             mouse_sensitivity: 0.0018,
             look_active: false,
             gamepad: GamepadCameraState::default(),
+            script_coordinate_space: TlscriptCoordinateSpace::World,
         }
     }
 }
@@ -1387,6 +1628,37 @@ impl FreeCameraController {
         self.gamepad.rise = axis[2].max(0.0);
         self.gamepad.descend = (-axis[2]).max(0.0);
         self.gamepad.sprint = sprint;
+    }
+
+    fn set_script_coordinate_space(&mut self, space: TlscriptCoordinateSpace) {
+        self.script_coordinate_space = space;
+    }
+
+    fn apply_script_translate_delta(&mut self, delta: [f32; 3]) {
+        let delta = Vector3::new(delta[0], delta[1], delta[2]);
+        match self.script_coordinate_space {
+            TlscriptCoordinateSpace::World => {
+                self.position += delta;
+            }
+            TlscriptCoordinateSpace::Local => {
+                let forward = self.forward_vector();
+                let world_up = Vector3::new(0.0, 1.0, 0.0);
+                let mut right = forward.cross(&world_up);
+                let right_len = right.norm();
+                if right_len <= 1e-5 {
+                    right = Vector3::new(1.0, 0.0, 0.0);
+                } else {
+                    right /= right_len;
+                }
+                let up = right.cross(&forward).normalize();
+                self.position += right * delta.x + up * delta.y + forward * delta.z;
+            }
+        }
+    }
+
+    fn apply_script_rotate_delta_deg(&mut self, delta_deg: [f32; 2]) {
+        self.yaw_rad += delta_deg[0].to_radians();
+        self.pitch_rad = (self.pitch_rad + delta_deg[1].to_radians()).clamp(-1.553_343, 1.553_343);
     }
 
     fn set_mouse_sensitivity(&mut self, sensitivity: f32) {

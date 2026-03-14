@@ -8,10 +8,11 @@
 //! tlpfile_v1
 //! [project]
 //! name = TLApp Demo
+//! scheduler = gms
 //! default_scene = main
 //!
 //! [scene.main]
-//! tljoint = bounce_showcase.tljoint
+//! tljoint = main.tljoint
 //! tljoint_scene = main
 //! tlscripts = bonus_rules.tlscript
 //! tlsprites = overlay.tlsprite
@@ -27,6 +28,33 @@ use crate::tlscript_showcase::{
 use crate::tlsprite::{
     compile_tlsprite_with_extra_roots, TlspriteDiagnosticLevel, TlspriteProgram,
 };
+
+/// Project-level graphics scheduler selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlpfileGraphicsScheduler {
+    /// Graphics Multi Scaler path (desktop/high-throughput).
+    #[default]
+    Gms,
+    /// Mobile Graphics Scaler path (mobile fallback).
+    Mgs,
+}
+
+impl TlpfileGraphicsScheduler {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "gms" => Some(Self::Gms),
+            "mgs" => Some(Self::Mgs),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gms => "gms",
+            Self::Mgs => "mgs",
+        }
+    }
+}
 
 /// Diagnostic level for `.tlpfile` parsing/compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +85,7 @@ pub struct TlpfileSceneBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlpfileProject {
     pub name: String,
+    pub scheduler: TlpfileGraphicsScheduler,
     pub default_scene: String,
     pub scenes: Vec<TlpfileSceneBinding>,
 }
@@ -87,6 +116,7 @@ impl TlpfileParseOutcome {
 pub struct TlpfileSceneBundle {
     pub project_path: PathBuf,
     pub project_name: String,
+    pub scheduler: TlpfileGraphicsScheduler,
     pub scene_name: String,
     pub selected_joint_path: Option<PathBuf>,
     pub selected_joint_scene: Option<String>,
@@ -126,6 +156,7 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
     let mut scenes = Vec::new();
     let mut saw_header = false;
     let mut project_name: Option<String> = None;
+    let mut project_scheduler: Option<TlpfileGraphicsScheduler> = None;
     let mut project_default_scene: Option<String> = None;
     let mut current_scene: Option<TlpfileSceneBinding> = None;
     let mut in_project_section = false;
@@ -218,6 +249,23 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
                         });
                     } else {
                         project_default_scene = Some(value.to_string());
+                    }
+                }
+                "scheduler" => {
+                    if value.is_empty() {
+                        diagnostics.push(TlpfileDiagnostic {
+                            level: TlpfileDiagnosticLevel::Warning,
+                            line: line_no,
+                            message: "empty scheduler ignored (expected gms|mgs)".to_string(),
+                        });
+                    } else if let Some(parsed) = TlpfileGraphicsScheduler::parse(value) {
+                        project_scheduler = Some(parsed);
+                    } else {
+                        diagnostics.push(TlpfileDiagnostic {
+                            level: TlpfileDiagnosticLevel::Error,
+                            line: line_no,
+                            message: format!("invalid scheduler '{value}' (expected gms|mgs)"),
+                        });
                     }
                 }
                 other => diagnostics.push(TlpfileDiagnostic {
@@ -323,6 +371,28 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
                 message: format!("scene '{}' has no tljoint/tlsprite entries", scene.scene),
             });
         }
+
+        if scene.scene == "main" {
+            match scene.tljoint.as_deref() {
+                Some(path) => {
+                    let file_name = Path::new(path).file_name().and_then(|name| name.to_str());
+                    if file_name != Some("main.tljoint") {
+                        diagnostics.push(TlpfileDiagnostic {
+                            level: TlpfileDiagnosticLevel::Error,
+                            line: 1,
+                            message: format!(
+                                "scene 'main' must use tljoint = main.tljoint (got '{path}')"
+                            ),
+                        });
+                    }
+                }
+                None => diagnostics.push(TlpfileDiagnostic {
+                    level: TlpfileDiagnosticLevel::Error,
+                    line: 1,
+                    message: "scene 'main' must declare tljoint = main.tljoint".to_string(),
+                }),
+            }
+        }
     }
 
     let has_errors = diagnostics
@@ -333,6 +403,7 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
     } else {
         Some(TlpfileProject {
             name: project_name.unwrap_or_else(|| "Tileline Project".to_string()),
+            scheduler: project_scheduler.unwrap_or_default(),
             default_scene,
             scenes,
         })
@@ -561,6 +632,7 @@ pub fn compile_tlpfile_scene_from_path(
         bundle: Some(TlpfileSceneBundle {
             project_path: project_path.to_path_buf(),
             project_name: project.name,
+            scheduler: project.scheduler,
             scene_name: resolved_scene_name.to_string(),
             selected_joint_path,
             selected_joint_scene,
@@ -667,9 +739,10 @@ mod tests {
             "tlpfile_v1\n",
             "[project]\n",
             "name = Demo Project\n",
+            "scheduler = gms\n",
             "default_scene = main\n",
             "[scene.main]\n",
-            "tljoint = bounce_showcase.tljoint\n",
+            "tljoint = main.tljoint\n",
             "tljoint_scene = main\n",
             "tlscripts = extra.tlscript\n",
             "tlsprites = overlay.tlsprite\n",
@@ -678,12 +751,10 @@ mod tests {
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
         let project = out.project.expect("project");
         assert_eq!(project.name, "Demo Project");
+        assert_eq!(project.scheduler, TlpfileGraphicsScheduler::Gms);
         assert_eq!(project.default_scene, "main");
         assert_eq!(project.scenes.len(), 1);
-        assert_eq!(
-            project.scenes[0].tljoint.as_deref(),
-            Some("bounce_showcase.tljoint")
-        );
+        assert_eq!(project.scenes[0].tljoint.as_deref(), Some("main.tljoint"));
     }
 
     #[test]
@@ -699,8 +770,8 @@ mod tests {
                 "tlpfile_v1\n",
                 "[project]\n",
                 "name = Compile Demo\n",
-                "default_scene = main\n",
-                "[scene.main]\n",
+                "default_scene = demo\n",
+                "[scene.demo]\n",
                 "tlscript = demo.tlscript\n",
                 "tlsprite = demo.tlsprite\n",
             ),
@@ -734,12 +805,43 @@ mod tests {
 
         let out = compile_tlpfile_scene_from_path(
             &manifest,
-            Some("main"),
+            Some("demo"),
             TlscriptShowcaseConfig::default(),
         );
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
         let bundle = out.bundle.expect("bundle");
         assert_eq!(bundle.scripts.len(), 1);
         assert_eq!(bundle.sprite_count(), 1);
+    }
+
+    #[test]
+    fn parses_project_scheduler_override() {
+        let source = concat!(
+            "tlpfile_v1\n",
+            "[project]\n",
+            "name = Scheduler Demo\n",
+            "scheduler = mgs\n",
+            "default_scene = demo\n",
+            "[scene.demo]\n",
+            "tlscript = demo.tlscript\n",
+        );
+        let out = parse_tlpfile(source);
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        let project = out.project.expect("project");
+        assert_eq!(project.scheduler, TlpfileGraphicsScheduler::Mgs);
+    }
+
+    #[test]
+    fn rejects_main_scene_without_main_joint() {
+        let source = concat!(
+            "tlpfile_v1\n",
+            "[project]\n",
+            "name = Main Scene Rule\n",
+            "default_scene = main\n",
+            "[scene.main]\n",
+            "tljoint = bounce_showcase.tljoint\n",
+        );
+        let out = parse_tlpfile(source);
+        assert!(out.has_errors());
     }
 }

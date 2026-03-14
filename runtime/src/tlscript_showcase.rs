@@ -20,7 +20,7 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 26] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 29] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_linear_damping",
@@ -47,7 +47,17 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 26] = [
     "set_camera_sprint",
     "set_camera_look_active",
     "reset_camera_pose",
+    "set_coordinate_space",
+    "move_camera",
+    "rotate_camera",
 ];
+
+/// Coordinate-space hint propagated from `.tlscript` to runtime camera controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlscriptCoordinateSpace {
+    World,
+    Local,
+}
 
 /// Showcase script compiler settings.
 #[derive(Debug, Clone)]
@@ -132,6 +142,9 @@ pub struct TlscriptShowcaseFrameOutput {
     pub camera_move_speed: Option<f32>,
     pub camera_look_sensitivity: Option<f32>,
     pub camera_pose: Option<([f32; 3], [f32; 3])>,
+    pub camera_coordinate_space: Option<TlscriptCoordinateSpace>,
+    pub camera_translate_delta: Option<[f32; 3]>,
+    pub camera_rotate_delta_deg: Option<[f32; 2]>,
     pub camera_move_axis: Option<[f32; 3]>,
     pub camera_look_delta: Option<[f32; 2]>,
     pub camera_sprint: Option<bool>,
@@ -258,6 +271,9 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             camera_move_speed: state.camera_move_speed,
             camera_look_sensitivity: state.camera_look_sensitivity,
             camera_pose: state.camera_pose,
+            camera_coordinate_space: state.camera_coordinate_space,
+            camera_translate_delta: state.camera_translate_delta,
+            camera_rotate_delta_deg: state.camera_rotate_delta_deg,
             camera_move_axis: state.camera_move_axis,
             camera_look_delta: state.camera_look_delta,
             camera_sprint: state.camera_sprint,
@@ -482,6 +498,9 @@ struct EvalState {
     camera_move_speed: Option<f32>,
     camera_look_sensitivity: Option<f32>,
     camera_pose: Option<([f32; 3], [f32; 3])>,
+    camera_coordinate_space: Option<TlscriptCoordinateSpace>,
+    camera_translate_delta: Option<[f32; 3]>,
+    camera_rotate_delta_deg: Option<[f32; 2]>,
     camera_move_axis: Option<[f32; 3]>,
     camera_look_delta: Option<[f32; 2]>,
     camera_sprint: Option<bool>,
@@ -503,6 +522,9 @@ impl EvalState {
             camera_move_speed: None,
             camera_look_sensitivity: None,
             camera_pose: None,
+            camera_coordinate_space: None,
+            camera_translate_delta: None,
+            camera_rotate_delta_deg: None,
             camera_move_axis: None,
             camera_look_delta: None,
             camera_sprint: None,
@@ -734,6 +756,47 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
                 ));
             }
             _ => state.warn("set_camera_pose expects 6 args"),
+        },
+        "set_coordinate_space" => match args {
+            [DemoValue::Str(space)] => {
+                let normalized = space.trim().to_ascii_lowercase();
+                state.camera_coordinate_space = match normalized.as_str() {
+                    "world" => Some(TlscriptCoordinateSpace::World),
+                    "local" => Some(TlscriptCoordinateSpace::Local),
+                    _ => {
+                        state.warn(format!(
+                            "set_coordinate_space expects 'world' or 'local', got '{space}'"
+                        ));
+                        None
+                    }
+                };
+            }
+            [v] => {
+                state.camera_coordinate_space = Some(if v.to_bool() {
+                    TlscriptCoordinateSpace::Local
+                } else {
+                    TlscriptCoordinateSpace::World
+                });
+            }
+            _ => state.warn("set_coordinate_space expects 1 arg"),
+        },
+        "move_camera" => match args {
+            [x, y, z] => {
+                state.camera_translate_delta =
+                    Some([x.to_f64() as f32, y.to_f64() as f32, z.to_f64() as f32]);
+            }
+            _ => state.warn("move_camera expects 3 args"),
+        },
+        "rotate_camera" => match args {
+            [yaw_deg, pitch_deg] => {
+                state.camera_rotate_delta_deg =
+                    Some([yaw_deg.to_f64() as f32, pitch_deg.to_f64() as f32]);
+            }
+            [yaw_deg, pitch_deg, _roll_deg] => {
+                state.camera_rotate_delta_deg =
+                    Some([yaw_deg.to_f64() as f32, pitch_deg.to_f64() as f32]);
+            }
+            _ => state.warn("rotate_camera expects 2 args (or 3 with roll ignored)"),
         },
         "set_camera_move_axis" => match args {
             [x, y, z] => {
@@ -1054,6 +1117,32 @@ mod tests {
         assert_eq!(out.camera_sprint, Some(true));
         assert_eq!(out.camera_look_active, Some(true));
         assert!(out.camera_reset_pose);
+    }
+
+    #[test]
+    fn supports_coordinate_space_and_camera_transform_builtins() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_coordinate_space(\"local\")\n",
+            "    move_camera(1.5, 0.0, -2.0)\n",
+            "    rotate_camera(12.0, -4.0)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 1,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(
+            out.camera_coordinate_space,
+            Some(TlscriptCoordinateSpace::Local)
+        );
+        assert_eq!(out.camera_translate_delta, Some([1.5, 0.0, -2.0]));
+        assert_eq!(out.camera_rotate_delta_deg, Some([12.0, -4.0]));
     }
 
     #[test]

@@ -490,6 +490,9 @@ fn empty_frame_output() -> TlscriptShowcaseFrameOutput {
         camera_move_speed: None,
         camera_look_sensitivity: None,
         camera_pose: None,
+        camera_coordinate_space: None,
+        camera_translate_delta: None,
+        camera_rotate_delta_deg: None,
         camera_move_axis: None,
         camera_look_delta: None,
         camera_sprint: None,
@@ -518,6 +521,15 @@ fn merge_frame_output(
     }
     if next.camera_pose.is_some() {
         merged.camera_pose = next.camera_pose;
+    }
+    if next.camera_coordinate_space.is_some() {
+        merged.camera_coordinate_space = next.camera_coordinate_space;
+    }
+    if next.camera_translate_delta.is_some() {
+        merged.camera_translate_delta = next.camera_translate_delta;
+    }
+    if next.camera_rotate_delta_deg.is_some() {
+        merged.camera_rotate_delta_deg = next.camera_rotate_delta_deg;
     }
     if next.camera_move_axis.is_some() {
         merged.camera_move_axis = next.camera_move_axis;

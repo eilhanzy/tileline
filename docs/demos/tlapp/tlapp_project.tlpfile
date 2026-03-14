@@ -2,8 +2,9 @@ tlpfile_v1
 
 [project]
 name = TLApp Showcase Project
+scheduler = gms
 default_scene = main
 
 [scene.main]
-tljoint = bounce_showcase.tljoint
+tljoint = main.tljoint
 tljoint_scene = main

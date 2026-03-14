@@ -6,7 +6,8 @@
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,9 +23,12 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::tlpfile::{
     compile_tlpfile_scene_from_path, load_tlpfile, parse_tlpfile, TlpfileDiagnostic,
-    TlpfileDiagnosticLevel, TlpfileParseOutcome, TlpfileProject, TlpfileSceneCompileOutcome,
+    TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlpfileParseOutcome, TlpfileProject,
+    TlpfileSceneCompileOutcome,
 };
 use crate::TlscriptShowcaseConfig;
+
+const PROJECT_SCAN_MAX_DEPTH: usize = 5;
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -146,6 +150,8 @@ struct ScenePreviewState {
     balls: Vec<PreviewBall>,
     last_tick: Instant,
     accumulator: f32,
+    tool_anchor: [f32; 2],
+    tool_rotation_rad: f32,
 }
 
 impl ScenePreviewState {
@@ -156,6 +162,8 @@ impl ScenePreviewState {
             balls: Vec::new(),
             last_tick: Instant::now(),
             accumulator: 0.0,
+            tool_anchor: [0.5, 0.5],
+            tool_rotation_rad: 0.0,
         };
         state.reset_balls();
         state
@@ -204,6 +212,29 @@ impl ScenePreviewState {
             });
         }
         self.balls = balls;
+    }
+
+    fn apply_transform_delta(
+        &mut self,
+        coordinate_space: EditorCoordinateSpace,
+        move_delta: [f32; 3],
+        rotate_delta_deg: [f32; 2],
+    ) {
+        let scale = if self.light_mode { 0.04 } else { 0.03 };
+        let local_xy = [move_delta[0], -move_delta[1]];
+        let world_xy = match coordinate_space {
+            EditorCoordinateSpace::World => local_xy,
+            EditorCoordinateSpace::Local => {
+                let (s, c) = self.tool_rotation_rad.sin_cos();
+                [
+                    local_xy[0] * c - local_xy[1] * s,
+                    local_xy[0] * s + local_xy[1] * c,
+                ]
+            }
+        };
+        self.tool_anchor[0] = (self.tool_anchor[0] + world_xy[0] * scale).clamp(0.1, 0.9);
+        self.tool_anchor[1] = (self.tool_anchor[1] + world_xy[1] * scale).clamp(0.1, 0.9);
+        self.tool_rotation_rad += rotate_delta_deg[0].to_radians();
     }
 
     fn tick(&mut self) {
@@ -257,9 +288,94 @@ impl ScenePreviewState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectFileKind {
+    Directory,
+    Project,
+    Joint,
+    Script,
+    Sprite,
+    Other,
+}
+
+impl ProjectFileKind {
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Directory => "DIR",
+            Self::Project => "TLP",
+            Self::Joint => "JNT",
+            Self::Script => "SCR",
+            Self::Sprite => "SPR",
+            Self::Other => "FIL",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectFileEntry {
+    absolute_path: PathBuf,
+    relative_path: String,
+    kind: ProjectFileKind,
+    depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewAssetKind {
+    Tlscript,
+    Tlsprite,
+    Tljoint,
+}
+
+impl NewAssetKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tlscript => ".tlscript",
+            Self::Tlsprite => ".tlsprite",
+            Self::Tljoint => ".tljoint",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorCoordinateSpace {
+    World,
+    Local,
+}
+
+impl EditorCoordinateSpace {
+    fn as_tlscript_str(self) -> &'static str {
+        match self {
+            Self::World => "world",
+            Self::Local => "local",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TransformToolState {
+    coordinate_space: EditorCoordinateSpace,
+    move_delta: [f32; 3],
+    rotate_delta_deg: [f32; 2],
+    move_step: f32,
+    rotate_step_deg: f32,
+}
+
+impl Default for TransformToolState {
+    fn default() -> Self {
+        Self {
+            coordinate_space: EditorCoordinateSpace::World,
+            move_delta: [0.0, 0.0, 0.0],
+            rotate_delta_deg: [0.0, 0.0],
+            move_step: 0.25,
+            rotate_step_deg: 5.0,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct UiModel {
     project_path: PathBuf,
+    project_root: PathBuf,
     selected_scene: String,
     parse: Option<TlpfileParseOutcome>,
     compile: Option<TlpfileSceneCompileOutcome>,
@@ -268,12 +384,27 @@ struct UiModel {
     editor_dirty: bool,
     editor_status: String,
     preview: ScenePreviewState,
+    scheduler_override: TlpfileGraphicsScheduler,
+    project_files: Vec<ProjectFileEntry>,
+    selected_file: Option<PathBuf>,
+    new_asset_name: String,
+    new_asset_kind: NewAssetKind,
+    creation_status: String,
+    runtime_child: Option<Child>,
+    runtime_status: String,
+    runtime_last_command: String,
+    transform_tool: TransformToolState,
+    transform_status: String,
 }
 
 impl UiModel {
     fn new(project_path: PathBuf, scene_override: Option<String>) -> Self {
+        let project_root = project_path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let mut model = Self {
             project_path,
+            project_root,
             selected_scene: scene_override.unwrap_or_default(),
             parse: None,
             compile: None,
@@ -282,6 +413,17 @@ impl UiModel {
             editor_dirty: false,
             editor_status: String::new(),
             preview: ScenePreviewState::new(),
+            scheduler_override: TlpfileGraphicsScheduler::Gms,
+            project_files: Vec::new(),
+            selected_file: None,
+            new_asset_name: String::from("new_scene"),
+            new_asset_kind: NewAssetKind::Tlscript,
+            creation_status: String::new(),
+            runtime_child: None,
+            runtime_status: String::from("runtime idle"),
+            runtime_last_command: String::new(),
+            transform_tool: TransformToolState::default(),
+            transform_status: String::new(),
         };
         model.reload_parse();
         model.compile_selected_scene();
@@ -290,6 +432,7 @@ impl UiModel {
 
     fn reload_parse(&mut self) {
         self.reload_source_from_disk();
+        self.refresh_project_files();
         match load_tlpfile(&self.project_path) {
             Ok(outcome) => {
                 self.status = format!(
@@ -305,6 +448,7 @@ impl UiModel {
                     {
                         self.selected_scene = project.default_scene.clone();
                     }
+                    self.scheduler_override = project.scheduler;
                 }
                 self.parse = Some(outcome);
             }
@@ -339,11 +483,24 @@ impl UiModel {
             self.compile = None;
             return;
         }
-        let outcome = compile_tlpfile_scene_from_path(
+        let mut outcome = compile_tlpfile_scene_from_path(
             &self.project_path,
             Some(self.selected_scene.as_str()),
             TlscriptShowcaseConfig::default(),
         );
+        if let Some(bundle) = outcome.bundle.as_ref() {
+            if bundle.scheduler != TlpfileGraphicsScheduler::Gms {
+                outcome.diagnostics.push(TlpfileDiagnostic {
+                    level: TlpfileDiagnosticLevel::Error,
+                    line: 1,
+                    message: format!(
+                        "scene viewer runtime currently requires scheduler=gms, got '{}'",
+                        bundle.scheduler.as_str()
+                    ),
+                });
+                outcome.bundle = None;
+            }
+        }
         let errors = count_diagnostics(&outcome.diagnostics, |level| {
             level == TlpfileDiagnosticLevel::Error
         });
@@ -352,8 +509,9 @@ impl UiModel {
         });
         if let Some(bundle) = &outcome.bundle {
             self.status = format!(
-                "scene '{}' compiled | scripts={} sprites={} warnings={warnings}",
+                "scene '{}' compiled | scheduler={} scripts={} sprites={} warnings={warnings}",
                 bundle.scene_name,
+                bundle.scheduler.as_str(),
                 bundle.scripts.len(),
                 bundle.sprite_count(),
             );
@@ -376,6 +534,10 @@ impl UiModel {
                 self.project_source = source;
                 self.editor_dirty = false;
                 self.editor_status = "buffer reloaded from disk".to_string();
+                self.project_root = self
+                    .project_path
+                    .parent()
+                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
             }
             Err(err) => {
                 self.project_source.clear();
@@ -390,6 +552,7 @@ impl UiModel {
             .map_err(|err| format!("failed to save '{}': {err}", self.project_path.display()))?;
         self.editor_dirty = false;
         self.editor_status = format!("saved {}", self.project_path.display());
+        self.refresh_project_files();
         Ok(())
     }
 
@@ -399,10 +562,321 @@ impl UiModel {
             if self.selected_scene.is_empty() || project.scene(&self.selected_scene).is_none() {
                 self.selected_scene = project.default_scene.clone();
             }
+            self.scheduler_override = project.scheduler;
         }
         self.parse = Some(outcome);
         self.compile = None;
         self.status = "reparsed in-memory .tlpfile buffer".to_string();
+    }
+
+    fn apply_scheduler_override(&mut self) {
+        self.project_source =
+            upsert_project_scheduler(&self.project_source, self.scheduler_override);
+        self.editor_dirty = true;
+        self.editor_status = format!(
+            "scheduler override set to {} (buffer modified)",
+            self.scheduler_override.as_str()
+        );
+        self.reparse_from_buffer();
+    }
+
+    fn refresh_project_files(&mut self) {
+        self.project_files.clear();
+        if let Err(err) = collect_project_files(
+            &self.project_root,
+            &self.project_root,
+            0,
+            &mut self.project_files,
+        ) {
+            self.creation_status = format!("file explorer refresh failed: {err}");
+            return;
+        }
+        self.project_files
+            .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    }
+
+    fn create_scene_pack(&mut self) {
+        let raw_name = self.new_asset_name.trim();
+        if raw_name.is_empty() {
+            self.creation_status = "scene pack name cannot be empty".to_string();
+            return;
+        }
+        let scene_name = sanitize_scene_name(raw_name);
+        if scene_name.is_empty() {
+            self.creation_status = "scene pack name is not valid".to_string();
+            return;
+        }
+
+        if let Err(err) = fs::create_dir_all(&self.project_root) {
+            self.creation_status = format!("failed to create project root: {err}");
+            return;
+        }
+
+        let joint_name = format!("{scene_name}.tljoint");
+        let script_name = format!("{scene_name}.tlscript");
+        let sprite_name = format!("{scene_name}_hud.tlsprite");
+        let joint_path = self.project_root.join(&joint_name);
+        let script_path = self.project_root.join(&script_name);
+        let sprite_path = self.project_root.join(&sprite_name);
+
+        if let Err(err) = write_if_missing(&script_path, &default_script_template()) {
+            self.creation_status = format!("failed to create script: {err}");
+            return;
+        }
+        if let Err(err) = write_if_missing(&sprite_path, &default_sprite_template()) {
+            self.creation_status = format!("failed to create sprite: {err}");
+            return;
+        }
+        let joint_source = format!(
+            "tljoint_v1\n\n[scene.{scene_name}]\ntlscripts = {script_name}\ntlsprites = {sprite_name}\n"
+        );
+        if let Err(err) = write_if_missing(&joint_path, &joint_source) {
+            self.creation_status = format!("failed to create joint: {err}");
+            return;
+        }
+
+        append_scene_section_to_project_source(&mut self.project_source, &scene_name, &joint_name);
+        self.editor_dirty = true;
+        self.selected_scene = scene_name.clone();
+        self.creation_status =
+            format!("scene pack created: {joint_name}, {script_name}, {sprite_name}");
+        self.editor_status = "scene pack appended to .tlpfile buffer".to_string();
+        self.refresh_project_files();
+        self.reparse_from_buffer();
+    }
+
+    fn create_single_asset(&mut self) {
+        let raw_name = self.new_asset_name.trim();
+        if raw_name.is_empty() {
+            self.creation_status = "asset name cannot be empty".to_string();
+            return;
+        }
+        if let Err(err) = fs::create_dir_all(&self.project_root) {
+            self.creation_status = format!("failed to create project root: {err}");
+            return;
+        }
+
+        let (file_name, template) = match self.new_asset_kind {
+            NewAssetKind::Tlscript => {
+                (ensure_ext(raw_name, ".tlscript"), default_script_template())
+            }
+            NewAssetKind::Tlsprite => {
+                (ensure_ext(raw_name, ".tlsprite"), default_sprite_template())
+            }
+            NewAssetKind::Tljoint => (
+                ensure_ext(raw_name, ".tljoint"),
+                String::from("tljoint_v1\n\n[scene.main]\n"),
+            ),
+        };
+        let path = self.project_root.join(&file_name);
+        match write_if_missing(&path, &template) {
+            Ok(created) => {
+                self.creation_status = if created {
+                    format!("created {}", path.display())
+                } else {
+                    format!("already exists {}", path.display())
+                };
+                self.selected_file = Some(path);
+                self.refresh_project_files();
+            }
+            Err(err) => self.creation_status = format!("asset creation failed: {err}"),
+        }
+    }
+
+    fn poll_runtime_process(&mut self) {
+        let Some(child) = self.runtime_child.as_mut() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.runtime_status = format!("runtime exited ({status})");
+                self.runtime_child = None;
+            }
+            Ok(None) => {
+                self.runtime_status = format!("runtime running (pid {})", child.id());
+            }
+            Err(err) => {
+                self.runtime_status = format!("runtime poll error: {err}");
+                self.runtime_child = None;
+            }
+        }
+    }
+
+    fn runtime_scene_name(&self) -> String {
+        if self.selected_scene.trim().is_empty() {
+            String::from("main")
+        } else {
+            self.selected_scene.trim().to_string()
+        }
+    }
+
+    fn launch_runtime(&mut self) {
+        self.poll_runtime_process();
+        if self.runtime_child.is_some() {
+            self.runtime_status = "runtime already running".to_string();
+            return;
+        }
+
+        let scene = self.runtime_scene_name();
+        let mut command = if let Some(binary) = tlapp_binary_candidate() {
+            if binary.exists() {
+                self.runtime_last_command = format!(
+                    "{} --project {} --scene {}",
+                    binary.display(),
+                    self.project_path.display(),
+                    scene
+                );
+                let mut command = Command::new(binary);
+                command
+                    .arg("--project")
+                    .arg(&self.project_path)
+                    .arg("--scene")
+                    .arg(&scene);
+                command
+            } else {
+                self.runtime_last_command = format!(
+                    "cargo run -p runtime --bin tlapp -- --project {} --scene {}",
+                    self.project_path.display(),
+                    scene
+                );
+                let mut command = Command::new("cargo");
+                command
+                    .arg("run")
+                    .arg("-p")
+                    .arg("runtime")
+                    .arg("--bin")
+                    .arg("tlapp")
+                    .arg("--")
+                    .arg("--project")
+                    .arg(&self.project_path)
+                    .arg("--scene")
+                    .arg(&scene);
+                command
+            }
+        } else {
+            self.runtime_last_command = format!(
+                "cargo run -p runtime --bin tlapp -- --project {} --scene {}",
+                self.project_path.display(),
+                scene
+            );
+            let mut command = Command::new("cargo");
+            command
+                .arg("run")
+                .arg("-p")
+                .arg("runtime")
+                .arg("--bin")
+                .arg("tlapp")
+                .arg("--")
+                .arg("--project")
+                .arg(&self.project_path)
+                .arg("--scene")
+                .arg(&scene);
+            command
+        };
+
+        command
+            .current_dir(workspace_root_hint())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match command.spawn() {
+            Ok(child) => {
+                self.runtime_status = format!("runtime launched (pid {})", child.id());
+                self.runtime_child = Some(child);
+            }
+            Err(err) => {
+                self.runtime_status = format!("runtime launch failed: {err}");
+            }
+        }
+    }
+
+    fn stop_runtime(&mut self) {
+        let Some(mut child) = self.runtime_child.take() else {
+            self.runtime_status = "runtime is not running".to_string();
+            return;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        self.runtime_status = "runtime stopped".to_string();
+    }
+
+    fn apply_transform_to_preview(&mut self) {
+        self.preview.apply_transform_delta(
+            self.transform_tool.coordinate_space,
+            self.transform_tool.move_delta,
+            self.transform_tool.rotate_delta_deg,
+        );
+        self.transform_status = format!(
+            "applied transform | space={} move=({:.2},{:.2},{:.2}) rotate=({:.2},{:.2})",
+            self.transform_tool.coordinate_space.as_tlscript_str(),
+            self.transform_tool.move_delta[0],
+            self.transform_tool.move_delta[1],
+            self.transform_tool.move_delta[2],
+            self.transform_tool.rotate_delta_deg[0],
+            self.transform_tool.rotate_delta_deg[1],
+        );
+    }
+
+    fn append_transform_to_selected_script(&mut self) {
+        let Some(script_path) = self.resolve_target_tlscript_path() else {
+            self.transform_status =
+                "select a .tlscript file in Project Files (or compile a scene first)".to_string();
+            return;
+        };
+        let snippet = format!(
+            "\n# Editor transform sync\nset_coordinate_space(\"{}\")\nmove_camera({:.4}, {:.4}, {:.4})\nrotate_camera({:.4}, {:.4})\n",
+            self.transform_tool.coordinate_space.as_tlscript_str(),
+            self.transform_tool.move_delta[0],
+            self.transform_tool.move_delta[1],
+            self.transform_tool.move_delta[2],
+            self.transform_tool.rotate_delta_deg[0],
+            self.transform_tool.rotate_delta_deg[1],
+        );
+        match fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&script_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(err) = file.write_all(snippet.as_bytes()) {
+                    self.transform_status =
+                        format!("failed to write script '{}': {err}", script_path.display());
+                    return;
+                }
+                self.transform_status =
+                    format!("transform snippet appended to {}", script_path.display());
+                self.selected_file = Some(script_path);
+                self.refresh_project_files();
+            }
+            Err(err) => {
+                self.transform_status =
+                    format!("failed to open script '{}': {err}", script_path.display());
+            }
+        }
+    }
+
+    fn resolve_target_tlscript_path(&self) -> Option<PathBuf> {
+        if let Some(path) = self.selected_file.as_ref() {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("tlscript") {
+                return Some(path.clone());
+            }
+        }
+        self.compile.as_ref().and_then(|compile| {
+            compile
+                .bundle
+                .as_ref()
+                .and_then(|bundle| bundle.script_paths.first().cloned())
+        })
+    }
+}
+
+impl Drop for UiModel {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.runtime_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -494,6 +968,7 @@ impl GuiRuntime {
     }
 
     fn render(&mut self) -> Result<(), Box<dyn Error>> {
+        self.model.poll_runtime_process();
         self.model.preview.tick();
         let raw_input = self.egui_state.take_egui_input(self.window.as_ref());
         let egui_ctx = self.egui_ctx.clone();
@@ -586,6 +1061,19 @@ impl GuiRuntime {
     }
 
     fn draw_ui(&mut self, ctx: &egui::Context) {
+        let project_meta = self.model.project().map(|project| {
+            (
+                project.name.clone(),
+                project.default_scene.clone(),
+                project.scheduler,
+                project
+                    .scenes
+                    .iter()
+                    .map(|scene| scene.scene.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Tileline Project GUI");
@@ -616,6 +1104,27 @@ impl GuiRuntime {
                 }
 
                 ui.separator();
+                let mut scheduler = self.model.scheduler_override;
+                egui::ComboBox::from_label("Scheduler")
+                    .selected_text(scheduler.as_str())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut scheduler, TlpfileGraphicsScheduler::Gms, "gms");
+                        ui.selectable_value(&mut scheduler, TlpfileGraphicsScheduler::Mgs, "mgs");
+                    });
+                if scheduler != self.model.scheduler_override {
+                    self.model.scheduler_override = scheduler;
+                }
+                if icon_button(ui, "AS", "Apply Scheduler").clicked() {
+                    self.model.apply_scheduler_override();
+                }
+                ui.separator();
+                if icon_button(ui, "RUN", "Run TLApp").clicked() {
+                    self.model.launch_runtime();
+                }
+                if icon_button(ui, "KILL", "Stop TLApp").clicked() {
+                    self.model.stop_runtime();
+                }
+                ui.separator();
                 ui.label(format!("Scene: {}", self.model.selected_scene));
             });
             ui.label(
@@ -632,37 +1141,124 @@ impl GuiRuntime {
                         .color(Color32::from_rgb(166, 214, 255)),
                 );
             }
+            if !self.model.creation_status.is_empty() {
+                ui.label(
+                    RichText::new(format!("workspace: {}", self.model.creation_status))
+                        .color(Color32::from_rgb(190, 242, 190)),
+                );
+            }
+            ui.label(
+                RichText::new(format!("runtime: {}", self.model.runtime_status))
+                    .color(Color32::from_rgb(172, 224, 250)),
+            );
+            if !self.model.runtime_last_command.is_empty() {
+                ui.label(
+                    RichText::new(format!("runtime cmd: {}", self.model.runtime_last_command))
+                        .small()
+                        .monospace()
+                        .color(Color32::from_rgb(152, 192, 226)),
+                );
+            }
+            if !self.model.transform_status.is_empty() {
+                ui.label(
+                    RichText::new(format!("transform: {}", self.model.transform_status))
+                        .color(Color32::from_rgb(218, 194, 255)),
+                );
+            }
         });
 
         egui::SidePanel::left("scene_panel")
             .resizable(true)
-            .default_width(240.0)
+            .default_width(320.0)
             .show(ctx, |ui| {
                 ui.heading("Scenes");
-                if let Some(project) = self.model.project() {
-                    let scene_names = project
-                        .scenes
-                        .iter()
-                        .map(|scene| scene.scene.clone())
-                        .collect::<Vec<_>>();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for scene_name in scene_names {
-                            let selected = self.model.selected_scene == scene_name;
-                            if ui.selectable_label(selected, &scene_name).clicked() {
-                                self.model.selected_scene = scene_name;
-                                self.model.compile_selected_scene();
+                if let Some((_, _, _, scene_names)) = project_meta.as_ref() {
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            for scene_name in scene_names {
+                                let selected = self.model.selected_scene == *scene_name;
+                                if ui.selectable_label(selected, scene_name).clicked() {
+                                    self.model.selected_scene = scene_name.clone();
+                                    self.model.compile_selected_scene();
+                                }
                             }
-                        }
-                    });
-                    ui.separator();
-                    ui.label(format!(
-                        "Playback: {}",
-                        playback_label(self.model.preview.playback)
-                    ));
-                    ui.label(format!("Preview balls: {}", self.model.preview.balls.len()));
+                        });
                 } else {
                     ui.label("No parsed project");
                 }
+                ui.separator();
+                ui.label(format!(
+                    "Playback: {}",
+                    playback_label(self.model.preview.playback)
+                ));
+                ui.label(format!("Preview balls: {}", self.model.preview.balls.len()));
+
+                ui.separator();
+                ui.heading("Project Files");
+                let file_entries = self.model.project_files.clone();
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for entry in file_entries {
+                            let indent = "  ".repeat(entry.depth);
+                            let label = format!(
+                                "{indent}[{}] {}",
+                                entry.kind.icon(),
+                                entry.relative_path
+                            );
+                            let selected = self
+                                .model
+                                .selected_file
+                                .as_ref()
+                                .map(|path| path == &entry.absolute_path)
+                                .unwrap_or(false);
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.model.selected_file = Some(entry.absolute_path.clone());
+                                self.model.creation_status =
+                                    format!("selected {}", entry.relative_path);
+                            }
+                        }
+                    });
+
+                ui.separator();
+                ui.heading("Create");
+                ui.label("Name");
+                ui.add(egui::TextEdit::singleline(&mut self.model.new_asset_name));
+                egui::ComboBox::from_label("Asset Type")
+                    .selected_text(self.model.new_asset_kind.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.model.new_asset_kind,
+                            NewAssetKind::Tlscript,
+                            ".tlscript",
+                        );
+                        ui.selectable_value(
+                            &mut self.model.new_asset_kind,
+                            NewAssetKind::Tlsprite,
+                            ".tlsprite",
+                        );
+                        ui.selectable_value(
+                            &mut self.model.new_asset_kind,
+                            NewAssetKind::Tljoint,
+                            ".tljoint",
+                        );
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    if icon_button(ui, "+F", "Create File").clicked() {
+                        self.model.create_single_asset();
+                    }
+                    if icon_button(ui, "+S", "Create Scene Pack").clicked() {
+                        self.model.create_scene_pack();
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Scene pack creates [.tlscript + .tlsprite + .tljoint] and appends [scene.*] to .tlpfile.",
+                    )
+                    .small()
+                    .color(Color32::from_rgb(176, 164, 220)),
+                );
             });
 
         egui::SidePanel::right("diagnostics_panel")
@@ -685,17 +1281,30 @@ impl GuiRuntime {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Scene Summary");
-            if let Some(project) = self.model.project() {
-                ui.label(format!("Project: {}", project.name));
-                ui.label(format!("Default scene: {}", project.default_scene));
+            if let Some((project_name, default_scene, scheduler, _)) = project_meta.as_ref() {
+                ui.label(format!("Project: {}", project_name));
+                ui.label(format!("Default scene: {}", default_scene));
                 ui.label(format!("Active scene: {}", self.model.selected_scene));
+                ui.label(format!("Scheduler: {}", scheduler.as_str()));
             } else {
                 ui.label("Project parse failed.");
             }
+            let runtime_ready = self.model.scheduler_override == TlpfileGraphicsScheduler::Gms;
+            let runtime_text = if runtime_ready {
+                "Scene viewer runtime: ready (GMS path)"
+            } else {
+                "Scene viewer runtime: blocked (switch scheduler to gms)"
+            };
+            let runtime_color = if runtime_ready {
+                Color32::from_rgb(178, 232, 178)
+            } else {
+                Color32::from_rgb(255, 180, 140)
+            };
+            ui.label(RichText::new(runtime_text).color(runtime_color));
             ui.separator();
 
             ui.label(RichText::new("Scene View").strong());
-            ui.label("GIMP-style lightweight preview lane for rapid iteration.");
+            ui.label("Runtime-linked preview lane (light mode keeps editor responsive).");
             let preview_height = if self.model.preview.light_mode {
                 240.0
             } else {
@@ -707,6 +1316,104 @@ impl GuiRuntime {
             );
             let painter = ui.painter_at(preview_rect);
             draw_scene_preview(&painter, preview_rect, &self.model.preview);
+            ui.separator();
+
+            ui.label(RichText::new("Transform Tool").strong());
+            ui.label("Pre-Beta move/rotate lane with world/local coordinate-space mapping.");
+            egui::ComboBox::from_label("Coordinate Space")
+                .selected_text(self.model.transform_tool.coordinate_space.as_tlscript_str())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.model.transform_tool.coordinate_space,
+                        EditorCoordinateSpace::World,
+                        "world",
+                    );
+                    ui.selectable_value(
+                        &mut self.model.transform_tool.coordinate_space,
+                        EditorCoordinateSpace::Local,
+                        "local",
+                    );
+                });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Move Δ");
+                ui.add(
+                    egui::DragValue::new(&mut self.model.transform_tool.move_delta[0])
+                        .speed(0.05)
+                        .prefix("x:"),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.model.transform_tool.move_delta[1])
+                        .speed(0.05)
+                        .prefix("y:"),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.model.transform_tool.move_delta[2])
+                        .speed(0.05)
+                        .prefix("z:"),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Rotate Δ");
+                ui.add(
+                    egui::DragValue::new(&mut self.model.transform_tool.rotate_delta_deg[0])
+                        .speed(0.5)
+                        .prefix("yaw:"),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.model.transform_tool.rotate_delta_deg[1])
+                        .speed(0.5)
+                        .prefix("pitch:"),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Nudge");
+                ui.add(
+                    egui::DragValue::new(&mut self.model.transform_tool.move_step)
+                        .speed(0.01)
+                        .range(0.01..=5.0)
+                        .prefix("move:"),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.model.transform_tool.rotate_step_deg)
+                        .speed(0.25)
+                        .range(0.1..=90.0)
+                        .prefix("rot:"),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                if icon_button(ui, "MX-", "-X").clicked() {
+                    self.model.transform_tool.move_delta[0] -= self.model.transform_tool.move_step;
+                }
+                if icon_button(ui, "MX+", "+X").clicked() {
+                    self.model.transform_tool.move_delta[0] += self.model.transform_tool.move_step;
+                }
+                if icon_button(ui, "MY-", "-Y").clicked() {
+                    self.model.transform_tool.move_delta[1] -= self.model.transform_tool.move_step;
+                }
+                if icon_button(ui, "MY+", "+Y").clicked() {
+                    self.model.transform_tool.move_delta[1] += self.model.transform_tool.move_step;
+                }
+                if icon_button(ui, "R-", "-Yaw").clicked() {
+                    self.model.transform_tool.rotate_delta_deg[0] -=
+                        self.model.transform_tool.rotate_step_deg;
+                }
+                if icon_button(ui, "R+", "+Yaw").clicked() {
+                    self.model.transform_tool.rotate_delta_deg[0] +=
+                        self.model.transform_tool.rotate_step_deg;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if icon_button(ui, "AP", "Apply Preview").clicked() {
+                    self.model.apply_transform_to_preview();
+                }
+                if icon_button(ui, "TS", "Append .tlscript").clicked() {
+                    self.model.append_transform_to_selected_script();
+                }
+                if icon_button(ui, "RST", "Reset Tool").clicked() {
+                    self.model.transform_tool = TransformToolState::default();
+                    self.model.transform_status = "transform tool reset".to_string();
+                }
+            });
             ui.separator();
 
             if let Some(compile) = &self.model.compile {
@@ -747,6 +1454,12 @@ impl GuiRuntime {
                 }
             } else {
                 ui.label("Press 'Compile Scene' after loading project.");
+            }
+
+            if let Some(path) = self.model.selected_file.as_ref() {
+                ui.separator();
+                ui.label(RichText::new("Selected File").strong());
+                ui.label(RichText::new(path.display().to_string()).monospace());
             }
         });
 
@@ -877,6 +1590,188 @@ pub fn run_from_env() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn upsert_project_scheduler(source: &str, scheduler: TlpfileGraphicsScheduler) -> String {
+    let mut out = String::with_capacity(source.len() + 32);
+    let mut in_project = false;
+    let mut wrote_scheduler = false;
+    let mut saw_project = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_project && !wrote_scheduler {
+                out.push_str(&format!("scheduler = {}\n", scheduler.as_str()));
+                wrote_scheduler = true;
+            }
+            let section = &trimmed[1..trimmed.len() - 1];
+            in_project = section.eq_ignore_ascii_case("project");
+            if in_project {
+                saw_project = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if in_project {
+            let head = trimmed.split_once('=').map(|(key, _)| key.trim());
+            if matches!(head, Some("scheduler")) {
+                out.push_str(&format!("scheduler = {}\n", scheduler.as_str()));
+                wrote_scheduler = true;
+                continue;
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if saw_project {
+        if in_project && !wrote_scheduler {
+            out.push_str(&format!("scheduler = {}\n", scheduler.as_str()));
+        }
+        out
+    } else {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("[project]\n");
+        out.push_str(&format!("scheduler = {}\n", scheduler.as_str()));
+        out
+    }
+}
+
+fn append_scene_section_to_project_source(source: &mut String, scene_name: &str, joint_name: &str) {
+    let section_header = format!("[scene.{scene_name}]");
+    if source.contains(&section_header) {
+        return;
+    }
+    if !source.ends_with('\n') {
+        source.push('\n');
+    }
+    source.push('\n');
+    source.push_str(&section_header);
+    source.push('\n');
+    source.push_str(&format!("tljoint = {joint_name}\n"));
+    source.push_str(&format!("tljoint_scene = {scene_name}\n"));
+}
+
+fn ensure_ext(raw_name: &str, ext: &str) -> String {
+    if raw_name.ends_with(ext) {
+        raw_name.to_string()
+    } else {
+        format!("{raw_name}{ext}")
+    }
+}
+
+fn sanitize_scene_name(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn write_if_missing(path: &Path, source: &str) -> Result<bool, String> {
+    if path.exists() {
+        return Ok(false);
+    }
+    fs::write(path, source)
+        .map_err(|err| format!("failed to write '{}': {err}", path.display()))?;
+    Ok(true)
+}
+
+fn default_script_template() -> String {
+    String::from(
+        "@export\n\
+def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool):\n\
+    # Runtime-safe default template for new scene scripts.\n\
+    set_spawn_per_tick(64)\n",
+    )
+}
+
+fn default_sprite_template() -> String {
+    String::from(
+        "tlsprite_v1\n\
+\n\
+[hud.main]\n\
+sprite_id = 1\n\
+kind = hud\n\
+texture_slot = 0\n\
+layer = 100\n\
+position = 0.0, 0.0, 0.0\n\
+size = 0.2, 0.08\n\
+rotation_rad = 0.0\n\
+color = 1.0, 1.0, 1.0, 1.0\n",
+    )
+}
+
+fn classify_project_file_kind(path: &Path, is_dir: bool) -> ProjectFileKind {
+    if is_dir {
+        return ProjectFileKind::Directory;
+    }
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("tlpfile") => ProjectFileKind::Project,
+        Some("tljoint") => ProjectFileKind::Joint,
+        Some("tlscript") => ProjectFileKind::Script,
+        Some("tlsprite") => ProjectFileKind::Sprite,
+        _ => ProjectFileKind::Other,
+    }
+}
+
+fn collect_project_files(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<ProjectFileEntry>,
+) -> std::io::Result<()> {
+    if depth > PROJECT_SCAN_MAX_DEPTH {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let relative = path.strip_prefix(root).map_or_else(
+            |_| path.display().to_string(),
+            |rel| rel.display().to_string(),
+        );
+        let kind = classify_project_file_kind(&path, file_type.is_dir());
+        out.push(ProjectFileEntry {
+            absolute_path: path.clone(),
+            relative_path: relative,
+            kind,
+            depth,
+        });
+        if file_type.is_dir() {
+            collect_project_files(root, &path, depth + 1, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn tlapp_binary_candidate() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let mut candidate = current.with_file_name("tlapp");
+    if cfg!(windows) {
+        candidate.set_extension("exe");
+    }
+    Some(candidate)
+}
+
+fn workspace_root_hint() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
 fn apply_lavender_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.window_fill = Color32::from_rgb(25, 21, 38);
@@ -933,6 +1828,32 @@ fn draw_scene_preview(painter: &egui::Painter, rect: egui::Rect, preview: &Scene
         painter.circle_filled(egui::pos2(x, y), radius.max(2.0), ball.color);
     }
 
+    let anchor = egui::pos2(
+        sim_rect.left() + preview.tool_anchor[0] * sim_rect.width(),
+        sim_rect.top() + preview.tool_anchor[1] * sim_rect.height(),
+    );
+    let half_w = sim_rect.width() * 0.06;
+    let half_h = sim_rect.height() * 0.035;
+    let (s, c) = preview.tool_rotation_rad.sin_cos();
+    let rotate = |x: f32, y: f32| egui::vec2(x * c - y * s, x * s + y * c);
+    let corners = [
+        anchor + rotate(-half_w, -half_h),
+        anchor + rotate(half_w, -half_h),
+        anchor + rotate(half_w, half_h),
+        anchor + rotate(-half_w, half_h),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        corners.to_vec(),
+        Color32::from_rgba_unmultiplied(174, 220, 255, 80),
+        egui::Stroke::new(1.5, Color32::from_rgb(174, 220, 255)),
+    ));
+    let axis_tip = anchor + rotate(half_w * 1.15, 0.0);
+    painter.line_segment(
+        [anchor, axis_tip],
+        egui::Stroke::new(2.0, Color32::from_rgb(255, 205, 120)),
+    );
+    painter.circle_filled(anchor, 2.5, Color32::from_rgb(255, 205, 120));
+
     let tag = if preview.light_mode {
         "LIGHT SCENE VIEW"
     } else {
@@ -944,6 +1865,18 @@ fn draw_scene_preview(painter: &egui::Painter, rect: egui::Rect, preview: &Scene
         format!("{tag} | {}", playback_label(preview.playback)),
         egui::FontId::monospace(12.0),
         Color32::from_rgb(185, 173, 232),
+    );
+    painter.text(
+        sim_rect.left_bottom() + egui::vec2(8.0, -8.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!(
+            "Tool pos=({:.2},{:.2}) rot={:.1}deg",
+            preview.tool_anchor[0],
+            preview.tool_anchor[1],
+            preview.tool_rotation_rad.to_degrees()
+        ),
+        egui::FontId::monospace(11.0),
+        Color32::from_rgb(177, 214, 255),
     );
 }
 

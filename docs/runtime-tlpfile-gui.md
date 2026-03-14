@@ -17,10 +17,11 @@ Minimal example:
 tlpfile_v1
 [project]
 name = TLApp Showcase Project
+scheduler = gms
 default_scene = main
 
 [scene.main]
-tljoint = bounce_showcase.tljoint
+tljoint = main.tljoint
 tljoint_scene = main
 tlscripts = extra_rules.tlscript
 tlsprites = overlay.tlsprite
@@ -49,20 +50,37 @@ Optional:
 
 ## Behavior
 
-- Left panel: scene selection from `.tlpfile`.
-- Center panel: merged compile summary (scripts/sprites/joint) + lightweight scene view.
+- Left panel: scene list + project file explorer + quick scene/file creation actions.
+- Center panel: merged compile summary (scripts/sprites/joint) + runtime-linked lightweight scene view.
 - Right panel: parse + compile diagnostics.
-- Top bar: icon buttons for `Reload`, `Compile`, `Start`, `Pause`, `Stop`.
+- Top bar: icon buttons for `Reload`, `Compile`, `Start`, `Pause`, `Stop`, scheduler apply, and TLApp `Run/Stop`.
 - Bottom panel: mini `.tlpfile` text editor (`Load`, `Save`, `Parse`, `Save+Compile`).
 
 ## Scene View (Light Mode)
 
 - A lightweight animated scene preview is rendered directly in the GUI.
+- Preview compile path enforces `scheduler = gms` (MGS scenes are shown as compile-blocked in this viewer).
 - `Light Mode` toggle keeps preview simulation cheap for editor responsiveness.
 - Playback controls:
   - `Start` runs preview simulation
   - `Pause` freezes simulation state
   - `Stop` resets and re-seeds preview bodies
+
+## Transform Tool (Pre-Beta)
+
+- Editor has a transform lane with:
+  - `Coordinate Space`: `world` / `local`
+  - `Move Δ`: X/Y/Z deltas
+  - `Rotate Δ`: yaw/pitch deltas
+  - one-click nudge buttons (`±X`, `±Y`, `±Yaw`)
+- `Apply Preview` updates the embedded scene-view tool marker.
+- `Append .tlscript` writes a transform snippet into selected `.tlscript`:
+
+```text
+set_coordinate_space("world"|"local")
+move_camera(dx, dy, dz)
+rotate_camera(yaw_deg, pitch_deg)
+```
 
 The compiler path merges:
 
