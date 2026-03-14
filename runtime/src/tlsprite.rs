@@ -25,6 +25,12 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    time::{Duration, Instant},
+};
+
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 
 use crate::scene::SpriteInstance;
@@ -280,6 +286,191 @@ impl TlspriteHotReloader {
     }
 }
 
+/// Watch backend used by `TlspriteWatchReloader`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlspriteWatchBackend {
+    Polling,
+    Notify,
+}
+
+/// File-watch layer configuration (Phase 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlspriteWatchConfig {
+    /// Try OS watcher backend first; fallback to polling if watcher initialization fails.
+    pub prefer_notify_backend: bool,
+    /// Minimum interval for safety polling and pure polling fallback.
+    pub poll_interval_ms: u64,
+}
+
+impl Default for TlspriteWatchConfig {
+    fn default() -> Self {
+        Self {
+            prefer_notify_backend: true,
+            poll_interval_ms: 200,
+        }
+    }
+}
+
+enum TlspriteWatchState {
+    Polling,
+    Notify {
+        rx: Receiver<notify::Result<Event>>,
+        _watcher: RecommendedWatcher,
+        pending_change: bool,
+        watched_path: PathBuf,
+    },
+}
+
+/// Phase-2 `.tlsprite` hot reloader: event-driven backend + polling fallback.
+pub struct TlspriteWatchReloader {
+    inner: TlspriteHotReloader,
+    state: TlspriteWatchState,
+    poll_interval: Duration,
+    next_poll_at: Instant,
+    init_warning: Option<String>,
+}
+
+impl TlspriteWatchReloader {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self::with_configs(
+            path,
+            TlspriteHotReloadConfig::default(),
+            TlspriteWatchConfig::default(),
+        )
+    }
+
+    pub fn with_configs(
+        path: impl Into<PathBuf>,
+        hot_config: TlspriteHotReloadConfig,
+        watch_config: TlspriteWatchConfig,
+    ) -> Self {
+        let path = path.into();
+        let inner = TlspriteHotReloader::with_config(path.clone(), hot_config);
+        let poll_interval = Duration::from_millis(watch_config.poll_interval_ms.max(1));
+        let mut init_warning = None;
+        let state = if watch_config.prefer_notify_backend {
+            match build_notify_state(&path) {
+                Ok(state) => state,
+                Err(err) => {
+                    init_warning = Some(format!(
+                        "notify backend unavailable for '{}': {err}; using polling fallback",
+                        path.display()
+                    ));
+                    TlspriteWatchState::Polling
+                }
+            }
+        } else {
+            TlspriteWatchState::Polling
+        };
+
+        Self {
+            inner,
+            state,
+            poll_interval,
+            next_poll_at: Instant::now(),
+            init_warning,
+        }
+    }
+
+    pub fn backend(&self) -> TlspriteWatchBackend {
+        match self.state {
+            TlspriteWatchState::Polling => TlspriteWatchBackend::Polling,
+            TlspriteWatchState::Notify { .. } => TlspriteWatchBackend::Notify,
+        }
+    }
+
+    pub fn init_warning(&self) -> Option<&str> {
+        self.init_warning.as_deref()
+    }
+
+    pub fn program(&self) -> Option<&TlspriteProgram> {
+        self.inner.program()
+    }
+
+    pub fn diagnostics(&self) -> &[TlspriteDiagnostic] {
+        self.inner.diagnostics()
+    }
+
+    /// Reload if notify signaled changes (or polling interval elapsed in fallback mode).
+    pub fn reload_if_needed(&mut self) -> TlspriteHotReloadEvent {
+        // Boot path: always load once.
+        if self.inner.program().is_none() {
+            self.next_poll_at = Instant::now() + self.poll_interval;
+            return self.inner.reload_if_changed();
+        }
+
+        match &mut self.state {
+            TlspriteWatchState::Polling => {
+                if Instant::now() < self.next_poll_at {
+                    return TlspriteHotReloadEvent::Unchanged;
+                }
+                self.next_poll_at = Instant::now() + self.poll_interval;
+                self.inner.reload_if_changed()
+            }
+            TlspriteWatchState::Notify {
+                rx,
+                pending_change,
+                watched_path,
+                ..
+            } => {
+                let mut changed = *pending_change;
+                loop {
+                    match rx.try_recv() {
+                        Ok(Ok(event)) => {
+                            if event_can_change_source(&event.kind)
+                                && event_targets_path(&event, watched_path.as_path())
+                            {
+                                changed = true;
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            return TlspriteHotReloadEvent::SourceError {
+                                message: format!("notify event error: {err}"),
+                            };
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            return TlspriteHotReloadEvent::SourceError {
+                                message: "notify channel disconnected".to_string(),
+                            };
+                        }
+                    }
+                }
+
+                // Safety poll in case a backend misses edge events.
+                if !changed && Instant::now() >= self.next_poll_at {
+                    changed = true;
+                }
+                self.next_poll_at = Instant::now() + self.poll_interval;
+                *pending_change = false;
+
+                if changed {
+                    self.inner.reload_if_changed()
+                } else {
+                    TlspriteHotReloadEvent::Unchanged
+                }
+            }
+        }
+    }
+}
+
+fn build_notify_state(path: &Path) -> notify::Result<TlspriteWatchState> {
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx.send(res);
+        },
+        NotifyConfig::default(),
+    )?;
+    watcher.watch(path, RecursiveMode::NonRecursive)?;
+    Ok(TlspriteWatchState::Notify {
+        rx,
+        _watcher: watcher,
+        pending_change: true,
+        watched_path: path.to_path_buf(),
+    })
+}
+
 /// Compile `.tlsprite` source from memory.
 pub fn compile_tlsprite(source: &str) -> TlspriteCompileOutcome {
     let mut diagnostics = Vec::new();
@@ -366,6 +557,24 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+fn event_can_change_source(kind: &EventKind) -> bool {
+    !matches!(kind, EventKind::Access(_))
+}
+
+fn event_targets_path(event: &Event, target: &Path) -> bool {
+    if event.paths.is_empty() {
+        return true;
+    }
+    let target_file_name = target.file_name();
+    event.paths.iter().any(|p| {
+        p == target
+            || target_file_name
+                .zip(p.file_name())
+                .map(|(a, b)| a == b)
+                .unwrap_or(false)
+    })
 }
 
 fn strip_comments(line: &str) -> &str {
@@ -668,7 +877,7 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     #[test]
@@ -790,6 +999,50 @@ mod tests {
                 .and_then(|p| p.sprites().first())
                 .map(|s| s.sprite.sprite_id),
             Some(42)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn watch_reloader_polling_backend_applies_updates() {
+        let path = temp_tlsprite_path("watch_poll");
+        fs::write(
+            &path,
+            concat!("tlsprite_v1\n", "[hud]\n", "sprite_id = 5\n",),
+        )
+        .expect("write initial");
+
+        let mut loader = TlspriteWatchReloader::with_configs(
+            &path,
+            TlspriteHotReloadConfig::default(),
+            TlspriteWatchConfig {
+                prefer_notify_backend: false,
+                poll_interval_ms: 1,
+            },
+        );
+        assert_eq!(loader.backend(), TlspriteWatchBackend::Polling);
+        assert!(matches!(
+            loader.reload_if_needed(),
+            TlspriteHotReloadEvent::Applied { .. }
+        ));
+
+        fs::write(
+            &path,
+            concat!("tlsprite_v1\n", "[hud]\n", "sprite_id = 6\n",),
+        )
+        .expect("write update");
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(matches!(
+            loader.reload_if_needed(),
+            TlspriteHotReloadEvent::Applied { .. }
+        ));
+        assert_eq!(
+            loader
+                .program()
+                .and_then(|p| p.sprites().first())
+                .map(|s| s.sprite.sprite_id),
+            Some(6)
         );
 
         let _ = fs::remove_file(path);

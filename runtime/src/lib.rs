@@ -70,6 +70,7 @@ pub use tlsprite::{
     compile_tlsprite, TlspriteCompileOutcome, TlspriteDiagnostic, TlspriteDiagnosticLevel,
     TlspriteFrameContext, TlspriteHotReloadConfig, TlspriteHotReloadEvent, TlspriteHotReloader,
     TlspriteProgram, TlspriteScaleAxis, TlspriteScaleSource, TlspriteSpriteDef,
+    TlspriteWatchBackend, TlspriteWatchConfig, TlspriteWatchReloader,
 };
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,

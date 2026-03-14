@@ -39,7 +39,7 @@ scale_max = 1.0
 
 If no program is installed (or emitted list is empty), runtime keeps the built-in fallback progress sprite.
 
-## Hot Reload (Phase 1)
+## Hot Reload (Phase 1 + Phase 2)
 
 `runtime::TlspriteHotReloader` provides hash-based polling reload:
 
@@ -47,6 +47,13 @@ If no program is installed (or emitted list is empty), runtime keeps the built-i
 2. Hash content.
 3. Recompile only when hash changes.
 4. If compile fails, keep last valid program (`keep_last_good_program = true` by default).
+
+`runtime::TlspriteWatchReloader` adds event-driven watch behavior:
+
+1. Tries `notify` backend first (OS file events).
+2. Falls back to polling automatically when watcher init fails.
+3. Performs safety polling at `poll_interval_ms` to avoid missed-edge cases.
+4. Reuses `TlspriteHotReloader` semantics for diagnostics and last-good fallback.
 
 Examples wired:
 
@@ -56,7 +63,7 @@ Examples wired:
 ## 3-Phase Plan
 
 - Phase 1 (implemented): polling hot reload + safe fallback.
-- Phase 2: platform file-watch backend to reduce polling overhead.
+- Phase 2 (implemented): `notify` file-watch backend + polling fallback.
 - Phase 3: asset pipeline integration (precompiled sprite packs + runtime cache invalidation).
 
 ## Current Scope

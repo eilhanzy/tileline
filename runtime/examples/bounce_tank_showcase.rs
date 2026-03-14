@@ -2,7 +2,7 @@ use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
 use runtime::{
     estimate_scene_workload_requests, BounceTankSceneConfig, BounceTankSceneController,
     RenderSyncMode, SceneWorkloadBridgeConfig, TickRatePolicy, TlspriteHotReloadEvent,
-    TlspriteHotReloader,
+    TlspriteWatchReloader,
 };
 
 fn main() {
@@ -26,8 +26,12 @@ fn main() {
     });
     let sprite_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples/assets/bounce_hud.tlsprite");
-    let mut sprite_loader = TlspriteHotReloader::new(&sprite_path);
-    print_tlsprite_event("[tlsprite boot]", sprite_loader.reload_if_changed());
+    let mut sprite_loader = TlspriteWatchReloader::new(&sprite_path);
+    if let Some(warn) = sprite_loader.init_warning() {
+        println!("[tlsprite watch] {warn}");
+    }
+    println!("[tlsprite watch] backend={:?}", sprite_loader.backend());
+    print_tlsprite_event("[tlsprite boot]", sprite_loader.reload_if_needed());
     if let Some(program) = sprite_loader.program().cloned() {
         scene.set_sprite_program(program);
     }
@@ -45,18 +49,16 @@ fn main() {
     );
 
     for frame_index in 0..total_frames {
-        if frame_index % 20 == 0 {
-            let event = sprite_loader.reload_if_changed();
-            match &event {
-                TlspriteHotReloadEvent::Applied { .. } => {
-                    print_tlsprite_event("[tlsprite reload]", event);
-                    if let Some(program) = sprite_loader.program().cloned() {
-                        scene.set_sprite_program(program);
-                    }
+        let event = sprite_loader.reload_if_needed();
+        match &event {
+            TlspriteHotReloadEvent::Applied { .. } => {
+                print_tlsprite_event("[tlsprite reload]", event);
+                if let Some(program) = sprite_loader.program().cloned() {
+                    scene.set_sprite_program(program);
                 }
-                TlspriteHotReloadEvent::Unchanged => {}
-                _ => print_tlsprite_event("[tlsprite reload]", event),
             }
+            TlspriteHotReloadEvent::Unchanged => {}
+            _ => print_tlsprite_event("[tlsprite reload]", event),
         }
         let tick = scene.physics_tick(&mut world);
         let substeps = world.step(render_dt);
