@@ -69,6 +69,10 @@ impl FixedStepClock {
         self.fixed_dt
     }
 
+    pub fn max_substeps(&self) -> u32 {
+        self.max_substeps
+    }
+
     pub fn tick(&self) -> u64 {
         self.tick
     }
@@ -95,6 +99,14 @@ impl FixedStepClock {
             steps += 1;
         }
         steps
+    }
+
+    pub fn set_timestep(&mut self, fixed_dt: f32, max_substeps: u32) {
+        self.fixed_dt = fixed_dt.max(1e-4);
+        self.max_substeps = max_substeps.max(1);
+        self.accumulator = self
+            .accumulator
+            .min(self.fixed_dt * self.max_substeps as f32);
     }
 }
 
@@ -186,6 +198,17 @@ impl PhysicsWorld {
 
     pub fn fixed_step_clock(&self) -> &FixedStepClock {
         &self.clock
+    }
+
+    /// Update fixed-step scheduler parameters at runtime.
+    ///
+    /// This is useful for adaptive tick controllers that need to react to render pacing and
+    /// workload pressure without rebuilding the world.
+    pub fn set_timestep(&mut self, fixed_dt: f32, max_substeps: u32) {
+        self.config.fixed_dt = fixed_dt.max(1e-4);
+        self.config.max_substeps = max_substeps.max(1);
+        self.clock
+            .set_timestep(self.config.fixed_dt, self.config.max_substeps);
     }
 
     /// Current render interpolation alpha derived from fixed-step accumulator state.
@@ -818,5 +841,15 @@ mod tests {
         world.interpolation.push_snapshot(second.clone());
         let pose = world.interpolate_body_pose(body, 0.5).unwrap();
         assert!(pose.position.x >= 0.0);
+    }
+
+    #[test]
+    fn world_timestep_can_be_updated_at_runtime() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
+        world.set_timestep(1.0 / 480.0, 24);
+        assert!((world.config().fixed_dt - (1.0 / 480.0)).abs() < 1e-6);
+        assert_eq!(world.config().max_substeps, 24);
+        assert!((world.fixed_step_clock().fixed_dt() - (1.0 / 480.0)).abs() < 1e-6);
+        assert_eq!(world.fixed_step_clock().max_substeps(), 24);
     }
 }

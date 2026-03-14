@@ -236,7 +236,7 @@ impl WgpuSceneRenderer {
 
         let box_mesh = create_box_mesh(device);
         let sphere_mesh_high = create_sphere_mesh(device);
-        let sphere_mesh_low = create_octa_sphere_mesh(device);
+        let sphere_mesh_low = create_icosa_sphere_mesh(device);
         let sprite_vertex_buffer = create_sprite_quad_vertex_buffer(device);
         let instance_3d_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("runtime-scene-3d-instance-buffer"),
@@ -822,6 +822,40 @@ fn create_octa_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
         0, 2, 4, 4, 2, 1, 1, 2, 5, 5, 2, 0, 4, 3, 0, 1, 3, 4, 5, 3, 1, 0, 3, 5,
     ];
     create_mesh(device, "runtime-scene-sphere", &vertices, &indices)
+}
+
+fn create_icosa_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
+    let t = (1.0 + 5.0_f32.sqrt()) * 0.5;
+    let mut v = [
+        [-1.0, t, 0.0],
+        [1.0, t, 0.0],
+        [-1.0, -t, 0.0],
+        [1.0, -t, 0.0],
+        [0.0, -1.0, t],
+        [0.0, 1.0, t],
+        [0.0, -1.0, -t],
+        [0.0, 1.0, -t],
+        [t, 0.0, -1.0],
+        [t, 0.0, 1.0],
+        [-t, 0.0, -1.0],
+        [-t, 0.0, 1.0],
+    ];
+
+    for p in &mut v {
+        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-6);
+        p[0] /= len;
+        p[1] /= len;
+        p[2] /= len;
+    }
+
+    let vertices = v.map(|position| GpuVertex3d { position });
+
+    let indices: [u16; 60] = [
+        0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7,
+        1, 8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9,
+        8, 1,
+    ];
+    create_mesh(device, "runtime-scene-sphere-icosa", &vertices, &indices)
 }
 
 #[derive(Debug, Clone)]

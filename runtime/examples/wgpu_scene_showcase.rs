@@ -117,6 +117,11 @@ struct ShowcaseRuntime {
     script_program: TlscriptShowcaseProgram<'static>,
     script_last_spawned: usize,
     script_frame_index: u64,
+    tick_policy: TickRatePolicy,
+    tick_hz: f32,
+    max_substeps: u32,
+    last_substeps: u32,
+    tick_retune_timer: f32,
     frame_started_at: Instant,
     fps_window_started_at: Instant,
     frames_in_window: u32,
@@ -155,13 +160,17 @@ impl ShowcaseRuntime {
         surface.configure(&device, &config);
 
         let tick_policy = TickRatePolicy {
-            ticks_per_render_frame: 3.0,
-            ..TickRatePolicy::default()
+            min_tick_hz: 180.0,
+            max_tick_hz: 1200.0,
+            ticks_per_render_frame: 8.0,
+            default_tick_hz: 480.0,
         };
         let fixed_dt = tick_policy
             .resolve_fixed_dt_seconds(RenderSyncMode::Vsync { display_hz: 60.0 }, Some(60.0));
+        let max_substeps = 24;
         let world = PhysicsWorld::new(PhysicsWorldConfig {
             fixed_dt,
+            max_substeps,
             ..PhysicsWorldConfig::default()
         });
         let scene = BounceTankSceneController::new(BounceTankSceneConfig {
@@ -229,6 +238,11 @@ impl ShowcaseRuntime {
             script_program,
             script_last_spawned: 0,
             script_frame_index: 0,
+            tick_policy,
+            tick_hz: 1.0 / fixed_dt.max(1e-6),
+            max_substeps,
+            last_substeps: 0,
+            tick_retune_timer: 0.0,
             frame_started_at: now,
             fps_window_started_at: now,
             frames_in_window: 0,
@@ -254,7 +268,9 @@ impl ShowcaseRuntime {
 
     fn render_frame(&mut self) -> Result<(), Box<dyn Error>> {
         let now = Instant::now();
-        let dt = (now - self.frame_started_at).as_secs_f32().max(1.0 / 240.0);
+        let dt = (now - self.frame_started_at)
+            .as_secs_f32()
+            .clamp(1.0 / 500.0, 1.0 / 20.0);
         self.frame_started_at = now;
         self.frames_in_window = self.frames_in_window.saturating_add(1);
         let fps_window = (now - self.fps_window_started_at).as_secs_f32();
@@ -287,13 +303,52 @@ impl ShowcaseRuntime {
                 live_balls: self.scene.live_ball_count(),
                 spawned_this_tick: self.script_last_spawned,
             });
+        let live_balls = self.scene.live_ball_count();
+        let parallel_ready = frame_eval
+            .dispatch_decision
+            .as_ref()
+            .map(|d| d.is_parallel())
+            .unwrap_or(false);
+
+        // Respect @parallel readiness and current physics pressure to avoid long-run collapse.
+        let mut runtime_patch = frame_eval.patch;
+        if self.last_substeps + 1 >= self.max_substeps && live_balls > 2_000 {
+            runtime_patch.spawn_per_tick =
+                Some(runtime_patch.spawn_per_tick.unwrap_or(96).clamp(32, 96));
+            runtime_patch.linear_damping =
+                Some(runtime_patch.linear_damping.unwrap_or(0.016).max(0.018));
+        }
+        if !parallel_ready && live_balls > 4_000 {
+            runtime_patch.spawn_per_tick =
+                Some(runtime_patch.spawn_per_tick.unwrap_or(64).clamp(24, 64));
+            runtime_patch.linear_damping =
+                Some(runtime_patch.linear_damping.unwrap_or(0.018).max(0.020));
+        }
+
+        self.tick_retune_timer -= dt;
+        if self.tick_retune_timer <= 0.0 {
+            let desired_hz = choose_aggressive_tick_hz(
+                self.tick_policy,
+                self.fps_estimate,
+                parallel_ready,
+                self.last_substeps,
+                self.max_substeps,
+                live_balls,
+            );
+            self.tick_hz = smooth_tick_hz(self.tick_hz, desired_hz, 0.35);
+            self.world
+                .set_timestep(1.0 / self.tick_hz.max(60.0), self.max_substeps);
+            self.tick_retune_timer = 0.2;
+        }
+
         let _patch_metrics = self
             .scene
-            .apply_runtime_patch(&mut self.world, frame_eval.patch);
+            .apply_runtime_patch(&mut self.world, runtime_patch);
         let tick = self.scene.physics_tick(&mut self.world);
         self.script_last_spawned = tick.spawned_this_tick;
         self.script_frame_index = self.script_frame_index.saturating_add(1);
         let substeps = self.world.step(dt);
+        self.last_substeps = substeps;
         let mut frame = self
             .scene
             .build_frame_instances(&self.world, Some(self.world.interpolation_alpha()));
@@ -352,6 +407,44 @@ impl ShowcaseRuntime {
         output.present();
         Ok(())
     }
+}
+
+fn choose_aggressive_tick_hz(
+    policy: TickRatePolicy,
+    fps_estimate: f32,
+    parallel_ready: bool,
+    last_substeps: u32,
+    max_substeps: u32,
+    live_balls: usize,
+) -> f32 {
+    let fps = fps_estimate.clamp(20.0, 240.0);
+    let mut multiplier = if parallel_ready { 8.0 } else { 6.0 };
+    if live_balls > 5_000 {
+        multiplier += 1.0;
+    }
+    if live_balls > 9_000 {
+        multiplier += 1.0;
+    }
+
+    let mut target_hz = fps * multiplier;
+    if last_substeps + 1 >= max_substeps {
+        target_hz *= 0.70;
+    } else if last_substeps >= max_substeps.saturating_sub(3) {
+        target_hz *= 0.85;
+    }
+    if fps < 45.0 {
+        target_hz *= 0.90;
+    }
+
+    target_hz.clamp(
+        policy.min_tick_hz.max(120.0),
+        policy.max_tick_hz.max(policy.min_tick_hz),
+    )
+}
+
+fn smooth_tick_hz(current_hz: f32, target_hz: f32, alpha: f32) -> f32 {
+    let alpha = alpha.clamp(0.0, 1.0);
+    current_hz + (target_hz - current_hz) * alpha
 }
 
 fn print_tlsprite_event(prefix: &str, event: TlspriteHotReloadEvent) {
