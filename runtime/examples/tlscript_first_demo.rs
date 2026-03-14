@@ -51,11 +51,13 @@ fn main() {
             frame_index,
             live_balls: scene.live_ball_count(),
             spawned_this_tick: last_spawned,
+            key_f_down: false,
         });
         let patch_metrics = scene.apply_runtime_patch(&mut world, frame_eval.patch);
         let tick = scene.physics_tick(&mut world);
         last_spawned = tick.spawned_this_tick;
         let substeps = world.step(render_dt);
+        let _ = scene.reconcile_after_step(&mut world);
         let frame = scene.build_frame_instances(&world, Some(world.interpolation_alpha()));
         let estimate =
             estimate_scene_workload_requests(&frame, tick.live_balls, 1280, 720, workload_cfg);

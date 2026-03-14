@@ -5,6 +5,7 @@
 //! broadphase pipeline that can scale across Tileline's CPU task execution model.
 
 use nalgebra::Vector3;
+use rayon::prelude::*;
 
 use crate::abi::ParadoxScriptHostAbi;
 use crate::body::{
@@ -200,6 +201,16 @@ impl PhysicsWorld {
         &self.clock
     }
 
+    /// Current world gravity vector applied to dynamic body integration.
+    pub fn gravity(&self) -> Vector3<f32> {
+        self.config.gravity
+    }
+
+    /// Update gravity at runtime without rebuilding the world.
+    pub fn set_gravity(&mut self, gravity: Vector3<f32>) {
+        self.config.gravity = gravity;
+    }
+
     /// Update fixed-step scheduler parameters at runtime.
     ///
     /// This is useful for adaptive tick controllers that need to react to render pacing and
@@ -209,6 +220,36 @@ impl PhysicsWorld {
         self.config.max_substeps = max_substeps.max(1);
         self.clock
             .set_timestep(self.config.fixed_dt, self.config.max_substeps);
+    }
+
+    /// Update contact solver tuning at runtime without rebuilding world state.
+    pub fn set_solver_config(&mut self, solver: ContactSolverConfig) {
+        self.config.solver = solver.clone();
+        self.solver.set_config(solver);
+    }
+
+    /// Apply a high-level anti-penetration guard profile.
+    ///
+    /// `level` range is `[0.0, 1.0]`:
+    /// - `0.0`: softer and faster
+    /// - `1.0`: tighter separation, less interpenetration
+    pub fn set_contact_guard(&mut self, level: f32) -> bool {
+        let level = level.clamp(0.0, 1.0);
+        let mut solver = self.config.solver.clone();
+        solver.iterations = lerp_u32(4, 10, level);
+        solver.baumgarte = lerp_f32(0.22, 0.62, level);
+        solver.penetration_slop = lerp_f32(0.0035, 0.0005, level);
+        solver.parallel_contact_push_strength = lerp_f32(0.18, 0.62, level);
+        solver.parallel_contact_push_threshold = lerp_usize(640, 96, level);
+        solver.hard_position_projection_strength = lerp_f32(0.90, 1.85, level);
+        solver.hard_position_projection_threshold = lerp_usize(192, 24, level);
+        solver.max_projection_per_contact = lerp_f32(0.12, 0.42, level);
+
+        if solver == self.config.solver {
+            return false;
+        }
+        self.set_solver_config(solver);
+        true
     }
 
     /// Current render interpolation alpha derived from fixed-step accumulator state.
@@ -383,6 +424,11 @@ impl PhysicsWorld {
         self.bodies.set_velocity(body, velocity)
     }
 
+    /// Move one body to a world-space position and rebuild its broadphase bounds.
+    pub fn set_position(&mut self, body: BodyHandle, position: Vector3<f32>) -> bool {
+        self.bodies.set_position(body, position)
+    }
+
     pub fn set_linear_damping(&mut self, body: BodyHandle, damping: f32) -> bool {
         self.bodies.set_linear_damping(body, damping)
     }
@@ -454,8 +500,18 @@ impl PhysicsWorld {
     pub fn step(&mut self, dt: f32) -> u32 {
         let substeps = self.clock.accumulate(dt);
         let fixed_dt = self.clock.fixed_dt();
-        for _ in 0..substeps {
-            self.interpolation.push_snapshot(self.capture_snapshot());
+        if substeps == 0 {
+            return 0;
+        }
+
+        // Keep interpolation snapshots bounded to one pre-step and one post-step capture per
+        // render frame. Capturing per-substep can dominate frame time at high body counts.
+        self.interpolation.push_snapshot(self.capture_snapshot());
+        let body_count = self.bodies.len();
+        // Sleep graph maintenance is useful but costly in huge fully-active scenes. Update it at
+        // a lower cadence under heavy load to keep more budget for parallel broadphase/narrowphase.
+        let sleep_update_stride = if body_count >= 3_500 { 2 } else { 1 };
+        for step_index in 0..substeps {
             self.bodies.integrate(fixed_dt, self.config.gravity);
             let bodies = &self.bodies;
             self.broadphase.rebuild_pairs_parallel(bodies);
@@ -470,24 +526,48 @@ impl PhysicsWorld {
             self.joint_solver
                 .solve(&mut self.bodies, &self.active_joints, fixed_dt);
             Self::rebuild_contacts_from_manifolds(&mut self.contacts, manifolds);
-            self.sleep_manager
-                .update(&mut self.bodies, manifolds, &self.active_joints, fixed_dt);
+            if step_index % sleep_update_stride == 0 || step_index + 1 == substeps {
+                self.sleep_manager.update(
+                    &mut self.bodies,
+                    manifolds,
+                    &self.active_joints,
+                    fixed_dt,
+                );
+            }
         }
+        self.interpolation.push_snapshot(self.capture_snapshot());
         substeps
     }
 
     pub fn capture_snapshot(&self) -> PhysicsSnapshot {
-        let mut bodies_out = Vec::with_capacity(self.bodies.len());
         let read = self.bodies.read_domain();
-        for index in 0..read.handles.len() {
-            bodies_out.push(BodyStateFrame {
-                handle: read.handles[index],
-                position: read.positions[index],
-                rotation: read.rotations[index],
-                linear_velocity: read.linear_velocities[index],
-                awake: read.awake[index],
-            });
-        }
+        let body_len = read.handles.len();
+        let bodies_out = if body_len >= 1_024 && rayon::current_num_threads() > 1 {
+            // Parallel snapshot capture is read-only over SoA slices and scales cleanly on MPS.
+            read.handles
+                .par_iter()
+                .enumerate()
+                .map(|(index, handle)| BodyStateFrame {
+                    handle: *handle,
+                    position: read.positions[index],
+                    rotation: read.rotations[index],
+                    linear_velocity: read.linear_velocities[index],
+                    awake: read.awake[index],
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let mut out = Vec::with_capacity(body_len);
+            for index in 0..body_len {
+                out.push(BodyStateFrame {
+                    handle: read.handles[index],
+                    position: read.positions[index],
+                    rotation: read.rotations[index],
+                    linear_velocity: read.linear_velocities[index],
+                    awake: read.awake[index],
+                });
+            }
+            out
+        };
         PhysicsSnapshot {
             tick: self.clock.tick(),
             bodies: bodies_out,
@@ -674,10 +754,35 @@ fn primary_shape_for_body(
     colliders: &[Slot<ColliderRecord>],
     bodies: &BodyRegistry,
     body: BodyHandle,
-) -> Option<(ColliderHandle, ColliderShape, crate::body::ColliderMaterial)> {
+) -> Option<(
+    ColliderHandle,
+    ColliderShape,
+    crate::body::ColliderMaterial,
+    u32,
+)> {
     let collider = bodies.primary_collider(body)?;
     let record = get_slot(colliders, collider.erased())?.value.as_ref()?;
-    Some((collider, record.desc.shape.clone(), record.desc.material))
+    Some((
+        collider,
+        record.desc.shape.clone(),
+        record.desc.material,
+        record.desc.user_tag,
+    ))
+}
+
+#[inline]
+fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+#[inline]
+fn lerp_usize(a: usize, b: usize, t: f32) -> usize {
+    lerp_f32(a as f32, b as f32, t).round() as usize
+}
+
+#[inline]
+fn lerp_u32(a: u32, b: u32, t: f32) -> u32 {
+    lerp_f32(a as f32, b as f32, t).round() as u32
 }
 
 fn alloc_slot<'a, T>(

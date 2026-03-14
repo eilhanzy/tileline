@@ -1,22 +1,65 @@
 @export
 @parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=128, schedule="performance")
 @deterministic
-def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):
+def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool):
     set_fbx_full_render(true)
-    let burst: int = 300
-    if frame < 45:
-        burst = 420
-    if live_balls > 3000:
-        burst = 120
-    if live_balls > 6000:
-        burst = 72
-    set_spawn_per_tick(burst)
+    set_ball_mesh_slot(2)
 
-    if spawned_this_tick == 0 && live_balls > 1200:
-        set_linear_damping(0.014)
+    if frame == 0:
+        set_camera_pose(0.0, 12.0, 36.0, 0.0, 0.0, 0.0)
+        set_target_ball_count(8000)
+        set_initial_speed(0.20, 0.90)
+        set_scatter_interval(520)
+        set_scatter_strength(0.08)
+    set_camera_move_speed(18.0)
+    set_camera_look_sensitivity(0.0018)
+    if live_balls > 7600:
+        set_gravity_ramp(frame, 0, 48000, -9.81, -10.80)
     else:
-        set_linear_damping(0.008)
+        set_gravity_ramp(frame, 0, 30000, -9.81, -10.40)
 
-    if frame % 120 == 0:
-        set_ball_restitution(0.94)
-        set_wall_restitution(0.95)
+    if key_f_down:
+        set_contact_guard(1.0)
+        set_bounce(0.90, 0.94)
+        set_scatter_interval(1)
+        set_scatter_strength(1.0)
+        set_initial_speed(2.5, 11.0)
+        set_linear_damping(0.0)
+    elif live_balls < 1800:
+        set_contact_guard(0.90)
+        set_bounce(0.64, 0.66)
+        set_scatter_interval(520)
+        set_scatter_strength(0.08)
+        set_initial_speed(0.20, 0.90)
+        set_linear_damping(0.018)
+    elif live_balls < 4800:
+        set_contact_guard(0.93)
+        set_bounce(0.60, 0.62)
+        set_scatter_interval(460)
+        set_scatter_strength(0.10)
+        set_initial_speed(0.24, 1.05)
+        set_linear_damping(0.020)
+    else:
+        set_contact_guard(0.95)
+        set_bounce(0.56, 0.58)
+        set_scatter_interval(380)
+        set_scatter_strength(0.12)
+        set_initial_speed(0.28, 1.15)
+        set_linear_damping(0.022)
+
+    let burst: int = 28
+    if frame > 180:
+        burst = 36
+    if frame > 420:
+        burst = 44
+    if frame > 900:
+        burst = 56
+    if live_balls > 2000:
+        burst = 52
+    if live_balls > 4000:
+        burst = 46
+    if live_balls > 6000:
+        burst = 38
+    if live_balls > 7600:
+        burst = 24
+    set_spawn_per_tick(burst)

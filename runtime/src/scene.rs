@@ -14,8 +14,19 @@ use paradoxpe::{
     Aabb, BodyDesc, BodyHandle, BodyKind, ColliderDesc, ColliderMaterial, ColliderShape,
     PhysicsWorld,
 };
+use rayon::prelude::*;
 
 use crate::tlsprite::{TlspriteFrameContext, TlspriteProgram};
+
+const COLLISION_GROUP_BALL: u16 = 1 << 0;
+const COLLISION_GROUP_WALL: u16 = 1 << 1;
+const SCATTER_MIN_LIVE_BALLS_BASE: usize = 600;
+const SCATTER_MIN_AFFECTED: usize = 12;
+
+#[inline]
+fn collision_filter_tag(group: u16, mask: u16) -> u32 {
+    (group as u32) | ((mask as u32) << 16)
+}
 
 /// Lightweight primitive kind for runtime-side scene batching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +204,8 @@ pub struct BounceTankSceneConfig {
     pub linear_damping: f32,
     pub initial_speed_min: f32,
     pub initial_speed_max: f32,
+    pub scatter_interval_ticks: u64,
+    pub scatter_strength: f32,
     pub seed: u64,
 }
 
@@ -200,18 +213,20 @@ impl Default for BounceTankSceneConfig {
     fn default() -> Self {
         Self {
             target_ball_count: 12_000,
-            spawn_per_tick: 240,
+            spawn_per_tick: 120,
             container_half_extents: [24.0, 16.0, 24.0],
             wall_thickness: 0.40,
             ball_radius_min: 0.10,
             ball_radius_max: 0.24,
-            ball_restitution: 0.84,
+            ball_restitution: 0.74,
             ball_friction: 0.28,
-            wall_restitution: 0.92,
+            wall_restitution: 0.78,
             wall_friction: 0.20,
-            linear_damping: 0.006,
-            initial_speed_min: 0.2,
-            initial_speed_max: 1.8,
+            linear_damping: 0.012,
+            initial_speed_min: 0.35,
+            initial_speed_max: 1.25,
+            scatter_interval_ticks: 420,
+            scatter_strength: 0.16,
             seed: 0x5EED_C0DE_u64,
         }
     }
@@ -221,6 +236,7 @@ impl Default for BounceTankSceneConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BounceTankTickMetrics {
     pub spawned_this_tick: usize,
+    pub scattered_this_tick: usize,
     pub live_balls: usize,
     pub target_balls: usize,
     pub fully_spawned: bool,
@@ -232,10 +248,14 @@ pub struct BounceTankRuntimePatch {
     pub target_ball_count: Option<usize>,
     pub spawn_per_tick: Option<usize>,
     pub linear_damping: Option<f32>,
+    pub gravity: Option<[f32; 3]>,
+    pub contact_guard: Option<f32>,
     pub ball_restitution: Option<f32>,
     pub wall_restitution: Option<f32>,
     pub initial_speed_min: Option<f32>,
     pub initial_speed_max: Option<f32>,
+    pub scatter_interval_ticks: Option<u64>,
+    pub scatter_strength: Option<f32>,
     pub ball_mesh_slot: Option<u8>,
     pub container_mesh_slot: Option<u8>,
 }
@@ -267,6 +287,7 @@ pub struct BounceTankSceneController {
     sprite_program: Option<TlspriteProgram>,
     ball_mesh_slot: Option<u8>,
     container_mesh_slot: Option<u8>,
+    last_scatter_tick: u64,
 }
 
 impl BounceTankSceneController {
@@ -279,6 +300,7 @@ impl BounceTankSceneController {
             sprite_program: None,
             ball_mesh_slot: None,
             container_mesh_slot: None,
+            last_scatter_tick: 0,
         }
     }
 
@@ -339,6 +361,22 @@ impl BounceTankSceneController {
                 updated = true;
             }
         }
+        if let Some(gravity) = patch.gravity {
+            let clamped = Vector3::new(
+                gravity[0].clamp(-120.0, 120.0),
+                gravity[1].clamp(-120.0, 120.0),
+                gravity[2].clamp(-120.0, 120.0),
+            );
+            if (world.gravity() - clamped).norm_squared() > 1e-8 {
+                world.set_gravity(clamped);
+                updated = true;
+            }
+        }
+        if let Some(contact_guard) = patch.contact_guard {
+            if world.set_contact_guard(contact_guard.clamp(0.0, 1.0)) {
+                updated = true;
+            }
+        }
         if let Some(restitution) = patch.ball_restitution {
             let clamped = restitution.clamp(0.0, 1.25);
             if (self.config.ball_restitution - clamped).abs() > f32::EPSILON {
@@ -364,6 +402,20 @@ impl BounceTankSceneController {
             let clamped = max_speed.clamp(0.0, 64.0);
             if (self.config.initial_speed_max - clamped).abs() > f32::EPSILON {
                 self.config.initial_speed_max = clamped;
+                updated = true;
+            }
+        }
+        if let Some(scatter_interval_ticks) = patch.scatter_interval_ticks {
+            let clamped = scatter_interval_ticks.clamp(1, 5_000);
+            if self.config.scatter_interval_ticks != clamped {
+                self.config.scatter_interval_ticks = clamped;
+                updated = true;
+            }
+        }
+        if let Some(scatter_strength) = patch.scatter_strength {
+            let clamped = scatter_strength.clamp(0.0, 1.0);
+            if (self.config.scatter_strength - clamped).abs() > f32::EPSILON {
+                self.config.scatter_strength = clamped;
                 updated = true;
             }
         }
@@ -394,13 +446,45 @@ impl BounceTankSceneController {
     pub fn physics_tick(&mut self, world: &mut PhysicsWorld) -> BounceTankTickMetrics {
         self.ensure_container_walls(world);
         self.cull_missing(world);
+        let _ = self.recycle_escaped_balls(world);
         let spawned = self.spawn_batch(world);
+        let scattered = self.maybe_scatter_burst(world);
         BounceTankTickMetrics {
             spawned_this_tick: spawned,
+            scattered_this_tick: scattered,
             live_balls: self.balls.len(),
             target_balls: self.config.target_ball_count,
             fully_spawned: self.balls.len() >= self.config.target_ball_count,
         }
+    }
+
+    /// Reconcile escaped dynamic balls after a fixed-step update.
+    ///
+    /// Call this right after `world.step(...)` to avoid one-frame visual pops where a high-energy
+    /// body tunnels outside the prism before the next `physics_tick`.
+    pub fn reconcile_after_step(&mut self, world: &mut PhysicsWorld) -> usize {
+        self.recycle_escaped_balls(world)
+    }
+
+    /// Enforce an upper bound for live dynamic balls and destroy overflow bodies immediately.
+    ///
+    /// This is used by runtime-level performance governors to keep CPU broadphase/narrowphase
+    /// cost bounded when scripts request very high object counts.
+    pub fn enforce_live_ball_budget(
+        &mut self,
+        world: &mut PhysicsWorld,
+        max_live_balls: usize,
+    ) -> usize {
+        if self.balls.len() <= max_live_balls {
+            return 0;
+        }
+        let to_remove = self.balls.len() - max_live_balls;
+        for _ in 0..to_remove {
+            if let Some(ball) = self.balls.pop() {
+                let _ = world.destroy_body(ball.body);
+            }
+        }
+        to_remove
     }
 
     /// Build renderer-facing scene payloads using optional interpolation alpha.
@@ -409,47 +493,87 @@ impl BounceTankSceneController {
         world: &PhysicsWorld,
         interpolation_alpha: Option<f32>,
     ) -> SceneFrameInstances {
+        self.build_frame_instances_with_ball_limit(world, interpolation_alpha, None)
+    }
+
+    /// Build renderer-facing scene payloads with an optional visible-ball cap.
+    ///
+    /// When `ball_render_limit` is lower than live body count, balls are sampled by stride to keep
+    /// draw workload bounded without touching physics ownership/state.
+    pub fn build_frame_instances_with_ball_limit(
+        &self,
+        world: &PhysicsWorld,
+        interpolation_alpha: Option<f32>,
+        ball_render_limit: Option<usize>,
+    ) -> SceneFrameInstances {
         let mut frame = SceneFrameInstances::default();
-        frame.transparent_3d.push(self.container_visual_instance());
+        // Default to edge-only prism rendering; full shell is opt-in via container mesh slot.
+        if self.container_mesh_slot.is_some() {
+            frame.transparent_3d.push(self.container_visual_instance());
+        }
         self.append_container_edge_instances(&mut frame.opaque_3d);
 
         let alpha = interpolation_alpha.unwrap_or(1.0).clamp(0.0, 1.0);
-        for ball in &self.balls {
-            let pose = world
-                .interpolate_body_pose(ball.body, alpha)
-                .map(|interp| (interp.position, interp.rotation))
-                .or_else(|| {
+        let total_balls = self.balls.len();
+        let visible_limit = ball_render_limit.unwrap_or(total_balls).min(total_balls);
+        let stride = if visible_limit == 0 || visible_limit >= total_balls {
+            1
+        } else {
+            ((total_balls + visible_limit - 1) / visible_limit).max(1)
+        };
+        let use_interpolation = alpha > 0.0 && total_balls <= 4_000;
+        let primitive = self
+            .ball_mesh_slot
+            .map(|slot| ScenePrimitive3d::Mesh { slot })
+            .unwrap_or(ScenePrimitive3d::Sphere);
+        let mut ball_instances = self
+            .balls
+            .par_iter()
+            .enumerate()
+            .filter_map(|(index, ball)| {
+                if stride > 1 && (index % stride != 0) {
+                    return None;
+                }
+                let pose = if use_interpolation {
+                    world
+                        .interpolate_body_pose(ball.body, alpha)
+                        .map(|interp| (interp.position, interp.rotation))
+                        .or_else(|| {
+                            world
+                                .body(ball.body)
+                                .map(|body| (body.position, body.rotation))
+                        })
+                } else {
                     world
                         .body(ball.body)
                         .map(|body| (body.position, body.rotation))
-                });
-            let Some((position, rotation)) = pose else {
-                continue;
-            };
-
-            let q = rotation.quaternion();
-            frame.opaque_3d.push(SceneInstance3d {
-                instance_id: ball.body.raw() as u64,
-                primitive: self
-                    .ball_mesh_slot
-                    .map(|slot| ScenePrimitive3d::Mesh { slot })
-                    .unwrap_or(ScenePrimitive3d::Sphere),
-                transform: SceneTransform3d {
-                    translation: [position.x, position.y, position.z],
-                    rotation_xyzw: [q.i, q.j, q.k, q.w],
-                    scale: [ball.radius * 2.0, ball.radius * 2.0, ball.radius * 2.0],
-                },
-                material: SceneMaterial {
-                    base_color_rgba: ball.color,
-                    roughness: ball.roughness,
-                    metallic: ball.metallic,
-                    emissive_rgb: [0.0, 0.0, 0.0],
-                    shading: ShadingModel::LitPbr,
-                },
-                casts_shadow: true,
-                receives_shadow: true,
-            });
+                };
+                let (position, rotation) = pose?;
+                let q = rotation.quaternion();
+                Some(SceneInstance3d {
+                    instance_id: ball.body.raw() as u64,
+                    primitive,
+                    transform: SceneTransform3d {
+                        translation: [position.x, position.y, position.z],
+                        rotation_xyzw: [q.i, q.j, q.k, q.w],
+                        scale: [ball.radius * 2.0, ball.radius * 2.0, ball.radius * 2.0],
+                    },
+                    material: SceneMaterial {
+                        base_color_rgba: ball.color,
+                        roughness: ball.roughness,
+                        metallic: ball.metallic,
+                        emissive_rgb: [0.0, 0.0, 0.0],
+                        shading: ShadingModel::LitPbr,
+                    },
+                    casts_shadow: true,
+                    receives_shadow: true,
+                })
+            })
+            .collect::<Vec<_>>();
+        if ball_instances.len() > visible_limit {
+            ball_instances.truncate(visible_limit);
         }
+        frame.opaque_3d.extend(ball_instances);
 
         // Simple sprite overlay payload (spawn progress bar), kept renderer-agnostic.
         let progress = if self.config.target_ball_count == 0 {
@@ -499,7 +623,12 @@ impl BounceTankSceneController {
         let hx = self.config.container_half_extents[0].max(0.5);
         let hy = self.config.container_half_extents[1].max(0.5);
         let hz = self.config.container_half_extents[2].max(0.5);
-        let t = self.config.wall_thickness.max(0.02);
+        // Keep physics walls thick enough for stable high-bounce scenes.
+        let t = self
+            .config
+            .wall_thickness
+            .max(self.config.ball_radius_max.max(0.02) * 1.35)
+            .max(0.02);
 
         let walls = [
             (
@@ -544,7 +673,7 @@ impl BounceTankSceneController {
                 shape: ColliderShape::Aabb { half_extents },
                 material: wall_material,
                 is_sensor: false,
-                user_tag: 0,
+                user_tag: collision_filter_tag(COLLISION_GROUP_WALL, COLLISION_GROUP_BALL),
             });
             self.walls.push(body);
         }
@@ -554,11 +683,33 @@ impl BounceTankSceneController {
         if self.balls.len() >= self.config.target_ball_count {
             return 0;
         }
-        let remaining = self
-            .config
-            .target_ball_count
-            .saturating_sub(self.balls.len());
-        let to_spawn = remaining.min(self.config.spawn_per_tick.max(1));
+        let live = self.balls.len();
+        let remaining = self.config.target_ball_count.saturating_sub(live);
+        // Stage spawn pressure so ball count grows progressively toward the target.
+        let progress = if self.config.target_ball_count == 0 {
+            1.0
+        } else {
+            (live as f32 / self.config.target_ball_count as f32).clamp(0.0, 1.0)
+        };
+        let stage_scale = if progress < 0.10 {
+            0.22
+        } else if progress < 0.25 {
+            0.32
+        } else if progress < 0.45 {
+            0.48
+        } else if progress < 0.65 {
+            0.64
+        } else if progress < 0.80 {
+            0.74
+        } else if progress < 0.92 {
+            0.56
+        } else {
+            0.30
+        };
+        let staged_spawn_cap = ((self.config.spawn_per_tick.max(1) as f32) * stage_scale)
+            .round()
+            .clamp(8.0, 128.0) as usize;
+        let to_spawn = remaining.min(staged_spawn_cap.max(1));
         let mut spawned = 0usize;
 
         let hx = self.config.container_half_extents[0].max(0.5);
@@ -591,7 +742,19 @@ impl BounceTankSceneController {
             let theta = self.rand01() * TAU;
             let vz = self.rand_range(-1.0, 1.0);
             let xy = (1.0 - vz * vz).sqrt();
-            let velocity = Vector3::new(xy * theta.cos(), -speed.abs(), xy * theta.sin()) * speed;
+            // Keep launch velocity bounded to configured speed range; avoid speed^2 blow-up.
+            let mut launch_dir = Vector3::new(
+                xy * theta.cos(),
+                -self.rand_range(0.15, 0.55),
+                xy * theta.sin(),
+            );
+            let launch_len = launch_dir.norm();
+            if launch_len > 1e-6 {
+                launch_dir /= launch_len;
+            } else {
+                launch_dir = Vector3::new(0.0, -1.0, 0.0);
+            }
+            let velocity = launch_dir * speed;
 
             let body = world.spawn_body(BodyDesc {
                 kind: BodyKind::Dynamic,
@@ -611,7 +774,10 @@ impl BounceTankSceneController {
                     shape: ColliderShape::Sphere { radius },
                     material,
                     is_sensor: false,
-                    user_tag: 0,
+                    user_tag: collision_filter_tag(
+                        COLLISION_GROUP_BALL,
+                        COLLISION_GROUP_BALL | COLLISION_GROUP_WALL,
+                    ),
                 })
                 .is_some();
             if !collider_ok {
@@ -633,6 +799,143 @@ impl BounceTankSceneController {
         }
 
         spawned
+    }
+
+    /// Apply an occasional high-energy burst so the showcase naturally "splashes" without
+    /// per-frame randomness overhead.
+    fn maybe_scatter_burst(&mut self, world: &mut PhysicsWorld) -> usize {
+        let strength = self.config.scatter_strength.clamp(0.0, 1.0);
+        if strength <= 0.01 {
+            return 0;
+        }
+        let min_live =
+            ((self.config.target_ball_count as f32) * (0.18 + strength * 0.25)).round() as usize;
+        if self.balls.len() < min_live.max(SCATTER_MIN_LIVE_BALLS_BASE) {
+            return 0;
+        }
+        let tick = world.fixed_step_clock().tick();
+        let interval = self.config.scatter_interval_ticks.max(1);
+        if tick == 0 || tick.saturating_sub(self.last_scatter_tick) < interval {
+            return 0;
+        }
+
+        let live = self.balls.len();
+        let fraction = self.rand_range(0.003 + 0.007 * strength, 0.010 + 0.030 * strength);
+        let divisor = ((12.0 - strength * 6.0).round() as usize).clamp(6, 12);
+        let mut target = ((live as f32) * fraction).round() as usize;
+        target = target
+            .max(SCATTER_MIN_AFFECTED.min(live))
+            .min((live / divisor).max(SCATTER_MIN_AFFECTED));
+        if target == 0 {
+            return 0;
+        }
+
+        let stride = (live / target).max(1);
+        let start = ((self.rand01() * stride as f32) as usize).min(stride.saturating_sub(1));
+        let base_speed = self
+            .config
+            .initial_speed_max
+            .max(self.config.initial_speed_min)
+            .max(0.8);
+        let burst_min = base_speed * (1.02 + 0.35 * strength);
+        let burst_max = base_speed * (1.25 + 0.95 * strength);
+
+        let mut scattered = 0usize;
+        for i in (start..live).step_by(stride) {
+            if scattered >= target {
+                break;
+            }
+            let ball = self.balls[i];
+            let Some(body) = world.body(ball.body) else {
+                continue;
+            };
+            let mut dir = body.position;
+            let jitter = 0.08 + strength * 0.18;
+            dir.x += self.rand_range(-jitter, jitter);
+            dir.y = dir.y.abs() + self.rand_range(0.10, 0.25 + 0.45 * strength);
+            dir.z += self.rand_range(-jitter, jitter);
+            let len2 = dir.dot(&dir);
+            if len2 <= 1e-8 {
+                continue;
+            }
+            let speed = self.rand_range(burst_min, burst_max);
+            let velocity = (dir / len2.sqrt()) * speed;
+            if world.set_velocity(ball.body, velocity) {
+                scattered = scattered.saturating_add(1);
+            }
+        }
+
+        if scattered > 0 {
+            self.last_scatter_tick = tick;
+        }
+        scattered
+    }
+
+    /// Clamps rare escaped balls back inside the prism instead of deleting them.
+    ///
+    /// This avoids visible pop-in/pop-out under high-energy bursts while keeping live count stable.
+    fn recycle_escaped_balls(&mut self, world: &mut PhysicsWorld) -> usize {
+        let hx = self.config.container_half_extents[0].max(0.5);
+        let hy = self.config.container_half_extents[1].max(0.5);
+        let hz = self.config.container_half_extents[2].max(0.5);
+        let wall_bounce = self.config.wall_restitution.clamp(0.45, 0.98);
+        let mut recycled = 0usize;
+
+        let mut i = 0usize;
+        while i < self.balls.len() {
+            let handle = self.balls[i].body;
+            let radius = self.balls[i].radius.max(0.02);
+            let Some(body) = world.body(handle) else {
+                self.balls.swap_remove(i);
+                continue;
+            };
+
+            let mut clamped = false;
+            let mut position = body.position;
+            let mut velocity = body.linear_velocity;
+            let limit_x = (hx - radius).max(radius * 0.5);
+            let limit_y = (hy - radius).max(radius * 0.5);
+            let limit_z = (hz - radius).max(radius * 0.5);
+
+            if position.x > limit_x {
+                position.x = limit_x;
+                velocity.x = -velocity.x.abs() * wall_bounce;
+                clamped = true;
+            } else if position.x < -limit_x {
+                position.x = -limit_x;
+                velocity.x = velocity.x.abs() * wall_bounce;
+                clamped = true;
+            }
+
+            if position.y > limit_y {
+                position.y = limit_y;
+                velocity.y = -velocity.y.abs() * wall_bounce;
+                clamped = true;
+            } else if position.y < -limit_y {
+                position.y = -limit_y;
+                velocity.y = velocity.y.abs() * wall_bounce;
+                clamped = true;
+            }
+
+            if position.z > limit_z {
+                position.z = limit_z;
+                velocity.z = -velocity.z.abs() * wall_bounce;
+                clamped = true;
+            } else if position.z < -limit_z {
+                position.z = -limit_z;
+                velocity.z = velocity.z.abs() * wall_bounce;
+                clamped = true;
+            }
+
+            if clamped {
+                let _ = world.set_position(handle, position);
+                let _ = world.set_velocity(handle, velocity);
+                recycled = recycled.saturating_add(1);
+            }
+            i += 1;
+        }
+
+        recycled
     }
 
     fn container_visual_instance(&self) -> SceneInstance3d {
@@ -914,7 +1217,7 @@ mod tests {
         assert!(scene.live_ball_count() <= 256);
 
         let frame = scene.build_frame_instances(&world, Some(0.5));
-        assert_eq!(frame.transparent_3d.len(), 1);
+        assert!(frame.transparent_3d.is_empty());
         assert!(!frame.sprites.is_empty());
         assert!(!frame.opaque_3d.is_empty());
     }
@@ -938,6 +1241,8 @@ mod tests {
             BounceTankRuntimePatch {
                 spawn_per_tick: Some(0),
                 linear_damping: Some(2.0),
+                gravity: Some([0.0, -14.5, 0.0]),
+                contact_guard: Some(0.92),
                 initial_speed_min: Some(3.0),
                 initial_speed_max: Some(1.0),
                 ..BounceTankRuntimePatch::default()
@@ -947,6 +1252,8 @@ mod tests {
         assert_eq!(cfg.spawn_per_tick, 1);
         assert!(cfg.linear_damping <= 0.95);
         assert!(cfg.initial_speed_max >= cfg.initial_speed_min);
+        assert!(world.gravity().y < -9.9);
+        assert!(world.solver().config().hard_position_projection_strength > 1.0);
         assert!(metrics.config_updated);
     }
 
@@ -1022,5 +1329,79 @@ mod tests {
         assert_eq!(frame.sprites[0].sprite_id, 77);
         assert_eq!(frame.sprites[0].texture_slot, 3);
         assert_eq!(frame.sprites[0].kind, SpriteKind::Hud);
+    }
+
+    #[test]
+    fn frame_build_respects_visible_ball_cap() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 300,
+            spawn_per_tick: 300,
+            ..BounceTankSceneConfig::default()
+        });
+
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+        let full = scene.build_frame_instances(&world, Some(1.0));
+        let capped = scene.build_frame_instances_with_ball_limit(&world, Some(1.0), Some(64));
+
+        assert!(full.opaque_3d.len() > capped.opaque_3d.len());
+        // 12 entries are always container edge visuals.
+        assert!(capped.opaque_3d.len() <= 12 + 64);
+    }
+
+    #[test]
+    fn enforce_live_ball_budget_removes_overflow_bodies() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 256,
+            spawn_per_tick: 256,
+            ..BounceTankSceneConfig::default()
+        });
+
+        for _ in 0..8 {
+            let _ = scene.physics_tick(&mut world);
+            let _ = world.step(world.config().fixed_dt);
+            if scene.live_ball_count() > 96 {
+                break;
+            }
+        }
+        let removed = scene.enforce_live_ball_budget(&mut world, 96);
+        assert!(removed > 0);
+        assert!(scene.live_ball_count() <= 96);
+    }
+
+    #[test]
+    fn physics_tick_recycles_escaped_balls_back_into_container_budget() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 32,
+            spawn_per_tick: 32,
+            ..BounceTankSceneConfig::default()
+        });
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+        let before = scene.live_ball_count();
+        assert!(before > 0);
+
+        // Force one body far outside the prism.
+        let escaped = scene.balls[0].body;
+        let mut snapshot = world.capture_snapshot();
+        if let Some(frame) = snapshot.bodies.iter_mut().find(|b| b.handle == escaped) {
+            frame.position.x = 999.0;
+        }
+        let _ = world.restore_snapshot(&snapshot);
+
+        let _ = scene.physics_tick(&mut world);
+        assert!(scene.live_ball_count() <= scene.config().target_ball_count);
     }
 }

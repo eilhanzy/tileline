@@ -339,6 +339,21 @@ impl WgpuSceneRenderer {
         self.bind_fbx_mesh_slot_from_bytes(device, slot, &bytes)
     }
 
+    /// Bind a built-in sphere mesh (high FBX or low icosa) into a runtime slot.
+    pub fn bind_builtin_sphere_mesh_slot(
+        &mut self,
+        device: &wgpu::Device,
+        slot: u8,
+        high_quality: bool,
+    ) {
+        let mesh = if high_quality {
+            create_sphere_mesh(device)
+        } else {
+            create_icosa_sphere_mesh(device)
+        };
+        self.custom_mesh_slots.insert(slot, mesh);
+    }
+
     pub fn upload_draw_frame(
         &mut self,
         device: &wgpu::Device,

@@ -27,6 +27,7 @@ scale_max = 1.0
 [scene.mesh_preview]
 sprite_id = 102
 kind = camera
+texture_slot = 2
 fbx = docs/demos/sphere.fbx
 layer = 150
 position = 0.88, 0.84, 0.0

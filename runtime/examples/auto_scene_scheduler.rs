@@ -104,6 +104,7 @@ fn run_gms_path(
         maybe_reload_tlsprite(scene, sprite_loader, sprite_cache);
         let tick = scene.physics_tick(world);
         let substeps = world.step(render_dt);
+        let _ = scene.reconcile_after_step(world);
         let mut frame = scene.build_frame_instances(world, Some(world.interpolation_alpha()));
         let fps = if render_dt > f32::EPSILON {
             1.0 / render_dt
@@ -185,6 +186,7 @@ fn run_mgs_path(
         maybe_reload_tlsprite(scene, sprite_loader, sprite_cache);
         let tick = scene.physics_tick(world);
         let substeps = world.step(render_dt);
+        let _ = scene.reconcile_after_step(world);
         let mut frame = scene.build_frame_instances(world, Some(world.interpolation_alpha()));
         let fps = if render_dt > f32::EPSILON {
             1.0 / render_dt

@@ -80,6 +80,20 @@ impl BroadphasePipeline {
         self.merged_pairs.capacity()
     }
 
+    #[inline]
+    fn effective_chunk_size(&self, body_count: usize) -> usize {
+        let base = self.config.chunk_size.max(16);
+        let workers = rayon::current_num_threads().max(1);
+        // Keep enough shards for work-stealing, but avoid tiny shard overhead on high-core CPUs.
+        let desired_shards = if body_count >= 4_096 {
+            workers.saturating_mul(2)
+        } else {
+            workers.saturating_mul(4)
+        };
+        let adaptive = body_count.div_ceil(desired_shards).max(16);
+        adaptive.min(base)
+    }
+
     /// Pre-size internal buffers for the current body count so `rebuild_pairs_parallel` can remain
     /// allocation-free during the hot step loop.
     pub fn sync_for_body_count(&mut self, body_count: usize) {
@@ -87,7 +101,8 @@ impl BroadphasePipeline {
             self.sorted_dense
                 .reserve(body_count.saturating_sub(self.sorted_dense.capacity()));
         }
-        let shard_count = shard_count_for(body_count, self.config.chunk_size);
+        let chunk_size = self.effective_chunk_size(body_count);
+        let shard_count = shard_count_for(body_count, chunk_size);
         let target_shard_capacity = self
             .config
             .shard_pair_reserve
@@ -134,12 +149,12 @@ impl BroadphasePipeline {
         self.sorted_dense
             .sort_unstable_by(|left, right| aabbs[*left].min.x.total_cmp(&aabbs[*right].min.x));
 
-        let shard_count = shard_count_for(body_count, self.config.chunk_size);
+        let chunk_size = self.effective_chunk_size(body_count);
+        let shard_count = shard_count_for(body_count, chunk_size);
         self.stats.shard_count = shard_count;
         let dropped_pairs = AtomicUsize::new(0);
         let overflowed = AtomicBool::new(false);
         let sorted_dense = &self.sorted_dense;
-        let chunk_size = self.config.chunk_size;
 
         self.shard_pairs[..shard_count]
             .par_iter_mut()

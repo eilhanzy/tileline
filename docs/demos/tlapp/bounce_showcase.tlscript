@@ -1,29 +1,65 @@
 @export
 @parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=128, schedule="performance")
 @deterministic
-def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):
+def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool):
     set_fbx_full_render(true)
     set_ball_mesh_slot(2)
 
     if frame == 0:
         set_camera_pose(0.0, 12.0, 36.0, 0.0, 0.0, 0.0)
+        set_target_ball_count(8000)
+        set_initial_speed(0.35, 1.25)
+        set_scatter_interval(420)
+        set_scatter_strength(0.16)
     set_camera_move_speed(18.0)
     set_camera_look_sensitivity(0.0018)
-
-    let burst: int = 300
-    if frame < 45:
-        burst = 420
-    if live_balls > 3000:
-        burst = 120
-    if live_balls > 6000:
-        burst = 72
-    set_spawn_per_tick(burst)
-
-    if spawned_this_tick == 0 && live_balls > 1200:
-        set_linear_damping(0.014)
+    if live_balls > 7600:
+        set_gravity_ramp(frame, 0, 36000, -9.81, -16.20)
     else:
+        set_gravity_ramp(frame, 0, 22000, -9.81, -14.80)
+
+    if key_f_down:
+        set_contact_guard(1.0)
+        set_bounce(0.90, 0.94)
+        set_scatter_interval(1)
+        set_scatter_strength(1.0)
+        set_initial_speed(2.5, 11.0)
+        set_linear_damping(0.0)
+    elif live_balls < 1800:
+        set_contact_guard(0.78)
+        set_bounce(0.77, 0.82)
+        set_scatter_interval(420)
+        set_scatter_strength(0.16)
+        set_initial_speed(0.35, 1.25)
+        set_linear_damping(0.010)
+    elif live_balls < 4800:
+        set_contact_guard(0.88)
+        set_bounce(0.75, 0.80)
+        set_scatter_interval(320)
+        set_scatter_strength(0.18)
+        set_initial_speed(0.45, 1.55)
+        set_linear_damping(0.009)
+    else:
+        set_contact_guard(0.96)
+        set_bounce(0.72, 0.78)
+        set_scatter_interval(220)
+        set_scatter_strength(0.24)
+        set_initial_speed(0.65, 2.05)
         set_linear_damping(0.008)
 
-    if frame % 120 == 0:
-        set_ball_restitution(0.94)
-        set_wall_restitution(0.95)
+    let burst: int = 28
+    if frame > 180:
+        burst = 36
+    if frame > 420:
+        burst = 44
+    if frame > 900:
+        burst = 56
+    if live_balls > 2000:
+        burst = 52
+    if live_balls > 4000:
+        burst = 46
+    if live_balls > 6000:
+        burst = 38
+    if live_balls > 7600:
+        burst = 24
+    set_spawn_per_tick(burst)

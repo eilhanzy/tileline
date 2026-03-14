@@ -5,6 +5,7 @@
 //! lock contention or pointer chasing.
 
 use nalgebra::{UnitQuaternion, Vector3};
+use rayon::prelude::*;
 
 use crate::body::{Aabb, BodyDesc, BodyKind, RigidBody};
 use crate::handle::{BodyHandle, ColliderHandle};
@@ -259,6 +260,19 @@ impl BodyRegistry {
         true
     }
 
+    /// Teleport one body to a world-space position and refresh its broadphase bounds.
+    pub fn set_position(&mut self, body: BodyHandle, position: Vector3<f32>) -> bool {
+        let Some(dense) = self.dense_index(body) else {
+            return false;
+        };
+        self.positions[dense] = position;
+        self.recompute_world_aabb(dense);
+        if self.kinds[dense] != BodyKind::Static {
+            self.wake_dense(dense);
+        }
+        true
+    }
+
     /// Update linear damping for one body.
     pub fn set_linear_damping(&mut self, body: BodyHandle, damping: f32) -> bool {
         let Some(dense) = self.dense_index(body) else {
@@ -286,6 +300,62 @@ impl BodyRegistry {
     }
 
     pub fn integrate(&mut self, dt: f32, gravity: Vector3<f32>) {
+        if self.handles.len() < 768 || rayon::current_num_threads() <= 1 {
+            self.integrate_serial(dt, gravity);
+            return;
+        }
+
+        self.positions
+            .par_iter_mut()
+            .zip(self.linear_velocities.par_iter_mut())
+            .zip(self.accumulated_forces.par_iter_mut())
+            .zip(self.aabbs.par_iter_mut())
+            .zip(self.kinds.par_iter())
+            .zip(self.awake.par_iter())
+            .zip(self.inverse_masses.par_iter())
+            .zip(self.linear_dampings.par_iter())
+            .zip(self.local_bounds.par_iter())
+            .for_each(
+                |(
+                    (
+                        (
+                            (
+                                ((((position, linear_velocity), accumulated_force), aabb), kind),
+                                awake,
+                            ),
+                            inverse_mass,
+                        ),
+                        linear_damping,
+                    ),
+                    local_bounds,
+                )| {
+                    match *kind {
+                        BodyKind::Static => {
+                            *accumulated_force = Vector3::zeros();
+                            *aabb = local_bounds.translated(*position);
+                        }
+                        BodyKind::Kinematic => {
+                            *position += *linear_velocity * dt;
+                            *aabb = local_bounds.translated(*position);
+                        }
+                        BodyKind::Dynamic => {
+                            if !*awake {
+                                *accumulated_force = Vector3::zeros();
+                                return;
+                            }
+                            let acceleration = gravity + *accumulated_force * *inverse_mass;
+                            *linear_velocity += acceleration * dt;
+                            *linear_velocity *= 1.0 - linear_damping.clamp(0.0, 0.95);
+                            *position += *linear_velocity * dt;
+                            *accumulated_force = Vector3::zeros();
+                            *aabb = local_bounds.translated(*position);
+                        }
+                    }
+                },
+            );
+    }
+
+    fn integrate_serial(&mut self, dt: f32, gravity: Vector3<f32>) {
         for dense in 0..self.handles.len() {
             match self.kinds[dense] {
                 BodyKind::Static => {

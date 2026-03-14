@@ -20,12 +20,19 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 14] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 21] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_linear_damping",
+    "set_contact_guard",
+    "set_bounce",
+    "set_gravity",
+    "set_gravity_y",
+    "set_gravity_ramp",
     "set_ball_restitution",
     "set_wall_restitution",
+    "set_scatter_interval",
+    "set_scatter_strength",
     "set_initial_speed",
     "set_initial_speed_min",
     "set_initial_speed_max",
@@ -81,6 +88,7 @@ pub struct TlscriptShowcaseFrameInput {
     pub frame_index: u64,
     pub live_balls: usize,
     pub spawned_this_tick: usize,
+    pub key_f_down: bool,
 }
 
 /// Per-frame script evaluation output.
@@ -150,6 +158,12 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             "spawned_this_tick".to_string(),
             DemoValue::Int(input.spawned_this_tick as i64),
         );
+        state
+            .vars
+            .insert("key_f_down".to_string(), DemoValue::Bool(input.key_f_down));
+        state
+            .vars
+            .insert("key_f".to_string(), DemoValue::Bool(input.key_f_down));
 
         let Item::Function(entry_fn) = &self.module.items[self.entry_item_index];
         self.exec_block(&entry_fn.body, &mut state);
@@ -517,6 +531,56 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
             [v] => state.patch.linear_damping = Some(v.to_f64() as f32),
             _ => state.warn("set_linear_damping expects 1 arg"),
         },
+        "set_contact_guard" => match args {
+            [v] => state.patch.contact_guard = Some(v.to_f64() as f32),
+            _ => state.warn("set_contact_guard expects 1 arg"),
+        },
+        "set_bounce" => match args {
+            [ball, wall] => {
+                state.patch.ball_restitution = Some(ball.to_f64() as f32);
+                state.patch.wall_restitution = Some(wall.to_f64() as f32);
+            }
+            _ => state.warn("set_bounce expects 2 args"),
+        },
+        "set_gravity" => match args {
+            [x, y, z] => {
+                state.patch.gravity =
+                    Some([x.to_f64() as f32, y.to_f64() as f32, z.to_f64() as f32]);
+            }
+            _ => state.warn("set_gravity expects 3 args"),
+        },
+        "set_gravity_y" => match args {
+            [y] => {
+                let gy = y.to_f64() as f32;
+                let gx = state.patch.gravity.map(|g| g[0]).unwrap_or(0.0);
+                let gz = state.patch.gravity.map(|g| g[2]).unwrap_or(0.0);
+                state.patch.gravity = Some([gx, gy, gz]);
+            }
+            _ => state.warn("set_gravity_y expects 1 arg"),
+        },
+        "set_gravity_ramp" => match args {
+            [frame, start_frame, end_frame, start_y, end_y] => {
+                let frame = frame.to_f64();
+                let start_frame = start_frame.to_f64();
+                let end_frame = end_frame.to_f64();
+                let start_y = start_y.to_f64();
+                let end_y = end_y.to_f64();
+                let t = if (end_frame - start_frame).abs() <= f64::EPSILON {
+                    if frame >= end_frame {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    ((frame - start_frame) / (end_frame - start_frame)).clamp(0.0, 1.0)
+                };
+                let gy = (start_y + (end_y - start_y) * t) as f32;
+                let gx = state.patch.gravity.map(|g| g[0]).unwrap_or(0.0);
+                let gz = state.patch.gravity.map(|g| g[2]).unwrap_or(0.0);
+                state.patch.gravity = Some([gx, gy, gz]);
+            }
+            _ => state.warn("set_gravity_ramp expects 5 args"),
+        },
         "set_ball_restitution" => match args {
             [v] => state.patch.ball_restitution = Some(v.to_f64() as f32),
             _ => state.warn("set_ball_restitution expects 1 arg"),
@@ -524,6 +588,14 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
         "set_wall_restitution" => match args {
             [v] => state.patch.wall_restitution = Some(v.to_f64() as f32),
             _ => state.warn("set_wall_restitution expects 1 arg"),
+        },
+        "set_scatter_interval" => match args {
+            [v] => state.patch.scatter_interval_ticks = Some(v.to_i64().max(0) as u64),
+            _ => state.warn("set_scatter_interval expects 1 arg"),
+        },
+        "set_scatter_strength" => match args {
+            [v] => state.patch.scatter_strength = Some(v.to_f64() as f32),
+            _ => state.warn("set_scatter_strength expects 1 arg"),
         },
         "set_initial_speed" => match args {
             [min_v, max_v] => {
@@ -749,6 +821,7 @@ mod tests {
             frame_index: 1,
             live_balls: 300,
             spawned_this_tick: 100,
+            key_f_down: false,
         });
         assert_eq!(frame_low.patch.spawn_per_tick, Some(640));
         assert!(frame_low.patch.linear_damping.unwrap_or(0.0) > 0.0);
@@ -758,6 +831,7 @@ mod tests {
             frame_index: 2,
             live_balls: 1_200,
             spawned_this_tick: 40,
+            key_f_down: false,
         });
         assert_eq!(frame_high.patch.spawn_per_tick, Some(64));
     }
@@ -788,6 +862,7 @@ mod tests {
             frame_index: 0,
             live_balls: 0,
             spawned_this_tick: 0,
+            key_f_down: false,
         });
         assert_eq!(out.force_full_fbx_sphere, Some(true));
     }
@@ -810,12 +885,90 @@ mod tests {
             frame_index: 0,
             live_balls: 0,
             spawned_this_tick: 0,
+            key_f_down: false,
         });
         assert_eq!(out.patch.ball_mesh_slot, Some(3));
         assert_eq!(out.patch.container_mesh_slot, Some(1));
         assert!(out.camera_move_speed.unwrap_or(0.0) > 0.0);
         assert!(out.camera_look_sensitivity.unwrap_or(0.0) > 0.0);
         assert!(out.camera_pose.is_some());
+    }
+
+    #[test]
+    fn supports_scatter_and_target_controls() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_target_ball_count(8000)\n",
+            "    set_initial_speed(0.35, 1.25)\n",
+            "    set_scatter_interval(420)\n",
+            "    set_scatter_strength(0.16)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.patch.target_ball_count, Some(8_000));
+        assert_eq!(out.patch.scatter_interval_ticks, Some(420));
+        assert!((out.patch.scatter_strength.unwrap_or(0.0) - 0.16).abs() < 1e-6);
+        assert!((out.patch.initial_speed_min.unwrap_or(0.0) - 0.35).abs() < 1e-6);
+        assert!((out.patch.initial_speed_max.unwrap_or(0.0) - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn supports_gravity_controls() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_gravity(0.0, -11.0, 0.0)\n",
+            "    set_gravity_ramp(frame, 0, 200, -11.0, -13.5)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out_early = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 10,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        let early = out_early.patch.gravity.expect("gravity");
+        assert!(early[1] < -11.0 && early[1] > -13.5);
+
+        let out_late = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 220,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out_late.patch.gravity, Some([0.0, -13.5, 0.0]));
+    }
+
+    #[test]
+    fn supports_contact_guard_and_bounce_controls() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_contact_guard(0.93)\n",
+            "    set_bounce(0.75, 0.81)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert!((out.patch.contact_guard.unwrap_or(0.0) - 0.93).abs() < 1e-6);
+        assert!((out.patch.ball_restitution.unwrap_or(0.0) - 0.75).abs() < 1e-6);
+        assert!((out.patch.wall_restitution.unwrap_or(0.0) - 0.81).abs() < 1e-6);
     }
 
     #[test]

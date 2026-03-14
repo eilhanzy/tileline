@@ -3,7 +3,10 @@
 //! This stage consumes broadphase body pairs, queries the attached primary collider shapes, and
 //! emits a reusable manifold buffer for the solver.
 
+use std::collections::HashMap;
+
 use nalgebra::Vector3;
+use rayon::prelude::*;
 
 use crate::body::{
     Aabb, ColliderMaterial, ColliderShape, ContactId, ContactManifold, MaterialCombineRule,
@@ -56,6 +59,7 @@ pub struct NarrowphasePipeline {
     manifolds: Vec<ContactManifold>,
     previous_states: Vec<PersistentManifoldState>,
     next_states: Vec<PersistentManifoldState>,
+    persisted_lookup: HashMap<ContactId, u16>,
     stats: NarrowphaseStats,
 }
 
@@ -65,6 +69,7 @@ impl NarrowphasePipeline {
             manifolds: Vec::new(),
             previous_states: Vec::new(),
             next_states: Vec::new(),
+            persisted_lookup: HashMap::new(),
             config,
             stats: NarrowphaseStats::default(),
         }
@@ -100,22 +105,27 @@ impl NarrowphasePipeline {
             self.next_states
                 .reserve(target.saturating_sub(self.next_states.capacity()));
         }
+        if self.persisted_lookup.capacity() < target {
+            self.persisted_lookup
+                .reserve(target.saturating_sub(self.persisted_lookup.capacity()));
+        }
     }
 
     pub fn rebuild_manifolds<F>(
         &mut self,
         bodies: &BodyRegistry,
         candidate_pairs: &[(BodyHandle, BodyHandle)],
-        mut collider_lookup: F,
+        collider_lookup: F,
     ) -> &[ContactManifold]
     where
-        F: FnMut(
-            BodyHandle,
-        ) -> Option<(
-            crate::handle::ColliderHandle,
-            ColliderShape,
-            ColliderMaterial,
-        )>,
+        F: Fn(
+                BodyHandle,
+            ) -> Option<(
+                crate::handle::ColliderHandle,
+                ColliderShape,
+                ColliderMaterial,
+                u32,
+            )> + Sync,
     {
         self.stats = NarrowphaseStats {
             candidate_pairs: candidate_pairs.len(),
@@ -124,54 +134,45 @@ impl NarrowphasePipeline {
         self.manifolds.clear();
         self.next_states.clear();
         self.sync_for_pair_capacity(candidate_pairs.len());
+        self.persisted_lookup.clear();
+        for state in &self.previous_states {
+            self.persisted_lookup
+                .insert(state.contact_id, state.persisted_frames);
+        }
+        let persisted_lookup = &self.persisted_lookup;
 
-        for &(body_a, body_b) in candidate_pairs {
-            let Some((collider_a, shape_a, material_a)) = collider_lookup(body_a) else {
-                self.stats.culled_pairs += 1;
-                continue;
-            };
-            let Some((collider_b, shape_b, material_b)) = collider_lookup(body_b) else {
-                self.stats.culled_pairs += 1;
-                continue;
-            };
-            let Some(center_a) = bodies.position_for(body_a) else {
-                self.stats.culled_pairs += 1;
-                continue;
-            };
-            let Some(center_b) = bodies.position_for(body_b) else {
-                self.stats.culled_pairs += 1;
-                continue;
-            };
-            let Some(aabb_a) = bodies.aabb_for(body_a) else {
-                self.stats.culled_pairs += 1;
-                continue;
-            };
-            let Some(aabb_b) = bodies.aabb_for(body_b) else {
-                self.stats.culled_pairs += 1;
-                continue;
-            };
-            let Some((point, normal, penetration)) =
-                collide_shapes(center_a, &shape_a, aabb_a, center_b, &shape_b, aabb_b)
-            else {
-                self.stats.culled_pairs += 1;
-                continue;
-            };
-            let feature_tag = feature_tag_for_contact(&shape_a, &shape_b, normal);
-            let contact_id = build_contact_id(collider_a, collider_b, feature_tag);
-            let persisted_frames = self
-                .lookup_persistent_state(contact_id)
-                .map(|state| state.persisted_frames.saturating_add(1))
-                .unwrap_or(1);
-            let restitution = self
-                .config
-                .restitution_combine_rule
-                .combine(material_a.restitution, material_b.restitution);
-            let friction = self
-                .config
-                .friction_combine_rule
-                .combine(material_a.friction, material_b.friction);
-            if self.manifolds.len() < self.manifolds.capacity() {
-                self.manifolds.push(ContactManifold {
+        let produced = candidate_pairs
+            .par_iter()
+            .filter_map(|&(body_a, body_b)| {
+                let (collider_a, shape_a, material_a, filter_a) = collider_lookup(body_a)?;
+                let (collider_b, shape_b, material_b, filter_b) = collider_lookup(body_b)?;
+                if !collision_filter_allows(filter_a, filter_b) {
+                    return None;
+                }
+                let center_a = bodies.position_for(body_a)?;
+                let center_b = bodies.position_for(body_b)?;
+                let aabb_a = bodies.aabb_for(body_a)?;
+                let aabb_b = bodies.aabb_for(body_b)?;
+                let (point, normal, penetration) =
+                    collide_shapes(center_a, &shape_a, aabb_a, center_b, &shape_b, aabb_b)?;
+
+                let feature_tag = feature_tag_for_contact(&shape_a, &shape_b, normal);
+                let contact_id = build_contact_id(collider_a, collider_b, feature_tag);
+                let persisted_frames = persisted_lookup
+                    .get(&contact_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let restitution = self
+                    .config
+                    .restitution_combine_rule
+                    .combine(material_a.restitution, material_b.restitution);
+                let friction = self
+                    .config
+                    .friction_combine_rule
+                    .combine(material_a.friction, material_b.friction);
+
+                Some(ContactManifold {
                     contact_id,
                     collider_a,
                     collider_b,
@@ -183,35 +184,63 @@ impl NarrowphasePipeline {
                     persisted_frames,
                     restitution,
                     friction,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let produced_count = produced.len();
+        let capacity = self.manifolds.capacity();
+        let keep_count = produced_count.min(capacity);
+        self.manifolds.extend(produced.into_iter().take(keep_count));
+
+        self.stats.culled_pairs = candidate_pairs.len().saturating_sub(produced_count);
+        if produced_count > capacity {
+            self.stats.overflowed = true;
+            self.stats.culled_pairs = self
+                .stats
+                .culled_pairs
+                .saturating_add(produced_count.saturating_sub(capacity));
+        }
+
+        for manifold in &self.manifolds {
+            if manifold.persisted_frames > 1 {
+                self.stats.persistent_manifolds += 1;
+            }
+            if self.next_states.len() < self.next_states.capacity() {
+                self.next_states.push(PersistentManifoldState {
+                    contact_id: manifold.contact_id,
+                    persisted_frames: manifold.persisted_frames,
                 });
-                if persisted_frames > 1 {
-                    self.stats.persistent_manifolds += 1;
-                }
-                if self.next_states.len() < self.next_states.capacity() {
-                    self.next_states.push(PersistentManifoldState {
-                        contact_id,
-                        persisted_frames,
-                    });
-                } else {
-                    self.stats.overflowed = true;
-                }
             } else {
                 self.stats.overflowed = true;
-                self.stats.culled_pairs += 1;
+                break;
             }
         }
 
-        self.stats.manifolds = self.manifolds.len();
+        self.stats.manifolds = keep_count;
         std::mem::swap(&mut self.previous_states, &mut self.next_states);
         &self.manifolds
     }
+}
 
-    fn lookup_persistent_state(&self, contact_id: ContactId) -> Option<PersistentManifoldState> {
-        self.previous_states
-            .iter()
-            .find(|state| state.contact_id == contact_id)
-            .copied()
+#[inline]
+fn collision_filter_allows(tag_a: u32, tag_b: u32) -> bool {
+    let (group_a, mask_a) = decode_collision_filter(tag_a);
+    let (group_b, mask_b) = decode_collision_filter(tag_b);
+    (mask_a & group_b) != 0 && (mask_b & group_a) != 0
+}
+
+#[inline]
+fn decode_collision_filter(tag: u32) -> (u16, u16) {
+    // Backward-compatible fallback: tag=0 means "default group, collide with everything".
+    if tag == 0 {
+        return (0x0001, u16::MAX);
     }
+    let group = (tag & 0xFFFF) as u16;
+    let mask = ((tag >> 16) & 0xFFFF) as u16;
+    let group = if group == 0 { 0x0001 } else { group };
+    let mask = if mask == 0 { u16::MAX } else { mask };
+    (group, mask)
 }
 
 fn collide_shapes(
@@ -273,23 +302,66 @@ fn sphere_aabb(
     let delta = sphere_center - clamped;
     let distance_sq = delta.norm_squared();
     let radius = radius.max(0.0);
-    if distance_sq > radius * radius {
-        return None;
-    }
-    let distance = distance_sq.sqrt();
-    let normal = if distance > 1e-6 {
-        delta / distance
-    } else {
-        let box_center = box_aabb.center();
-        let dir = sphere_center - box_center;
-        if dir.norm_squared() > 1e-6 {
-            dir.normalize()
-        } else {
-            Vector3::new(1.0, 0.0, 0.0)
+    if distance_sq > 1e-12 {
+        let distance = distance_sq.sqrt();
+        if distance > radius {
+            return None;
         }
+        // Normal points from sphere -> box (A -> B convention for solver).
+        let normal = (clamped - sphere_center) / distance;
+        let penetration = radius - distance;
+        let point = clamped;
+        return Some((point, normal, penetration));
+    }
+
+    // Sphere center is inside the box volume; resolve against the closest face.
+    let dist_to_min = sphere_center - box_aabb.min;
+    let dist_to_max = box_aabb.max - sphere_center;
+
+    let mut axis = 0usize;
+    let mut use_max_face = dist_to_max.x < dist_to_min.x;
+    let mut min_face_distance = if use_max_face {
+        dist_to_max.x
+    } else {
+        dist_to_min.x
     };
-    let penetration = radius - distance;
-    let point = clamped;
+
+    let y_face_uses_max = dist_to_max.y < dist_to_min.y;
+    let y_face_distance = if y_face_uses_max {
+        dist_to_max.y
+    } else {
+        dist_to_min.y
+    };
+    if y_face_distance < min_face_distance {
+        axis = 1;
+        use_max_face = y_face_uses_max;
+        min_face_distance = y_face_distance;
+    }
+
+    let z_face_uses_max = dist_to_max.z < dist_to_min.z;
+    let z_face_distance = if z_face_uses_max {
+        dist_to_max.z
+    } else {
+        dist_to_min.z
+    };
+    if z_face_distance < min_face_distance {
+        axis = 2;
+        use_max_face = z_face_uses_max;
+        min_face_distance = z_face_distance;
+    }
+
+    let mut normal = Vector3::zeros();
+    normal[axis] = if use_max_face { 1.0 } else { -1.0 };
+
+    let mut point = sphere_center;
+    point[axis] = if use_max_face {
+        box_aabb.max[axis]
+    } else {
+        box_aabb.min[axis]
+    };
+
+    // Distance to closest face + radius required to exit overlap.
+    let penetration = radius + min_face_distance.max(0.0);
     Some((point, normal, penetration))
 }
 
@@ -369,7 +441,7 @@ mod tests {
     use nalgebra::Vector3;
 
     use super::*;
-    use crate::body::{BodyDesc, ColliderMaterial, ColliderShape};
+    use crate::body::{Aabb, BodyDesc, ColliderMaterial, ColliderShape};
     use crate::handle::ColliderHandle;
 
     #[test]
@@ -392,6 +464,7 @@ mod tests {
                     half_extents: Vector3::new(0.5, 0.5, 0.5),
                 },
                 ColliderMaterial::default(),
+                0,
             ))
         });
         assert_eq!(manifolds.len(), 1);
@@ -421,6 +494,7 @@ mod tests {
                         half_extents: Vector3::new(0.5, 0.5, 0.5),
                     },
                     ColliderMaterial::default(),
+                    0,
                 ))
             });
             assert_eq!(manifolds[0].persisted_frames, 1);
@@ -434,6 +508,7 @@ mod tests {
                     half_extents: Vector3::new(0.5, 0.5, 0.5),
                 },
                 ColliderMaterial::default(),
+                0,
             ))
         });
         assert_eq!(manifolds[0].contact_id, first_id);
@@ -473,9 +548,66 @@ mod tests {
                     half_extents: Vector3::new(0.5, 0.5, 0.5),
                 },
                 material,
+                0,
             ))
         });
         assert!((manifolds[0].restitution - 0.8).abs() < 1e-6);
         assert!((manifolds[0].friction - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn collision_layer_filter_can_reject_pair() {
+        let mut bodies = BodyRegistry::new();
+        let a = bodies.spawn(BodyDesc::default());
+        let b = bodies.spawn(BodyDesc {
+            position: Vector3::new(0.2, 0.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let candidate_pairs = vec![(a, b)];
+        let mut narrowphase = NarrowphasePipeline::new(NarrowphaseConfig::default());
+
+        let manifolds = narrowphase.rebuild_manifolds(&bodies, &candidate_pairs, |body| {
+            // group=1 mask=1 for a, group=2 mask=2 for b -> no overlap in masks.
+            let filter = if body == a {
+                (0x0001_u32) | ((0x0001_u32) << 16)
+            } else {
+                (0x0002_u32) | ((0x0002_u32) << 16)
+            };
+            Some((
+                ColliderHandle::new(body.index() as u16, body.generation()),
+                ColliderShape::Aabb {
+                    half_extents: Vector3::new(0.5, 0.5, 0.5),
+                },
+                ColliderMaterial::default(),
+                filter,
+            ))
+        });
+        assert!(manifolds.is_empty());
+    }
+
+    #[test]
+    fn sphere_aabb_normal_points_from_sphere_to_box_for_outside_contact() {
+        let sphere_center = Vector3::new(1.15, 0.0, 0.0);
+        let radius = 0.25;
+        let box_aabb = Aabb::from_center_half_extents(Vector3::zeros(), Vector3::repeat(1.0));
+        let (_point, normal, penetration) =
+            sphere_aabb(sphere_center, radius, box_aabb).expect("contact");
+
+        assert!(penetration > 0.0);
+        // Sphere is on +X side of the box, so sphere -> box normal should be -X.
+        assert!(normal.x < -0.9);
+    }
+
+    #[test]
+    fn sphere_aabb_inside_chooses_nearest_face_and_positive_penetration() {
+        let sphere_center = Vector3::new(0.92, 0.1, 0.0);
+        let radius = 0.20;
+        let box_aabb = Aabb::from_center_half_extents(Vector3::zeros(), Vector3::repeat(1.0));
+        let (_point, normal, penetration) =
+            sphere_aabb(sphere_center, radius, box_aabb).expect("contact");
+
+        // Nearest face is +X, so sphere -> box normal should be +X.
+        assert!(normal.x > 0.9);
+        assert!(penetration > radius);
     }
 }

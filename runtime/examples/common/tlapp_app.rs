@@ -3,10 +3,13 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use nalgebra::Vector3;
-use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
+use paradoxpe::{
+    BroadphaseConfig, ContactSolverConfig, NarrowphaseConfig, PhysicsWorld, PhysicsWorldConfig,
+};
 use runtime::{
     compile_tlscript_showcase, BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler,
     RenderSyncMode, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
@@ -21,7 +24,16 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
+const AUTO_LOW_POLY_BALL_SLOT: u8 = 250;
+const DEFAULT_FBX_BALL_SLOT: u8 = 2;
+
 pub fn run_from_env() -> Result<(), Box<dyn Error>> {
+    configure_parallel_runtime();
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[perf warning] TLApp is running in debug mode. Use `--release` for meaningful FPS/core utilization."
+        );
+    }
     let options = CliOptions::parse_from_env()?;
     let event_loop = EventLoop::new()?;
     let mut app = TlApp::new(options);
@@ -29,11 +41,30 @@ pub fn run_from_env() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn configure_parallel_runtime() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|idx| format!("tileline-mps-{idx}"))
+            .build_global()
+        {
+            Ok(()) => eprintln!("[mps] rayon global thread pool configured: {threads} threads"),
+            Err(err) => eprintln!("[mps] rayon global thread pool unchanged: {err}"),
+        }
+    });
+}
+
 #[derive(Debug, Clone)]
 struct CliOptions {
     resolution: PhysicalSize<u32>,
     vsync: VsyncMode,
     fps_cap: Option<f32>,
+    tick_profile: TickProfile,
     fps_report_interval: Duration,
     script_path: PathBuf,
     sprite_path: PathBuf,
@@ -45,6 +76,7 @@ impl Default for CliOptions {
             resolution: PhysicalSize::new(1280, 720),
             vsync: VsyncMode::Auto,
             fps_cap: Some(60.0),
+            tick_profile: TickProfile::Max,
             fps_report_interval: Duration::from_secs_f32(1.0),
             script_path: PathBuf::from("docs/demos/tlapp/bounce_showcase.tlscript"),
             sprite_path: PathBuf::from("docs/demos/tlapp/bounce_hud.tlsprite"),
@@ -74,6 +106,10 @@ impl CliOptions {
                 "--fps-cap" => {
                     let value = next_arg(&mut args, "--fps-cap")?;
                     options.fps_cap = parse_fps_cap(&value)?;
+                }
+                "--tick-profile" => {
+                    let value = next_arg(&mut args, "--tick-profile")?;
+                    options.tick_profile = TickProfile::parse(&value)?;
                 }
                 "--fps-report" => {
                     let value = next_arg(&mut args, "--fps-report")?;
@@ -111,6 +147,24 @@ enum VsyncMode {
     Auto,
     On,
     Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickProfile {
+    Balanced,
+    Max,
+}
+
+impl TickProfile {
+    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        match value.to_ascii_lowercase().as_str() {
+            "balanced" => Ok(Self::Balanced),
+            "max" | "aggressive" => Ok(Self::Max),
+            _ => {
+                Err(format!("invalid --tick-profile value: {value} (expected balanced|max)").into())
+            }
+        }
+    }
 }
 
 impl VsyncMode {
@@ -169,6 +223,11 @@ fn parse_fps_cap(value: &str) -> Result<Option<f32>, Box<dyn Error>> {
     Ok(Some(fps))
 }
 
+fn bootstrap_uncapped_fps_hint(logical_threads: usize) -> f32 {
+    // Start from a conservative-but-fast target and let runtime sampling retune to hardware limit.
+    (170.0 + logical_threads as f32 * 7.5).clamp(170.0, 420.0)
+}
+
 fn print_usage() {
     println!("Tileline TLApp Runtime Demo");
     println!("Usage: cargo run -p runtime --example tlapp -- [options]");
@@ -176,6 +235,7 @@ fn print_usage() {
     println!("  --resolution <WxH>        Window size (default: 1280x720)");
     println!("  --vsync auto|on|off       Present mode preference (default: auto)");
     println!("  --fps-cap <N|off>         Frame cap target (default: 60)");
+    println!("  --tick-profile <mode>     Physics tick planner: balanced|max (default: max)");
     println!("  --fps-report <sec>        CLI FPS report cadence (default: 1.0)");
     println!(
         "  --script <path>           .tlscript path (default: docs/demos/tlapp/bounce_showcase.tlscript)"
@@ -305,11 +365,19 @@ struct TlAppRuntime {
     script_program: TlscriptShowcaseProgram<'static>,
     script_last_spawned: usize,
     script_frame_index: u64,
+    script_key_f_down: bool,
     tick_policy: TickRatePolicy,
+    tick_profile: TickProfile,
     tick_hz: f32,
+    fps_limit_hint: f32,
+    uncapped_dynamic_fps_hint: bool,
+    mps_logical_threads: usize,
     max_substeps: u32,
     last_substeps: u32,
     tick_retune_timer: f32,
+    adaptive_ball_render_limit: Option<usize>,
+    adaptive_live_ball_budget: Option<usize>,
+    adaptive_low_poly_override: bool,
     frame_started_at: Instant,
     frame_cap_interval: Option<Duration>,
     next_redraw_at: Instant,
@@ -379,31 +447,104 @@ impl TlAppRuntime {
             .program
             .expect("showcase script should compile without errors");
 
+        let logical_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        let physical_threads = num_cpus::get_physical().max(1);
+        let uncapped_dynamic_fps_hint =
+            options.fps_cap.is_none() && matches!(options.vsync, VsyncMode::Off);
+        let display_refresh_hint_hz = window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+            .map(|mhz| (mhz as f32 / 1_000.0).max(24.0));
+        let initial_fps_hint = match (options.fps_cap, options.vsync) {
+            (Some(fps), _) => fps.max(24.0),
+            (None, VsyncMode::Off) => bootstrap_uncapped_fps_hint(logical_threads),
+            (None, _) => display_refresh_hint_hz.unwrap_or(60.0),
+        };
         let tick_policy = TickRatePolicy {
-            min_tick_hz: 120.0,
-            max_tick_hz: 960.0,
-            ticks_per_render_frame: 4.0,
-            default_tick_hz: 240.0,
+            min_tick_hz: 30.0,
+            max_tick_hz: (480.0 + logical_threads as f32 * 40.0).clamp(480.0, 1_440.0),
+            ticks_per_render_frame: 2.6,
+            default_tick_hz: (initial_fps_hint * 2.4).clamp(180.0, 420.0),
         };
         let render_mode = match options.fps_cap {
             Some(fps) => RenderSyncMode::FpsCap { fps },
-            None => RenderSyncMode::Uncapped,
+            None => {
+                if uncapped_dynamic_fps_hint {
+                    RenderSyncMode::Uncapped
+                } else {
+                    RenderSyncMode::Vsync {
+                        display_hz: display_refresh_hint_hz.unwrap_or(60.0),
+                    }
+                }
+            }
         };
-        let fixed_dt = tick_policy.resolve_fixed_dt_seconds(render_mode, options.fps_cap);
-        let max_substeps = 20;
+        let fixed_dt = tick_policy.resolve_fixed_dt_seconds(render_mode, Some(initial_fps_hint));
+        let fps_limit_hint = initial_fps_hint;
+        let thread_scale = (logical_threads as f32 / 8.0).clamp(0.75, 4.0);
+        // Keep shards coarse enough to avoid scheduler overhead on high-core systems.
+        let broadphase_chunk = logical_threads.saturating_mul(16).clamp(128, 512);
+        let max_pairs = (96_000.0 * thread_scale).round() as usize;
+        let max_manifolds = max_pairs;
+        let solver_iterations = if logical_threads >= 20 { 5 } else { 4 };
+        let tuned_max_substeps = (12 + logical_threads / 4).clamp(10, 24) as u32;
         let world = PhysicsWorld::new(PhysicsWorldConfig {
+            // Keep Earth-like gravity explicit for showcase consistency across presets.
+            gravity: Vector3::new(0.0, -9.81, 0.0),
             fixed_dt,
-            max_substeps,
+            max_substeps: tuned_max_substeps,
+            broadphase: BroadphaseConfig {
+                chunk_size: broadphase_chunk,
+                max_candidate_pairs: max_pairs,
+                shard_pair_reserve: 1_536,
+            },
+            narrowphase: NarrowphaseConfig {
+                max_manifolds,
+                ..NarrowphaseConfig::default()
+            },
+            solver: ContactSolverConfig {
+                iterations: solver_iterations,
+                baumgarte: 0.32,
+                penetration_slop: 0.0015,
+                parallel_contact_push_strength: 0.28,
+                parallel_contact_push_threshold: 256,
+                hard_position_projection_strength: 0.95,
+                hard_position_projection_threshold: 128,
+                max_projection_per_contact: 0.10,
+                ..ContactSolverConfig::default()
+            },
             ..PhysicsWorldConfig::default()
         });
         let scene = BounceTankSceneController::new(BounceTankSceneConfig {
             target_ball_count: 8_000,
-            spawn_per_tick: 280,
+            // Script can still tune this, but runtime starts from a progressive default.
+            spawn_per_tick: (96.0 * thread_scale).round() as usize,
+            ball_restitution: 0.74,
+            wall_restitution: 0.78,
+            linear_damping: 0.012,
+            initial_speed_min: 0.35,
+            initial_speed_max: 1.25,
             ..BounceTankSceneConfig::default()
         });
+        eprintln!(
+            "[mps] cpu profile logical={} physical={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={}",
+            logical_threads,
+            physical_threads,
+            thread_scale,
+            broadphase_chunk,
+            max_pairs,
+            solver_iterations,
+            tuned_max_substeps
+        );
 
         let mut renderer =
             WgpuSceneRenderer::new(&device, &queue, config.format, size.width, size.height);
+        // Always keep a deterministic high-quality FBX-equivalent mesh in slot 2 so script
+        // `set_ball_mesh_slot(2)` stays stable even when tlsprite binding fails.
+        renderer.bind_builtin_sphere_mesh_slot(&device, DEFAULT_FBX_BALL_SLOT, true);
+        renderer.bind_builtin_sphere_mesh_slot(&device, AUTO_LOW_POLY_BALL_SLOT, false);
         let camera = FreeCameraController::default();
         let (eye, target) = camera.eye_target();
         renderer.set_camera_view(&queue, size.width.max(1), size.height.max(1), eye, target);
@@ -459,11 +600,19 @@ impl TlAppRuntime {
             script_program,
             script_last_spawned: 0,
             script_frame_index: 0,
+            script_key_f_down: false,
             tick_policy,
+            tick_profile: options.tick_profile,
             tick_hz: 1.0 / fixed_dt.max(1e-6),
-            max_substeps,
+            fps_limit_hint,
+            uncapped_dynamic_fps_hint,
+            mps_logical_threads: logical_threads,
+            max_substeps: tuned_max_substeps,
             last_substeps: 0,
             tick_retune_timer: 0.0,
+            adaptive_ball_render_limit: None,
+            adaptive_live_ball_budget: None,
+            adaptive_low_poly_override: false,
             frame_started_at: now,
             frame_cap_interval,
             next_redraw_at: now,
@@ -503,6 +652,10 @@ impl TlAppRuntime {
 
     fn on_keyboard_input(&mut self, event: &KeyEvent) {
         self.camera.on_keyboard_input(event);
+        let pressed = event.state == ElementState::Pressed;
+        if let PhysicalKey::Code(KeyCode::KeyF) = event.physical_key {
+            self.script_key_f_down = pressed;
+        }
     }
 
     fn on_mouse_button(&mut self, state: ElementState, button: MouseButton) {
@@ -520,12 +673,15 @@ impl TlAppRuntime {
 
     fn render_frame(&mut self) -> Result<(), Box<dyn Error>> {
         let frame_begin = Instant::now();
-        let dt = (frame_begin - self.frame_started_at)
-            .as_secs_f32()
-            .clamp(1.0 / 500.0, 1.0 / 20.0);
+        let raw_dt = (frame_begin - self.frame_started_at).as_secs_f32();
+        // Keep simulation time real-time (decoupled from render FPS) and only guard against large
+        // stalls (alt-tab/debugger) so physics does not enter slow-motion at low FPS.
+        let sim_dt = raw_dt.clamp(1.0 / 1_000.0, 0.25);
+        // Camera/input smoothing can use a separate clamped delta.
+        let view_dt = raw_dt.clamp(1.0 / 500.0, 1.0 / 24.0);
         self.frame_started_at = frame_begin;
 
-        self.camera.update(dt);
+        self.camera.update(view_dt);
         let (eye, target) = self.camera.eye_target();
         self.renderer.set_camera_view(
             &self.queue,
@@ -564,6 +720,7 @@ impl TlAppRuntime {
                 frame_index: self.script_frame_index,
                 live_balls: self.scene.live_ball_count(),
                 spawned_this_tick: self.script_last_spawned,
+                key_f_down: self.script_key_f_down,
             });
 
         if let Some(speed) = frame_eval.camera_move_speed {
@@ -585,36 +742,107 @@ impl TlAppRuntime {
         let force_full_fbx = frame_eval
             .force_full_fbx_sphere
             .unwrap_or(self.force_full_fbx_from_sprite);
-        self.renderer.set_force_full_fbx_sphere(force_full_fbx);
-
         let mut runtime_patch = frame_eval.patch;
-        if self.last_substeps + 1 >= self.max_substeps && live_balls > 2_000 {
+        let mut load_plan = choose_runtime_load_plan(
+            self.fps_tracker.ema_fps(),
+            raw_dt * 1_000.0,
+            live_balls,
+            self.last_substeps,
+            self.max_substeps,
+            parallel_ready,
+            self.mps_logical_threads,
+        );
+        if matches!(self.tick_profile, TickProfile::Max) {
+            load_plan.tick_scale = load_plan.tick_scale.max(0.90);
+            let profile_cap = (10_u32 + (self.mps_logical_threads as u32 / 6)).clamp(10, 20);
+            load_plan.max_substeps = load_plan.max_substeps.clamp(10, profile_cap);
+        }
+        self.adaptive_ball_render_limit = load_plan.visible_ball_limit;
+        self.adaptive_live_ball_budget = load_plan.live_ball_budget;
+        self.adaptive_low_poly_override = load_plan.force_low_poly_ball_mesh;
+
+        if let Some(cap) = self.adaptive_live_ball_budget {
+            let target = runtime_patch
+                .target_ball_count
+                .unwrap_or(self.scene.config().target_ball_count)
+                .min(cap);
+            runtime_patch.target_ball_count = Some(target);
+        }
+        runtime_patch.spawn_per_tick = Some(
+            runtime_patch
+                .spawn_per_tick
+                .unwrap_or(load_plan.spawn_per_tick_cap)
+                .min(load_plan.spawn_per_tick_cap),
+        );
+
+        if self.last_substeps + 1 >= self.max_substeps && live_balls > 1_500 {
             runtime_patch.spawn_per_tick =
                 Some(runtime_patch.spawn_per_tick.unwrap_or(96).clamp(32, 96));
             runtime_patch.linear_damping =
                 Some(runtime_patch.linear_damping.unwrap_or(0.016).max(0.018));
         }
-        if !parallel_ready && live_balls > 4_000 {
+        if !parallel_ready && live_balls > 2_500 {
             runtime_patch.spawn_per_tick =
                 Some(runtime_patch.spawn_per_tick.unwrap_or(64).clamp(24, 64));
             runtime_patch.linear_damping =
                 Some(runtime_patch.linear_damping.unwrap_or(0.018).max(0.020));
         }
+        if self.adaptive_low_poly_override {
+            // Preserve FBX silhouette; shed load via body/render budgets instead of slot swapping.
+            runtime_patch.ball_mesh_slot = Some(DEFAULT_FBX_BALL_SLOT);
+        }
+        self.renderer.set_force_full_fbx_sphere(force_full_fbx);
 
-        self.tick_retune_timer -= dt;
+        if let Some(cap) = self.adaptive_live_ball_budget {
+            let _ = self.scene.enforce_live_ball_budget(&mut self.world, cap);
+        }
+
+        self.tick_retune_timer -= sim_dt;
         if self.tick_retune_timer <= 0.0 {
-            let desired_hz = choose_aggressive_tick_hz(
+            self.max_substeps = load_plan.max_substeps.max(2);
+            let mut desired_hz = choose_aggressive_tick_hz(
                 self.tick_policy,
+                self.tick_profile,
                 self.fps_tracker.ema_fps().max(1.0),
                 parallel_ready,
                 self.last_substeps,
                 self.max_substeps,
                 live_balls,
+                load_plan.tick_scale,
+                self.fps_limit_hint,
+                self.mps_logical_threads,
             );
-            self.tick_hz = smooth_tick_hz(self.tick_hz, desired_hz, 0.35);
+            // Avoid fixed-step overload: if tick is too high for current FPS and max_substeps,
+            // simulation falls behind (slow-motion). Clamp to catch-up-safe frequency.
+            let catch_up_hz =
+                (self.fps_tracker.ema_fps().max(1.0) * self.max_substeps as f32 * 0.88)
+                    .clamp(24.0, 900.0);
+            desired_hz = desired_hz.min(catch_up_hz);
+            let ramp_up = desired_hz > self.tick_hz;
+            let smoothing = match (self.tick_profile, ramp_up) {
+                (TickProfile::Max, true) => 0.86,
+                (TickProfile::Max, false) => 0.55,
+                (_, true) => 0.72,
+                (_, false) => 0.42,
+            };
+            self.tick_hz = smooth_tick_hz(self.tick_hz, desired_hz, smoothing);
+            let hard_floor = match self.tick_profile {
+                TickProfile::Balanced => 35.0,
+                TickProfile::Max => {
+                    let ema_floor = (self.fps_tracker.ema_fps().max(1.0) * 6.0).clamp(45.0, 180.0);
+                    let cap_floor = if self.uncapped_dynamic_fps_hint {
+                        self.fps_limit_hint * 0.45
+                    } else {
+                        self.fps_limit_hint * 0.60
+                    };
+                    ema_floor.min(cap_floor.clamp(45.0, 220.0))
+                }
+            };
+            let floor_hz = hard_floor.min(catch_up_hz * 0.90).max(24.0);
+            self.tick_hz = self.tick_hz.max(floor_hz).min(catch_up_hz);
             self.world
-                .set_timestep(1.0 / self.tick_hz.max(60.0), self.max_substeps);
-            self.tick_retune_timer = 0.2;
+                .set_timestep(1.0 / self.tick_hz, self.max_substeps);
+            self.tick_retune_timer = if ramp_up { 0.08 } else { 0.16 };
         }
 
         let _patch_metrics = self
@@ -624,16 +852,20 @@ impl TlAppRuntime {
         self.script_last_spawned = tick.spawned_this_tick;
         self.script_frame_index = self.script_frame_index.saturating_add(1);
 
-        let substeps = self.world.step(dt);
+        let substeps = self.world.step(sim_dt);
         self.last_substeps = substeps;
+        let _ = self.scene.reconcile_after_step(&mut self.world);
 
-        let mut frame = self
-            .scene
-            .build_frame_instances(&self.world, Some(self.world.interpolation_alpha()));
+        let mut frame = self.scene.build_frame_instances_with_ball_limit(
+            &self.world,
+            Some(self.world.interpolation_alpha()),
+            self.adaptive_ball_render_limit,
+        );
+        let visible_ball_count = frame.opaque_3d.len().saturating_sub(12);
         let _hud = self.hud.append_to_sprites(
             TelemetryHudSample {
                 fps: self.fps_tracker.ema_fps(),
-                frame_time_ms: dt * 1_000.0,
+                frame_time_ms: raw_dt * 1_000.0,
                 physics_substeps: substeps,
                 live_balls: tick.live_balls,
                 draw_calls: frame.opaque_3d.len()
@@ -688,27 +920,60 @@ impl TlAppRuntime {
         let frame_end = Instant::now();
         let frame_time = (frame_end - frame_begin).as_secs_f32();
         let report = self.fps_tracker.record(frame_end, frame_time);
+        if self.uncapped_dynamic_fps_hint {
+            let measured_hint = self.fps_tracker.dynamic_uncapped_fps_hint();
+            self.fps_limit_hint =
+                smooth_tick_hz(self.fps_limit_hint, measured_hint, 0.22).clamp(48.0, 1_200.0);
+        }
+        let pacing_suffix = self
+            .frame_cap_interval
+            .map(|d| format!(" | cap {:.0}", 1.0 / d.as_secs_f32().max(1e-6)))
+            .unwrap_or_else(|| {
+                if self.uncapped_dynamic_fps_hint {
+                    format!(" | target {:.0}", self.fps_limit_hint)
+                } else {
+                    String::new()
+                }
+            });
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Balls {} | Substeps {}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Substeps {}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
+            self.tick_hz,
             tick.live_balls,
+            visible_ball_count,
             substeps,
-            self.frame_cap_interval
-                .map(|d| format!(" | cap {:.0}", 1.0 / d.as_secs_f32().max(1e-6)))
-                .unwrap_or_default()
+            pacing_suffix,
+            if self.adaptive_low_poly_override {
+                " | lowpoly"
+            } else {
+                ""
+            },
+            if tick.scattered_this_tick > 0 {
+                format!(" | scatter {}", tick.scattered_this_tick)
+            } else {
+                String::new()
+            }
         );
         self.window.set_title(&title);
 
         if let Some(report) = report {
+            let broadphase = self.world.broadphase().stats();
+            let narrowphase = self.world.narrowphase().stats();
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | substeps: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | substeps: {} | scattered: {:>4} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
                 report.frame_time_stddev_ms,
                 tick.live_balls,
-                substeps
+                visible_ball_count,
+                substeps,
+                tick.scattered_this_tick,
+                self.mps_logical_threads,
+                broadphase.shard_count,
+                broadphase.candidate_pairs,
+                narrowphase.manifolds
             );
         }
 
@@ -963,6 +1228,25 @@ impl FpsTracker {
         self.ema_fps
     }
 
+    fn dynamic_uncapped_fps_hint(&self) -> f32 {
+        if self.count == 0 {
+            return self.ema_fps.max(90.0);
+        }
+        let fast_lane_fps = self.fast_percentile_fps(0.20);
+        let blended = fast_lane_fps * 0.78 + self.ema_fps * 0.22;
+        blended.clamp(45.0, 1_200.0)
+    }
+
+    fn fast_percentile_fps(&self, quantile: f32) -> f32 {
+        let count = self.count.max(1).min(self.frame_times.len());
+        let mut scratch = [0.0_f32; 120];
+        scratch[..count].copy_from_slice(&self.frame_times[..count]);
+        scratch[..count].sort_by(|a, b| a.total_cmp(b));
+        let idx = ((count as f32 - 1.0) * quantile.clamp(0.0, 1.0)).round() as usize;
+        let frame_time = scratch[idx.min(count.saturating_sub(1))].max(1e-6);
+        1.0 / frame_time
+    }
+
     fn record(&mut self, now: Instant, frame_time: f32) -> Option<FpsReport> {
         let frame_time = frame_time.clamp(1.0 / 500.0, 0.25);
         self.frame_times[self.cursor] = frame_time;
@@ -1009,40 +1293,212 @@ impl FpsTracker {
 
 fn choose_aggressive_tick_hz(
     policy: TickRatePolicy,
+    profile: TickProfile,
     fps_estimate: f32,
     parallel_ready: bool,
     last_substeps: u32,
     max_substeps: u32,
     live_balls: usize,
+    tick_scale: f32,
+    fps_limit_hint: f32,
+    logical_threads: usize,
 ) -> f32 {
-    let fps = fps_estimate.clamp(20.0, 240.0);
-    let mut multiplier = if parallel_ready { 7.0 } else { 5.0 };
-    if live_balls > 5_000 {
+    let fps_limit = fps_limit_hint.clamp(24.0, 1_200.0);
+    let fps = fps_estimate.clamp(20.0, fps_limit * 2.0);
+    let fps_ratio = (fps / fps_limit).clamp(0.35, 1.25);
+    let mut multiplier = match profile {
+        TickProfile::Balanced => {
+            if parallel_ready {
+                2.9
+            } else {
+                2.3
+            }
+        }
+        TickProfile::Max => {
+            if parallel_ready {
+                3.4
+            } else {
+                2.9
+            }
+        }
+    };
+    if fps_ratio > 0.95 {
         multiplier += 1.0;
     }
-    if live_balls > 9_000 {
-        multiplier += 1.0;
+    if fps_ratio > 1.05 {
+        multiplier += 0.45;
+    }
+    if live_balls > 3_500 {
+        multiplier += 0.2;
+    }
+    if live_balls > 5_500 {
+        multiplier += 0.25;
+    }
+    if live_balls > 8_000 {
+        multiplier += 0.25;
     }
 
-    let mut target_hz = fps * multiplier;
+    let mut target_hz = fps_limit * multiplier * fps_ratio;
     if last_substeps + 1 >= max_substeps {
-        target_hz *= 0.70;
+        target_hz *= match profile {
+            TickProfile::Balanced => 0.62,
+            TickProfile::Max => 0.78,
+        };
     } else if last_substeps >= max_substeps.saturating_sub(3) {
-        target_hz *= 0.85;
+        target_hz *= match profile {
+            TickProfile::Balanced => 0.78,
+            TickProfile::Max => 0.90,
+        };
     }
     if fps < 45.0 {
-        target_hz *= 0.90;
+        target_hz *= match profile {
+            TickProfile::Balanced => 0.85,
+            TickProfile::Max => 0.93,
+        };
     }
+    target_hz *= match profile {
+        TickProfile::Balanced => tick_scale.clamp(0.50, 1.20),
+        TickProfile::Max => tick_scale.clamp(0.85, 1.35),
+    };
 
-    target_hz.clamp(
-        policy.min_tick_hz.max(120.0),
-        policy.max_tick_hz.max(policy.min_tick_hz),
-    )
+    let dynamic_min = match profile {
+        TickProfile::Balanced => (fps_limit * 0.5).max(policy.min_tick_hz.max(30.0)),
+        TickProfile::Max => policy.min_tick_hz.max(45.0),
+    };
+    let thread_scale = (logical_threads as f32 / 8.0).clamp(0.75, 4.0);
+    let ceiling_factor = match profile {
+        TickProfile::Balanced => {
+            if parallel_ready {
+                8.0
+            } else {
+                6.0
+            }
+        }
+        TickProfile::Max => {
+            if parallel_ready {
+                12.0
+            } else {
+                10.0
+            }
+        }
+    };
+    let thread_gain = match profile {
+        TickProfile::Balanced => 0.8 + thread_scale * 0.4,
+        TickProfile::Max => 0.9 + thread_scale * 0.55,
+    };
+    let dynamic_max =
+        (fps_limit * ceiling_factor * thread_gain).min(policy.max_tick_hz.max(dynamic_min));
+
+    target_hz.clamp(dynamic_min, dynamic_max)
 }
 
 fn smooth_tick_hz(current_hz: f32, target_hz: f32, alpha: f32) -> f32 {
     let alpha = alpha.clamp(0.0, 1.0);
     current_hz + (target_hz - current_hz) * alpha
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeLoadPlan {
+    visible_ball_limit: Option<usize>,
+    live_ball_budget: Option<usize>,
+    spawn_per_tick_cap: usize,
+    max_substeps: u32,
+    force_low_poly_ball_mesh: bool,
+    tick_scale: f32,
+}
+
+fn choose_runtime_load_plan(
+    ema_fps: f32,
+    frame_time_ms: f32,
+    live_balls: usize,
+    last_substeps: u32,
+    max_substeps: u32,
+    parallel_ready: bool,
+    logical_threads: usize,
+) -> RuntimeLoadPlan {
+    let mut pressure = 0u32;
+    let fps = ema_fps.clamp(1.0, 240.0);
+    if fps < 55.0 {
+        pressure += 1;
+    }
+    if fps < 42.0 {
+        pressure += 1;
+    }
+    if fps < 30.0 {
+        pressure += 1;
+    }
+    if fps < 20.0 {
+        pressure += 1;
+    }
+    if frame_time_ms > 20.0 {
+        pressure += 1;
+    }
+    if frame_time_ms > 33.0 {
+        pressure += 1;
+    }
+    if frame_time_ms > 50.0 {
+        pressure += 1;
+    }
+    if last_substeps + 1 >= max_substeps {
+        pressure += 2;
+    } else if last_substeps >= max_substeps.saturating_sub(2) {
+        pressure += 1;
+    }
+    if !parallel_ready {
+        pressure += 1;
+    }
+    if live_balls > 4_500 {
+        pressure += 1;
+    }
+    if live_balls > 6_500 {
+        pressure += 1;
+    }
+
+    let thread_scale = (logical_threads as f32 / 8.0).clamp(0.75, 4.0);
+    let cap = |base: usize| ((base as f32) * thread_scale).round() as usize;
+
+    match pressure {
+        0..=2 => RuntimeLoadPlan {
+            visible_ball_limit: None,
+            live_ball_budget: None,
+            spawn_per_tick_cap: cap(420),
+            max_substeps: 14,
+            force_low_poly_ball_mesh: false,
+            tick_scale: 1.00,
+        },
+        3..=4 => RuntimeLoadPlan {
+            visible_ball_limit: None,
+            live_ball_budget: None,
+            spawn_per_tick_cap: cap(360),
+            max_substeps: 12,
+            force_low_poly_ball_mesh: false,
+            tick_scale: 0.96,
+        },
+        5..=6 => RuntimeLoadPlan {
+            visible_ball_limit: None,
+            live_ball_budget: None,
+            spawn_per_tick_cap: cap(260),
+            max_substeps: 10,
+            force_low_poly_ball_mesh: false,
+            tick_scale: 0.82,
+        },
+        7..=8 => RuntimeLoadPlan {
+            visible_ball_limit: None,
+            live_ball_budget: None,
+            spawn_per_tick_cap: cap(200),
+            max_substeps: 10,
+            force_low_poly_ball_mesh: false,
+            tick_scale: 0.72,
+        },
+        _ => RuntimeLoadPlan {
+            visible_ball_limit: None,
+            live_ball_budget: None,
+            spawn_per_tick_cap: cap(160),
+            max_substeps: 10,
+            force_low_poly_ball_mesh: false,
+            tick_scale: 0.60,
+        },
+    }
 }
 
 fn print_tlsprite_event(prefix: &str, event: TlspriteHotReloadEvent) {
