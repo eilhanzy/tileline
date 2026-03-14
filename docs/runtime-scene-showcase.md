@@ -26,6 +26,7 @@ This note documents the pre-alpha scene orchestration foundation added for the u
 - `SceneFrameInstances`: `opaque_3d`, `transparent_3d`, `sprites`
 - `ScenePrimitive3d`: `Sphere` / `Box`
 - `SceneMaterial` + `ShadingModel`
+- `set_sprite_program(...)` hook for compiled `.tlsprite` overlays
 
 ## Bounce Tank Controller
 

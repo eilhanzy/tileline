@@ -1,7 +1,8 @@
 use paradoxpe::{PhysicsWorld, PhysicsWorldConfig};
 use runtime::{
     estimate_scene_workload_requests, BounceTankSceneConfig, BounceTankSceneController,
-    RenderSyncMode, SceneWorkloadBridgeConfig, TickRatePolicy,
+    RenderSyncMode, SceneWorkloadBridgeConfig, TickRatePolicy, TlspriteHotReloadEvent,
+    TlspriteHotReloader,
 };
 
 fn main() {
@@ -23,6 +24,13 @@ fn main() {
         spawn_per_tick: 280,
         ..BounceTankSceneConfig::default()
     });
+    let sprite_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/assets/bounce_hud.tlsprite");
+    let mut sprite_loader = TlspriteHotReloader::new(&sprite_path);
+    print_tlsprite_event("[tlsprite boot]", sprite_loader.reload_if_changed());
+    if let Some(program) = sprite_loader.program().cloned() {
+        scene.set_sprite_program(program);
+    }
     let workload_cfg = SceneWorkloadBridgeConfig {
         target_frame_budget_ms: 16.67,
         ..SceneWorkloadBridgeConfig::default()
@@ -37,6 +45,19 @@ fn main() {
     );
 
     for frame_index in 0..total_frames {
+        if frame_index % 20 == 0 {
+            let event = sprite_loader.reload_if_changed();
+            match &event {
+                TlspriteHotReloadEvent::Applied { .. } => {
+                    print_tlsprite_event("[tlsprite reload]", event);
+                    if let Some(program) = sprite_loader.program().cloned() {
+                        scene.set_sprite_program(program);
+                    }
+                }
+                TlspriteHotReloadEvent::Unchanged => {}
+                _ => print_tlsprite_event("[tlsprite reload]", event),
+            }
+        }
         let tick = scene.physics_tick(&mut world);
         let substeps = world.step(render_dt);
         let frame = scene.build_frame_instances(&world, Some(world.interpolation_alpha()));
@@ -59,6 +80,26 @@ fn main() {
                 estimate.multi_gpu.ui_jobs,
                 estimate.multi_gpu.post_fx_jobs
             );
+        }
+    }
+}
+
+fn print_tlsprite_event(prefix: &str, event: TlspriteHotReloadEvent) {
+    match event {
+        TlspriteHotReloadEvent::Unchanged => {}
+        TlspriteHotReloadEvent::Applied {
+            sprite_count,
+            warning_count,
+        } => println!("{prefix} applied sprites={sprite_count} warnings={warning_count}"),
+        TlspriteHotReloadEvent::Rejected {
+            error_count,
+            warning_count,
+            kept_last_program,
+        } => println!(
+            "{prefix} rejected errors={error_count} warnings={warning_count} kept_last_program={kept_last_program}"
+        ),
+        TlspriteHotReloadEvent::SourceError { message } => {
+            println!("{prefix} source_error: {message}")
         }
     }
 }

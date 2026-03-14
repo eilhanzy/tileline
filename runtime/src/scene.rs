@@ -15,6 +15,8 @@ use paradoxpe::{
     PhysicsWorld,
 };
 
+use crate::tlsprite::{TlspriteFrameContext, TlspriteProgram};
+
 /// Lightweight primitive kind for runtime-side scene batching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScenePrimitive3d {
@@ -240,6 +242,7 @@ pub struct BounceTankSceneController {
     rng_state: u64,
     walls: Vec<BodyHandle>,
     balls: Vec<BallVisual>,
+    sprite_program: Option<TlspriteProgram>,
 }
 
 impl BounceTankSceneController {
@@ -249,6 +252,7 @@ impl BounceTankSceneController {
             config,
             walls: Vec::with_capacity(6),
             balls: Vec::new(),
+            sprite_program: None,
         }
     }
 
@@ -262,6 +266,20 @@ impl BounceTankSceneController {
 
     pub fn wall_count(&self) -> usize {
         self.walls.len()
+    }
+
+    /// Override the default HUD sprite emission with a compiled `.tlsprite` program.
+    pub fn set_sprite_program(&mut self, program: TlspriteProgram) {
+        self.sprite_program = Some(program);
+    }
+
+    /// Remove a custom `.tlsprite` program and fall back to the built-in progress sprite.
+    pub fn clear_sprite_program(&mut self) {
+        self.sprite_program = None;
+    }
+
+    pub fn has_sprite_program(&self) -> bool {
+        self.sprite_program.is_some()
     }
 
     /// Apply a bounded runtime patch and propagate dynamic damping changes to existing bodies.
@@ -397,15 +415,29 @@ impl BounceTankSceneController {
         } else {
             (self.balls.len() as f32 / self.config.target_ball_count as f32).clamp(0.0, 1.0)
         };
-        frame.sprites.push(SpriteInstance {
-            sprite_id: 1,
-            position: [-0.86, 0.90, 0.0],
-            size: [0.40 * progress.max(0.02), 0.035],
-            rotation_rad: 0.0,
-            color_rgba: [0.10, 0.84, 0.62, 0.92],
-            texture_slot: 0,
-            layer: 100,
-        });
+        if let Some(program) = &self.sprite_program {
+            program.emit_instances(
+                TlspriteFrameContext {
+                    spawn_progress: progress,
+                    live_balls: self.balls.len(),
+                    target_balls: self.config.target_ball_count,
+                },
+                &mut frame.sprites,
+            );
+        }
+
+        // Built-in fallback overlay (spawn progress bar), kept renderer-agnostic.
+        if frame.sprites.is_empty() {
+            frame.sprites.push(SpriteInstance {
+                sprite_id: 1,
+                position: [-0.86, 0.90, 0.0],
+                size: [0.40 * progress.max(0.02), 0.035],
+                rotation_rad: 0.0,
+                color_rgba: [0.10, 0.84, 0.62, 0.92],
+                texture_slot: 0,
+                layer: 100,
+            });
+        }
 
         frame
     }
@@ -653,6 +685,7 @@ fn quantize_tick_hz(target: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compile_tlsprite;
     use paradoxpe::PhysicsWorldConfig;
 
     #[test]
@@ -727,5 +760,44 @@ mod tests {
         assert!(cfg.linear_damping <= 0.95);
         assert!(cfg.initial_speed_max >= cfg.initial_speed_min);
         assert!(metrics.config_updated);
+    }
+
+    #[test]
+    fn tlsprite_program_overrides_builtin_progress_sprite() {
+        let src = concat!(
+            "tlsprite_v1\n",
+            "[hud.progress]\n",
+            "sprite_id = 77\n",
+            "texture_slot = 3\n",
+            "layer = 120\n",
+            "position = -0.5, 0.9, 0.0\n",
+            "size = 0.4, 0.03\n",
+            "color = 0.9, 0.2, 0.2, 1.0\n",
+            "scale_axis = x\n",
+            "scale_source = spawn_progress\n",
+            "scale_min = 0.1\n",
+            "scale_max = 1.0\n",
+        );
+        let compile = compile_tlsprite(src);
+        assert!(!compile.has_errors());
+        let program = compile.program.expect("program");
+
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 200,
+            spawn_per_tick: 100,
+            ..BounceTankSceneConfig::default()
+        });
+        scene.set_sprite_program(program);
+
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+        let frame = scene.build_frame_instances(&world, Some(0.5));
+        assert_eq!(frame.sprites.len(), 1);
+        assert_eq!(frame.sprites[0].sprite_id, 77);
+        assert_eq!(frame.sprites[0].texture_slot, 3);
     }
 }

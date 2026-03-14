@@ -20,6 +20,7 @@ in `src/` crates (not benchmark-only code).
 - `runtime-scene-showcase.md`: runtime-side 3D scene/sprite payload model and bounce-tank showcase controller
 - `runtime-scene-workload.md`: runtime scene density to GMS dispatch workload mapping
 - `runtime-scheduler-path.md`: runtime automatic scheduler path selection (`GMS` vs `MGS`)
+- `runtime-tlsprite.md`: `.tlsprite` parser, runtime sprite program flow, and HUD scaling signals
 - `runtime-tlscript-showcase.md`: `.tlscript` showcase compile/evaluate bootstrap for scene control
 - `mgs-scene-workload.md`: runtime/mobile scene density to MGS bridge hint and tile planning mapping
 - `demos/`: demo-specific flow notes and show scripts (`docs/demos/*`)

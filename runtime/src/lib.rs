@@ -11,6 +11,7 @@
 //! - `scene`: runtime scene/sprite payloads and bounce showcase orchestration helpers
 //! - `scene_dispatch`: scene workload -> bridge task submission helpers
 //! - `scene_workload`: scene->GMS workload synthesis helpers
+//! - `tlsprite`: `.tlsprite` sprite program parser and frame emitter
 //! - `tlscript_showcase`: `.tlscript` showcase compile/evaluate bootstrap
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
@@ -24,6 +25,7 @@ mod scene_workload;
 mod scheduler_path;
 mod tlscript_parallel;
 mod tlscript_showcase;
+mod tlsprite;
 mod wgpu_render_loop;
 
 pub use frame_loop::{
@@ -63,6 +65,11 @@ pub use tlscript_parallel::{
 pub use tlscript_showcase::{
     compile_tlscript_showcase, TlscriptShowcaseCompileOutcome, TlscriptShowcaseConfig,
     TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
+};
+pub use tlsprite::{
+    compile_tlsprite, TlspriteCompileOutcome, TlspriteDiagnostic, TlspriteDiagnosticLevel,
+    TlspriteFrameContext, TlspriteHotReloadConfig, TlspriteHotReloadEvent, TlspriteHotReloader,
+    TlspriteProgram, TlspriteScaleAxis, TlspriteScaleSource, TlspriteSpriteDef,
 };
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,
