@@ -10,6 +10,7 @@ in `src/` crates (not benchmark-only code).
 - `tlscript-semantic.md`: semantic rules, soft diagnostics, handles, and WASM sandbox policy
 - `tlscript-parallel-runtime.md`: parallel contracts, advisor suggestions, and runtime dispatch planning
 - `tileline-pre-alpha-transition.md`: immediate Foundation -> Pre-Alpha gates, sprint plan, and validation checks
+- `tileline-pre-beta-fsr-plan.md`: pre-beta milestones with FSR 1.0, adaptive quality, and full input accessibility
 - `tileline-beta-roadmap.md`: phased beta roadmap, integration milestones, and deferred scope
 - `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
 - `nps-runtime-plan.md`: canonical NPS channel, tick, snapshot, and transport runtime plan

@@ -1,7 +1,7 @@
 @export
 @parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=128, schedule="performance")
 @deterministic
-def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool):
+def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool):
     set_fbx_full_render(true)
     set_ball_mesh_slot(2)
 
@@ -13,6 +13,12 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
         set_scatter_strength(0.16)
     set_camera_move_speed(18.0)
     set_camera_look_sensitivity(0.0018)
+    set_camera_move_axis(input_move_x, input_move_y, input_move_z)
+    set_camera_look_delta(input_look_dx, input_look_dy)
+    set_camera_sprint(input_sprint_down)
+    set_camera_look_active(input_look_active)
+    if input_reset_camera:
+        reset_camera_pose()
     if live_balls > 7600:
         set_gravity_ramp(frame, 0, 36000, -9.81, -16.20)
     else:

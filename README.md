@@ -39,6 +39,7 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/tlscript-semantic.md`: `.tlscript` semantic analyzer (types, handles, WASM sandboxing)
 - `docs/tlscript-parallel-runtime.md`: `.tlscript` parallel contracts, advisor, and runtime dispatch planning
 - `docs/tileline-pre-alpha-transition.md`: immediate Foundation -> Pre-Alpha transition gates and sprint plan
+- `docs/tileline-pre-beta-fsr-plan.md`: pre-beta FSR 1.0, adaptive quality, and input accessibility plan
 - `docs/tileline-beta-roadmap.md`: phased plan from foundation state to a usable beta
 - `docs/nps-protocol.md`: NPS packet format, reliability, authority handoff, and MPS integration
 - `docs/nps-runtime-plan.md`: NPS channel/tick/snapshot runtime plan for the beta transport path

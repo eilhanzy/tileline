@@ -20,7 +20,7 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 21] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 26] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_linear_damping",
@@ -42,6 +42,11 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 21] = [
     "set_camera_move_speed",
     "set_camera_look_sensitivity",
     "set_camera_pose",
+    "set_camera_move_axis",
+    "set_camera_look_delta",
+    "set_camera_sprint",
+    "set_camera_look_active",
+    "reset_camera_pose",
 ];
 
 /// Showcase script compiler settings.
@@ -91,6 +96,34 @@ pub struct TlscriptShowcaseFrameInput {
     pub key_f_down: bool,
 }
 
+/// Optional input-control snapshot for script-driven camera handling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TlscriptShowcaseControlInput {
+    pub move_x: f32,
+    pub move_y: f32,
+    pub move_z: f32,
+    pub look_dx: f32,
+    pub look_dy: f32,
+    pub sprint_down: bool,
+    pub look_active: bool,
+    pub reset_camera: bool,
+}
+
+impl Default for TlscriptShowcaseControlInput {
+    fn default() -> Self {
+        Self {
+            move_x: 0.0,
+            move_y: 0.0,
+            move_z: 0.0,
+            look_dx: 0.0,
+            look_dy: 0.0,
+            sprint_down: false,
+            look_active: false,
+            reset_camera: false,
+        }
+    }
+}
+
 /// Per-frame script evaluation output.
 #[derive(Debug, Clone)]
 pub struct TlscriptShowcaseFrameOutput {
@@ -99,6 +132,11 @@ pub struct TlscriptShowcaseFrameOutput {
     pub camera_move_speed: Option<f32>,
     pub camera_look_sensitivity: Option<f32>,
     pub camera_pose: Option<([f32; 3], [f32; 3])>,
+    pub camera_move_axis: Option<[f32; 3]>,
+    pub camera_look_delta: Option<[f32; 2]>,
+    pub camera_sprint: Option<bool>,
+    pub camera_look_active: Option<bool>,
+    pub camera_reset_pose: bool,
     pub dispatch_decision: Option<ParallelDispatchDecision>,
     pub warnings: Vec<String>,
     pub aborted_early: bool,
@@ -145,6 +183,15 @@ impl<'src> TlscriptShowcaseProgram<'src> {
 
     /// Evaluate one script frame and emit a bounded runtime patch.
     pub fn evaluate_frame(&self, input: TlscriptShowcaseFrameInput) -> TlscriptShowcaseFrameOutput {
+        self.evaluate_frame_with_controls(input, TlscriptShowcaseControlInput::default())
+    }
+
+    /// Evaluate one script frame and provide optional control channels for script-driven camera.
+    pub fn evaluate_frame_with_controls(
+        &self,
+        input: TlscriptShowcaseFrameInput,
+        controls: TlscriptShowcaseControlInput,
+    ) -> TlscriptShowcaseFrameOutput {
         let mut state = EvalState::new(self.max_eval_steps, self.max_loop_iterations);
         state.vars.insert(
             "frame".to_string(),
@@ -164,6 +211,38 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         state
             .vars
             .insert("key_f".to_string(), DemoValue::Bool(input.key_f_down));
+        state.vars.insert(
+            "input_move_x".to_string(),
+            DemoValue::Float(controls.move_x as f64),
+        );
+        state.vars.insert(
+            "input_move_y".to_string(),
+            DemoValue::Float(controls.move_y as f64),
+        );
+        state.vars.insert(
+            "input_move_z".to_string(),
+            DemoValue::Float(controls.move_z as f64),
+        );
+        state.vars.insert(
+            "input_look_dx".to_string(),
+            DemoValue::Float(controls.look_dx as f64),
+        );
+        state.vars.insert(
+            "input_look_dy".to_string(),
+            DemoValue::Float(controls.look_dy as f64),
+        );
+        state.vars.insert(
+            "input_sprint_down".to_string(),
+            DemoValue::Bool(controls.sprint_down),
+        );
+        state.vars.insert(
+            "input_look_active".to_string(),
+            DemoValue::Bool(controls.look_active),
+        );
+        state.vars.insert(
+            "input_reset_camera".to_string(),
+            DemoValue::Bool(controls.reset_camera),
+        );
 
         let Item::Function(entry_fn) = &self.module.items[self.entry_item_index];
         self.exec_block(&entry_fn.body, &mut state);
@@ -179,6 +258,11 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             camera_move_speed: state.camera_move_speed,
             camera_look_sensitivity: state.camera_look_sensitivity,
             camera_pose: state.camera_pose,
+            camera_move_axis: state.camera_move_axis,
+            camera_look_delta: state.camera_look_delta,
+            camera_sprint: state.camera_sprint,
+            camera_look_active: state.camera_look_active,
+            camera_reset_pose: state.camera_reset_pose,
             dispatch_decision,
             warnings: state.warnings,
             aborted_early: state.aborted_early,
@@ -398,6 +482,11 @@ struct EvalState {
     camera_move_speed: Option<f32>,
     camera_look_sensitivity: Option<f32>,
     camera_pose: Option<([f32; 3], [f32; 3])>,
+    camera_move_axis: Option<[f32; 3]>,
+    camera_look_delta: Option<[f32; 2]>,
+    camera_sprint: Option<bool>,
+    camera_look_active: Option<bool>,
+    camera_reset_pose: bool,
     warnings: Vec<String>,
     steps: usize,
     max_steps: usize,
@@ -414,6 +503,11 @@ impl EvalState {
             camera_move_speed: None,
             camera_look_sensitivity: None,
             camera_pose: None,
+            camera_move_axis: None,
+            camera_look_delta: None,
+            camera_sprint: None,
+            camera_look_active: None,
+            camera_reset_pose: false,
             warnings: Vec::new(),
             steps: 0,
             max_steps: max_steps.max(1),
@@ -640,6 +734,34 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
                 ));
             }
             _ => state.warn("set_camera_pose expects 6 args"),
+        },
+        "set_camera_move_axis" => match args {
+            [x, y, z] => {
+                state.camera_move_axis = Some([
+                    (x.to_f64() as f32).clamp(-1.0, 1.0),
+                    (y.to_f64() as f32).clamp(-1.0, 1.0),
+                    (z.to_f64() as f32).clamp(-1.0, 1.0),
+                ]);
+            }
+            _ => state.warn("set_camera_move_axis expects 3 args"),
+        },
+        "set_camera_look_delta" => match args {
+            [dx, dy] => {
+                state.camera_look_delta = Some([dx.to_f64() as f32, dy.to_f64() as f32]);
+            }
+            _ => state.warn("set_camera_look_delta expects 2 args"),
+        },
+        "set_camera_sprint" => match args {
+            [v] => state.camera_sprint = Some(v.to_bool()),
+            _ => state.warn("set_camera_sprint expects 1 arg"),
+        },
+        "set_camera_look_active" => match args {
+            [v] => state.camera_look_active = Some(v.to_bool()),
+            _ => state.warn("set_camera_look_active expects 1 arg"),
+        },
+        "reset_camera_pose" => match args {
+            [] => state.camera_reset_pose = true,
+            _ => state.warn("reset_camera_pose expects 0 args"),
         },
         _ => state.warn(format!("unknown showcase builtin '{name}'")),
     }
@@ -892,6 +1014,46 @@ mod tests {
         assert!(out.camera_move_speed.unwrap_or(0.0) > 0.0);
         assert!(out.camera_look_sensitivity.unwrap_or(0.0) > 0.0);
         assert!(out.camera_pose.is_some());
+    }
+
+    #[test]
+    fn supports_script_driven_camera_input_controls() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool):\n",
+            "    set_camera_move_axis(input_move_x, input_move_y, input_move_z)\n",
+            "    set_camera_look_delta(input_look_dx, input_look_dy)\n",
+            "    set_camera_sprint(input_sprint_down)\n",
+            "    set_camera_look_active(input_look_active)\n",
+            "    if input_reset_camera:\n",
+            "        reset_camera_pose()\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame_with_controls(
+            TlscriptShowcaseFrameInput {
+                frame_index: 1,
+                live_balls: 500,
+                spawned_this_tick: 16,
+                key_f_down: false,
+            },
+            TlscriptShowcaseControlInput {
+                move_x: 0.5,
+                move_y: -0.25,
+                move_z: 0.9,
+                look_dx: 3.0,
+                look_dy: -2.0,
+                sprint_down: true,
+                look_active: true,
+                reset_camera: true,
+            },
+        );
+        assert_eq!(out.camera_move_axis, Some([0.5, -0.25, 0.9]));
+        assert_eq!(out.camera_look_delta, Some([3.0, -2.0]));
+        assert_eq!(out.camera_sprint, Some(true));
+        assert_eq!(out.camera_look_active, Some(true));
+        assert!(out.camera_reset_pose);
     }
 
     #[test]

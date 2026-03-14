@@ -6,26 +6,38 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use crate::{
+    compile_tlscript_showcase, BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler,
+    RenderSyncMode, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
+    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
+    TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache,
+    TlspriteWatchReloader, WgpuSceneRenderer,
+};
 use nalgebra::Vector3;
 use paradoxpe::{
     BroadphaseConfig, ContactSolverConfig, NarrowphaseConfig, PhysicsWorld, PhysicsWorldConfig,
-};
-use runtime::{
-    compile_tlscript_showcase, BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler,
-    RenderSyncMode, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
-    TlscriptShowcaseConfig, TlscriptShowcaseFrameInput, TlscriptShowcaseProgram,
-    TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader,
-    WgpuSceneRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
+
+#[cfg(feature = "gamepad")]
+use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
 
 const AUTO_LOW_POLY_BALL_SLOT: u8 = 250;
 const DEFAULT_FBX_BALL_SLOT: u8 = 2;
+#[cfg(feature = "gamepad")]
+const GAMEPAD_DEADZONE: f32 = 0.16;
+const GAMEPAD_LOOK_SPEED_RAD: f32 = 2.6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeCommand {
+    None,
+    Exit,
+}
 
 pub fn run_from_env() -> Result<(), Box<dyn Error>> {
     configure_parallel_runtime();
@@ -230,7 +242,7 @@ fn bootstrap_uncapped_fps_hint(logical_threads: usize) -> f32 {
 
 fn print_usage() {
     println!("Tileline TLApp Runtime Demo");
-    println!("Usage: cargo run -p runtime --example tlapp -- [options]");
+    println!("Usage: cargo run -p runtime --bin tlapp -- [options]");
     println!("Options:");
     println!("  --resolution <WxH>        Window size (default: 1280x720)");
     println!("  --vsync auto|on|off       Present mode preference (default: auto)");
@@ -244,6 +256,15 @@ fn print_usage() {
         "  --sprite <path>           .tlsprite path (default: docs/demos/tlapp/bounce_hud.tlsprite)"
     );
     println!("  -h, --help                Show help");
+    println!();
+    println!("Keyboard:");
+    println!("  Move: WASD / Arrows | Up: Space/E | Down: Ctrl/Q | Sprint: Shift");
+    println!("  Look: RMB hold + mouse");
+    println!("  Combos: Ctrl+Q exit | Ctrl+F fullscreen | Alt+Enter fullscreen");
+    println!("          Ctrl+R reset camera | Ctrl+L toggle look lock");
+    println!("Gamepad:");
+    println!("  Left stick move | Right stick look | D-Pad move");
+    println!("  South button mirrors F action | Trigger buttons add vertical move");
 }
 
 struct TlApp {
@@ -299,13 +320,20 @@ impl ApplicationHandler for TlApp {
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                runtime.on_keyboard_input(&event);
+                if matches!(runtime.on_keyboard_input(&event), RuntimeCommand::Exit) {
+                    self.exit_requested = true;
+                    event_loop.exit();
+                    return;
+                }
                 if matches!(event.logical_key, Key::Named(NamedKey::Escape))
                     && event.state == ElementState::Pressed
                 {
                     self.exit_requested = true;
                     event_loop.exit();
                 }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                runtime.on_modifiers_changed(modifiers.state());
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 runtime.on_mouse_button(state, button);
@@ -365,7 +393,14 @@ struct TlAppRuntime {
     script_program: TlscriptShowcaseProgram<'static>,
     script_last_spawned: usize,
     script_frame_index: u64,
-    script_key_f_down: bool,
+    script_key_f_keyboard: bool,
+    keyboard_camera: CameraInputState,
+    mouse_look_held: bool,
+    look_lock_active: bool,
+    mouse_look_delta: (f32, f32),
+    camera_reset_requested: bool,
+    keyboard_modifiers: ModifiersState,
+    gamepad: GamepadManager,
     tick_policy: TickRatePolicy,
     tick_profile: TickProfile,
     tick_hz: f32,
@@ -546,6 +581,7 @@ impl TlAppRuntime {
         renderer.bind_builtin_sphere_mesh_slot(&device, DEFAULT_FBX_BALL_SLOT, true);
         renderer.bind_builtin_sphere_mesh_slot(&device, AUTO_LOW_POLY_BALL_SLOT, false);
         let camera = FreeCameraController::default();
+        let gamepad = GamepadManager::new();
         let (eye, target) = camera.eye_target();
         renderer.set_camera_view(&queue, size.width.max(1), size.height.max(1), eye, target);
 
@@ -600,7 +636,14 @@ impl TlAppRuntime {
             script_program,
             script_last_spawned: 0,
             script_frame_index: 0,
-            script_key_f_down: false,
+            script_key_f_keyboard: false,
+            keyboard_camera: CameraInputState::default(),
+            mouse_look_held: false,
+            look_lock_active: false,
+            mouse_look_delta: (0.0, 0.0),
+            camera_reset_requested: false,
+            keyboard_modifiers: ModifiersState::empty(),
+            gamepad,
             tick_policy,
             tick_profile: options.tick_profile,
             tick_hz: 1.0 / fixed_dt.max(1e-6),
@@ -650,24 +693,138 @@ impl TlAppRuntime {
         );
     }
 
-    fn on_keyboard_input(&mut self, event: &KeyEvent) {
-        self.camera.on_keyboard_input(event);
+    fn on_keyboard_input(&mut self, event: &KeyEvent) -> RuntimeCommand {
         let pressed = event.state == ElementState::Pressed;
+        self.update_camera_keyboard_input(event.physical_key, pressed);
         if let PhysicalKey::Code(KeyCode::KeyF) = event.physical_key {
-            self.script_key_f_down = pressed;
+            self.script_key_f_keyboard = pressed;
         }
+
+        if !pressed || event.repeat {
+            return RuntimeCommand::None;
+        }
+
+        let ctrl = self.keyboard_modifiers.control_key();
+        let alt = self.keyboard_modifiers.alt_key();
+
+        if alt && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Enter)) {
+            self.toggle_fullscreen();
+            return RuntimeCommand::None;
+        }
+
+        if ctrl {
+            match event.physical_key {
+                PhysicalKey::Code(KeyCode::KeyQ) => return RuntimeCommand::Exit,
+                PhysicalKey::Code(KeyCode::KeyF) => {
+                    self.toggle_fullscreen();
+                    return RuntimeCommand::None;
+                }
+                PhysicalKey::Code(KeyCode::KeyR) => {
+                    self.camera_reset_requested = true;
+                    return RuntimeCommand::None;
+                }
+                PhysicalKey::Code(KeyCode::KeyL) => {
+                    self.look_lock_active = !self.look_lock_active;
+                    return RuntimeCommand::None;
+                }
+                _ => {}
+            }
+        }
+        RuntimeCommand::None
+    }
+
+    fn on_modifiers_changed(&mut self, modifiers: ModifiersState) {
+        self.keyboard_modifiers = modifiers;
+    }
+
+    fn toggle_fullscreen(&self) {
+        let next = if self.window.fullscreen().is_some() {
+            None
+        } else {
+            Some(Fullscreen::Borderless(None))
+        };
+        self.window.set_fullscreen(next);
     }
 
     fn on_mouse_button(&mut self, state: ElementState, button: MouseButton) {
         if button == MouseButton::Right {
-            let active = state == ElementState::Pressed;
-            self.camera.set_look_active(&self.window, active);
+            self.mouse_look_held = state == ElementState::Pressed;
         }
     }
 
     fn on_device_event(&mut self, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            self.camera.on_mouse_delta(delta.0 as f32, delta.1 as f32);
+            self.mouse_look_delta.0 += delta.0 as f32;
+            self.mouse_look_delta.1 += delta.1 as f32;
+        }
+    }
+
+    fn poll_input_devices(&mut self) {
+        self.gamepad.poll();
+    }
+
+    fn update_camera_keyboard_input(&mut self, key: PhysicalKey, pressed: bool) {
+        match key {
+            PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
+                self.keyboard_camera.forward = pressed
+            }
+            PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::ArrowDown) => {
+                self.keyboard_camera.backward = pressed
+            }
+            PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                self.keyboard_camera.left = pressed
+            }
+            PhysicalKey::Code(KeyCode::KeyD) | PhysicalKey::Code(KeyCode::ArrowRight) => {
+                self.keyboard_camera.right = pressed
+            }
+            PhysicalKey::Code(KeyCode::Space) | PhysicalKey::Code(KeyCode::KeyE) => {
+                self.keyboard_camera.up = pressed
+            }
+            PhysicalKey::Code(KeyCode::ControlLeft)
+            | PhysicalKey::Code(KeyCode::ControlRight)
+            | PhysicalKey::Code(KeyCode::KeyQ)
+            | PhysicalKey::Code(KeyCode::KeyC) => self.keyboard_camera.down = pressed,
+            PhysicalKey::Code(KeyCode::ShiftLeft) | PhysicalKey::Code(KeyCode::ShiftRight) => {
+                self.keyboard_camera.sprint = pressed
+            }
+            _ => {}
+        }
+    }
+
+    fn script_camera_input(&mut self, view_dt: f32) -> TlscriptShowcaseControlInput {
+        let gamepad = self.gamepad.camera_state();
+        let sensitivity = self.camera.mouse_sensitivity().max(0.0001);
+        let pad_look_to_mouse = (GAMEPAD_LOOK_SPEED_RAD * view_dt.max(0.0)) / sensitivity;
+
+        let move_x = (axis_from_bools(self.keyboard_camera.right, self.keyboard_camera.left)
+            + gamepad.move_x)
+            .clamp(-1.0, 1.0);
+        let move_y = (axis_from_bools(self.keyboard_camera.forward, self.keyboard_camera.backward)
+            + gamepad.move_y)
+            .clamp(-1.0, 1.0);
+        let move_z = (axis_from_bools(self.keyboard_camera.up, self.keyboard_camera.down)
+            + gamepad.rise
+            - gamepad.descend)
+            .clamp(-1.0, 1.0);
+        let look_dx = self.mouse_look_delta.0 + gamepad.look_x * pad_look_to_mouse;
+        let look_dy = self.mouse_look_delta.1 + gamepad.look_y * pad_look_to_mouse;
+        self.mouse_look_delta = (0.0, 0.0);
+
+        let look_active = self.look_lock_active
+            || self.mouse_look_held
+            || gamepad.look_x.abs() > 0.001
+            || gamepad.look_y.abs() > 0.001;
+        let reset_camera = std::mem::take(&mut self.camera_reset_requested);
+
+        TlscriptShowcaseControlInput {
+            move_x,
+            move_y,
+            move_z,
+            look_dx,
+            look_dy,
+            sprint_down: self.keyboard_camera.sprint || gamepad.sprint,
+            look_active,
+            reset_camera,
         }
     }
 
@@ -681,15 +838,8 @@ impl TlAppRuntime {
         let view_dt = raw_dt.clamp(1.0 / 500.0, 1.0 / 24.0);
         self.frame_started_at = frame_begin;
 
-        self.camera.update(view_dt);
-        let (eye, target) = self.camera.eye_target();
-        self.renderer.set_camera_view(
-            &self.queue,
-            self.size.width.max(1),
-            self.size.height.max(1),
-            eye,
-            target,
-        );
+        self.poll_input_devices();
+        let script_camera_input = self.script_camera_input(view_dt);
 
         let event = self.sprite_loader.reload_into_cache(&mut self.sprite_cache);
         match &event {
@@ -714,14 +864,15 @@ impl TlAppRuntime {
             _ => print_tlsprite_event("[tlsprite reload]", event),
         }
 
-        let frame_eval = self
-            .script_program
-            .evaluate_frame(TlscriptShowcaseFrameInput {
+        let frame_eval = self.script_program.evaluate_frame_with_controls(
+            TlscriptShowcaseFrameInput {
                 frame_index: self.script_frame_index,
                 live_balls: self.scene.live_ball_count(),
                 spawned_this_tick: self.script_last_spawned,
-                key_f_down: self.script_key_f_down,
-            });
+                key_f_down: self.script_key_f_keyboard || self.gamepad.action_f_down(),
+            },
+            script_camera_input,
+        );
 
         if let Some(speed) = frame_eval.camera_move_speed {
             self.camera.set_move_speed(speed);
@@ -729,9 +880,31 @@ impl TlAppRuntime {
         if let Some(sensitivity) = frame_eval.camera_look_sensitivity {
             self.camera.set_mouse_sensitivity(sensitivity);
         }
+        if let Some(active) = frame_eval.camera_look_active {
+            self.camera.set_look_active(&self.window, active);
+        }
+        if frame_eval.camera_reset_pose {
+            self.camera.reset_pose();
+        }
         if let Some((camera_eye, camera_target)) = frame_eval.camera_pose {
             self.camera.set_pose(camera_eye, camera_target);
         }
+        self.camera.set_script_move_axis(
+            frame_eval.camera_move_axis.unwrap_or([0.0, 0.0, 0.0]),
+            frame_eval.camera_sprint.unwrap_or(false),
+        );
+        if let Some([look_dx, look_dy]) = frame_eval.camera_look_delta {
+            self.camera.on_mouse_delta(look_dx, look_dy);
+        }
+        self.camera.update(view_dt);
+        let (eye, target) = self.camera.eye_target();
+        self.renderer.set_camera_view(
+            &self.queue,
+            self.size.width.max(1),
+            self.size.height.max(1),
+            eye,
+            target,
+        );
 
         let live_balls = self.scene.live_ball_count();
         let parallel_ready = frame_eval
@@ -1025,6 +1198,11 @@ fn resolve_asset_path(base_file: &Path, raw_path: &str) -> PathBuf {
     raw
 }
 
+#[inline]
+fn axis_from_bools(positive: bool, negative: bool) -> f32 {
+    (positive as i8 - negative as i8) as f32
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct CameraInputState {
     forward: bool,
@@ -1033,6 +1211,17 @@ struct CameraInputState {
     right: bool,
     up: bool,
     down: bool,
+    sprint: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GamepadCameraState {
+    move_x: f32,
+    move_y: f32,
+    look_x: f32,
+    look_y: f32,
+    rise: f32,
+    descend: f32,
     sprint: bool,
 }
 
@@ -1045,7 +1234,7 @@ struct FreeCameraController {
     sprint_multiplier: f32,
     mouse_sensitivity: f32,
     look_active: bool,
-    input: CameraInputState,
+    gamepad: GamepadCameraState,
 }
 
 impl Default for FreeCameraController {
@@ -1058,30 +1247,12 @@ impl Default for FreeCameraController {
             sprint_multiplier: 2.5,
             mouse_sensitivity: 0.0018,
             look_active: false,
-            input: CameraInputState::default(),
+            gamepad: GamepadCameraState::default(),
         }
     }
 }
 
 impl FreeCameraController {
-    fn on_keyboard_input(&mut self, event: &KeyEvent) {
-        let pressed = event.state == ElementState::Pressed;
-        match event.physical_key {
-            PhysicalKey::Code(KeyCode::KeyW) => self.input.forward = pressed,
-            PhysicalKey::Code(KeyCode::KeyS) => self.input.backward = pressed,
-            PhysicalKey::Code(KeyCode::KeyA) => self.input.left = pressed,
-            PhysicalKey::Code(KeyCode::KeyD) => self.input.right = pressed,
-            PhysicalKey::Code(KeyCode::Space) => self.input.up = pressed,
-            PhysicalKey::Code(KeyCode::ShiftLeft) | PhysicalKey::Code(KeyCode::ShiftRight) => {
-                self.input.down = pressed
-            }
-            PhysicalKey::Code(KeyCode::ControlLeft) | PhysicalKey::Code(KeyCode::ControlRight) => {
-                self.input.sprint = pressed
-            }
-            _ => {}
-        }
-    }
-
     fn set_look_active(&mut self, window: &Window, active: bool) {
         if self.look_active == active {
             return;
@@ -1115,6 +1286,18 @@ impl FreeCameraController {
         self.move_speed = speed.clamp(1.0, 200.0);
     }
 
+    fn mouse_sensitivity(&self) -> f32 {
+        self.mouse_sensitivity
+    }
+
+    fn set_script_move_axis(&mut self, axis: [f32; 3], sprint: bool) {
+        self.gamepad.move_x = axis[0].clamp(-1.0, 1.0);
+        self.gamepad.move_y = axis[1].clamp(-1.0, 1.0);
+        self.gamepad.rise = axis[2].max(0.0);
+        self.gamepad.descend = (-axis[2]).max(0.0);
+        self.gamepad.sprint = sprint;
+    }
+
     fn set_mouse_sensitivity(&mut self, sensitivity: f32) {
         self.mouse_sensitivity = sensitivity.clamp(0.0001, 0.02);
     }
@@ -1131,6 +1314,12 @@ impl FreeCameraController {
         self.yaw_rad = d.x.atan2(-d.z);
     }
 
+    fn reset_pose(&mut self) {
+        self.position = Vector3::new(0.0, 12.0, 36.0);
+        self.yaw_rad = 0.0;
+        self.pitch_rad = -0.321_750_55;
+    }
+
     fn update(&mut self, dt: f32) {
         let forward = self.forward_vector();
         let horizontal_forward = Vector3::new(forward.x, 0.0, forward.z);
@@ -1143,30 +1332,16 @@ impl FreeCameraController {
         let right = Vector3::new(-forward_flat.z, 0.0, forward_flat.x);
 
         let mut move_dir = Vector3::zeros();
-        if self.input.forward {
-            move_dir += forward_flat;
-        }
-        if self.input.backward {
-            move_dir -= forward_flat;
-        }
-        if self.input.right {
-            move_dir += right;
-        }
-        if self.input.left {
-            move_dir -= right;
-        }
-        if self.input.up {
-            move_dir.y += 1.0;
-        }
-        if self.input.down {
-            move_dir.y -= 1.0;
-        }
+        move_dir += right * self.gamepad.move_x;
+        move_dir += forward_flat * self.gamepad.move_y;
+        move_dir.y += self.gamepad.rise;
+        move_dir.y -= self.gamepad.descend;
 
         let len = move_dir.norm();
         if len > 1e-5 {
             let move_dir = move_dir / len;
             let speed = self.move_speed
-                * if self.input.sprint {
+                * if self.gamepad.sprint {
                     self.sprint_multiplier
                 } else {
                     1.0
@@ -1190,6 +1365,175 @@ impl FreeCameraController {
         let (sin_yaw, cos_yaw) = self.yaw_rad.sin_cos();
         let (sin_pitch, cos_pitch) = self.pitch_rad.sin_cos();
         Vector3::new(sin_yaw * cos_pitch, sin_pitch, -cos_yaw * cos_pitch)
+    }
+}
+
+#[cfg(feature = "gamepad")]
+#[derive(Debug, Clone, Copy, Default)]
+struct GamepadRawState {
+    left_x: f32,
+    left_y: f32,
+    right_x: f32,
+    right_y: f32,
+    left_trigger_2: f32,
+    right_trigger_2: f32,
+    dpad_up: bool,
+    dpad_down: bool,
+    dpad_left: bool,
+    dpad_right: bool,
+    south: bool,
+    sprint_left_trigger: bool,
+    sprint_left_thumb: bool,
+}
+
+#[cfg(feature = "gamepad")]
+struct GamepadManager {
+    gilrs: Option<Gilrs>,
+    active_id: Option<GamepadId>,
+    raw: GamepadRawState,
+}
+
+#[cfg(feature = "gamepad")]
+impl GamepadManager {
+    fn new() -> Self {
+        let mut manager = Self {
+            gilrs: None,
+            active_id: None,
+            raw: GamepadRawState::default(),
+        };
+        match Gilrs::new() {
+            Ok(gilrs) => {
+                manager.active_id = gilrs.gamepads().next().map(|(id, _)| id);
+                if manager.active_id.is_some() {
+                    eprintln!("[input] gamepad support enabled");
+                } else {
+                    eprintln!("[input] gamepad subsystem ready (no device connected yet)");
+                }
+                manager.gilrs = Some(gilrs);
+            }
+            Err(err) => {
+                eprintln!("[input] gamepad subsystem unavailable: {err}");
+            }
+        }
+        manager
+    }
+
+    fn poll(&mut self) {
+        loop {
+            let event = match self.gilrs.as_mut().and_then(|g| g.next_event()) {
+                Some(event) => event,
+                None => break,
+            };
+            self.active_id = Some(event.id);
+            match event.event {
+                EventType::Connected => {
+                    self.active_id = Some(event.id);
+                    self.raw = GamepadRawState::default();
+                }
+                EventType::Disconnected => {
+                    if self.active_id == Some(event.id) {
+                        self.active_id = None;
+                        self.raw = GamepadRawState::default();
+                    }
+                }
+                EventType::AxisChanged(axis, value, _) => {
+                    self.update_axis(axis, value);
+                }
+                EventType::ButtonPressed(button, _) => {
+                    self.set_button(button, true);
+                }
+                EventType::ButtonReleased(button, _) => {
+                    self.set_button(button, false);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn action_f_down(&self) -> bool {
+        self.raw.south
+    }
+
+    fn camera_state(&self) -> GamepadCameraState {
+        let dpad_x = (self.raw.dpad_right as i8 - self.raw.dpad_left as i8) as f32;
+        let dpad_y = (self.raw.dpad_up as i8 - self.raw.dpad_down as i8) as f32;
+        GamepadCameraState {
+            move_x: normalize_axis(self.raw.left_x + dpad_x),
+            move_y: normalize_axis(-self.raw.left_y + dpad_y),
+            look_x: normalize_axis(self.raw.right_x),
+            look_y: normalize_axis(-self.raw.right_y),
+            rise: normalize_axis(self.raw.right_trigger_2),
+            descend: normalize_axis(self.raw.left_trigger_2),
+            sprint: self.raw.sprint_left_trigger || self.raw.sprint_left_thumb,
+        }
+    }
+
+    fn update_axis(&mut self, axis: Axis, value: f32) {
+        let value = normalize_axis(value);
+        match axis {
+            Axis::LeftStickX => self.raw.left_x = value,
+            Axis::LeftStickY => self.raw.left_y = value,
+            Axis::RightStickX => self.raw.right_x = value,
+            Axis::RightStickY => self.raw.right_y = value,
+            Axis::LeftZ => self.raw.left_trigger_2 = value.max(0.0),
+            Axis::RightZ => self.raw.right_trigger_2 = value.max(0.0),
+            Axis::DPadX => {
+                self.raw.dpad_left = value < -0.5;
+                self.raw.dpad_right = value > 0.5;
+            }
+            Axis::DPadY => {
+                self.raw.dpad_down = value < -0.5;
+                self.raw.dpad_up = value > 0.5;
+            }
+            _ => {}
+        }
+    }
+
+    fn set_button(&mut self, button: Button, pressed: bool) {
+        match button {
+            Button::South => self.raw.south = pressed,
+            Button::LeftTrigger => self.raw.sprint_left_trigger = pressed,
+            Button::LeftThumb => self.raw.sprint_left_thumb = pressed,
+            Button::LeftTrigger2 => self.raw.left_trigger_2 = if pressed { 1.0 } else { 0.0 },
+            Button::RightTrigger2 => self.raw.right_trigger_2 = if pressed { 1.0 } else { 0.0 },
+            Button::DPadUp => self.raw.dpad_up = pressed,
+            Button::DPadDown => self.raw.dpad_down = pressed,
+            Button::DPadLeft => self.raw.dpad_left = pressed,
+            Button::DPadRight => self.raw.dpad_right = pressed,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(not(feature = "gamepad"))]
+struct GamepadManager;
+
+#[cfg(not(feature = "gamepad"))]
+impl GamepadManager {
+    fn new() -> Self {
+        eprintln!("[input] gamepad support disabled (runtime feature 'gamepad' is off)");
+        Self
+    }
+
+    fn poll(&mut self) {}
+
+    fn action_f_down(&self) -> bool {
+        false
+    }
+
+    fn camera_state(&self) -> GamepadCameraState {
+        GamepadCameraState::default()
+    }
+}
+
+#[cfg(feature = "gamepad")]
+#[inline]
+fn normalize_axis(value: f32) -> f32 {
+    let clamped = value.clamp(-1.0, 1.0);
+    if clamped.abs() < GAMEPAD_DEADZONE {
+        0.0
+    } else {
+        clamped
     }
 }
 
