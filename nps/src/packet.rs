@@ -112,6 +112,10 @@ pub enum PayloadKind {
     AuthorityTransfer = 4,
     /// ACK-only keepalive or timing packet.
     AckOnly = 5,
+    /// Client-to-server bootstrap/handshake packet.
+    BootstrapHello = 6,
+    /// Server-to-client bootstrap acceptance packet.
+    BootstrapWelcome = 7,
 }
 
 impl PayloadKind {
@@ -122,6 +126,8 @@ impl PayloadKind {
             3 => Some(Self::LifecycleEvent),
             4 => Some(Self::AuthorityTransfer),
             5 => Some(Self::AckOnly),
+            6 => Some(Self::BootstrapHello),
+            7 => Some(Self::BootstrapWelcome),
             _ => None,
         }
     }
@@ -370,6 +376,32 @@ pub struct AuthorityTransfer {
     pub reason: u8,
 }
 
+/// Client bootstrap packet used to open an NPS session without string allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapHello {
+    /// Client-generated random salt for cookie/session binding.
+    pub client_salt: u32,
+    /// Requested simulation tick rate.
+    pub requested_tick_hz: u16,
+    /// Capability bitmask (`bit0=parallel_script`, `bit1=reliable_lifecycle`, etc).
+    pub capability_bits: u16,
+    /// Caller-provided build fingerprint/hash (engine/game specific).
+    pub build_hash: u32,
+}
+
+/// Server bootstrap response with accepted session parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapWelcome {
+    /// Server-issued session id for subsequent packet tracking.
+    pub session_id: u32,
+    /// Server-generated salt paired with `client_salt`.
+    pub server_salt: u32,
+    /// Accepted simulation tick rate.
+    pub accepted_tick_hz: u16,
+    /// Maximum accepted datagram payload budget in bytes.
+    pub max_datagram_bytes: u16,
+}
+
 /// Owned decoded payload value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedPayload {
@@ -378,6 +410,8 @@ pub enum DecodedPayload {
     LifecycleEvent(LifecycleEvent),
     AuthorityTransfer(AuthorityTransfer),
     AckOnly,
+    BootstrapHello(BootstrapHello),
+    BootstrapWelcome(BootstrapWelcome),
 }
 
 /// Packet encode/decode error.
@@ -552,6 +586,52 @@ pub fn decode_authority_transfer(view: &PacketView<'_>) -> Result<AuthorityTrans
     })
 }
 
+/// Encode a bootstrap hello payload.
+pub fn encode_bootstrap_hello(
+    writer: &mut BitWriter<'_>,
+    hello: BootstrapHello,
+) -> Result<(), PacketError> {
+    writer.write_bits(hello.client_salt, 32)?;
+    writer.write_bits(u32::from(hello.requested_tick_hz), 16)?;
+    writer.write_bits(u32::from(hello.capability_bits), 16)?;
+    writer.write_bits(hello.build_hash, 32)?;
+    Ok(())
+}
+
+/// Decode a bootstrap hello payload.
+pub fn decode_bootstrap_hello(view: &PacketView<'_>) -> Result<BootstrapHello, PacketError> {
+    let mut reader = view.payload_reader()?;
+    Ok(BootstrapHello {
+        client_salt: reader.read_bits(32)?,
+        requested_tick_hz: reader.read_bits(16)? as u16,
+        capability_bits: reader.read_bits(16)? as u16,
+        build_hash: reader.read_bits(32)?,
+    })
+}
+
+/// Encode a bootstrap welcome payload.
+pub fn encode_bootstrap_welcome(
+    writer: &mut BitWriter<'_>,
+    welcome: BootstrapWelcome,
+) -> Result<(), PacketError> {
+    writer.write_bits(welcome.session_id, 32)?;
+    writer.write_bits(welcome.server_salt, 32)?;
+    writer.write_bits(u32::from(welcome.accepted_tick_hz), 16)?;
+    writer.write_bits(u32::from(welcome.max_datagram_bytes), 16)?;
+    Ok(())
+}
+
+/// Decode a bootstrap welcome payload.
+pub fn decode_bootstrap_welcome(view: &PacketView<'_>) -> Result<BootstrapWelcome, PacketError> {
+    let mut reader = view.payload_reader()?;
+    Ok(BootstrapWelcome {
+        session_id: reader.read_bits(32)?,
+        server_salt: reader.read_bits(32)?,
+        accepted_tick_hz: reader.read_bits(16)? as u16,
+        max_datagram_bytes: reader.read_bits(16)? as u16,
+    })
+}
+
 /// Decode a packet payload into an owned value for cross-thread handoff.
 pub fn decode_payload_owned(view: &PacketView<'_>) -> Result<DecodedPayload, PacketError> {
     match view.header.kind {
@@ -566,6 +646,12 @@ pub fn decode_payload_owned(view: &PacketView<'_>) -> Result<DecodedPayload, Pac
             decode_authority_transfer(view).map(DecodedPayload::AuthorityTransfer)
         }
         PayloadKind::AckOnly => Ok(DecodedPayload::AckOnly),
+        PayloadKind::BootstrapHello => {
+            decode_bootstrap_hello(view).map(DecodedPayload::BootstrapHello)
+        }
+        PayloadKind::BootstrapWelcome => {
+            decode_bootstrap_welcome(view).map(DecodedPayload::BootstrapWelcome)
+        }
     }
 }
 
@@ -625,5 +711,63 @@ mod tests {
         let (x, y) = grid.decode_position(decoded[0].pos_x, decoded[0].pos_y);
         assert!((x - 128.0).abs() < 1.0);
         assert!((y - 64.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn bootstrap_hello_roundtrip() {
+        let mut datagram = [0u8; 128];
+        let header = PacketHeader {
+            magic: NPS_MAGIC,
+            version: NPS_VERSION,
+            flags: PacketFlags::RELIABLE,
+            channel: PacketChannel::Lifecycle,
+            kind: PayloadKind::BootstrapHello,
+            sequence: 2,
+            ack: 1,
+            ack_bits: 0,
+            tick: 0,
+            payload_bits: 0,
+        };
+        let hello = BootstrapHello {
+            client_salt: 0x1234_5678,
+            requested_tick_hz: 120,
+            capability_bits: 0b1011,
+            build_hash: 0xCAFE_BABE,
+        };
+        let len =
+            encode_packet(header, &mut datagram, |w| encode_bootstrap_hello(w, hello)).unwrap();
+        let view = PacketView::parse(&datagram[..len]).unwrap();
+        let decoded = decode_bootstrap_hello(&view).unwrap();
+        assert_eq!(decoded, hello);
+    }
+
+    #[test]
+    fn bootstrap_welcome_roundtrip() {
+        let mut datagram = [0u8; 128];
+        let header = PacketHeader {
+            magic: NPS_MAGIC,
+            version: NPS_VERSION,
+            flags: PacketFlags::RELIABLE,
+            channel: PacketChannel::Lifecycle,
+            kind: PayloadKind::BootstrapWelcome,
+            sequence: 3,
+            ack: 2,
+            ack_bits: 0,
+            tick: 0,
+            payload_bits: 0,
+        };
+        let welcome = BootstrapWelcome {
+            session_id: 0x8877_6655,
+            server_salt: 0xABCD_0123,
+            accepted_tick_hz: 60,
+            max_datagram_bytes: 1200,
+        };
+        let len = encode_packet(header, &mut datagram, |w| {
+            encode_bootstrap_welcome(w, welcome)
+        })
+        .unwrap();
+        let view = PacketView::parse(&datagram[..len]).unwrap();
+        let decoded = decode_bootstrap_welcome(&view).unwrap();
+        assert_eq!(decoded, welcome);
     }
 }

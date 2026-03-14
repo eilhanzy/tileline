@@ -140,6 +140,12 @@ cargo test -p runtime
 cargo run -p runtime --example wgpu_scene_showcase
 ```
 
+### Run NPS Starter Packet Example
+
+```bash
+cargo run -p nps --example starter_packet
+```
+
 ## Canonical Runtime Flow (Non-Benchmark)
 
 The intended engine-side `wgpu` frame flow is:

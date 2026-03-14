@@ -19,10 +19,12 @@ use mps::{CorePreference, MpsScheduler, TaskId, TaskPriority};
 use paradoxpe::PhysicsSnapshot;
 
 use crate::packet::{
-    decode_payload_owned, encode_authority_transfer, encode_input_frame, encode_lifecycle_event,
-    encode_packet, encode_transform_batch, AuthorityTransfer, DecodedPayload, GridQuantization,
-    InputFrame, LifecycleEvent, PacketChannel, PacketError, PacketFlags, PacketHeader, PacketView,
-    PayloadKind, TransformBatch, TransformSample, NPS_HEADER_BYTES, NPS_MAGIC, NPS_VERSION,
+    decode_payload_owned, encode_authority_transfer, encode_bootstrap_hello,
+    encode_bootstrap_welcome, encode_input_frame, encode_lifecycle_event, encode_packet,
+    encode_transform_batch, AuthorityTransfer, BootstrapHello, BootstrapWelcome, DecodedPayload,
+    GridQuantization, InputFrame, LifecycleEvent, PacketChannel, PacketError, PacketFlags,
+    PacketHeader, PacketView, PayloadKind, TransformBatch, TransformSample, NPS_HEADER_BYTES,
+    NPS_MAGIC, NPS_VERSION,
 };
 use crate::reliability::{
     PeerId, PeerLinkMetrics, PeerReliabilityState, PhysAuthorityTable, SendPolicy,
@@ -146,6 +148,10 @@ pub enum OutboundPayload {
     AuthorityTransfer(AuthorityTransfer),
     /// ACK-only heartbeat.
     AckOnly,
+    /// Initial client bootstrap packet for NPS session setup.
+    BootstrapHello(BootstrapHello),
+    /// Initial server bootstrap acceptance packet.
+    BootstrapWelcome(BootstrapWelcome),
 }
 
 impl OutboundPayload {
@@ -156,6 +162,8 @@ impl OutboundPayload {
             Self::LifecycleEvent(_) => PayloadKind::LifecycleEvent,
             Self::AuthorityTransfer(_) => PayloadKind::AuthorityTransfer,
             Self::AckOnly => PayloadKind::AckOnly,
+            Self::BootstrapHello(_) => PayloadKind::BootstrapHello,
+            Self::BootstrapWelcome(_) => PayloadKind::BootstrapWelcome,
         }
     }
 }
@@ -472,6 +480,30 @@ impl NetworkPacketManager {
         );
     }
 
+    /// Queue a reliable bootstrap hello packet (client -> server/session host).
+    pub fn queue_bootstrap_hello(&mut self, peer: PeerId, tick: u32, hello: BootstrapHello) {
+        let addr = self.peers.get(&peer).and_then(|p| p.addr);
+        self.queue_outbound_payload(
+            peer,
+            addr,
+            PacketChannel::Lifecycle,
+            tick,
+            OutboundPayload::BootstrapHello(hello),
+        );
+    }
+
+    /// Queue a reliable bootstrap welcome packet (server/session host -> client).
+    pub fn queue_bootstrap_welcome(&mut self, peer: PeerId, tick: u32, welcome: BootstrapWelcome) {
+        let addr = self.peers.get(&peer).and_then(|p| p.addr);
+        self.queue_outbound_payload(
+            peer,
+            addr,
+            PacketChannel::Lifecycle,
+            tick,
+            OutboundPayload::BootstrapWelcome(welcome),
+        );
+    }
+
     /// Submit outbound encode jobs to MPS (or encode inline if no scheduler).
     pub fn submit_outbound_encode_jobs(&mut self, max_jobs: usize) -> Vec<TaskId> {
         let mut task_ids = Vec::new();
@@ -743,6 +775,8 @@ fn encode_outbound_job(
             encode_authority_transfer(writer, *transfer)
         }
         OutboundPayload::AckOnly => Ok(()),
+        OutboundPayload::BootstrapHello(hello) => encode_bootstrap_hello(writer, *hello),
+        OutboundPayload::BootstrapWelcome(welcome) => encode_bootstrap_welcome(writer, *welcome),
     });
 
     match result {
@@ -890,6 +924,57 @@ mod tests {
                 assert_eq!(samples[0].flags & 0x1, 0x1);
             }
             other => panic!("expected transform batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manager_roundtrips_bootstrap_packets() {
+        let mut mgr = NetworkPacketManager::new(NetworkPacketConfig::default());
+        mgr.set_peer_addr(11, "127.0.0.1:27017".parse().unwrap());
+
+        let hello = BootstrapHello {
+            client_salt: 0x0102_0304,
+            requested_tick_hz: 120,
+            capability_bits: 0b0011,
+            build_hash: 0xA1B2_C3D4,
+        };
+        mgr.queue_bootstrap_hello(11, 0, hello);
+        mgr.submit_outbound_encode_jobs(4);
+        let datagrams = mgr.drain_encoded_datagrams(4);
+        assert_eq!(datagrams.len(), 1);
+        assert!(datagrams[0].header.flags.contains(PacketFlags::RELIABLE));
+        assert_eq!(datagrams[0].header.kind, PayloadKind::BootstrapHello);
+
+        mgr.enqueue_inbound_datagram(11, None, Arc::clone(&datagrams[0].bytes));
+        mgr.submit_inbound_decode_jobs(4);
+        let decoded = mgr.drain_decoded_packets(4);
+        assert_eq!(decoded.len(), 1);
+        match &decoded[0].payload {
+            DecodedPayload::BootstrapHello(decoded_hello) => assert_eq!(*decoded_hello, hello),
+            other => panic!("expected bootstrap hello, got {other:?}"),
+        }
+
+        let welcome = BootstrapWelcome {
+            session_id: 77,
+            server_salt: 0xDEAD_BEEF,
+            accepted_tick_hz: 60,
+            max_datagram_bytes: 1200,
+        };
+        mgr.queue_bootstrap_welcome(11, 0, welcome);
+        mgr.submit_outbound_encode_jobs(4);
+        let datagrams = mgr.drain_encoded_datagrams(4);
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(datagrams[0].header.kind, PayloadKind::BootstrapWelcome);
+
+        mgr.enqueue_inbound_datagram(11, None, Arc::clone(&datagrams[0].bytes));
+        mgr.submit_inbound_decode_jobs(4);
+        let decoded = mgr.drain_decoded_packets(4);
+        assert_eq!(decoded.len(), 1);
+        match &decoded[0].payload {
+            DecodedPayload::BootstrapWelcome(decoded_welcome) => {
+                assert_eq!(*decoded_welcome, welcome)
+            }
+            other => panic!("expected bootstrap welcome, got {other:?}"),
         }
     }
 }

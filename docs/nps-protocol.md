@@ -9,6 +9,7 @@ Scope of this version:
 - lightweight reliability over UDP for lifecycle events
 - deterministic physics-object authority handoff (physgun-style)
 - MPS-integrated async encode/decode task flow
+- bootstrap session packets (`BootstrapHello` / `BootstrapWelcome`) for startup negotiation
 
 ## Goals
 
@@ -43,6 +44,24 @@ Core fields:
 - `payload_bits`
 
 Implementation: `nps/src/packet.rs`
+
+### Bootstrap Startup Packets
+
+NPS V1 now includes explicit startup payload kinds:
+
+- `PayloadKind::BootstrapHello` (client -> host/server)
+- `PayloadKind::BootstrapWelcome` (host/server -> client)
+
+These packets are intentionally compact and integer-only:
+
+- no string payloads
+- fixed-width scalar fields
+- reliable control lane semantics
+
+Current intent:
+
+1. open the session with deterministic capability/tick negotiation
+2. keep bootstrap overhead low before high-rate physics/input traffic starts
 
 ## Bit-Packed Payloads and Quantization
 

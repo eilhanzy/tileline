@@ -23,10 +23,12 @@ pub use manager::{
 };
 pub use model::{packet_semantics, PacketLane, PacketSemantics, SnapshotMode, TickScope};
 pub use packet::{
-    decode_authority_transfer, decode_input_frame, decode_lifecycle_event, decode_payload_owned,
-    decode_transform_batch, dequantize_u16_to_unit, encode_authority_transfer, encode_input_frame,
-    encode_lifecycle_event, encode_packet, encode_transform_batch, quantize_unit_to_u16,
-    AuthorityTransfer, DecodedPayload, GridQuantization, InputFrame, LifecycleEvent, PacketChannel,
+    decode_authority_transfer, decode_bootstrap_hello, decode_bootstrap_welcome,
+    decode_input_frame, decode_lifecycle_event, decode_payload_owned, decode_transform_batch,
+    dequantize_u16_to_unit, encode_authority_transfer, encode_bootstrap_hello,
+    encode_bootstrap_welcome, encode_input_frame, encode_lifecycle_event, encode_packet,
+    encode_transform_batch, quantize_unit_to_u16, AuthorityTransfer, BootstrapHello,
+    BootstrapWelcome, DecodedPayload, GridQuantization, InputFrame, LifecycleEvent, PacketChannel,
     PacketError, PacketFlags, PacketHeader, PacketView, PayloadKind, TransformBatch,
     TransformSample, NPS_HEADER_BYTES, NPS_MAGIC, NPS_VERSION,
 };

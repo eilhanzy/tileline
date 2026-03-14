@@ -117,6 +117,15 @@ pub const fn packet_semantics(channel: PacketChannel, kind: PayloadKind) -> Pack
             sequenced: false,
             budget_weight: 64,
         },
+        (PacketChannel::Lifecycle, PayloadKind::BootstrapHello)
+        | (PacketChannel::Lifecycle, PayloadKind::BootstrapWelcome) => PacketSemantics {
+            lane: PacketLane::LifecycleEvent,
+            tick_scope: TickScope::Control,
+            snapshot_mode: SnapshotMode::None,
+            reliable: true,
+            sequenced: false,
+            budget_weight: 200,
+        },
         (PacketChannel::Lifecycle, _) | (_, PayloadKind::LifecycleEvent) => PacketSemantics {
             lane: PacketLane::LifecycleEvent,
             tick_scope: TickScope::Control,
@@ -197,5 +206,15 @@ mod tests {
         assert_eq!(semantics.snapshot_mode, SnapshotMode::InputFrame);
         assert!(!semantics.reliable);
         assert!(semantics.sequenced);
+    }
+
+    #[test]
+    fn bootstrap_packets_are_reliable_control_lane() {
+        let semantics = packet_semantics(PacketChannel::Lifecycle, PayloadKind::BootstrapHello);
+        assert_eq!(semantics.lane, PacketLane::LifecycleEvent);
+        assert_eq!(semantics.tick_scope, TickScope::Control);
+        assert_eq!(semantics.snapshot_mode, SnapshotMode::None);
+        assert!(semantics.reliable);
+        assert!(!semantics.sequenced);
     }
 }
