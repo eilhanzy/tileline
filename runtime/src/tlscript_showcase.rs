@@ -817,4 +817,15 @@ mod tests {
         assert!(out.camera_look_sensitivity.unwrap_or(0.0) > 0.0);
         assert!(out.camera_pose.is_some());
     }
+
+    #[test]
+    fn tlapp_demo_script_compiles() {
+        let src = include_str!("../../docs/demos/tlapp/bounce_showcase.tlscript");
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(
+            outcome.errors.is_empty(),
+            "tlapp demo script should compile cleanly: {:?}",
+            outcome.errors
+        );
+    }
 }
