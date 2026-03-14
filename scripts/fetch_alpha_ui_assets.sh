@@ -19,6 +19,12 @@ download_and_extract_zip() {
   unzip -q "${zip_path}" -d "${dst}"
 }
 
+download_file() {
+  local url="$1"
+  local dst="$2"
+  curl -L --fail --silent --show-error "${url}" -o "${dst}"
+}
+
 resolve_jetbrains_mono_url() {
   local api_url="https://api.github.com/repos/JetBrains/JetBrainsMono/releases/latest"
   local api_payload=""
@@ -40,8 +46,41 @@ resolve_jetbrains_mono_url() {
   printf "%s\n" "https://download.jetbrains.com/fonts/JetBrainsMono-2.304.zip"
 }
 
+resolve_noto_sans_file_urls() {
+  local base="https://raw.githubusercontent.com/notofonts/noto-fonts/main/hinted/ttf/NotoSans"
+  printf "%s\n" \
+    "${base}/NotoSans-Regular.ttf" \
+    "${base}/NotoSans-Bold.ttf" \
+    "${base}/NotoSans-Italic.ttf" \
+    "${base}/NotoSans-BoldItalic.ttf"
+}
+
+download_noto_sans_family() {
+  local dst="$1"
+  rm -rf "${dst}"
+  mkdir -p "${dst}"
+
+  while IFS= read -r url; do
+    [[ -z "${url}" ]] && continue
+    local file_name
+    file_name="$(basename "${url}")"
+    echo "[alpha-assets] Noto Sans file: ${url}"
+    download_file "${url}" "${dst}/${file_name}"
+  done < <(resolve_noto_sans_file_urls)
+
+  # Keep upstream license text alongside downloaded files.
+  download_file \
+    "https://raw.githubusercontent.com/notofonts/noto-fonts/main/LICENSE" \
+    "${dst}/LICENSE"
+}
+
 if [[ "${1:-}" == "--print-jetbrains-url" ]]; then
   resolve_jetbrains_mono_url
+  exit 0
+fi
+
+if [[ "${1:-}" == "--print-noto-urls" ]]; then
+  resolve_noto_sans_file_urls
   exit 0
 fi
 
@@ -53,9 +92,7 @@ download_and_extract_zip \
   "${OUT_DIR}/fonts/jetbrains-mono"
 
 echo "[alpha-assets] downloading Noto Sans (OFL-1.1)"
-download_and_extract_zip \
-  "https://github.com/notofonts/noto-fonts/releases/latest/download/07_NotoSans.zip" \
-  "${OUT_DIR}/fonts/noto-sans"
+download_noto_sans_family "${OUT_DIR}/fonts/noto-sans"
 
 echo "[alpha-assets] downloading Tabler Icons (MIT)"
 download_and_extract_zip \
