@@ -32,6 +32,7 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 ## Documentation
 
 - `README.md`: workspace overview and quick start
+- `CHANGELOG.md`: release history
 - `docs/README.md`: documentation index
 - `docs/tlscript-lexer.md`: `.tlscript` zero-copy lexer/token design
 - `docs/tlscript-parser-plan.md`: `.tlscript` parser/AST roadmap and V1 grammar
@@ -137,6 +138,12 @@ cargo test -p runtime
 ### Run Runtime TLApp Demo
 
 ```bash
+cargo run -p runtime --bin tlapp -- --fps-cap 60 --vsync auto
+```
+
+Legacy example entrypoint remains available:
+
+```bash
 cargo run -p runtime --example tlapp -- --fps-cap 60 --vsync auto
 ```
 
@@ -215,3 +222,18 @@ Next pipeline steps:
 
 This repository is structured to be MIT-license ready (code comments and docs use FOSS-friendly
 terminology and style). Add/update the root `LICENSE` file as the project license source of truth.
+
+## Release v0.1.0
+
+`v0.1.0` packaging now includes a runnable `tlapp` binary artifact flow.
+
+Build/package artifacts:
+
+```bash
+./scripts/release_v0.1.0.sh
+```
+
+Release notes:
+
+- `docs/releases/v0.1.0.md`
+- `CHANGELOG.md`
