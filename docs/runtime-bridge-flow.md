@@ -14,6 +14,7 @@ stack into a `wgpu` render loop.
 - `runtime/src/scene_dispatch.rs` (scene workload estimate -> bridge task submission + frame seal)
 - `runtime/src/scene_workload.rs` (scene density -> GMS planner request synthesis)
 - `runtime/src/mobile_scene_workload.rs` (scene density -> MGS bridge hint synthesis)
+- `runtime/src/scheduler_path.rs` (auto select `GMS` vs `MGS` from adapter metadata)
 - `runtime/src/wgpu_render_loop.rs` (`WgpuRenderLoopCoordinator`)
 - `runtime/src/tlscript_parallel.rs` (`TlscriptParallelRuntimeCoordinator`)
 

@@ -7,6 +7,7 @@
 //! - `frame_loop`: bridge pumping and frame-plan queue management
 //! - `mobile_scene_workload`: scene->MGS hint synthesis helpers
 //! - `pre_alpha_loop`: canonical pre-alpha runtime phase ordering
+//! - `scheduler_path`: automatic runtime selection policy for GMS vs MGS
 //! - `scene`: runtime scene/sprite payloads and bounce showcase orchestration helpers
 //! - `scene_dispatch`: scene workload -> bridge task submission helpers
 //! - `scene_workload`: scene->GMS workload synthesis helpers
@@ -19,6 +20,7 @@ mod pre_alpha_loop;
 mod scene;
 mod scene_dispatch;
 mod scene_workload;
+mod scheduler_path;
 mod tlscript_parallel;
 mod wgpu_render_loop;
 
@@ -50,6 +52,7 @@ pub use scene_dispatch::{
 pub use scene_workload::{
     build_scene_workload_snapshot, estimate_scene_workload_requests, SceneWorkloadBridgeConfig,
 };
+pub use scheduler_path::{choose_scheduler_path, GraphicsSchedulerDecision, GraphicsSchedulerPath};
 pub use tlscript_parallel::{
     TlscriptDispatchSubmission, TlscriptMpsDispatchConfig, TlscriptParallelRuntimeCoordinator,
     TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,

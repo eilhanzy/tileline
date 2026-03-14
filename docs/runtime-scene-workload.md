@@ -9,6 +9,7 @@ planner requests without relying on benchmark-only code.
 - `runtime/src/scene_dispatch.rs`
 - `runtime/src/scene_workload.rs`
 - `runtime/examples/bounce_tank_showcase.rs`
+- `runtime/examples/auto_scene_scheduler.rs`
 
 ## Why This Exists
 

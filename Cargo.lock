@@ -3004,6 +3004,7 @@ dependencies = [
  "nalgebra",
  "nps",
  "paradoxpe",
+ "pollster",
  "tl-core",
  "tokio",
  "wgpu",

@@ -47,6 +47,7 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/runtime-bridge-flow.md`: canonical MPS -> GMS -> runtime synchronization flow
 - `docs/runtime-scene-showcase.md`: runtime scene/sprite payload model and bounce-tank showcase scaffolding
 - `docs/runtime-scene-workload.md`: runtime scene/sprite density to GMS workload mapping
+- `docs/runtime-scheduler-path.md`: runtime auto-selection policy for `GMS` vs `MGS`
 - `docs/mgs-scene-workload.md`: runtime/mobile scene/sprite density to MGS hint and tile planning mapping
 - `docs/demos/README.md`: show/demo documentation area (`docs/demos/*`)
 

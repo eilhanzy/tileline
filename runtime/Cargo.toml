@@ -13,3 +13,6 @@ nps = { path = "../nps" }
 paradoxpe = { path = "../paradoxpe" }
 tokio = { workspace = true, features = ["net", "time", "rt", "macros"] }
 nalgebra.workspace = true
+
+[dev-dependencies]
+pollster = "0.4.0"
