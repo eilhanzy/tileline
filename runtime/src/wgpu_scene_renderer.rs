@@ -5,6 +5,9 @@
 //! - transparent 3D batches
 //! - sprite overlays (including telemetry HUD sprites)
 
+use std::io::Cursor;
+
+use fbx::Property as FbxProperty;
 use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3};
 use wgpu::util::DeviceExt;
 
@@ -14,9 +17,10 @@ use crate::scene::SpriteKind;
 const SPRITE_ATLAS_GRID_DIM: u32 = 4;
 const SPRITE_ATLAS_TILE_SIZE: u32 = 64;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const DEFAULT_SPHERE_FBX_BYTES: &[u8] = include_bytes!("../../docs/demos/sphere.fbx");
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct GpuVertex3d {
     position: [f32; 3],
 }
@@ -219,7 +223,7 @@ impl WgpuSceneRenderer {
             create_default_sprite_atlas_resources(device, queue, &sprite_bgl);
 
         let box_mesh = create_box_mesh(device);
-        let sphere_mesh = create_octa_sphere_mesh(device);
+        let sphere_mesh = create_sphere_mesh(device);
         let sprite_vertex_buffer = create_sprite_quad_vertex_buffer(device);
         let instance_3d_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("runtime-scene-3d-instance-buffer"),
@@ -726,6 +730,18 @@ fn create_box_mesh(device: &wgpu::Device) -> GpuMesh {
     create_mesh(device, "runtime-scene-box", &vertices, &indices)
 }
 
+fn create_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
+    match parse_first_mesh_from_fbx(DEFAULT_SPHERE_FBX_BYTES) {
+        Ok(mesh_data) => create_mesh(
+            device,
+            "runtime-scene-sphere-fbx",
+            &mesh_data.vertices,
+            &mesh_data.indices,
+        ),
+        Err(_) => create_octa_sphere_mesh(device),
+    }
+}
+
 fn create_octa_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
     let vertices = [
         GpuVertex3d {
@@ -751,6 +767,158 @@ fn create_octa_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
         0, 2, 4, 4, 2, 1, 1, 2, 5, 5, 2, 0, 4, 3, 0, 1, 3, 4, 5, 3, 1, 0, 3, 5,
     ];
     create_mesh(device, "runtime-scene-sphere", &vertices, &indices)
+}
+
+#[derive(Debug, Clone)]
+struct ParsedFbxMesh {
+    vertices: Vec<GpuVertex3d>,
+    indices: Vec<u16>,
+}
+
+fn parse_first_mesh_from_fbx(bytes: &[u8]) -> Result<ParsedFbxMesh, String> {
+    let file = fbx::File::read_from(Cursor::new(bytes)).map_err(|err| format!("{err}"))?;
+    let objects = file
+        .children
+        .iter()
+        .find(|node| node.name == "Objects")
+        .ok_or_else(|| "FBX objects node was not found".to_string())?;
+
+    for geometry in objects
+        .children
+        .iter()
+        .filter(|node| node.name == "Geometry")
+    {
+        let kind = geometry
+            .properties
+            .get(2)
+            .and_then(fbx_property_as_string)
+            .unwrap_or_default();
+        if kind != "Mesh" {
+            continue;
+        }
+
+        let vertices_f64 = geometry
+            .children
+            .iter()
+            .find(|node| node.name == "Vertices")
+            .and_then(|node| node.properties.first())
+            .and_then(fbx_property_as_f64_slice)
+            .ok_or_else(|| "FBX mesh does not contain vertices".to_string())?;
+        let polygon_vertex_index = geometry
+            .children
+            .iter()
+            .find(|node| node.name == "PolygonVertexIndex")
+            .and_then(|node| node.properties.first())
+            .and_then(fbx_property_as_i32_slice)
+            .ok_or_else(|| "FBX mesh does not contain polygon vertex indices".to_string())?;
+
+        let vertices = fbx_vertices_to_gpu(vertices_f64)?;
+        let indices = fbx_polygon_indices_to_triangles(polygon_vertex_index, vertices.len())?;
+        if indices.is_empty() {
+            return Err("FBX mesh did not produce triangle indices".to_string());
+        }
+        return Ok(ParsedFbxMesh { vertices, indices });
+    }
+
+    Err("No FBX mesh geometry node found".to_string())
+}
+
+fn fbx_vertices_to_gpu(vertices_f64: &[f64]) -> Result<Vec<GpuVertex3d>, String> {
+    if vertices_f64.len() < 9 {
+        return Err("FBX vertices array is too small".to_string());
+    }
+    if vertices_f64.len() % 3 != 0 {
+        return Err("FBX vertices array is not 3-component aligned".to_string());
+    }
+
+    let mut vertices = Vec::with_capacity(vertices_f64.len() / 3);
+    for chunk in vertices_f64.chunks_exact(3) {
+        vertices.push(GpuVertex3d {
+            position: [chunk[0] as f32, chunk[1] as f32, chunk[2] as f32],
+        });
+    }
+    Ok(vertices)
+}
+
+fn fbx_polygon_indices_to_triangles(
+    polygon_vertex_index: &[i32],
+    vertex_count: usize,
+) -> Result<Vec<u16>, String> {
+    let mut triangles_u32 = Vec::<u32>::new();
+    let mut polygon = Vec::<u32>::with_capacity(8);
+
+    for &raw_index in polygon_vertex_index {
+        let (resolved, is_polygon_end) = if raw_index < 0 {
+            let corrected = raw_index
+                .checked_neg()
+                .and_then(|v| v.checked_sub(1))
+                .ok_or_else(|| "FBX polygon index underflow".to_string())?;
+            (corrected, true)
+        } else {
+            (raw_index, false)
+        };
+
+        let resolved_u32: u32 = resolved
+            .try_into()
+            .map_err(|_| "FBX polygon index is negative".to_string())?;
+        if resolved_u32 as usize >= vertex_count {
+            return Err("FBX polygon index exceeds vertex count".to_string());
+        }
+        polygon.push(resolved_u32);
+
+        if is_polygon_end {
+            triangulate_polygon_fan(&polygon, &mut triangles_u32);
+            polygon.clear();
+        }
+    }
+
+    if !polygon.is_empty() {
+        triangulate_polygon_fan(&polygon, &mut triangles_u32);
+    }
+    if triangles_u32.is_empty() {
+        return Err("FBX polygon list did not contain triangles".to_string());
+    }
+
+    if triangles_u32.iter().any(|index| *index > u16::MAX as u32) {
+        return Err("FBX mesh has indices above u16 range".to_string());
+    }
+
+    let mut triangles_u16 = Vec::with_capacity(triangles_u32.len());
+    triangles_u16.extend(triangles_u32.into_iter().map(|v| v as u16));
+    Ok(triangles_u16)
+}
+
+fn triangulate_polygon_fan(polygon: &[u32], triangles_out: &mut Vec<u32>) {
+    if polygon.len() < 3 {
+        return;
+    }
+    let first = polygon[0];
+    for i in 1..polygon.len() - 1 {
+        triangles_out.push(first);
+        triangles_out.push(polygon[i]);
+        triangles_out.push(polygon[i + 1]);
+    }
+}
+
+fn fbx_property_as_string(property: &FbxProperty) -> Option<&str> {
+    match property {
+        FbxProperty::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn fbx_property_as_f64_slice(property: &FbxProperty) -> Option<&[f64]> {
+    match property {
+        FbxProperty::F64Array(values) => Some(values.as_slice()),
+        _ => None,
+    }
+}
+
+fn fbx_property_as_i32_slice(property: &FbxProperty) -> Option<&[i32]> {
+    match property {
+        FbxProperty::I32Array(values) => Some(values.as_slice()),
+        _ => None,
+    }
 }
 
 fn create_mesh(
@@ -1191,6 +1359,17 @@ mod tests {
         let second = &pixels
             [(SPRITE_ATLAS_TILE_SIZE as usize * 4)..(SPRITE_ATLAS_TILE_SIZE as usize * 4 + 4)];
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn embedded_sphere_fbx_is_parsed_into_indexed_triangles() {
+        let mesh = parse_first_mesh_from_fbx(DEFAULT_SPHERE_FBX_BYTES)
+            .expect("embedded sphere.fbx should parse");
+        assert!(!mesh.vertices.is_empty());
+        assert!(!mesh.indices.is_empty());
+        assert_eq!(mesh.indices.len() % 3, 0);
+        let max_index = mesh.indices.iter().copied().max().unwrap_or(0) as usize;
+        assert!(max_index < mesh.vertices.len());
     }
 
     fn make_instance(id: u64) -> DrawInstance3d {
