@@ -50,9 +50,19 @@ Optional:
 ## Behavior
 
 - Left panel: scene selection from `.tlpfile`.
-- Center panel: merged compile summary (scripts/sprites/joint).
+- Center panel: merged compile summary (scripts/sprites/joint) + lightweight scene view.
 - Right panel: parse + compile diagnostics.
-- Top bar: explicit `Reload .tlpfile` and `Compile Scene` actions.
+- Top bar: icon buttons for `Reload`, `Compile`, `Start`, `Pause`, `Stop`.
+- Bottom panel: mini `.tlpfile` text editor (`Load`, `Save`, `Parse`, `Save+Compile`).
+
+## Scene View (Light Mode)
+
+- A lightweight animated scene preview is rendered directly in the GUI.
+- `Light Mode` toggle keeps preview simulation cheap for editor responsiveness.
+- Playback controls:
+  - `Start` runs preview simulation
+  - `Pause` freezes simulation state
+  - `Stop` resets and re-seeds preview bodies
 
 The compiler path merges:
 
