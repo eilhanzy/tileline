@@ -3000,6 +3000,7 @@ version = "0.1.0"
 dependencies = [
  "gms",
  "mps",
+ "nalgebra",
  "nps",
  "paradoxpe",
  "tl-core",

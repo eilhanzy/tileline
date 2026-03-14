@@ -73,6 +73,18 @@ impl FixedStepClock {
         self.tick
     }
 
+    /// Fractional interpolation alpha for render-side snapshot blending.
+    ///
+    /// `0.0` means exactly on the previous fixed-step snapshot,
+    /// `1.0` means exactly on the latest fixed-step snapshot.
+    pub fn interpolation_alpha(&self) -> f32 {
+        if self.fixed_dt <= f32::EPSILON {
+            1.0
+        } else {
+            (self.accumulator / self.fixed_dt).clamp(0.0, 1.0)
+        }
+    }
+
     pub fn accumulate(&mut self, dt: f32) -> u32 {
         self.accumulator =
             (self.accumulator + dt.max(0.0)).min(self.fixed_dt * self.max_substeps as f32);
@@ -174,6 +186,11 @@ impl PhysicsWorld {
 
     pub fn fixed_step_clock(&self) -> &FixedStepClock {
         &self.clock
+    }
+
+    /// Current render interpolation alpha derived from fixed-step accumulator state.
+    pub fn interpolation_alpha(&self) -> f32 {
+        self.clock.interpolation_alpha()
     }
 
     pub fn body_registry(&self) -> &BodyRegistry {

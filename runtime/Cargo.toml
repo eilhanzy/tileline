@@ -11,3 +11,4 @@ mps = { path = "../mps" }
 nps = { path = "../nps" }
 paradoxpe = { path = "../paradoxpe" }
 tokio = { workspace = true, features = ["net", "time", "rt", "macros"] }
+nalgebra.workspace = true

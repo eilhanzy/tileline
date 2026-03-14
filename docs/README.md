@@ -17,6 +17,7 @@ in `src/` crates (not benchmark-only code).
 - `paradoxpe-tlscript-examples.md`: verified `.tlscript` examples targeting the current ParadoxPE ABI
 - `gms-dispatch-planner.md`: GPU scoring, workload assignment, aggressive secondary-lane multi-GPU planning, and Vulkan version gating
 - `runtime-bridge-flow.md`: canonical MPS -> `tl-core` -> GMS -> runtime submit/present flow
+- `runtime-scene-showcase.md`: runtime-side 3D scene/sprite payload model and bounce-tank showcase controller
 
 ## Documentation Style
 

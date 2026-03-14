@@ -10,6 +10,7 @@ stack into a `wgpu` render loop.
 - `runtime/src/frame_loop.rs` (`FrameLoopRuntime`)
 - `runtime/src/network_transport.rs` (`NetworkTransportRuntime`)
 - `runtime/src/pre_alpha_loop.rs` (`RuntimePhaseOrderTracker`)
+- `runtime/src/scene.rs` (`BounceTankSceneController`, scene/sprite payloads, tick-rate policy)
 - `runtime/src/wgpu_render_loop.rs` (`WgpuRenderLoopCoordinator`)
 - `runtime/src/tlscript_parallel.rs` (`TlscriptParallelRuntimeCoordinator`)
 

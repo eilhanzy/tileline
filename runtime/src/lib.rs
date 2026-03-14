@@ -6,11 +6,13 @@
 //! Modules:
 //! - `frame_loop`: bridge pumping and frame-plan queue management
 //! - `pre_alpha_loop`: canonical pre-alpha runtime phase ordering
+//! - `scene`: runtime scene/sprite payloads and bounce showcase orchestration helpers
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
 mod frame_loop;
 mod network_transport;
 mod pre_alpha_loop;
+mod scene;
 mod tlscript_parallel;
 mod wgpu_render_loop;
 
@@ -26,6 +28,11 @@ pub use network_transport::{
 pub use pre_alpha_loop::{
     RuntimeFramePhase, RuntimePhaseOrderMetrics, RuntimePhaseOrderTracker, RuntimePhaseViolation,
     PRE_ALPHA_PHASE_ORDER,
+};
+pub use scene::{
+    BounceTankSceneConfig, BounceTankSceneController, BounceTankTickMetrics, RenderSyncMode,
+    SceneFrameInstances, SceneInstance3d, SceneMaterial, ScenePrimitive3d, SceneTransform3d,
+    ShadingModel, SpriteInstance, TickRatePolicy,
 };
 pub use tlscript_parallel::{
     TlscriptDispatchSubmission, TlscriptMpsDispatchConfig, TlscriptParallelRuntimeCoordinator,

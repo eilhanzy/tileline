@@ -27,7 +27,7 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `nps/`: low-level UDP packet protocol, bit packing, reliability, authority handoff, MPS-integrated packet manager
 - `paradoxpe/`: fixed-step physics core with packed handles, SoA body storage, parallel broadphase, narrowphase/solver passes, starter joints/sleep, snapshot/interpolation buffering, and `.tlscript`-friendly host ABI
 - `tl-core/`: `MpsGmsBridge`, portable multi-GPU sync abstractions, and `.tlscript` compiler/runtime metadata layers
-- `runtime/`: frame-loop coordinators, `.tlscript` parallel planning glue, and NPS UDP transport runtime integration
+- `runtime/`: frame-loop coordinators, scene/sprite runtime payload management, `.tlscript` parallel planning glue, and NPS UDP transport runtime integration
 
 ## Documentation
 
@@ -45,6 +45,7 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/paradoxpe-tlscript-examples.md`: verified `.tlscript` examples targeting the current ParadoxPE ABI
 - `docs/gms-dispatch-planner.md`: GMS workload planning and multi-GPU dispatch notes
 - `docs/runtime-bridge-flow.md`: canonical MPS -> GMS -> runtime synchronization flow
+- `docs/runtime-scene-showcase.md`: runtime scene/sprite payload model and bounce-tank showcase scaffolding
 
 ## Current Architecture
 
