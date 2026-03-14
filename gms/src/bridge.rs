@@ -816,21 +816,29 @@ fn aggressive_secondary_target_share(
     let secondary_score = secondary_gpu.score.max(1) as f64;
     let relative = (secondary_score / primary_score).clamp(0.05, 1.60);
 
-    let (base, max_share) = match secondary_gpu.memory_topology {
-        MemoryTopology::DiscreteVram => (0.24, 0.58),
-        MemoryTopology::Unified => (0.18, 0.36),
-        MemoryTopology::Virtualized => (0.10, 0.22),
-        MemoryTopology::System | MemoryTopology::Unknown => (0.08, 0.18),
+    let (base, max_share, scale) = match secondary_gpu.memory_topology {
+        MemoryTopology::DiscreteVram => (0.14, 0.34, 0.14),
+        MemoryTopology::Unified => (0.10, 0.22, 0.10),
+        MemoryTopology::Virtualized => (0.06, 0.14, 0.06),
+        MemoryTopology::System | MemoryTopology::Unknown => (0.04, 0.10, 0.04),
     };
     let dual_discrete_bonus = if matches!(primary_gpu.memory_topology, MemoryTopology::DiscreteVram)
         && matches!(secondary_gpu.memory_topology, MemoryTopology::DiscreteVram)
     {
-        0.08
+        0.05
     } else {
         0.0
     };
 
-    (base + relative.sqrt() * 0.18 + dual_discrete_bonus).clamp(base, max_share)
+    let weak_helper_guard = if relative < 0.22
+        && !matches!(secondary_gpu.memory_topology, MemoryTopology::DiscreteVram)
+    {
+        0.0
+    } else {
+        relative.sqrt() * scale
+    };
+
+    (base + weak_helper_guard + dual_discrete_bonus).clamp(base, max_share)
 }
 
 fn move_lane_jobs(

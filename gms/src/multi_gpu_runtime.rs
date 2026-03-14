@@ -110,8 +110,11 @@ pub struct MultiGpuExecutor {
     frame_height: u32,
     secondary_format: TextureFormat,
     secondary_clear_phase: f64,
+    secondary_work_units_cap: u32,
     secondary_work_units_per_present: u32,
+    secondary_passes_cap: u32,
     secondary_passes_per_work_unit: u32,
+    secondary_stable_frames: u32,
     bridge_runtime: Option<MultiGpuBridgeRuntime>,
     sync_state: MultiGpuSyncState,
     total_secondary_work_units: u64,
@@ -281,14 +284,16 @@ impl MultiGpuExecutor {
             });
 
         let primary_units = primary_work_units_per_present.max(1);
-        let secondary_work_units_per_present = derive_secondary_work_units_per_present(
+        let secondary_work_units_cap = derive_secondary_work_units_per_present(
             primary_units,
             primary_assignment_jobs,
             secondary_assignment.total_jobs,
             &plan,
         );
-        let secondary_passes_per_work_unit =
-            derive_secondary_passes_per_work_unit(&secondary_profile, &plan);
+        let secondary_passes_cap = derive_secondary_passes_per_work_unit(&secondary_profile, &plan);
+        let secondary_work_units_per_present =
+            initial_secondary_work_units(secondary_work_units_cap);
+        let secondary_passes_per_work_unit = initial_secondary_passes(secondary_passes_cap);
 
         if matches!(policy, MultiGpuInitPolicy::Auto) && secondary_work_units_per_present == 0 {
             return Ok(None);
@@ -327,8 +332,11 @@ impl MultiGpuExecutor {
             frame_height,
             secondary_format: secondary_offscreen_format,
             secondary_clear_phase: 0.0,
+            secondary_work_units_cap,
             secondary_work_units_per_present,
+            secondary_passes_cap,
             secondary_passes_per_work_unit,
+            secondary_stable_frames: 0,
             bridge_runtime,
             sync_state,
             total_secondary_work_units: 0,
@@ -367,7 +375,10 @@ impl MultiGpuExecutor {
         }
 
         let frames_in_flight_limit = self.plan.sync.frames_in_flight.max(1) as usize;
+        let mut had_backpressure = false;
+        let mut timed_out_gate = false;
         if self.sync_state.pending_secondary_submissions.len() >= frames_in_flight_limit {
+            had_backpressure = true;
             if let Some(oldest_submission) = self
                 .sync_state
                 .pending_secondary_submissions
@@ -392,6 +403,7 @@ impl MultiGpuExecutor {
                         let _ = self.sync_state.pending_secondary_submissions.pop_front();
                         self.sync_state.skipped_submission_count =
                             self.sync_state.skipped_submission_count.saturating_add(1);
+                        timed_out_gate = true;
                         let _ = self.secondary_device.poll(wgpu::PollType::Poll);
                         self.sync_state.poll_count = self.sync_state.poll_count.saturating_add(1);
                     }
@@ -440,6 +452,7 @@ impl MultiGpuExecutor {
             .total_secondary_work_units
             .saturating_add(self.secondary_work_units_per_present as u64);
         self.total_secondary_submissions = self.total_secondary_submissions.saturating_add(1);
+        self.reconcile_secondary_intensity(timed_out_gate, had_backpressure);
 
         MultiGpuFrameSubmitResult {
             work_units: self.secondary_work_units_per_present,
@@ -520,6 +533,48 @@ impl MultiGpuExecutor {
     pub fn secondary_profile(&self) -> &GpuAdapterProfile {
         &self.secondary_profile
     }
+
+    fn reconcile_secondary_intensity(&mut self, timed_out_gate: bool, had_backpressure: bool) {
+        if timed_out_gate {
+            // Hard backoff on timeout to protect frame-time.
+            self.secondary_work_units_per_present = ((self.secondary_work_units_per_present as f64)
+                * 0.75)
+                .floor()
+                .max(1.0) as u32;
+            self.secondary_passes_per_work_unit = ((self.secondary_passes_per_work_unit as f64)
+                * 0.80)
+                .floor()
+                .max(2.0) as u32;
+            self.secondary_stable_frames = 0;
+            return;
+        }
+
+        if had_backpressure {
+            // Soft backoff when queue depth repeatedly saturates.
+            self.secondary_work_units_per_present = ((self.secondary_work_units_per_present as f64)
+                * 0.90)
+                .floor()
+                .max(1.0) as u32;
+            self.secondary_passes_per_work_unit = ((self.secondary_passes_per_work_unit as f64)
+                * 0.92)
+                .floor()
+                .max(2.0) as u32;
+            self.secondary_stable_frames = 0;
+            return;
+        }
+
+        self.secondary_stable_frames = self.secondary_stable_frames.saturating_add(1);
+        if self.secondary_stable_frames >= 120 {
+            self.secondary_stable_frames = 0;
+            if self.secondary_work_units_per_present < self.secondary_work_units_cap {
+                self.secondary_work_units_per_present =
+                    self.secondary_work_units_per_present.saturating_add(1);
+            } else if self.secondary_passes_per_work_unit < self.secondary_passes_cap {
+                self.secondary_passes_per_work_unit =
+                    self.secondary_passes_per_work_unit.saturating_add(1);
+            }
+        }
+    }
 }
 
 impl MultiGpuBridgeRuntime {
@@ -558,25 +613,25 @@ fn derive_secondary_work_units_per_present(
     };
 
     let projected_gain_bias =
-        (1.0 + plan.projected_score_gain_pct.max(0.0) / 100.0).clamp(1.0, 3.5);
-    let raw = (primary_units.max(1) as f64) * ratio * projected_gain_bias;
+        (1.0 + plan.projected_score_gain_pct.max(0.0) / 100.0).clamp(1.0, 2.2);
+    let raw = (primary_units.max(1) as f64) * ratio * projected_gain_bias.sqrt();
 
     // Keep the helper lane active even when planner ratios are conservative, so secondary
     // adapters can hold meaningful utilization in explicit multi-GPU mode.
-    let min_util_floor = if ratio < 0.15 {
-        0.35
-    } else if ratio < 0.30 {
-        0.25
+    let min_util_floor = if ratio < 0.12 {
+        0.18
+    } else if ratio < 0.25 {
+        0.12
     } else {
-        0.15
+        0.08
     };
     let floor_by_primary = (primary_units.max(1) as f64 * min_util_floor).ceil();
-    let floor_by_jobs = (secondary_jobs as f64).sqrt().clamp(1.0, 96.0);
+    let floor_by_jobs = (secondary_jobs as f64).sqrt().clamp(1.0, 48.0);
 
     raw.max(floor_by_primary)
         .max(floor_by_jobs)
         .round()
-        .clamp(1.0, 512.0) as u32
+        .clamp(1.0, 256.0) as u32
 }
 
 fn derive_secondary_passes_per_work_unit(
@@ -584,16 +639,16 @@ fn derive_secondary_passes_per_work_unit(
     plan: &MultiGpuDispatchPlan,
 ) -> u32 {
     let topology_base: u32 = match secondary_profile.memory_topology {
-        MemoryTopology::Unified => 8,
-        MemoryTopology::DiscreteVram => 10,
-        MemoryTopology::Virtualized => 4,
-        MemoryTopology::System | MemoryTopology::Unknown => 4,
+        MemoryTopology::Unified => 5,
+        MemoryTopology::DiscreteVram => 6,
+        MemoryTopology::Virtualized => 3,
+        MemoryTopology::System | MemoryTopology::Unknown => 3,
     };
-    let unit_bias = (secondary_profile.estimated_compute_units / 16).clamp(0, 12);
+    let unit_bias = (secondary_profile.estimated_compute_units / 24).clamp(0, 8);
     let gain_bias: u32 = if plan.projected_score_gain_pct < 10.0 {
-        4
-    } else if plan.projected_score_gain_pct < 20.0 {
         2
+    } else if plan.projected_score_gain_pct < 20.0 {
+        1
     } else {
         0
     };
@@ -604,16 +659,32 @@ fn derive_secondary_passes_per_work_unit(
                 crate::SharedTransferKind::UnifiedMemoryMirror
             ) =>
         {
-            2
+            1
         }
-        Some(_) => 1,
+        Some(_) => 0,
         None => 0,
     };
     topology_base
         .saturating_add(unit_bias)
         .saturating_add(gain_bias)
         .saturating_add(bridge_bias)
-        .clamp(4, 32)
+        .clamp(3, 18)
+}
+
+fn initial_secondary_work_units(cap: u32) -> u32 {
+    if cap <= 1 {
+        cap
+    } else {
+        ((cap as f64) * 0.70).round().clamp(1.0, cap as f64) as u32
+    }
+}
+
+fn initial_secondary_passes(cap: u32) -> u32 {
+    if cap <= 2 {
+        cap.max(1)
+    } else {
+        ((cap as f64) * 0.65).round().clamp(2.0, cap as f64) as u32
+    }
 }
 
 fn build_multi_gpu_bridge_runtime(

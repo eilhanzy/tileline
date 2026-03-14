@@ -82,6 +82,9 @@ now apply an aggressive secondary-lane policy directly in `gms/src`:
   submission remains meaningful even when planner ratios are conservative.
 - Secondary pass intensity (`passes_per_work_unit`) is expanded to a wider range so helper-side
   GPU occupancy is less bursty.
+- Runtime intensity governor:
+  secondary WU/present + passes/WU start from a conservative fraction of cap, ramp up on stable
+  frames, and back off automatically on queue backpressure/timeout events to protect frame-time.
 
 ## Vulkan Version Gate (Explicit Multi-GPU Safety)
 
@@ -110,7 +113,7 @@ sync with:
 - bounded `Device::poll(...)` waits
 - explicit compose budget policy (sub-millisecond target in `tl-core`)
 - in-flight backpressure: if secondary queue depth is saturated and wait times out, runtime drops
-  one oldest tracked submission slot and continues helper submission (instead of stalling the lane)
+  one oldest tracked submission slot, applies governor backoff, and continues helper submission
 
 ## Runtime Telemetry To Watch
 
