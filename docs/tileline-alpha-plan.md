@@ -1,6 +1,6 @@
 # Tileline Alpha Plan
 
-This document defines the first Alpha milestone scope after `v0.1.0`.
+This document defines the first Alpha milestone scope after `v0.2.0`.
 
 ## Alpha Goals
 
@@ -62,4 +62,3 @@ This document defines the first Alpha milestone scope after `v0.1.0`.
    - `docs/README.md`
    - `README.md`
    - subsystem notes (`docs/runtime-tlsprite.md`, `docs/runtime-mas.md`)
-

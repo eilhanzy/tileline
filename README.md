@@ -235,14 +235,15 @@ Next pipeline steps:
 This repository is structured to be MIT-license ready (code comments and docs use FOSS-friendly
 terminology and style). Add/update the root `LICENSE` file as the project license source of truth.
 
-## Release v0.1.0
+## Release v0.2.0
 
-`v0.1.0` packaging now includes a runnable `tlapp` binary artifact flow.
+`v0.2.0` extends release packaging with runtime `.pak` tooling and keeps the runnable `tlapp`
+binary artifact flow.
 
 Build/package artifacts:
 
 ```bash
-./scripts/release_v0.1.0.sh
+./scripts/release_v0.2.0.sh
 ```
 
 Cross-target toolchain doctor/setup:
@@ -253,5 +254,6 @@ Cross-target toolchain doctor/setup:
 
 Release notes:
 
+- `docs/releases/v0.2.0.md`
 - `docs/releases/v0.1.0.md`
 - `CHANGELOG.md`
