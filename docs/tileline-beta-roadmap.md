@@ -64,6 +64,9 @@ the active phase before broad beta feature expansion.
 
 - implement and validate pre-alpha gates listed in `docs/tileline-pre-alpha-transition.md`
 - keep multi-GPU and mobile fallback behavior in `gms/src` and `mgs/src` aligned with runtime flow
+- keep ARM mobile validation repeatable with the Orange Pi 5 MGS gate:
+  - runner: `scripts/test_mgs_orangepi5.sh`
+  - guide: `docs/mgs-orangepi5-validation.md`
 - prioritize integration bugs over new subsystem scope
 
 ## Phase 0: Foundation Hardening
