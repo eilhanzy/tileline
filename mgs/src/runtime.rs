@@ -41,6 +41,13 @@ pub fn is_unified_memory_profile(
     matches!(profile.architecture, TbdrArchitecture::AppleTbdr)
         || matches!(profile.family, MobileGpuFamily::Apple)
         || matches!(adapter_info.backend, wgpu::Backend::Metal)
+        // Most mobile TBDR iGPU paths are system-memory-backed and should use
+        // conservative memory/throughput policy to avoid OS-wide contention.
+        || (profile.is_mobile_tbdr()
+            && matches!(
+                adapter_info.device_type,
+                wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Other
+            ))
 }
 
 /// Returns true when the selected present mode is expected to be uncapped.
@@ -317,6 +324,26 @@ mod tests {
     use super::*;
     use crate::hardware::MobileGpuProfile;
 
+    fn make_adapter_info(
+        name: &str,
+        backend: wgpu::Backend,
+        device_type: wgpu::DeviceType,
+    ) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.to_string(),
+            vendor: 0,
+            device: 0,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend,
+            subgroup_min_size: 1,
+            subgroup_max_size: 1,
+            transient_saves_memory: false,
+        }
+    }
+
     #[test]
     fn vsync_off_prefers_immediate() {
         let selected = select_present_mode(
@@ -387,6 +414,28 @@ mod tests {
         let burst_max = select_throughput_burst(&profile, RuntimeMode::MaxThroughput, false);
         assert_eq!(burst_auto, 3);
         assert_eq!(burst_max, 4);
+    }
+
+    #[test]
+    fn mali_integrated_profile_is_treated_as_unified_memory() {
+        let profile = MobileGpuProfile::detect("Mali-G610");
+        let info = make_adapter_info(
+            "Mali-G610",
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::IntegratedGpu,
+        );
+        assert!(is_unified_memory_profile(&profile, &info));
+    }
+
+    #[test]
+    fn discrete_desktop_profile_is_not_unified_by_mobile_rule() {
+        let profile = MobileGpuProfile::detect("NVIDIA GeForce RTX 5060 Ti");
+        let info = make_adapter_info(
+            "NVIDIA GeForce RTX 5060 Ti",
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::DiscreteGpu,
+        );
+        assert!(!is_unified_memory_profile(&profile, &info));
     }
 }
 

@@ -327,17 +327,19 @@ impl ApplicationHandler for RenderBenchmarkApp {
                     runtime.window.request_redraw();
                 }
             } else {
-                if let Err(render_outcome) = runtime.render_frame() {
-                    match render_outcome {
-                        RenderOutcome::SurfaceLost | RenderOutcome::Outdated => {
-                            runtime.reconfigure_surface();
+                if runtime.ready_for_next_frame(Instant::now()) {
+                    if let Err(render_outcome) = runtime.render_frame() {
+                        match render_outcome {
+                            RenderOutcome::SurfaceLost | RenderOutcome::Outdated => {
+                                runtime.reconfigure_surface();
+                            }
+                            RenderOutcome::OutOfMemory => {
+                                eprintln!("wgpu surface out of memory, exiting benchmark");
+                                self.exit_requested = true;
+                                event_loop.exit();
+                            }
+                            RenderOutcome::Timeout | RenderOutcome::Other => {}
                         }
-                        RenderOutcome::OutOfMemory => {
-                            eprintln!("wgpu surface out of memory, exiting benchmark");
-                            self.exit_requested = true;
-                            event_loop.exit();
-                        }
-                        RenderOutcome::Timeout | RenderOutcome::Other => {}
                     }
                 }
             }
@@ -377,6 +379,8 @@ struct BenchmarkRuntime {
     min_frame_interval: Duration,
     options: CliOptions,
     session_start: Instant,
+    next_frame_at: Instant,
+    cpu_relief_interval: Duration,
     sample_started_at: Option<Instant>,
     sample_finished: bool,
 }
@@ -407,6 +411,7 @@ impl BenchmarkRuntime {
         );
         let stats = FrameStats::new(renderer.size, Duration::from_millis(500));
         let session_start = Instant::now();
+        let renderer_is_uma = renderer.memory_policy.is_uma();
         let sample_started_at = if options.warmup_duration.is_zero() {
             Some(session_start)
         } else {
@@ -420,6 +425,16 @@ impl BenchmarkRuntime {
             min_frame_interval,
             options,
             session_start,
+            next_frame_at: session_start,
+            cpu_relief_interval: if matches!(pacing_mode, BenchmarkPacingMode::MaxThroughput) {
+                if renderer_is_uma {
+                    Duration::from_micros(2_400)
+                } else {
+                    Duration::from_micros(1_200)
+                }
+            } else {
+                Duration::ZERO
+            },
             sample_started_at,
             sample_finished: false,
         };
@@ -548,7 +563,16 @@ impl BenchmarkRuntime {
     fn preferred_control_flow(&self) -> ControlFlow {
         match self.pacing_mode {
             BenchmarkPacingMode::Stable => ControlFlow::Wait,
-            BenchmarkPacingMode::MaxThroughput => ControlFlow::Poll,
+            BenchmarkPacingMode::MaxThroughput => {
+                let now = Instant::now();
+                let floor = self.cpu_relief_interval.max(Duration::from_micros(500));
+                let wake_at = if self.next_frame_at > now {
+                    self.next_frame_at
+                } else {
+                    now + floor
+                };
+                ControlFlow::WaitUntil(wake_at)
+            }
         }
     }
 
@@ -558,6 +582,13 @@ impl BenchmarkRuntime {
 
     fn should_auto_exit(&self) -> bool {
         self.sample_finished
+    }
+
+    fn ready_for_next_frame(&self, now: Instant) -> bool {
+        if !matches!(self.pacing_mode, BenchmarkPacingMode::MaxThroughput) {
+            return true;
+        }
+        now >= self.next_frame_at
     }
 
     fn update_phase_before_frame(&mut self, now: Instant) {
@@ -591,24 +622,21 @@ impl BenchmarkRuntime {
         }
     }
 
-    fn apply_max_throughput_pacing(&self, frame_start: Instant, frame_end: Instant) {
+    fn apply_max_throughput_pacing(&mut self, frame_start: Instant, frame_end: Instant) {
         if !matches!(self.pacing_mode, BenchmarkPacingMode::MaxThroughput) {
             return;
         }
-        if self.min_frame_interval.is_zero() {
-            return;
-        }
-
-        let elapsed = frame_end.saturating_duration_since(frame_start);
-        if elapsed >= self.min_frame_interval {
-            return;
-        }
-
-        let wait_until = frame_start + self.min_frame_interval;
-        std::thread::yield_now();
-        while Instant::now() < wait_until {
-            std::hint::spin_loop();
-        }
+        let target = if self.min_frame_interval.is_zero() {
+            frame_end + self.cpu_relief_interval.max(Duration::from_micros(500))
+        } else {
+            let elapsed = frame_end.saturating_duration_since(frame_start);
+            if elapsed >= self.min_frame_interval {
+                frame_end + self.cpu_relief_interval.max(Duration::from_micros(500))
+            } else {
+                frame_start + self.min_frame_interval
+            }
+        };
+        self.next_frame_at = target;
     }
 }
 
