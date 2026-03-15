@@ -92,6 +92,7 @@ struct GpuMesh {
     vertex: wgpu::Buffer,
     index: wgpu::Buffer,
     index_count: u32,
+    index_format: wgpu::IndexFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -317,7 +318,7 @@ impl WgpuSceneRenderer {
         bytes: &[u8],
     ) -> Result<(), String> {
         let mesh_data = parse_first_mesh_from_fbx(bytes)?;
-        let mesh = create_mesh(
+        let mesh = create_mesh_u32(
             device,
             &format!("runtime-scene-fbx-slot-{slot}"),
             &mesh_data.vertices,
@@ -645,7 +646,7 @@ fn draw_3d_range(
         1 => box_mesh,
         code => {
             let slot = code.saturating_sub(2);
-            custom_mesh_slots.get(&slot).unwrap_or(sphere_mesh_high)
+            custom_mesh_slots.get(&slot).unwrap_or(box_mesh)
         }
     };
     pass.set_vertex_buffer(0, mesh.vertex.slice(..));
@@ -653,7 +654,7 @@ fn draw_3d_range(
     let start = range.start as u64 * bytes_per_instance;
     let end = (range.start as u64 + range.count as u64) * bytes_per_instance;
     pass.set_vertex_buffer(1, instance_buffer.slice(start..end));
-    pass.set_index_buffer(mesh.index.slice(..), wgpu::IndexFormat::Uint16);
+    pass.set_index_buffer(mesh.index.slice(..), mesh.index_format);
     pass.draw_indexed(0..mesh.index_count, 0, 0..range.count);
 }
 
@@ -875,12 +876,12 @@ fn create_box_mesh(device: &wgpu::Device) -> GpuMesh {
         1, 5, 6, 6, 2, 1, // right
         0, 3, 7, 7, 4, 0, // left
     ];
-    create_mesh(device, "runtime-scene-box", &vertices, &indices)
+    create_mesh_u16(device, "runtime-scene-box", &vertices, &indices)
 }
 
 fn create_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
     match parse_first_mesh_from_fbx(DEFAULT_SPHERE_FBX_BYTES) {
-        Ok(mesh_data) => create_mesh(
+        Ok(mesh_data) => create_mesh_u32(
             device,
             "runtime-scene-sphere-fbx",
             &mesh_data.vertices,
@@ -914,7 +915,7 @@ fn create_octa_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
     let indices: [u16; 24] = [
         0, 2, 4, 4, 2, 1, 1, 2, 5, 5, 2, 0, 4, 3, 0, 1, 3, 4, 5, 3, 1, 0, 3, 5,
     ];
-    create_mesh(device, "runtime-scene-sphere", &vertices, &indices)
+    create_mesh_u16(device, "runtime-scene-sphere", &vertices, &indices)
 }
 
 fn create_icosa_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
@@ -948,13 +949,13 @@ fn create_icosa_sphere_mesh(device: &wgpu::Device) -> GpuMesh {
         1, 8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9,
         8, 1,
     ];
-    create_mesh(device, "runtime-scene-sphere-icosa", &vertices, &indices)
+    create_mesh_u16(device, "runtime-scene-sphere-icosa", &vertices, &indices)
 }
 
 #[derive(Debug, Clone)]
 struct ParsedFbxMesh {
     vertices: Vec<GpuVertex3d>,
-    indices: Vec<u16>,
+    indices: Vec<u32>,
 }
 
 fn parse_first_mesh_from_fbx(bytes: &[u8]) -> Result<ParsedFbxMesh, String> {
@@ -1025,7 +1026,7 @@ fn fbx_vertices_to_gpu(vertices_f64: &[f64]) -> Result<Vec<GpuVertex3d>, String>
 fn fbx_polygon_indices_to_triangles(
     polygon_vertex_index: &[i32],
     vertex_count: usize,
-) -> Result<Vec<u16>, String> {
+) -> Result<Vec<u32>, String> {
     let mut triangles_u32 = Vec::<u32>::new();
     let mut polygon = Vec::<u32>::with_capacity(8);
 
@@ -1061,13 +1062,7 @@ fn fbx_polygon_indices_to_triangles(
         return Err("FBX polygon list did not contain triangles".to_string());
     }
 
-    if triangles_u32.iter().any(|index| *index > u16::MAX as u32) {
-        return Err("FBX mesh has indices above u16 range".to_string());
-    }
-
-    let mut triangles_u16 = Vec::with_capacity(triangles_u32.len());
-    triangles_u16.extend(triangles_u32.into_iter().map(|v| v as u16));
-    Ok(triangles_u16)
+    Ok(triangles_u32)
 }
 
 fn triangulate_polygon_fan(polygon: &[u32], triangles_out: &mut Vec<u32>) {
@@ -1103,7 +1098,7 @@ fn fbx_property_as_i32_slice(property: &FbxProperty) -> Option<&[i32]> {
     }
 }
 
-fn create_mesh(
+fn create_mesh_u16(
     device: &wgpu::Device,
     label: &str,
     vertices: &[GpuVertex3d],
@@ -1123,6 +1118,31 @@ fn create_mesh(
         vertex,
         index,
         index_count: indices.len() as u32,
+        index_format: wgpu::IndexFormat::Uint16,
+    }
+}
+
+fn create_mesh_u32(
+    device: &wgpu::Device,
+    label: &str,
+    vertices: &[GpuVertex3d],
+    indices: &[u32],
+) -> GpuMesh {
+    let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&format!("{label}-vb")),
+        contents: bytemuck::cast_slice(vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(&format!("{label}-ib")),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    GpuMesh {
+        vertex,
+        index,
+        index_count: indices.len() as u32,
+        index_format: wgpu::IndexFormat::Uint32,
     }
 }
 

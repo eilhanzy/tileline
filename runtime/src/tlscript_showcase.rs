@@ -20,9 +20,11 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 53] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 55] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
+    "set_container_half_extents",
+    "set_wall_thickness",
     "set_linear_damping",
     "set_contact_guard",
     "set_bounce",
@@ -835,6 +837,17 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
             [v] => state.patch.target_ball_count = Some(v.to_i64().max(0) as usize),
             _ => state.warn("set_target_ball_count expects 1 arg"),
         },
+        "set_container_half_extents" => match args {
+            [x, y, z] => {
+                state.patch.container_half_extents =
+                    Some([x.to_f64() as f32, y.to_f64() as f32, z.to_f64() as f32]);
+            }
+            _ => state.warn("set_container_half_extents expects 3 args"),
+        },
+        "set_wall_thickness" => match args {
+            [v] => state.patch.wall_thickness = Some(v.to_f64() as f32),
+            _ => state.warn("set_wall_thickness expects 1 arg"),
+        },
         "set_linear_damping" => match args {
             [v] => state.patch.linear_damping = Some(v.to_f64() as f32),
             _ => state.warn("set_linear_damping expects 1 arg"),
@@ -1500,6 +1513,27 @@ mod tests {
             key_f_down: false,
         });
         assert_eq!(out.patch.virtual_barrier_enabled, Some(false));
+    }
+
+    #[test]
+    fn supports_container_shape_controls() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_container_half_extents(24.0, 16.0, 24.0)\n",
+            "    set_wall_thickness(0.46)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.patch.container_half_extents, Some([24.0, 16.0, 24.0]));
+        assert!((out.patch.wall_thickness.unwrap_or(0.0) - 0.46).abs() < 1e-6);
     }
 
     #[test]

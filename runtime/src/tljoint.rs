@@ -574,6 +574,12 @@ fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatc
     if patch.spawn_per_tick.is_some() {
         target.spawn_per_tick = patch.spawn_per_tick;
     }
+    if patch.container_half_extents.is_some() {
+        target.container_half_extents = patch.container_half_extents;
+    }
+    if patch.wall_thickness.is_some() {
+        target.wall_thickness = patch.wall_thickness;
+    }
     if patch.linear_damping.is_some() {
         target.linear_damping = patch.linear_damping;
     }

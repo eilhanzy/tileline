@@ -282,6 +282,8 @@ pub struct BounceTankTickMetrics {
 pub struct BounceTankRuntimePatch {
     pub target_ball_count: Option<usize>,
     pub spawn_per_tick: Option<usize>,
+    pub container_half_extents: Option<[f32; 3]>,
+    pub wall_thickness: Option<f32>,
     pub linear_damping: Option<f32>,
     pub gravity: Option<[f32; 3]>,
     pub contact_guard: Option<f32>,
@@ -443,6 +445,27 @@ impl BounceTankSceneController {
             let clamped = spawn.clamp(1, 8_192);
             if self.config.spawn_per_tick != clamped {
                 self.config.spawn_per_tick = clamped;
+                updated = true;
+            }
+        }
+        let mut rebuild_barriers = false;
+        if let Some(ext) = patch.container_half_extents {
+            let clamped = [
+                ext[0].clamp(0.5, 256.0),
+                ext[1].clamp(0.5, 256.0),
+                ext[2].clamp(0.5, 256.0),
+            ];
+            if self.config.container_half_extents != clamped {
+                self.config.container_half_extents = clamped;
+                rebuild_barriers = true;
+                updated = true;
+            }
+        }
+        if let Some(thickness) = patch.wall_thickness {
+            let clamped = thickness.clamp(0.01, 8.0);
+            if (self.config.wall_thickness - clamped).abs() > f32::EPSILON {
+                self.config.wall_thickness = clamped;
+                rebuild_barriers = true;
                 updated = true;
             }
         }
@@ -668,6 +691,14 @@ impl BounceTankSceneController {
             if self.container_mesh_slot != Some(slot) {
                 self.container_mesh_slot = Some(slot);
                 updated = true;
+            }
+        }
+        if rebuild_barriers {
+            for body in self.walls.drain(..) {
+                let _ = world.destroy_body(body);
+            }
+            for body in self.edge_barriers.drain(..) {
+                let _ = world.destroy_body(body);
             }
         }
 
