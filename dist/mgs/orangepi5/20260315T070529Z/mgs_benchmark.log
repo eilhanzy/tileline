@@ -1,0 +1,18 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running `target/debug/examples/render_benchmark --mode stable --vsync on --warmup 2 --duration 10 --resolution 1280x720`
+MGS note: MPS-zram enabled (target=48 MB hard=72 MB shards=8 chunk=32 KB)
+--- MGS Render Benchmark Summary ---
+Adapter: NVIDIA GeForce RTX 5060 Ti
+Backend: Vulkan | Device type: DiscreteGpu | Present mode: Fifo
+Profile: family=Unknown arch=Unknown gfx=Unknown cores=4 bw=15.0 GB/s tile_mem=64 KB
+Resolution: 1280x720 | Frames: 601 | Presented: 601 | WorkUnits: 601 | Elapsed: 10.009s
+Render FPS: avg=60.05 peak=3200.99 low1%=1347.92
+Present FPS: avg=60.05 peak=101.25
+WFPS: avg=60.05 peak=101.25
+Display match ratio: 100.0% (present/render)
+Frame ms: avg=0.447 p95=0.537 p99=0.742 stddev=0.125
+Work ms/unit: avg=0.447 p95=0.537 p99=0.742
+Fallback counts: tbdr=0 simple=722 immediate=0 sw=0 | last_tile_count=3600 | last_memory_pressure=false
+MPS-ZRAM: pages=0 spill=0 restore=0 evict=0 ratio=1.000 saved=0 KB
+Score: 16 [D] | stability=72.33% work_stability=72.33%
+Mode=Stable | VSync=On | Warmup=2.00s | Sample=10.00s | Pacing=Stable | BurstCap=1 | AggNoVsync=false | PresentEvery=1

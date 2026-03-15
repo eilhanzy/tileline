@@ -28,8 +28,14 @@ pub struct ContactSolverConfig {
     pub iterations: u32,
     pub baumgarte: f32,
     pub penetration_slop: f32,
+    /// Maximum per-contact position correction applied in one sequential impulse iteration.
+    pub max_position_correction_per_iteration: f32,
     pub restitution_velocity_threshold: f32,
     pub warm_starting: bool,
+    /// Damping factor for cached warm-start impulses.
+    pub warmstart_impulse_decay: f32,
+    /// Persistent-contact multiplier used to slightly boost penetration resolution.
+    pub persistent_contact_boost: f32,
     /// Extra parallel repulsion pass applied on deep overlaps.
     pub parallel_contact_push_strength: f32,
     /// Minimum manifold count before enabling the parallel repulsion pass.
@@ -40,6 +46,14 @@ pub struct ContactSolverConfig {
     pub hard_position_projection_threshold: usize,
     /// Clamp on per-manifold projection depth to avoid explosive corrections.
     pub max_projection_per_contact: f32,
+    /// Tangential speed threshold used to blend static-like to kinetic-like friction.
+    ///
+    /// `0` disables speed-aware friction scaling and keeps legacy behavior.
+    pub friction_transition_speed: f32,
+    /// Friction multiplier near zero tangential speed (static-like region).
+    pub friction_static_boost: f32,
+    /// Friction multiplier at/above transition speed (kinetic-like region).
+    pub friction_kinetic_scale: f32,
 }
 
 impl Default for ContactSolverConfig {
@@ -48,13 +62,19 @@ impl Default for ContactSolverConfig {
             iterations: 4,
             baumgarte: 0.2,
             penetration_slop: 0.005,
+            max_position_correction_per_iteration: 0.08,
             restitution_velocity_threshold: 1.0,
             warm_starting: true,
+            warmstart_impulse_decay: 0.92,
+            persistent_contact_boost: 0.20,
             parallel_contact_push_strength: 0.24,
             parallel_contact_push_threshold: 384,
             hard_position_projection_strength: 0.90,
             hard_position_projection_threshold: 192,
             max_projection_per_contact: 0.12,
+            friction_transition_speed: 1.2,
+            friction_static_boost: 1.10,
+            friction_kinetic_scale: 0.92,
         }
     }
 }
@@ -438,15 +458,25 @@ impl ContactSolver {
             let Some(cached) = self.cached_lookup.get(&manifold.contact_id).copied() else {
                 continue;
             };
+            let persistence = manifold.persisted_frames.saturating_sub(1).min(8) as f32;
+            let persistence_scale =
+                1.0 + persistence * (self.config.persistent_contact_boost * 0.04);
+            let decay = self.config.warmstart_impulse_decay.clamp(0.0, 1.0);
+            let normal_impulse = (cached.normal_impulse * decay * persistence_scale).max(0.0);
+            let relative_velocity = bodies.relative_velocity(manifold.body_a, manifold.body_b);
             let normal = safe_normal(manifold.normal);
-            let tangent = tangent_basis(
-                bodies.relative_velocity(manifold.body_a, manifold.body_b),
-                normal,
-            );
-            let impulse = normal * cached.normal_impulse + tangent * cached.tangent_impulse;
+            let tangent = tangent_basis(relative_velocity, normal);
+            let tangent_speed = relative_velocity.dot(&tangent).abs();
+            let max_tangent =
+                self.effective_friction(manifold.friction, tangent_speed) * normal_impulse;
+            let tangent_impulse = (cached.tangent_impulse * decay).clamp(-max_tangent, max_tangent);
+            if normal_impulse <= f32::EPSILON && tangent_impulse.abs() <= f32::EPSILON {
+                continue;
+            }
+            let impulse = normal * normal_impulse + tangent * tangent_impulse;
             self.apply_impulse_pair(bodies, manifold, impulse);
-            self.normal_impulses[index] = cached.normal_impulse;
-            self.tangent_impulses[index] = cached.tangent_impulse;
+            self.normal_impulses[index] = normal_impulse;
+            self.tangent_impulses[index] = tangent_impulse;
             self.stats.warmstart_hits = self.stats.warmstart_hits.saturating_add(1);
         }
     }
@@ -471,9 +501,14 @@ impl ContactSolver {
         }
 
         let normal = safe_normal(manifold.normal);
-        let correction_mag = ((manifold.penetration - self.config.penetration_slop).max(0.0)
+        let persistence = manifold.persisted_frames.saturating_sub(1).min(8) as f32;
+        let correction_boost = 1.0 + persistence * (self.config.persistent_contact_boost * 0.08);
+        let correction_mag = (((manifold.penetration - self.config.penetration_slop).max(0.0)
             * self.config.baumgarte)
-            / total_inv_mass;
+            / total_inv_mass)
+            * correction_boost;
+        let correction_mag =
+            correction_mag.min(self.config.max_position_correction_per_iteration.max(0.001));
         if correction_mag > 0.0 {
             let correction = normal * correction_mag;
             if inv_mass_a > 0.0 && bodies.kinds[dense_a] == BodyKind::Dynamic {
@@ -490,7 +525,8 @@ impl ContactSolver {
         let relative_velocity =
             bodies.linear_velocities[dense_b] - bodies.linear_velocities[dense_a];
         let contact_velocity = relative_velocity.dot(&normal);
-        let restitution = if contact_velocity.abs() > self.config.restitution_velocity_threshold {
+        // Restitution only when bodies move toward each other across the contact normal.
+        let restitution = if contact_velocity < -self.config.restitution_velocity_threshold {
             manifold.restitution.max(0.0)
         } else {
             0.0
@@ -514,7 +550,8 @@ impl ContactSolver {
         }
         let tangent_speed = relative_velocity.dot(&tangent);
         let raw_tangent_impulse = -tangent_speed / total_inv_mass;
-        let max_friction = manifold.friction.max(0.0) * self.normal_impulses[index];
+        let max_friction = self.effective_friction(manifold.friction, tangent_speed.abs())
+            * self.normal_impulses[index];
         let prev_tangent = self.tangent_impulses[index];
         let next_tangent = (prev_tangent + raw_tangent_impulse).clamp(-max_friction, max_friction);
         let delta_tangent = next_tangent - prev_tangent;
@@ -548,6 +585,19 @@ impl ContactSolver {
             bodies.linear_velocities[dense_b] += impulse * inv_mass_b;
             bodies.awake[dense_b] = true;
         }
+    }
+
+    fn effective_friction(&self, base: f32, tangent_speed_abs: f32) -> f32 {
+        let base = base.max(0.0);
+        let transition = self.config.friction_transition_speed.max(0.0);
+        if transition <= f32::EPSILON {
+            return base;
+        }
+        let static_boost = self.config.friction_static_boost.max(0.0);
+        let kinetic_scale = self.config.friction_kinetic_scale.max(0.0);
+        let t = (tangent_speed_abs / transition).clamp(0.0, 1.0);
+        let speed_scale = static_boost + (kinetic_scale - static_boost) * t;
+        base * speed_scale.max(0.0)
     }
 }
 
@@ -767,5 +817,102 @@ mod tests {
 
         solver.solve(&mut bodies, &manifolds, 1.0 / 60.0);
         assert!(solver.stats().warmstart_hits > 0);
+    }
+
+    #[test]
+    fn solver_does_not_apply_restitution_while_separating() {
+        let mut bodies = BodyRegistry::new();
+        let a = bodies.spawn(BodyDesc {
+            position: Vector3::new(0.0, 0.0, 0.0),
+            linear_velocity: Vector3::new(0.0, 0.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let b = bodies.spawn(BodyDesc {
+            position: Vector3::new(0.0, 0.6, 0.0),
+            // Positive Y with normal +Y means separating contact.
+            linear_velocity: Vector3::new(0.0, 2.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let manifolds = vec![ContactManifold {
+            contact_id: ContactId::new(3),
+            collider_a: ColliderHandle::new(a.index() as u16, a.generation()),
+            collider_b: ColliderHandle::new(b.index() as u16, b.generation()),
+            body_a: a,
+            body_b: b,
+            point: Vector3::new(0.0, 0.3, 0.0),
+            normal: Vector3::new(0.0, 1.0, 0.0),
+            penetration: 0.1,
+            persisted_frames: 1,
+            restitution: 0.95,
+            friction: 0.0,
+        }];
+
+        let mut solver = ContactSolver::new(ContactSolverConfig::default());
+        solver.solve(&mut bodies, &manifolds, 1.0 / 60.0);
+
+        let vy_after = bodies.body(b).unwrap().linear_velocity.y;
+        // Restitution should not add energy while bodies are separating.
+        assert!(vy_after <= 2.0 + 1e-4);
+    }
+
+    #[test]
+    fn solver_clamps_position_correction_per_iteration() {
+        let mut bodies = BodyRegistry::new();
+        let a = bodies.spawn(BodyDesc {
+            position: Vector3::new(0.0, 0.0, 0.0),
+            local_bounds: Aabb::from_center_half_extents(Vector3::zeros(), Vector3::repeat(1.0)),
+            ..BodyDesc::default()
+        });
+        let b = bodies.spawn(BodyDesc {
+            position: Vector3::new(0.1, 0.0, 0.0),
+            local_bounds: Aabb::from_center_half_extents(Vector3::zeros(), Vector3::repeat(1.0)),
+            ..BodyDesc::default()
+        });
+        let manifolds = vec![ContactManifold {
+            contact_id: ContactId::new(4),
+            collider_a: ColliderHandle::new(a.index() as u16, a.generation()),
+            collider_b: ColliderHandle::new(b.index() as u16, b.generation()),
+            body_a: a,
+            body_b: b,
+            point: Vector3::new(0.05, 0.0, 0.0),
+            normal: Vector3::new(1.0, 0.0, 0.0),
+            penetration: 2.5,
+            persisted_frames: 4,
+            restitution: 0.0,
+            friction: 0.2,
+        }];
+
+        let mut cfg = ContactSolverConfig::default();
+        cfg.iterations = 1;
+        cfg.max_position_correction_per_iteration = 0.02;
+        cfg.parallel_contact_push_strength = 0.0;
+        cfg.hard_position_projection_strength = 0.0;
+        let mut solver = ContactSolver::new(cfg);
+        solver.solve(&mut bodies, &manifolds, 1.0 / 60.0);
+
+        let pos_a = bodies.position_for(a).unwrap();
+        let pos_b = bodies.position_for(b).unwrap();
+        let moved = (pos_a.x.abs() + (pos_b.x - 0.1).abs()).max(0.0);
+        assert!(moved <= 0.05);
+    }
+
+    #[test]
+    fn speed_aware_friction_profile_blends_static_to_kinetic() {
+        let mut cfg = ContactSolverConfig::default();
+        cfg.friction_transition_speed = 2.0;
+        cfg.friction_static_boost = 1.4;
+        cfg.friction_kinetic_scale = 0.6;
+        let solver = ContactSolver::new(cfg);
+
+        let base = 0.5;
+        let low = solver.effective_friction(base, 0.1);
+        let high = solver.effective_friction(base, 4.0);
+        assert!(low > high);
+        assert!((high - base * 0.6).abs() < 1e-6);
+
+        let mut disabled_cfg = ContactSolverConfig::default();
+        disabled_cfg.friction_transition_speed = 0.0;
+        let disabled_solver = ContactSolver::new(disabled_cfg);
+        assert!((disabled_solver.effective_friction(base, 999.0) - base).abs() < 1e-6);
     }
 }

@@ -1,0 +1,13 @@
+MGS Orange Pi 5 Validation Summary
+run_id=20260315T070753Z
+run_dir=/home/eilhanzy/Projects/tileline/dist/mgs/orangepi5/20260315T070753Z
+mode=stable
+vsync=on
+warmup_sec=0.2
+duration_sec=0.8
+resolution=800x600
+benchmark_exit=0
+avg_fps=58.44
+stability_percent=84.62
+render_fps_line=Render FPS: avg=58.44 peak=3369.48 low1%=1502.35
+score_line=Score: 18 [D] | stability=84.62% work_stability=84.62%
