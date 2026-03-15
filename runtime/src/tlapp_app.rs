@@ -1119,6 +1119,13 @@ impl TlAppRuntime {
             .unwrap_or(1)
             .max(1);
         let physical_threads = num_cpus::get_physical().max(1);
+        let mgs_like_path = matches!(scheduler_resolution.selected, GraphicsSchedulerPath::Mgs);
+        // Treat MGS + ARM/Android as mobile-class scheduling: tighter tick ceilings and smaller
+        // chunks help avoid frame-time chopping on heterogeneous SoCs (e.g., RK3588S).
+        let mobile_class_tuning = matches!(platform, RuntimePlatform::Android)
+            || mgs_like_path
+            || cfg!(any(target_arch = "aarch64", target_arch = "arm"));
+        let little_core_class = mobile_class_tuning && logical_threads <= 8;
         let uncapped_dynamic_fps_hint =
             options.fps_cap.is_none() && matches!(options.vsync, VsyncMode::Off);
         let display_refresh_hint_hz = window
@@ -1130,11 +1137,25 @@ impl TlAppRuntime {
             (None, VsyncMode::Off) => bootstrap_uncapped_fps_hint(logical_threads),
             (None, _) => display_refresh_hint_hz.unwrap_or(60.0),
         };
-        let tick_policy = TickRatePolicy {
-            min_tick_hz: 30.0,
-            max_tick_hz: (480.0 + logical_threads as f32 * 40.0).clamp(480.0, 1_440.0),
-            ticks_per_render_frame: 2.6,
-            default_tick_hz: (initial_fps_hint * 2.4).clamp(180.0, 420.0),
+        let initial_fps_hint = if mobile_class_tuning && options.fps_cap.is_none() {
+            initial_fps_hint.min(if little_core_class { 96.0 } else { 120.0 })
+        } else {
+            initial_fps_hint
+        };
+        let tick_policy = if mobile_class_tuning {
+            TickRatePolicy {
+                min_tick_hz: 24.0,
+                max_tick_hz: if little_core_class { 220.0 } else { 300.0 },
+                ticks_per_render_frame: 1.85,
+                default_tick_hz: (initial_fps_hint * 1.45).clamp(72.0, 180.0),
+            }
+        } else {
+            TickRatePolicy {
+                min_tick_hz: 30.0,
+                max_tick_hz: (480.0 + logical_threads as f32 * 40.0).clamp(480.0, 1_440.0),
+                ticks_per_render_frame: 2.6,
+                default_tick_hz: (initial_fps_hint * 2.4).clamp(180.0, 420.0),
+            }
         };
         let render_mode = match options.fps_cap {
             Some(fps) => RenderSyncMode::FpsCap { fps },
@@ -1150,13 +1171,38 @@ impl TlAppRuntime {
         };
         let fixed_dt = tick_policy.resolve_fixed_dt_seconds(render_mode, Some(initial_fps_hint));
         let fps_limit_hint = initial_fps_hint;
-        let thread_scale = (logical_threads as f32 / 8.0).clamp(0.75, 4.0);
-        // Keep shards coarse enough to avoid scheduler overhead on high-core systems.
-        let broadphase_chunk = logical_threads.saturating_mul(16).clamp(128, 512);
-        let max_pairs = (96_000.0 * thread_scale).round() as usize;
+        let thread_scale = if mobile_class_tuning {
+            (logical_threads as f32 / 6.0).clamp(0.70, 2.20)
+        } else {
+            (logical_threads as f32 / 8.0).clamp(0.75, 4.0)
+        };
+        // Smaller mobile shards improve load balancing across big.LITTLE clusters.
+        let broadphase_chunk = if little_core_class {
+            logical_threads.saturating_mul(8).clamp(48, 96)
+        } else if mobile_class_tuning {
+            logical_threads.saturating_mul(10).clamp(64, 160)
+        } else {
+            // Keep shards coarse enough to avoid scheduler overhead on high-core systems.
+            logical_threads.saturating_mul(16).clamp(128, 512)
+        };
+        let max_pairs = if mobile_class_tuning {
+            (72_000.0 * thread_scale).round() as usize
+        } else {
+            (96_000.0 * thread_scale).round() as usize
+        };
         let max_manifolds = max_pairs;
-        let solver_iterations = if logical_threads >= 20 { 5 } else { 4 };
-        let tuned_max_substeps = (12 + logical_threads / 4).clamp(10, 24) as u32;
+        let solver_iterations = if little_core_class {
+            4
+        } else if logical_threads >= 20 {
+            5
+        } else {
+            4
+        };
+        let tuned_max_substeps = if mobile_class_tuning {
+            (8 + logical_threads / 4).clamp(6, 12) as u32
+        } else {
+            (12 + logical_threads / 4).clamp(10, 24) as u32
+        };
         let world = PhysicsWorld::new(PhysicsWorldConfig {
             // Keep Earth-like gravity explicit for showcase consistency across presets.
             gravity: Vector3::new(0.0, -9.81, 0.0),
@@ -1165,7 +1211,7 @@ impl TlAppRuntime {
             broadphase: BroadphaseConfig {
                 chunk_size: broadphase_chunk,
                 max_candidate_pairs: max_pairs,
-                shard_pair_reserve: 1_536,
+                shard_pair_reserve: if mobile_class_tuning { 768 } else { 1_536 },
             },
             narrowphase: NarrowphaseConfig {
                 max_manifolds,
@@ -1176,10 +1222,10 @@ impl TlAppRuntime {
                 baumgarte: 0.32,
                 penetration_slop: 0.0015,
                 parallel_contact_push_strength: 0.28,
-                parallel_contact_push_threshold: 256,
+                parallel_contact_push_threshold: if mobile_class_tuning { 128 } else { 256 },
                 hard_position_projection_strength: 0.95,
-                hard_position_projection_threshold: 128,
-                max_projection_per_contact: 0.10,
+                hard_position_projection_threshold: if mobile_class_tuning { 96 } else { 128 },
+                max_projection_per_contact: if mobile_class_tuning { 0.08 } else { 0.10 },
                 ..ContactSolverConfig::default()
             },
             ..PhysicsWorldConfig::default()
@@ -1187,7 +1233,11 @@ impl TlAppRuntime {
         let scene = BounceTankSceneController::new(BounceTankSceneConfig {
             target_ball_count: 8_000,
             // Script can still tune this, but runtime starts from a progressive default.
-            spawn_per_tick: (96.0 * thread_scale).round() as usize,
+            spawn_per_tick: if mobile_class_tuning {
+                (68.0 * thread_scale).round() as usize
+            } else {
+                (96.0 * thread_scale).round() as usize
+            },
             ball_restitution: 0.74,
             wall_restitution: 0.78,
             linear_damping: 0.012,
@@ -1196,9 +1246,11 @@ impl TlAppRuntime {
             ..BounceTankSceneConfig::default()
         });
         eprintln!(
-            "[mps] cpu profile logical={} physical={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={}",
+            "[mps] cpu profile logical={} physical={} mobile_tuning={} little_core_class={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={}",
             logical_threads,
             physical_threads,
+            mobile_class_tuning,
+            little_core_class,
             thread_scale,
             broadphase_chunk,
             max_pairs,
@@ -1615,6 +1667,8 @@ impl TlAppRuntime {
             .as_ref()
             .map(|d| d.is_parallel())
             .unwrap_or(false);
+        let mobile_path = matches!(self.platform, RuntimePlatform::Android)
+            || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
         let force_full_fbx = frame_eval
             .force_full_fbx_sphere
             .unwrap_or(self.force_full_fbx_from_sprite);
@@ -1627,9 +1681,8 @@ impl TlAppRuntime {
             self.max_substeps,
             parallel_ready,
             self.mps_logical_threads,
+            mobile_path,
         );
-        let mobile_path = matches!(self.platform, RuntimePlatform::Android)
-            || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
         self.frame_time_budget_ms = (1_000.0 / self.fps_limit_hint.max(24.0)).clamp(3.0, 41.0);
         let moderate_jitter = self.frame_time_ema_ms > self.frame_time_budget_ms * 1.10
             || self.frame_time_jitter_ema_ms > 1.8;
@@ -1646,11 +1699,12 @@ impl TlAppRuntime {
             load_plan.spawn_per_tick_cap = load_plan.spawn_per_tick_cap.min(120);
         }
         if mobile_path {
-            load_plan.tick_scale *= if severe_jitter { 0.78 } else { 0.86 };
+            load_plan.tick_scale *= if severe_jitter { 0.70 } else { 0.82 };
             load_plan.max_substeps = load_plan
                 .max_substeps
-                .min(if severe_jitter { 5 } else { 7 });
-            load_plan.spawn_per_tick_cap = load_plan.spawn_per_tick_cap.min(128);
+                .min(if severe_jitter { 4 } else { 6 });
+            load_plan.spawn_per_tick_cap =
+                load_plan.spawn_per_tick_cap.min(if severe_jitter { 96 } else { 112 });
         }
         if matches!(self.tick_profile, TickProfile::Max) {
             let min_tick_scale = if severe_jitter {
@@ -1658,17 +1712,17 @@ impl TlAppRuntime {
             } else if moderate_jitter {
                 0.74
             } else if mobile_path {
-                0.80
+                0.68
             } else {
                 0.90
             };
             load_plan.tick_scale = load_plan.tick_scale.max(min_tick_scale);
             let profile_cap = if mobile_path {
-                (6_u32 + (self.mps_logical_threads as u32 / 8)).clamp(6, 10)
+                (5_u32 + (self.mps_logical_threads as u32 / 10)).clamp(5, 8)
             } else {
                 (10_u32 + (self.mps_logical_threads as u32 / 6)).clamp(10, 20)
             };
-            let min_substeps = if mobile_path { 4 } else { 10 };
+            let min_substeps = if mobile_path { 3 } else { 10 };
             load_plan.max_substeps = load_plan
                 .max_substeps
                 .clamp(min_substeps, profile_cap.max(min_substeps));
@@ -1727,38 +1781,54 @@ impl TlAppRuntime {
                 load_plan.tick_scale,
                 self.fps_limit_hint,
                 self.mps_logical_threads,
+                mobile_path,
             );
             if mobile_path {
                 let mobile_ceiling = match self.tick_profile {
-                    TickProfile::Balanced => 170.0,
-                    TickProfile::Max => 220.0,
+                    TickProfile::Balanced => 120.0,
+                    TickProfile::Max => 160.0,
                 };
                 desired_hz = desired_hz.min(mobile_ceiling);
             }
             // Avoid fixed-step overload: if tick is too high for current FPS and max_substeps,
             // simulation falls behind (slow-motion). Clamp to catch-up-safe frequency.
-            let catch_up_hz =
-                (self.fps_tracker.ema_fps().max(1.0) * self.max_substeps as f32 * 0.88)
-                    .clamp(24.0, 900.0);
+            let catch_up_factor = if mobile_path { 0.78 } else { 0.88 };
+            let catch_up_hz = (self.fps_tracker.ema_fps().max(1.0)
+                * self.max_substeps as f32
+                * catch_up_factor)
+                .clamp(24.0, 900.0);
             desired_hz = desired_hz.min(catch_up_hz);
             let ramp_up = desired_hz > self.tick_hz;
-            let smoothing = match (self.tick_profile, ramp_up) {
-                (TickProfile::Max, true) => 0.86,
-                (TickProfile::Max, false) => 0.55,
-                (_, true) => 0.72,
-                (_, false) => 0.42,
+            let smoothing = if mobile_path {
+                match (self.tick_profile, ramp_up) {
+                    (TickProfile::Max, true) => 0.48,
+                    (TickProfile::Max, false) => 0.30,
+                    (_, true) => 0.42,
+                    (_, false) => 0.26,
+                }
+            } else {
+                match (self.tick_profile, ramp_up) {
+                    (TickProfile::Max, true) => 0.86,
+                    (TickProfile::Max, false) => 0.55,
+                    (_, true) => 0.72,
+                    (_, false) => 0.42,
+                }
             };
             self.tick_hz = smooth_tick_hz(self.tick_hz, desired_hz, smoothing);
             let hard_floor = match self.tick_profile {
                 TickProfile::Balanced => 35.0,
                 TickProfile::Max => {
                     let ema_floor = if mobile_path {
-                        (self.fps_tracker.ema_fps().max(1.0) * 2.6).clamp(36.0, 96.0)
+                        (self.fps_tracker.ema_fps().max(1.0) * 1.45).clamp(28.0, 84.0)
                     } else {
                         (self.fps_tracker.ema_fps().max(1.0) * 6.0).clamp(45.0, 180.0)
                     };
                     let cap_floor = if mobile_path {
-                        self.fps_limit_hint * 0.38
+                        if self.uncapped_dynamic_fps_hint {
+                            self.fps_limit_hint * 0.26
+                        } else {
+                            self.fps_limit_hint * 0.32
+                        }
                     } else if self.uncapped_dynamic_fps_hint {
                         self.fps_limit_hint * 0.45
                     } else {
@@ -1771,7 +1841,13 @@ impl TlAppRuntime {
             self.tick_hz = self.tick_hz.max(floor_hz).min(catch_up_hz);
             self.world
                 .set_timestep(1.0 / self.tick_hz, self.max_substeps);
-            self.tick_retune_timer = if ramp_up { 0.08 } else { 0.16 };
+            self.tick_retune_timer = if mobile_path {
+                if ramp_up { 0.12 } else { 0.08 }
+            } else if ramp_up {
+                0.08
+            } else {
+                0.16
+            };
         }
 
         let _patch_metrics = self
@@ -2464,40 +2540,35 @@ fn choose_aggressive_tick_hz(
     tick_scale: f32,
     fps_limit_hint: f32,
     logical_threads: usize,
+    mobile_path: bool,
 ) -> f32 {
     let fps_limit = fps_limit_hint.clamp(24.0, 1_200.0);
     let fps = fps_estimate.clamp(20.0, fps_limit * 2.0);
     let fps_ratio = (fps / fps_limit).clamp(0.35, 1.25);
-    let mut multiplier = match profile {
-        TickProfile::Balanced => {
-            if parallel_ready {
-                2.9
-            } else {
-                2.3
-            }
-        }
-        TickProfile::Max => {
-            if parallel_ready {
-                3.4
-            } else {
-                2.9
-            }
-        }
+    let mut multiplier = match (profile, mobile_path, parallel_ready) {
+        (TickProfile::Balanced, true, true) => 2.0,
+        (TickProfile::Balanced, true, false) => 1.7,
+        (TickProfile::Balanced, false, true) => 2.9,
+        (TickProfile::Balanced, false, false) => 2.3,
+        (TickProfile::Max, true, true) => 2.4,
+        (TickProfile::Max, true, false) => 2.0,
+        (TickProfile::Max, false, true) => 3.4,
+        (TickProfile::Max, false, false) => 2.9,
     };
     if fps_ratio > 0.95 {
-        multiplier += 1.0;
+        multiplier += if mobile_path { 0.35 } else { 1.0 };
     }
     if fps_ratio > 1.05 {
-        multiplier += 0.45;
+        multiplier += if mobile_path { 0.15 } else { 0.45 };
     }
     if live_balls > 3_500 {
-        multiplier += 0.2;
+        multiplier += if mobile_path { 0.12 } else { 0.2 };
     }
     if live_balls > 5_500 {
-        multiplier += 0.25;
+        multiplier += if mobile_path { 0.16 } else { 0.25 };
     }
     if live_balls > 8_000 {
-        multiplier += 0.25;
+        multiplier += if mobile_path { 0.18 } else { 0.25 };
     }
 
     let mut target_hz = fps_limit * multiplier * fps_ratio;
@@ -2514,30 +2585,82 @@ fn choose_aggressive_tick_hz(
     }
     if fps < 45.0 {
         target_hz *= match profile {
-            TickProfile::Balanced => 0.85,
-            TickProfile::Max => 0.93,
+            TickProfile::Balanced => {
+                if mobile_path {
+                    0.72
+                } else {
+                    0.85
+                }
+            }
+            TickProfile::Max => {
+                if mobile_path {
+                    0.82
+                } else {
+                    0.93
+                }
+            }
         };
     }
     target_hz *= match profile {
-        TickProfile::Balanced => tick_scale.clamp(0.50, 1.20),
-        TickProfile::Max => tick_scale.clamp(0.85, 1.35),
+        TickProfile::Balanced => {
+            if mobile_path {
+                tick_scale.clamp(0.42, 1.05)
+            } else {
+                tick_scale.clamp(0.50, 1.20)
+            }
+        }
+        TickProfile::Max => {
+            if mobile_path {
+                tick_scale.clamp(0.60, 1.10)
+            } else {
+                tick_scale.clamp(0.85, 1.35)
+            }
+        }
     };
 
     let dynamic_min = match profile {
-        TickProfile::Balanced => (fps_limit * 0.5).max(policy.min_tick_hz.max(30.0)),
-        TickProfile::Max => policy.min_tick_hz.max(45.0),
+        TickProfile::Balanced => {
+            if mobile_path {
+                policy.min_tick_hz.max(24.0)
+            } else {
+                (fps_limit * 0.5).max(policy.min_tick_hz.max(30.0))
+            }
+        }
+        TickProfile::Max => {
+            if mobile_path {
+                policy.min_tick_hz.max(28.0)
+            } else {
+                policy.min_tick_hz.max(45.0)
+            }
+        }
     };
-    let thread_scale = (logical_threads as f32 / 8.0).clamp(0.75, 4.0);
+    let thread_scale = if mobile_path {
+        (logical_threads as f32 / 6.0).clamp(0.70, 2.20)
+    } else {
+        (logical_threads as f32 / 8.0).clamp(0.75, 4.0)
+    };
     let ceiling_factor = match profile {
         TickProfile::Balanced => {
-            if parallel_ready {
+            if mobile_path {
+                if parallel_ready {
+                    3.2
+                } else {
+                    2.6
+                }
+            } else if parallel_ready {
                 8.0
             } else {
                 6.0
             }
         }
         TickProfile::Max => {
-            if parallel_ready {
+            if mobile_path {
+                if parallel_ready {
+                    4.0
+                } else {
+                    3.2
+                }
+            } else if parallel_ready {
                 12.0
             } else {
                 10.0
@@ -2545,8 +2668,20 @@ fn choose_aggressive_tick_hz(
         }
     };
     let thread_gain = match profile {
-        TickProfile::Balanced => 0.8 + thread_scale * 0.4,
-        TickProfile::Max => 0.9 + thread_scale * 0.55,
+        TickProfile::Balanced => {
+            if mobile_path {
+                0.72 + thread_scale * 0.18
+            } else {
+                0.8 + thread_scale * 0.4
+            }
+        }
+        TickProfile::Max => {
+            if mobile_path {
+                0.82 + thread_scale * 0.28
+            } else {
+                0.9 + thread_scale * 0.55
+            }
+        }
     };
     let dynamic_max =
         (fps_limit * ceiling_factor * thread_gain).min(policy.max_tick_hz.max(dynamic_min));
@@ -2577,6 +2712,7 @@ fn choose_runtime_load_plan(
     max_substeps: u32,
     parallel_ready: bool,
     logical_threads: usize,
+    mobile_path: bool,
 ) -> RuntimeLoadPlan {
     let mut pressure = 0u32;
     let fps = ema_fps.clamp(1.0, 240.0);
@@ -2615,50 +2751,66 @@ fn choose_runtime_load_plan(
     if live_balls > 6_500 {
         pressure += 1;
     }
+    if mobile_path {
+        // Mobile scheduler should shed load earlier to avoid whole-system chopping.
+        if fps < 62.0 {
+            pressure += 1;
+        }
+        if frame_time_ms > 16.8 {
+            pressure += 1;
+        }
+        if last_substeps >= max_substeps.saturating_sub(3) {
+            pressure += 1;
+        }
+    }
 
-    let thread_scale = (logical_threads as f32 / 8.0).clamp(0.75, 4.0);
+    let thread_scale = if mobile_path {
+        (logical_threads as f32 / 6.0).clamp(0.70, 2.20)
+    } else {
+        (logical_threads as f32 / 8.0).clamp(0.75, 4.0)
+    };
     let cap = |base: usize| ((base as f32) * thread_scale).round() as usize;
 
     match pressure {
         0..=2 => RuntimeLoadPlan {
             visible_ball_limit: None,
             live_ball_budget: None,
-            spawn_per_tick_cap: cap(420),
-            max_substeps: 14,
+            spawn_per_tick_cap: cap(if mobile_path { 280 } else { 420 }),
+            max_substeps: if mobile_path { 10 } else { 14 },
             force_low_poly_ball_mesh: false,
-            tick_scale: 1.00,
+            tick_scale: if mobile_path { 0.92 } else { 1.00 },
         },
         3..=4 => RuntimeLoadPlan {
             visible_ball_limit: None,
             live_ball_budget: None,
-            spawn_per_tick_cap: cap(360),
-            max_substeps: 12,
+            spawn_per_tick_cap: cap(if mobile_path { 220 } else { 360 }),
+            max_substeps: if mobile_path { 8 } else { 12 },
             force_low_poly_ball_mesh: false,
-            tick_scale: 0.96,
+            tick_scale: if mobile_path { 0.84 } else { 0.96 },
         },
         5..=6 => RuntimeLoadPlan {
             visible_ball_limit: None,
             live_ball_budget: None,
-            spawn_per_tick_cap: cap(260),
-            max_substeps: 10,
+            spawn_per_tick_cap: cap(if mobile_path { 180 } else { 260 }),
+            max_substeps: if mobile_path { 7 } else { 10 },
             force_low_poly_ball_mesh: false,
-            tick_scale: 0.82,
+            tick_scale: if mobile_path { 0.72 } else { 0.82 },
         },
         7..=8 => RuntimeLoadPlan {
             visible_ball_limit: None,
             live_ball_budget: None,
-            spawn_per_tick_cap: cap(200),
-            max_substeps: 10,
+            spawn_per_tick_cap: cap(if mobile_path { 140 } else { 200 }),
+            max_substeps: if mobile_path { 6 } else { 10 },
             force_low_poly_ball_mesh: false,
-            tick_scale: 0.72,
+            tick_scale: if mobile_path { 0.62 } else { 0.72 },
         },
         _ => RuntimeLoadPlan {
             visible_ball_limit: None,
             live_ball_budget: None,
-            spawn_per_tick_cap: cap(160),
-            max_substeps: 10,
+            spawn_per_tick_cap: cap(if mobile_path { 112 } else { 160 }),
+            max_substeps: if mobile_path { 5 } else { 10 },
             force_low_poly_ball_mesh: false,
-            tick_scale: 0.60,
+            tick_scale: if mobile_path { 0.52 } else { 0.60 },
         },
     }
 }
