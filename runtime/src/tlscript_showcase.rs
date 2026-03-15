@@ -20,17 +20,40 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 29] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 52] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_linear_damping",
     "set_contact_guard",
     "set_bounce",
+    "set_friction",
     "set_gravity",
     "set_gravity_y",
     "set_gravity_ramp",
     "set_ball_restitution",
+    "set_ball_friction",
     "set_wall_restitution",
+    "set_wall_friction",
+    "set_friction_profile",
+    "set_restitution_threshold",
+    "set_levitation",
+    "set_levitation_height",
+    "set_levitation_strength",
+    "set_levitation_damping",
+    "set_levitation_max_vertical_speed",
+    "set_levitation_reaction",
+    "set_levitation_reaction_strength",
+    "set_levitation_reaction_radius",
+    "set_levitation_reaction_damping",
+    "set_levitation_lateral",
+    "set_levitation_lateral_strength",
+    "set_levitation_lateral_damping",
+    "set_levitation_lateral_max_horizontal_speed",
+    "set_levitation_lateral_wall_push",
+    "set_levitation_lateral_frequency",
+    "set_friction_transition_speed",
+    "set_friction_static_boost",
+    "set_friction_kinetic_scale",
     "set_scatter_interval",
     "set_scatter_strength",
     "set_initial_speed",
@@ -117,6 +140,30 @@ pub struct TlscriptShowcaseControlInput {
     pub sprint_down: bool,
     pub look_active: bool,
     pub reset_camera: bool,
+    pub key_w_down: bool,
+    pub key_s_down: bool,
+    pub key_a_down: bool,
+    pub key_d_down: bool,
+    pub key_up_down: bool,
+    pub key_down_down: bool,
+    pub key_left_down: bool,
+    pub key_right_down: bool,
+    pub key_space_down: bool,
+    pub key_ctrl_down: bool,
+    pub key_shift_down: bool,
+    pub key_q_down: bool,
+    pub key_e_down: bool,
+    pub key_c_down: bool,
+    pub key_r_down: bool,
+    pub key_l_down: bool,
+    pub mouse_look_down: bool,
+    pub pad_move_x: f32,
+    pub pad_move_y: f32,
+    pub pad_rise: f32,
+    pub pad_descend: f32,
+    pub pad_look_x: f32,
+    pub pad_look_y: f32,
+    pub pad_sprint_down: bool,
 }
 
 impl Default for TlscriptShowcaseControlInput {
@@ -130,6 +177,30 @@ impl Default for TlscriptShowcaseControlInput {
             sprint_down: false,
             look_active: false,
             reset_camera: false,
+            key_w_down: false,
+            key_s_down: false,
+            key_a_down: false,
+            key_d_down: false,
+            key_up_down: false,
+            key_down_down: false,
+            key_left_down: false,
+            key_right_down: false,
+            key_space_down: false,
+            key_ctrl_down: false,
+            key_shift_down: false,
+            key_q_down: false,
+            key_e_down: false,
+            key_c_down: false,
+            key_r_down: false,
+            key_l_down: false,
+            mouse_look_down: false,
+            pad_move_x: 0.0,
+            pad_move_y: 0.0,
+            pad_rise: 0.0,
+            pad_descend: 0.0,
+            pad_look_x: 0.0,
+            pad_look_y: 0.0,
+            pad_sprint_down: false,
         }
     }
 }
@@ -255,6 +326,89 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         state.vars.insert(
             "input_reset_camera".to_string(),
             DemoValue::Bool(controls.reset_camera),
+        );
+        state
+            .vars
+            .insert("key_w_down".to_string(), DemoValue::Bool(controls.key_w_down));
+        state
+            .vars
+            .insert("key_s_down".to_string(), DemoValue::Bool(controls.key_s_down));
+        state
+            .vars
+            .insert("key_a_down".to_string(), DemoValue::Bool(controls.key_a_down));
+        state
+            .vars
+            .insert("key_d_down".to_string(), DemoValue::Bool(controls.key_d_down));
+        state
+            .vars
+            .insert("key_up_down".to_string(), DemoValue::Bool(controls.key_up_down));
+        state
+            .vars
+            .insert("key_down_down".to_string(), DemoValue::Bool(controls.key_down_down));
+        state
+            .vars
+            .insert("key_left_down".to_string(), DemoValue::Bool(controls.key_left_down));
+        state
+            .vars
+            .insert("key_right_down".to_string(), DemoValue::Bool(controls.key_right_down));
+        state.vars.insert(
+            "key_space_down".to_string(),
+            DemoValue::Bool(controls.key_space_down),
+        );
+        state.vars.insert(
+            "key_ctrl_down".to_string(),
+            DemoValue::Bool(controls.key_ctrl_down),
+        );
+        state.vars.insert(
+            "key_shift_down".to_string(),
+            DemoValue::Bool(controls.key_shift_down),
+        );
+        state
+            .vars
+            .insert("key_q_down".to_string(), DemoValue::Bool(controls.key_q_down));
+        state
+            .vars
+            .insert("key_e_down".to_string(), DemoValue::Bool(controls.key_e_down));
+        state
+            .vars
+            .insert("key_c_down".to_string(), DemoValue::Bool(controls.key_c_down));
+        state
+            .vars
+            .insert("key_r_down".to_string(), DemoValue::Bool(controls.key_r_down));
+        state
+            .vars
+            .insert("key_l_down".to_string(), DemoValue::Bool(controls.key_l_down));
+        state.vars.insert(
+            "mouse_look_down".to_string(),
+            DemoValue::Bool(controls.mouse_look_down),
+        );
+        state.vars.insert(
+            "pad_move_x".to_string(),
+            DemoValue::Float(controls.pad_move_x as f64),
+        );
+        state.vars.insert(
+            "pad_move_y".to_string(),
+            DemoValue::Float(controls.pad_move_y as f64),
+        );
+        state.vars.insert(
+            "pad_rise".to_string(),
+            DemoValue::Float(controls.pad_rise as f64),
+        );
+        state.vars.insert(
+            "pad_descend".to_string(),
+            DemoValue::Float(controls.pad_descend as f64),
+        );
+        state.vars.insert(
+            "pad_look_x".to_string(),
+            DemoValue::Float(controls.pad_look_x as f64),
+        );
+        state.vars.insert(
+            "pad_look_y".to_string(),
+            DemoValue::Float(controls.pad_look_y as f64),
+        );
+        state.vars.insert(
+            "pad_sprint_down".to_string(),
+            DemoValue::Bool(controls.pad_sprint_down),
         );
 
         let Item::Function(entry_fn) = &self.module.items[self.entry_item_index];
@@ -658,6 +812,13 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
             }
             _ => state.warn("set_bounce expects 2 args"),
         },
+        "set_friction" => match args {
+            [ball, wall] => {
+                state.patch.ball_friction = Some(ball.to_f64() as f32);
+                state.patch.wall_friction = Some(wall.to_f64() as f32);
+            }
+            _ => state.warn("set_friction expects 2 args"),
+        },
         "set_gravity" => match args {
             [x, y, z] => {
                 state.patch.gravity =
@@ -704,6 +865,114 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
         "set_wall_restitution" => match args {
             [v] => state.patch.wall_restitution = Some(v.to_f64() as f32),
             _ => state.warn("set_wall_restitution expects 1 arg"),
+        },
+        "set_ball_friction" => match args {
+            [v] => state.patch.ball_friction = Some(v.to_f64() as f32),
+            _ => state.warn("set_ball_friction expects 1 arg"),
+        },
+        "set_wall_friction" => match args {
+            [v] => state.patch.wall_friction = Some(v.to_f64() as f32),
+            _ => state.warn("set_wall_friction expects 1 arg"),
+        },
+        "set_friction_profile" => match args {
+            [transition, static_boost, kinetic_scale] => {
+                state.patch.friction_transition_speed = Some(transition.to_f64() as f32);
+                state.patch.friction_static_boost = Some(static_boost.to_f64() as f32);
+                state.patch.friction_kinetic_scale = Some(kinetic_scale.to_f64() as f32);
+            }
+            _ => state.warn("set_friction_profile expects 3 args"),
+        },
+        "set_restitution_threshold" => match args {
+            [v] => state.patch.restitution_velocity_threshold = Some(v.to_f64() as f32),
+            _ => state.warn("set_restitution_threshold expects 1 arg"),
+        },
+        "set_levitation" => match args {
+            [height, strength, damping, max_speed] => {
+                state.patch.levitation_height = Some(height.to_f64() as f32);
+                state.patch.levitation_strength = Some(strength.to_f64() as f32);
+                state.patch.levitation_damping = Some(damping.to_f64() as f32);
+                state.patch.levitation_max_vertical_speed = Some(max_speed.to_f64() as f32);
+            }
+            _ => state.warn("set_levitation expects 4 args"),
+        },
+        "set_levitation_height" => match args {
+            [v] => state.patch.levitation_height = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_height expects 1 arg"),
+        },
+        "set_levitation_strength" => match args {
+            [v] => state.patch.levitation_strength = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_strength expects 1 arg"),
+        },
+        "set_levitation_damping" => match args {
+            [v] => state.patch.levitation_damping = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_damping expects 1 arg"),
+        },
+        "set_levitation_max_vertical_speed" => match args {
+            [v] => state.patch.levitation_max_vertical_speed = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_max_vertical_speed expects 1 arg"),
+        },
+        "set_levitation_reaction" => match args {
+            [strength, radius, damping] => {
+                state.patch.levitation_reaction_strength = Some(strength.to_f64() as f32);
+                state.patch.levitation_reaction_radius = Some(radius.to_f64() as f32);
+                state.patch.levitation_reaction_damping = Some(damping.to_f64() as f32);
+            }
+            _ => state.warn("set_levitation_reaction expects 3 args"),
+        },
+        "set_levitation_reaction_strength" => match args {
+            [v] => state.patch.levitation_reaction_strength = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_reaction_strength expects 1 arg"),
+        },
+        "set_levitation_reaction_radius" => match args {
+            [v] => state.patch.levitation_reaction_radius = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_reaction_radius expects 1 arg"),
+        },
+        "set_levitation_reaction_damping" => match args {
+            [v] => state.patch.levitation_reaction_damping = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_reaction_damping expects 1 arg"),
+        },
+        "set_levitation_lateral" => match args {
+            [strength, damping, max_horizontal_speed, wall_push, frequency] => {
+                state.patch.levitation_lateral_strength = Some(strength.to_f64() as f32);
+                state.patch.levitation_lateral_damping = Some(damping.to_f64() as f32);
+                state.patch.levitation_lateral_max_horizontal_speed =
+                    Some(max_horizontal_speed.to_f64() as f32);
+                state.patch.levitation_lateral_wall_push = Some(wall_push.to_f64() as f32);
+                state.patch.levitation_lateral_frequency = Some(frequency.to_f64() as f32);
+            }
+            _ => state.warn("set_levitation_lateral expects 5 args"),
+        },
+        "set_levitation_lateral_strength" => match args {
+            [v] => state.patch.levitation_lateral_strength = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_lateral_strength expects 1 arg"),
+        },
+        "set_levitation_lateral_damping" => match args {
+            [v] => state.patch.levitation_lateral_damping = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_lateral_damping expects 1 arg"),
+        },
+        "set_levitation_lateral_max_horizontal_speed" => match args {
+            [v] => state.patch.levitation_lateral_max_horizontal_speed = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_lateral_max_horizontal_speed expects 1 arg"),
+        },
+        "set_levitation_lateral_wall_push" => match args {
+            [v] => state.patch.levitation_lateral_wall_push = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_lateral_wall_push expects 1 arg"),
+        },
+        "set_levitation_lateral_frequency" => match args {
+            [v] => state.patch.levitation_lateral_frequency = Some(v.to_f64() as f32),
+            _ => state.warn("set_levitation_lateral_frequency expects 1 arg"),
+        },
+        "set_friction_transition_speed" => match args {
+            [v] => state.patch.friction_transition_speed = Some(v.to_f64() as f32),
+            _ => state.warn("set_friction_transition_speed expects 1 arg"),
+        },
+        "set_friction_static_boost" => match args {
+            [v] => state.patch.friction_static_boost = Some(v.to_f64() as f32),
+            _ => state.warn("set_friction_static_boost expects 1 arg"),
+        },
+        "set_friction_kinetic_scale" => match args {
+            [v] => state.patch.friction_kinetic_scale = Some(v.to_f64() as f32),
+            _ => state.warn("set_friction_kinetic_scale expects 1 arg"),
         },
         "set_scatter_interval" => match args {
             [v] => state.patch.scatter_interval_ticks = Some(v.to_i64().max(0) as u64),
@@ -1110,6 +1379,7 @@ mod tests {
                 sprint_down: true,
                 look_active: true,
                 reset_camera: true,
+                ..TlscriptShowcaseControlInput::default()
             },
         );
         assert_eq!(out.camera_move_axis, Some([0.5, -0.25, 0.9]));
@@ -1207,6 +1477,12 @@ mod tests {
             "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
             "    set_contact_guard(0.93)\n",
             "    set_bounce(0.75, 0.81)\n",
+            "    set_friction(0.42, 0.18)\n",
+            "    set_friction_profile(1.5, 1.3, 0.8)\n",
+            "    set_restitution_threshold(0.22)\n",
+            "    set_levitation(1.8, 7.2, 2.1, 4.6)\n",
+            "    set_levitation_reaction(5.5, 1.35, 1.4)\n",
+            "    set_levitation_lateral(3.2, 1.6, 9.5, 12.0, 0.45)\n",
         );
         let outcome = compile_tlscript_showcase(src, Default::default());
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -1220,6 +1496,31 @@ mod tests {
         assert!((out.patch.contact_guard.unwrap_or(0.0) - 0.93).abs() < 1e-6);
         assert!((out.patch.ball_restitution.unwrap_or(0.0) - 0.75).abs() < 1e-6);
         assert!((out.patch.wall_restitution.unwrap_or(0.0) - 0.81).abs() < 1e-6);
+        assert!((out.patch.ball_friction.unwrap_or(0.0) - 0.42).abs() < 1e-6);
+        assert!((out.patch.wall_friction.unwrap_or(0.0) - 0.18).abs() < 1e-6);
+        assert!((out.patch.friction_transition_speed.unwrap_or(0.0) - 1.5).abs() < 1e-6);
+        assert!((out.patch.friction_static_boost.unwrap_or(0.0) - 1.3).abs() < 1e-6);
+        assert!((out.patch.friction_kinetic_scale.unwrap_or(0.0) - 0.8).abs() < 1e-6);
+        assert!((out.patch.restitution_velocity_threshold.unwrap_or(0.0) - 0.22).abs() < 1e-6);
+        assert!((out.patch.levitation_height.unwrap_or(0.0) - 1.8).abs() < 1e-6);
+        assert!((out.patch.levitation_strength.unwrap_or(0.0) - 7.2).abs() < 1e-6);
+        assert!((out.patch.levitation_damping.unwrap_or(0.0) - 2.1).abs() < 1e-6);
+        assert!((out.patch.levitation_max_vertical_speed.unwrap_or(0.0) - 4.6).abs() < 1e-6);
+        assert!((out.patch.levitation_reaction_strength.unwrap_or(0.0) - 5.5).abs() < 1e-6);
+        assert!((out.patch.levitation_reaction_radius.unwrap_or(0.0) - 1.35).abs() < 1e-6);
+        assert!((out.patch.levitation_reaction_damping.unwrap_or(0.0) - 1.4).abs() < 1e-6);
+        assert!((out.patch.levitation_lateral_strength.unwrap_or(0.0) - 3.2).abs() < 1e-6);
+        assert!((out.patch.levitation_lateral_damping.unwrap_or(0.0) - 1.6).abs() < 1e-6);
+        assert!(
+            (out.patch
+                .levitation_lateral_max_horizontal_speed
+                .unwrap_or(0.0)
+                - 9.5)
+                .abs()
+                < 1e-6
+        );
+        assert!((out.patch.levitation_lateral_wall_push.unwrap_or(0.0) - 12.0).abs() < 1e-6);
+        assert!((out.patch.levitation_lateral_frequency.unwrap_or(0.0) - 0.45).abs() < 1e-6);
     }
 
     #[test]
@@ -1229,6 +1530,17 @@ mod tests {
         assert!(
             outcome.errors.is_empty(),
             "tlapp demo script should compile cleanly: {:?}",
+            outcome.errors
+        );
+    }
+
+    #[test]
+    fn tlapp_mobile_safe_script_compiles() {
+        let src = include_str!("../../docs/demos/tlapp/bounce_showcase_mobile_safe.tlscript");
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(
+            outcome.errors.is_empty(),
+            "tlapp mobile-safe script should compile cleanly: {:?}",
             outcome.errors
         );
     }
