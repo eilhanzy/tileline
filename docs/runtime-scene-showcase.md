@@ -23,9 +23,12 @@ This note documents the pre-alpha scene orchestration foundation added for the u
 
 - `SceneInstance3d`: primitive + transform + material + shadow flags
 - `SpriteInstance`: overlay/sprite payload (HUD/progress/etc.)
-- `SceneFrameInstances`: `opaque_3d`, `transparent_3d`, `sprites`
+- `SceneFrameInstances`: `opaque_3d`, `transparent_3d`, `sprites`, `lights`
 - `ScenePrimitive3d`: `Sphere` / `Box` / `Mesh { slot }`
 - `SceneMaterial` + `ShadingModel`
+- `SceneLight` + `SceneLightKind` (`Point`, `Spot`)
+- `SceneLightOverride` merge helpers for `.tlscript` runtime control
+- `RayTracingMode` (`Off`, `Auto`, `On`) for renderer RT policy
 - `set_sprite_program(...)` hook for compiled `.tlsprite` overlays
 
 ## Bounce Tank Controller
@@ -43,6 +46,9 @@ silhouette clarity; balls are emitted as `opaque_3d` spheres by default.
 
 When `.tlscript` sets `set_ball_mesh_slot(...)` or `set_container_mesh_slot(...)`, the same scene
 path can emit `ScenePrimitive3d::Mesh { slot }` and consume FBX bindings loaded from `.tlsprite`.
+
+When `.tlsprite` contains `entry_kind=light`, the same scene build path emits static lights into
+`SceneFrameInstances::lights`. `.tlscript` can then override those lights by `light_id` each frame.
 
 ## Tick/FPS Decoupling
 
@@ -77,6 +83,9 @@ For deterministic backend batching, runtime now exposes `DrawPathCompiler` and `
 (`runtime/src/draw_path.rs`), plus `TelemetryHudComposer` for overlay meters
 (`runtime/src/telemetry_hud.rs`) and `WgpuSceneRenderer` for real render-pass encoding
 (`runtime/src/wgpu_scene_renderer.rs`).
+
+Renderer telemetry now includes lighting + RT status (`light_count`, `rt_mode`, `rt_active`,
+`rt_dynamic_count`, fallback reason), so fail-soft fallback behavior is visible both in logs and HUD.
 
 `runtime::estimate_scene_workload_requests(...)` can be used to translate scene/sprite density into
 `gms::WorkloadRequest` and `gms::MultiGpuWorkloadRequest` for planner-driven dispatch.

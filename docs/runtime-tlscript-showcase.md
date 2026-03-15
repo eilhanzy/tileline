@@ -24,6 +24,7 @@ The frame path:
 2. emit bounded `BounceTankRuntimePatch`
 3. apply patch to scene/world (`apply_runtime_patch`)
 4. expose planner decision (`ParallelDispatchDecision`) for telemetry
+5. emit light overrides + RT mode hints for renderer merge
 
 ## Supported Builtins (V1)
 
@@ -41,6 +42,24 @@ The frame path:
 - `set_camera_move_speed(v)`
 - `set_camera_look_sensitivity(v)`
 - `set_camera_pose(ex, ey, ez, tx, ty, tz)`
+- `set_light_enabled(id, bool)`
+- `set_light_position(id, x, y, z)`
+- `set_light_direction(id, x, y, z)`
+- `set_light_intensity(id, v)`
+- `set_light_range(id, v)`
+- `set_light_cone(id, inner_deg, outer_deg)`
+- `set_light_color(id, r, g, b)`
+- `set_light_softness(id, v)`
+- `set_rt_mode(mode)` (`off|auto|on`)
 
 All values are soft-validated and clamped during patch application to keep simulation and runtime
 controls safe.
+
+## Light Merge Rule
+
+Final frame lights are merged deterministically:
+
+1. Static `.tlsprite` light entries build the base list.
+2. `.tlscript` applies id-based partial overrides.
+3. Unknown `light_id` emits soft warning (no hard fail).
+4. Renderer clamps to `MAX_LIGHTS` with deterministic priority.

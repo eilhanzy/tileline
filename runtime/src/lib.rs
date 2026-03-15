@@ -81,10 +81,11 @@ pub use pre_alpha_loop::{
     PRE_ALPHA_PHASE_ORDER,
 };
 pub use scene::{
-    BounceTankPatchMetrics, BounceTankRuntimePatch, BounceTankSceneConfig,
-    BounceTankSceneController, BounceTankTickMetrics, RenderSyncMode, SceneFrameInstances,
-    SceneInstance3d, SceneMaterial, ScenePrimitive3d, SceneTransform3d, ShadingModel,
-    SpriteInstance, SpriteKind, TickRatePolicy,
+    apply_scene_light_overrides, clamp_scene_lights_for_camera, BounceTankPatchMetrics,
+    BounceTankRuntimePatch, BounceTankSceneConfig, BounceTankSceneController, BounceTankTickMetrics,
+    RayTracingMode, RenderSyncMode, SceneFrameInstances, SceneInstance3d, SceneLight,
+    SceneLightKind, SceneLightOverride, SceneMaterial, ScenePrimitive3d, SceneTransform3d,
+    ShadingModel, SpriteInstance, SpriteKind, TickRatePolicy, MAX_SCENE_LIGHTS,
 };
 pub use scene_dispatch::{
     submit_scene_estimate_to_bridge, SceneDispatchBridgeConfig, SceneDispatchLaneSummary,
@@ -130,8 +131,8 @@ pub use tlsprite::{
     TlspriteCacheLoadOutcome, TlspriteCacheLoadSource, TlspriteCompileOutcome, TlspriteDiagnostic,
     TlspriteDiagnosticLevel, TlspriteFrameContext, TlspriteHotReloadConfig, TlspriteHotReloadEvent,
     TlspriteHotReloader, TlspritePack, TlspriteProgram, TlspriteProgramCache,
-    TlspriteProgramCacheStats, TlspriteScaleAxis, TlspriteScaleSource, TlspriteSpriteDef,
-    TlspriteWatchBackend, TlspriteWatchConfig, TlspriteWatchReloader,
+    TlspriteProgramCacheStats, TlspriteLightDef, TlspriteScaleAxis, TlspriteScaleSource,
+    TlspriteSpriteDef, TlspriteWatchBackend, TlspriteWatchConfig, TlspriteWatchReloader,
 };
 pub use tlsprite_editor::{
     TlspriteEditorPalette, TlspriteEditorTheme, TlspriteListDocument, TlspriteListRow,
@@ -141,4 +142,6 @@ pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,
     SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,
 };
-pub use wgpu_scene_renderer::{WgpuSceneRenderer, WgpuSceneRendererUploadStats};
+pub use wgpu_scene_renderer::{
+    SceneRayTracingStatus, WgpuSceneRenderer, WgpuSceneRendererUploadStats,
+};

@@ -3,7 +3,7 @@
 //! This module appends deterministic HUD sprites directly onto `SceneFrameInstances::sprites`.
 //! It is renderer-agnostic and can be consumed by either GMS/MGS draw paths.
 
-use crate::scene::{SpriteInstance, SpriteKind};
+use crate::scene::{RayTracingMode, SpriteInstance, SpriteKind};
 
 /// Input telemetry for HUD composition.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -13,6 +13,10 @@ pub struct TelemetryHudSample {
     pub physics_substeps: u32,
     pub live_balls: usize,
     pub draw_calls: usize,
+    pub rt_mode: RayTracingMode,
+    pub rt_active: bool,
+    pub rt_dynamic_count: u32,
+    pub rt_fallback: bool,
 }
 
 /// HUD configuration.
@@ -81,10 +85,10 @@ impl TelemetryHudComposer {
             kind: SpriteKind::Hud,
             position: [
                 cfg.anchor_top_left[0] + cfg.width * 0.5,
-                cfg.anchor_top_left[1] - 0.075,
+                cfg.anchor_top_left[1] - 0.092,
                 0.0,
             ],
-            size: [cfg.width, 0.17],
+            size: [cfg.width, 0.205],
             rotation_rad: 0.0,
             color_rgba: [0.05, 0.07, 0.10, 0.70],
             texture_slot: 0,
@@ -139,6 +143,29 @@ impl TelemetryHudComposer {
             1.0 - load,
             [0.92, 0.36, 0.28, 0.92],
             [0.25, 0.14, 0.14, 0.80],
+        );
+
+        // RT quality/health bar.
+        let rt_fill = if sample.rt_active {
+            safe_ratio(sample.rt_dynamic_count as f32, 1_024.0).max(0.20)
+        } else {
+            0.10
+        };
+        let rt_color = if sample.rt_active {
+            [0.76, 0.60, 0.96, 0.92]
+        } else if sample.rt_fallback || matches!(sample.rt_mode, RayTracingMode::On) {
+            [0.92, 0.42, 0.34, 0.92]
+        } else {
+            [0.44, 0.50, 0.60, 0.80]
+        };
+        self.push_meter(
+            sprites,
+            5,
+            5,
+            4.0,
+            rt_fill,
+            rt_color,
+            [0.20, 0.16, 0.26, 0.82],
         );
 
         TelemetryHudMetrics {
@@ -209,11 +236,15 @@ mod tests {
                 physics_substeps: 2,
                 live_balls: 4_000,
                 draw_calls: 1_200,
+                rt_mode: RayTracingMode::Auto,
+                rt_active: false,
+                rt_dynamic_count: 0,
+                rt_fallback: false,
             },
             &mut sprites,
         );
-        assert_eq!(m.appended_sprites, 9);
-        assert_eq!(sprites.len(), 9);
+        assert_eq!(m.appended_sprites, 11);
+        assert_eq!(sprites.len(), 11);
     }
 
     #[test]
@@ -227,6 +258,10 @@ mod tests {
                 physics_substeps: 100,
                 live_balls: 1_000_000,
                 draw_calls: 1_000_000,
+                rt_mode: RayTracingMode::On,
+                rt_active: true,
+                rt_dynamic_count: 2_048,
+                rt_fallback: false,
             },
             &mut sprites,
         );

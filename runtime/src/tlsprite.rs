@@ -37,7 +37,7 @@ use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 
-use crate::scene::{SpriteInstance, SpriteKind};
+use crate::scene::{SceneLight, SceneLightKind, SpriteInstance, SpriteKind};
 
 /// Input bindings consumed while emitting runtime sprite instances.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -120,15 +120,27 @@ pub struct TlspriteSpriteDef {
     dynamic_scale: Option<TlspriteDynamicScale>,
 }
 
+/// One compiled light definition emitted from `.tlsprite`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TlspriteLightDef {
+    pub name: String,
+    pub light: SceneLight,
+}
+
 /// Compiled `.tlsprite` sprite set.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TlspriteProgram {
     sprites: Vec<TlspriteSpriteDef>,
+    lights: Vec<TlspriteLightDef>,
 }
 
 impl TlspriteProgram {
     pub fn sprites(&self) -> &[TlspriteSpriteDef] {
         &self.sprites
+    }
+
+    pub fn lights(&self) -> &[TlspriteLightDef] {
+        &self.lights
     }
 
     /// Returns `true` when at least one sprite section requests FBX-derived behavior.
@@ -193,17 +205,29 @@ impl TlspriteProgram {
         }
     }
 
+    /// Emit frame-local scene lights into `out`.
+    pub fn emit_lights(&self, out: &mut Vec<SceneLight>) {
+        out.reserve(self.lights.len());
+        for def in &self.lights {
+            out.push(def.light.clone());
+        }
+        out.sort_by_key(|light| (light.layer, light.id));
+    }
+
     /// Merge multiple compiled programs into one deterministic emission order.
     ///
     /// Programs are appended in slice order and each program's internal sprite order is preserved.
     /// This enables `.tljoint` scene bundles to compose multiple `.tlsprite` files.
     pub fn merge_programs(programs: &[TlspriteProgram]) -> TlspriteProgram {
         let total = programs.iter().map(|program| program.sprites.len()).sum();
+        let total_lights = programs.iter().map(|program| program.lights.len()).sum();
         let mut sprites = Vec::with_capacity(total);
+        let mut lights = Vec::with_capacity(total_lights);
         for program in programs {
             sprites.extend(program.sprites.iter().cloned());
+            lights.extend(program.lights.iter().cloned());
         }
-        TlspriteProgram { sprites }
+        TlspriteProgram { sprites, lights }
     }
 }
 
@@ -526,7 +550,8 @@ fn build_notify_state(path: &Path) -> notify::Result<TlspriteWatchState> {
 
 const TLSPRITE_PACK_MAGIC_V1: &[u8; 8] = b"TLSPK001";
 const TLSPRITE_PACK_MAGIC_V2: &[u8; 8] = b"TLSPK002";
-const TLSPRITE_PACK_MAGIC: &[u8; 8] = TLSPRITE_PACK_MAGIC_V2;
+const TLSPRITE_PACK_MAGIC_V3: &[u8; 8] = b"TLSPK003";
+const TLSPRITE_PACK_MAGIC: &[u8; 8] = TLSPRITE_PACK_MAGIC_V3;
 
 /// In-memory binary pack produced from a `.tlsprite` source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,6 +559,7 @@ pub struct TlspritePack {
     pub bytes: Vec<u8>,
     pub source_hash: u64,
     pub sprite_count: usize,
+    pub light_count: usize,
 }
 
 /// Compile `.tlsprite` into a compact precompiled pack.
@@ -557,6 +583,7 @@ pub fn compile_tlsprite_pack(source: &str) -> Result<TlspritePack, TlspriteCompi
         bytes,
         source_hash,
         sprite_count: program.sprites().len(),
+        light_count: program.lights().len(),
     })
 }
 
@@ -575,6 +602,7 @@ struct DecodedTlspritePack {
 enum TlspritePackVersion {
     V1,
     V2,
+    V3,
 }
 
 /// Source marker returned by cache loads.
@@ -792,8 +820,9 @@ pub fn compile_tlsprite_with_extra_roots(
 ) -> TlspriteCompileOutcome {
     let mut diagnostics = Vec::new();
     let mut sprites = Vec::new();
+    let mut lights = Vec::new();
     let mut header_checked = false;
-    let mut pending: Option<PendingSprite> = None;
+    let mut pending: Option<PendingEntry> = None;
 
     for (idx, raw_line) in source.lines().enumerate() {
         let line_no = idx + 1;
@@ -817,11 +846,9 @@ pub fn compile_tlsprite_with_extra_roots(
 
         if let Some(section) = parse_section_name(line) {
             if let Some(curr) = pending.take() {
-                if let Some(def) = curr.finish(&mut diagnostics, extra_roots) {
-                    sprites.push(def);
-                }
+                curr.finish(&mut diagnostics, extra_roots, &mut sprites, &mut lights);
             }
-            pending = Some(PendingSprite::new(section.to_string(), line_no));
+            pending = Some(PendingEntry::new(section.to_string(), line_no));
             continue;
         }
 
@@ -848,16 +875,14 @@ pub fn compile_tlsprite_with_extra_roots(
     }
 
     if let Some(curr) = pending.take() {
-        if let Some(def) = curr.finish(&mut diagnostics, extra_roots) {
-            sprites.push(def);
-        }
+        curr.finish(&mut diagnostics, extra_roots, &mut sprites, &mut lights);
     }
 
-    if sprites.is_empty() {
+    if sprites.is_empty() && lights.is_empty() {
         diagnostics.push(TlspriteDiagnostic {
             level: TlspriteDiagnosticLevel::Error,
             line: 0,
-            message: "no sprite sections were produced".to_string(),
+            message: "no sprite/light sections were produced".to_string(),
         });
     }
 
@@ -865,7 +890,7 @@ pub fn compile_tlsprite_with_extra_roots(
         .iter()
         .any(|d| d.level == TlspriteDiagnosticLevel::Error);
     TlspriteCompileOutcome {
-        program: (!has_errors).then_some(TlspriteProgram { sprites }),
+        program: (!has_errors).then_some(TlspriteProgram { sprites, lights }),
         diagnostics,
     }
 }
@@ -877,10 +902,12 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 fn encode_tlsprite_pack(program: &TlspriteProgram, source_hash: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + program.sprites().len() * 96);
+    let mut out =
+        Vec::with_capacity(64 + program.sprites().len() * 96 + program.lights().len() * 116);
     out.extend_from_slice(TLSPRITE_PACK_MAGIC);
     out.extend_from_slice(&source_hash.to_le_bytes());
     out.extend_from_slice(&(program.sprites().len() as u32).to_le_bytes());
+    out.extend_from_slice(&(program.lights().len() as u32).to_le_bytes());
     for def in program.sprites() {
         write_len_prefixed_str(&mut out, &def.name);
         out.extend_from_slice(&def.sprite.sprite_id.to_le_bytes());
@@ -909,6 +936,23 @@ fn encode_tlsprite_pack(program: &TlspriteProgram, source_hash: u64) -> Vec<u8> 
             None => out.push(0),
         }
     }
+    for def in program.lights() {
+        write_len_prefixed_str(&mut out, &def.name);
+        out.extend_from_slice(&def.light.id.to_le_bytes());
+        out.push(light_kind_to_tag(def.light.kind));
+        out.extend_from_slice(&def.light.layer.to_le_bytes());
+        out.push(u8::from(def.light.enabled));
+        out.push(u8::from(def.light.casts_shadow));
+        write_f32s(&mut out, &def.light.position);
+        write_f32s(&mut out, &def.light.direction);
+        write_f32s(&mut out, &def.light.color);
+        out.extend_from_slice(&def.light.intensity.to_le_bytes());
+        out.extend_from_slice(&def.light.range.to_le_bytes());
+        out.extend_from_slice(&def.light.inner_cone_deg.to_le_bytes());
+        out.extend_from_slice(&def.light.outer_cone_deg.to_le_bytes());
+        out.extend_from_slice(&def.light.softness.to_le_bytes());
+        out.extend_from_slice(&def.light.specular_strength.to_le_bytes());
+    }
     out
 }
 
@@ -917,6 +961,10 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
     let version = rd.expect_pack_version()?;
     let source_hash = rd.read_u64()?;
     let sprite_count = rd.read_u32()? as usize;
+    let light_count = match version {
+        TlspritePackVersion::V3 => rd.read_u32()? as usize,
+        TlspritePackVersion::V1 | TlspritePackVersion::V2 => 0,
+    };
     let mut sprites = Vec::with_capacity(sprite_count);
     for _ in 0..sprite_count {
         let name = rd.read_string()?;
@@ -925,8 +973,10 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
         let layer = rd.read_i16()?;
         let kind = match version {
             TlspritePackVersion::V1 => infer_sprite_kind(None, Some(layer)),
-            TlspritePackVersion::V2 => sprite_kind_from_tag(rd.read_u8()?)
-                .ok_or_else(|| "invalid packed sprite kind tag".to_string())?,
+            TlspritePackVersion::V2 | TlspritePackVersion::V3 => {
+                sprite_kind_from_tag(rd.read_u8()?)
+                    .ok_or_else(|| "invalid packed sprite kind tag".to_string())?
+            }
         };
         let position = rd.read_f32_array::<3>()?;
         let size = rd.read_f32_array::<2>()?;
@@ -972,12 +1022,50 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
             dynamic_scale,
         });
     }
+    let mut lights = Vec::with_capacity(light_count);
+    for _ in 0..light_count {
+        let name = rd.read_string()?;
+        let id = rd.read_u64()?;
+        let kind = light_kind_from_tag(rd.read_u8()?)
+            .ok_or_else(|| "invalid packed light kind tag".to_string())?;
+        let layer = rd.read_i16()?;
+        let enabled = rd.read_u8()? != 0;
+        let casts_shadow = rd.read_u8()? != 0;
+        let position = rd.read_f32_array::<3>()?;
+        let direction = rd.read_f32_array::<3>()?;
+        let color = rd.read_f32_array::<3>()?;
+        let intensity = rd.read_f32()?;
+        let range = rd.read_f32()?;
+        let inner_cone_deg = rd.read_f32()?;
+        let outer_cone_deg = rd.read_f32()?;
+        let softness = rd.read_f32()?;
+        let specular_strength = rd.read_f32()?;
+        lights.push(TlspriteLightDef {
+            name,
+            light: SceneLight {
+                id,
+                enabled,
+                kind,
+                position,
+                direction,
+                color,
+                intensity,
+                range,
+                inner_cone_deg,
+                outer_cone_deg,
+                softness,
+                casts_shadow,
+                specular_strength,
+                layer,
+            },
+        });
+    }
     if rd.remaining() != 0 {
         return Err("packed data contains trailing bytes".to_string());
     }
 
     Ok(DecodedTlspritePack {
-        program: TlspriteProgram { sprites },
+        program: TlspriteProgram { sprites, lights },
         source_hash,
     })
 }
@@ -1011,7 +1099,9 @@ impl<'a> ByteReader<'a> {
 
     fn expect_pack_version(&mut self) -> Result<TlspritePackVersion, String> {
         let got = self.read_bytes(8)?;
-        if got == TLSPRITE_PACK_MAGIC_V2 {
+        if got == TLSPRITE_PACK_MAGIC_V3 {
+            Ok(TlspritePackVersion::V3)
+        } else if got == TLSPRITE_PACK_MAGIC_V2 {
             Ok(TlspritePackVersion::V2)
         } else if got == TLSPRITE_PACK_MAGIC_V1 {
             Ok(TlspritePackVersion::V1)
@@ -1120,10 +1210,24 @@ fn parse_section_name(line: &str) -> Option<&str> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlspriteEntryKind {
+    Sprite,
+    Light,
+}
+
+impl Default for TlspriteEntryKind {
+    fn default() -> Self {
+        Self::Sprite
+    }
+}
+
 #[derive(Debug, Clone)]
-struct PendingSprite {
+struct PendingEntry {
     name: String,
     line_started: usize,
+    entry_kind: TlspriteEntryKind,
+    // sprite keys
     sprite_id: Option<u64>,
     kind: Option<SpriteKind>,
     fbx: Option<String>,
@@ -1137,13 +1241,25 @@ struct PendingSprite {
     scale_source: Option<TlspriteScaleSource>,
     scale_min: Option<f32>,
     scale_max: Option<f32>,
+    // light keys
+    light_id: Option<u64>,
+    light_type: Option<SceneLightKind>,
+    direction: Option<[f32; 3]>,
+    intensity: Option<f32>,
+    range: Option<f32>,
+    inner_cone_deg: Option<f32>,
+    outer_cone_deg: Option<f32>,
+    softness: Option<f32>,
+    casts_shadow: Option<bool>,
+    specular_strength: Option<f32>,
 }
 
-impl PendingSprite {
+impl PendingEntry {
     fn new(name: String, line_started: usize) -> Self {
         Self {
             name,
             line_started,
+            entry_kind: TlspriteEntryKind::Sprite,
             sprite_id: None,
             kind: None,
             fbx: None,
@@ -1157,6 +1273,16 @@ impl PendingSprite {
             scale_source: None,
             scale_min: None,
             scale_max: None,
+            light_id: None,
+            light_type: None,
+            direction: None,
+            intensity: None,
+            range: None,
+            inner_cone_deg: None,
+            outer_cone_deg: None,
+            softness: None,
+            casts_shadow: None,
+            specular_strength: None,
         }
     }
 
@@ -1168,6 +1294,17 @@ impl PendingSprite {
         diagnostics: &mut Vec<TlspriteDiagnostic>,
     ) {
         match key {
+            "entry_kind" => match value.trim().to_ascii_lowercase().as_str() {
+                "sprite" => self.entry_kind = TlspriteEntryKind::Sprite,
+                "light" => self.entry_kind = TlspriteEntryKind::Light,
+                other => diagnostics.push(TlspriteDiagnostic {
+                    level: TlspriteDiagnosticLevel::Error,
+                    line,
+                    message: format!(
+                        "invalid entry_kind '{other}' (expected sprite|light)"
+                    ),
+                }),
+            },
             "sprite_id" => {
                 self.sprite_id = parse_scalar::<u64>(value, line, key, diagnostics);
             }
@@ -1216,6 +1353,36 @@ impl PendingSprite {
             "scale_max" => {
                 self.scale_max = parse_scalar::<f32>(value, line, key, diagnostics);
             }
+            "light_id" => {
+                self.light_id = parse_scalar::<u64>(value, line, key, diagnostics);
+            }
+            "light_type" => {
+                self.light_type = parse_light_kind(value, line, diagnostics);
+            }
+            "direction" => {
+                self.direction = parse_vec3(value, line, key, diagnostics);
+            }
+            "intensity" => {
+                self.intensity = parse_scalar::<f32>(value, line, key, diagnostics);
+            }
+            "range" => {
+                self.range = parse_scalar::<f32>(value, line, key, diagnostics);
+            }
+            "inner_cone_deg" => {
+                self.inner_cone_deg = parse_scalar::<f32>(value, line, key, diagnostics);
+            }
+            "outer_cone_deg" => {
+                self.outer_cone_deg = parse_scalar::<f32>(value, line, key, diagnostics);
+            }
+            "softness" => {
+                self.softness = parse_scalar::<f32>(value, line, key, diagnostics);
+            }
+            "casts_shadow" => {
+                self.casts_shadow = parse_scalar::<bool>(value, line, key, diagnostics);
+            }
+            "specular_strength" => {
+                self.specular_strength = parse_scalar::<f32>(value, line, key, diagnostics);
+            }
             _ => diagnostics.push(TlspriteDiagnostic {
                 level: TlspriteDiagnosticLevel::Warning,
                 line,
@@ -1225,6 +1392,27 @@ impl PendingSprite {
     }
 
     fn finish(
+        self,
+        diagnostics: &mut Vec<TlspriteDiagnostic>,
+        extra_roots: &[PathBuf],
+        sprites: &mut Vec<TlspriteSpriteDef>,
+        lights: &mut Vec<TlspriteLightDef>,
+    ) {
+        match self.entry_kind {
+            TlspriteEntryKind::Sprite => {
+                if let Some(def) = self.finish_sprite(diagnostics, extra_roots) {
+                    sprites.push(def);
+                }
+            }
+            TlspriteEntryKind::Light => {
+                if let Some(def) = self.finish_light(diagnostics) {
+                    lights.push(def);
+                }
+            }
+        }
+    }
+
+    fn finish_sprite(
         self,
         diagnostics: &mut Vec<TlspriteDiagnostic>,
         extra_roots: &[PathBuf],
@@ -1322,6 +1510,69 @@ impl PendingSprite {
             dynamic_scale,
         })
     }
+
+    fn finish_light(self, diagnostics: &mut Vec<TlspriteDiagnostic>) -> Option<TlspriteLightDef> {
+        let Some(light_id) = self.light_id else {
+            diagnostics.push(TlspriteDiagnostic {
+                level: TlspriteDiagnosticLevel::Error,
+                line: self.line_started,
+                message: format!(
+                    "section '{}' is missing required key 'light_id'",
+                    self.name
+                ),
+            });
+            return None;
+        };
+        let kind = self.light_type.unwrap_or(SceneLightKind::Point);
+        let position = self.position.unwrap_or([0.0, 4.0, 0.0]);
+        let mut direction = self.direction.unwrap_or([0.0, -1.0, 0.0]);
+        let mut color = self.color.map(|rgba| [rgba[0], rgba[1], rgba[2]]).unwrap_or([1.0; 3]);
+        for c in &mut color {
+            *c = c.clamp(0.0, 16.0);
+        }
+        let intensity = self.intensity.unwrap_or(5.0).clamp(0.0, 1000.0);
+        let range = self.range.unwrap_or(30.0).clamp(0.05, 10_000.0);
+        let mut inner_cone_deg = self.inner_cone_deg.unwrap_or(20.0).clamp(0.0, 89.0);
+        let mut outer_cone_deg = self.outer_cone_deg.unwrap_or(35.0).clamp(0.1, 89.9);
+        if outer_cone_deg < inner_cone_deg {
+            std::mem::swap(&mut outer_cone_deg, &mut inner_cone_deg);
+        }
+        let softness = self.softness.unwrap_or(0.35).clamp(0.0, 1.0);
+        let casts_shadow = self.casts_shadow.unwrap_or(true);
+        let specular_strength = self.specular_strength.unwrap_or(1.0).clamp(0.0, 8.0);
+
+        let len = (direction[0] * direction[0]
+            + direction[1] * direction[1]
+            + direction[2] * direction[2])
+            .sqrt();
+        if len <= 1e-6 {
+            direction = [0.0, -1.0, 0.0];
+        } else {
+            direction[0] /= len;
+            direction[1] /= len;
+            direction[2] /= len;
+        }
+
+        Some(TlspriteLightDef {
+            name: self.name,
+            light: SceneLight {
+                id: light_id,
+                enabled: true,
+                kind,
+                position,
+                direction,
+                color,
+                intensity,
+                range,
+                inner_cone_deg,
+                outer_cone_deg,
+                softness,
+                casts_shadow,
+                specular_strength,
+                layer: self.layer.unwrap_or(0),
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1397,6 +1648,21 @@ fn sprite_kind_from_tag(tag: u8) -> Option<SpriteKind> {
         1 => Some(SpriteKind::Hud),
         2 => Some(SpriteKind::Camera),
         3 => Some(SpriteKind::Terrain),
+        _ => None,
+    }
+}
+
+fn light_kind_to_tag(kind: SceneLightKind) -> u8 {
+    match kind {
+        SceneLightKind::Point => 0,
+        SceneLightKind::Spot => 1,
+    }
+}
+
+fn light_kind_from_tag(tag: u8) -> Option<SceneLightKind> {
+    match tag {
+        0 => Some(SceneLightKind::Point),
+        1 => Some(SceneLightKind::Spot),
         _ => None,
     }
 }
@@ -1548,6 +1814,25 @@ fn parse_sprite_kind(
                 message: format!(
                     "invalid kind '{other}', expected 'generic', 'hud', 'camera', or 'terrain'"
                 ),
+            });
+            None
+        }
+    }
+}
+
+fn parse_light_kind(
+    value: &str,
+    line: usize,
+    diagnostics: &mut Vec<TlspriteDiagnostic>,
+) -> Option<SceneLightKind> {
+    match value.trim() {
+        "point" => Some(SceneLightKind::Point),
+        "spot" => Some(SceneLightKind::Spot),
+        other => {
+            diagnostics.push(TlspriteDiagnostic {
+                level: TlspriteDiagnosticLevel::Error,
+                line,
+                message: format!("invalid light_type '{other}', expected 'point' or 'spot'"),
             });
             None
         }
@@ -1741,6 +2026,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_light_entries_with_required_fields() {
+        let src = concat!(
+            "tlsprite_v1\n",
+            "[flash]\n",
+            "entry_kind = light\n",
+            "light_id = 42\n",
+            "light_type = spot\n",
+            "position = 0.0, 5.0, 2.0\n",
+            "direction = 0.0, -1.0, 0.0\n",
+            "color = 1.0, 0.9, 0.8, 1.0\n",
+            "intensity = 6.0\n",
+            "range = 32.0\n",
+            "inner_cone_deg = 20.0\n",
+            "outer_cone_deg = 32.0\n",
+            "softness = 0.4\n",
+            "casts_shadow = true\n",
+            "specular_strength = 1.4\n",
+        );
+        let out = compile_tlsprite(src);
+        assert!(!out.has_errors());
+        let program = out.program.expect("program");
+        assert_eq!(program.lights().len(), 1);
+        assert_eq!(program.lights()[0].light.id, 42);
+        assert_eq!(program.lights()[0].light.kind, SceneLightKind::Spot);
+    }
+
+    #[test]
     fn fbx_key_infers_sprite_hints_when_available() {
         let fbx_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../docs/demos/sphere.fbx")
@@ -1835,12 +2147,21 @@ mod tests {
             "scale_source = spawn_progress\n",
             "scale_min = 0.1\n",
             "scale_max = 0.9\n",
+            "[flash]\n",
+            "entry_kind = light\n",
+            "light_id = 200\n",
+            "light_type = point\n",
+            "position = 0.0, 3.0, 0.0\n",
+            "intensity = 3.5\n",
+            "range = 14.0\n",
         );
 
         let pack = compile_tlsprite_pack(src).expect("pack compile");
         let program = load_tlsprite_pack(&pack.bytes).expect("pack decode");
         assert_eq!(pack.sprite_count, 1);
+        assert_eq!(pack.light_count, 1);
         assert_eq!(program.sprites().len(), 1);
+        assert_eq!(program.lights().len(), 1);
         assert_eq!(program.sprites()[0].sprite.sprite_id, 88);
         assert_eq!(program.sprites()[0].sprite.kind, SpriteKind::Hud);
     }

@@ -18,9 +18,9 @@ use tl_core::{
     TypedIrModule, UnaryOp,
 };
 
-use crate::scene::BounceTankRuntimePatch;
+use crate::scene::{BounceTankRuntimePatch, RayTracingMode, SceneLightOverride};
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 60] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 69] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_container_size",
@@ -70,6 +70,15 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 60] = [
     "set_ball_mesh_slot",
     "set_container_mesh_slot",
     "set_fbx_full_render",
+    "set_light_enabled",
+    "set_light_position",
+    "set_light_direction",
+    "set_light_intensity",
+    "set_light_range",
+    "set_light_cone",
+    "set_light_color",
+    "set_light_softness",
+    "set_rt_mode",
     "set_camera_move_speed",
     "set_camera_look_sensitivity",
     "set_camera_pose",
@@ -225,6 +234,8 @@ impl Default for TlscriptShowcaseControlInput {
 #[derive(Debug, Clone)]
 pub struct TlscriptShowcaseFrameOutput {
     pub patch: BounceTankRuntimePatch,
+    pub light_overrides: Vec<SceneLightOverride>,
+    pub rt_mode: Option<RayTracingMode>,
     pub force_full_fbx_sphere: Option<bool>,
     pub camera_move_speed: Option<f32>,
     pub camera_look_sensitivity: Option<f32>,
@@ -466,6 +477,8 @@ impl<'src> TlscriptShowcaseProgram<'src> {
 
         TlscriptShowcaseFrameOutput {
             patch: state.patch,
+            light_overrides: state.light_overrides_values(),
+            rt_mode: state.rt_mode,
             force_full_fbx_sphere: state.force_full_fbx_sphere,
             camera_move_speed: state.camera_move_speed,
             camera_look_sensitivity: state.camera_look_sensitivity,
@@ -693,6 +706,8 @@ impl<'src> TlscriptShowcaseProgram<'src> {
 struct EvalState {
     vars: HashMap<String, DemoValue>,
     patch: BounceTankRuntimePatch,
+    light_overrides: HashMap<u64, SceneLightOverride>,
+    rt_mode: Option<RayTracingMode>,
     force_full_fbx_sphere: Option<bool>,
     camera_move_speed: Option<f32>,
     camera_look_sensitivity: Option<f32>,
@@ -717,6 +732,8 @@ impl EvalState {
         Self {
             vars: HashMap::new(),
             patch: BounceTankRuntimePatch::default(),
+            light_overrides: HashMap::new(),
+            rt_mode: None,
             force_full_fbx_sphere: None,
             camera_move_speed: None,
             camera_look_sensitivity: None,
@@ -747,6 +764,19 @@ impl EvalState {
 
     fn warn(&mut self, message: impl Into<String>) {
         self.warnings.push(message.into());
+    }
+
+    fn light_override_mut(&mut self, id: u64) -> &mut SceneLightOverride {
+        self.light_overrides.entry(id).or_insert_with(|| SceneLightOverride {
+            id,
+            ..SceneLightOverride::default()
+        })
+    }
+
+    fn light_overrides_values(&self) -> Vec<SceneLightOverride> {
+        let mut out = self.light_overrides.values().cloned().collect::<Vec<_>>();
+        out.sort_by_key(|entry| entry.id);
+        out
     }
 }
 
@@ -1110,6 +1140,88 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
         "set_fbx_full_render" => match args {
             [v] => state.force_full_fbx_sphere = Some(v.to_bool()),
             _ => state.warn("set_fbx_full_render expects 1 arg"),
+        },
+        "set_light_enabled" => match args {
+            [id, enabled] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).enabled = Some(enabled.to_bool());
+            }
+            _ => state.warn("set_light_enabled expects 2 args"),
+        },
+        "set_light_position" => match args {
+            [id, x, y, z] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).position =
+                    Some([x.to_f64() as f32, y.to_f64() as f32, z.to_f64() as f32]);
+            }
+            _ => state.warn("set_light_position expects 4 args"),
+        },
+        "set_light_direction" => match args {
+            [id, x, y, z] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).direction =
+                    Some([x.to_f64() as f32, y.to_f64() as f32, z.to_f64() as f32]);
+            }
+            _ => state.warn("set_light_direction expects 4 args"),
+        },
+        "set_light_intensity" => match args {
+            [id, intensity] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).intensity = Some(intensity.to_f64() as f32);
+            }
+            _ => state.warn("set_light_intensity expects 2 args"),
+        },
+        "set_light_range" => match args {
+            [id, range] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).range = Some(range.to_f64() as f32);
+            }
+            _ => state.warn("set_light_range expects 2 args"),
+        },
+        "set_light_cone" => match args {
+            [id, inner_deg, outer_deg] => {
+                let id = id.to_i64().max(0) as u64;
+                let entry = state.light_override_mut(id);
+                entry.inner_cone_deg = Some(inner_deg.to_f64() as f32);
+                entry.outer_cone_deg = Some(outer_deg.to_f64() as f32);
+            }
+            _ => state.warn("set_light_cone expects 3 args"),
+        },
+        "set_light_color" => match args {
+            [id, r, g, b] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).color =
+                    Some([r.to_f64() as f32, g.to_f64() as f32, b.to_f64() as f32]);
+            }
+            _ => state.warn("set_light_color expects 4 args"),
+        },
+        "set_light_softness" => match args {
+            [id, softness] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).softness = Some(softness.to_f64() as f32);
+            }
+            _ => state.warn("set_light_softness expects 2 args"),
+        },
+        "set_rt_mode" => match args {
+            [DemoValue::Str(mode)] => {
+                state.rt_mode = match RayTracingMode::from_str(mode) {
+                    Some(mode) => Some(mode),
+                    None => {
+                        state.warn(format!(
+                            "set_rt_mode expects 'off'|'auto'|'on', got '{mode}'"
+                        ));
+                        None
+                    }
+                };
+            }
+            [mode] => {
+                state.rt_mode = Some(if mode.to_bool() {
+                    RayTracingMode::On
+                } else {
+                    RayTracingMode::Off
+                });
+            }
+            _ => state.warn("set_rt_mode expects 1 arg"),
         },
         "set_camera_move_speed" => match args {
             [v] => state.camera_move_speed = Some(v.to_f64() as f32),
@@ -1541,6 +1653,38 @@ mod tests {
         assert!((out.patch.scatter_strength.unwrap_or(0.0) - 0.16).abs() < 1e-6);
         assert!((out.patch.initial_speed_min.unwrap_or(0.0) - 0.35).abs() < 1e-6);
         assert!((out.patch.initial_speed_max.unwrap_or(0.0) - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn supports_light_overrides_and_rt_mode() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_light_enabled(100, true)\n",
+            "    set_light_position(100, 0.0, 4.0, 2.0)\n",
+            "    set_light_direction(100, 0.0, -1.0, 0.0)\n",
+            "    set_light_intensity(100, 7.5)\n",
+            "    set_light_range(100, 42.0)\n",
+            "    set_light_cone(100, 22.0, 35.0)\n",
+            "    set_light_color(100, 0.9, 0.8, 0.7)\n",
+            "    set_light_softness(100, 0.45)\n",
+            "    set_rt_mode(\"auto\")\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.rt_mode, Some(RayTracingMode::Auto));
+        assert_eq!(out.light_overrides.len(), 1);
+        assert_eq!(out.light_overrides[0].id, 100);
+        assert!(out.light_overrides[0].enabled.unwrap_or(false));
+        assert_eq!(out.light_overrides[0].position, Some([0.0, 4.0, 2.0]));
+        assert_eq!(out.light_overrides[0].range, Some(42.0));
     }
 
     #[test]

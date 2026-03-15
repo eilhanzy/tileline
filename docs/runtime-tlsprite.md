@@ -39,6 +39,48 @@ scale_max = 1.0
 `camera` and `terrain` kinds provide sensible defaults (position/size/layer/color) when fields are
 not specified, so minimal sections can be authored quickly.
 
+### Light Authoring (`entry_kind = light`)
+
+`.tlsprite` now supports static light definitions in the same file. Use `entry_kind` to switch an
+entry from sprite payload to light payload:
+
+```text
+[light.flashlight]
+entry_kind = light
+light_id = 1001
+light_type = spot
+position = 0.0, 3.0, 6.0
+direction = 0.0, -0.4, -1.0
+color = 1.0, 0.95, 0.85
+intensity = 14.0
+range = 40.0
+inner_cone_deg = 12.0
+outer_cone_deg = 24.0
+softness = 0.35
+casts_shadow = true
+specular_strength = 1.1
+layer = 20
+```
+
+Supported light keys:
+
+- `light_id`
+- `light_type = spot | point`
+- `position`
+- `direction`
+- `color`
+- `intensity`
+- `range`
+- `inner_cone_deg`
+- `outer_cone_deg`
+- `softness`
+- `casts_shadow`
+- `specular_strength`
+- `layer`
+
+Light entries do not emit sprite draw commands. They are routed into
+`SceneFrameInstances::lights` and consumed by runtime lighting in `src/`.
+
 ## Runtime Flow
 
 1. Load source as in-memory string (engine asset loader or `std::fs` at app layer).
@@ -88,7 +130,7 @@ Examples wired:
 
 Runtime now exposes precompiled pack + cache primitives:
 
-- `compile_tlsprite_pack(source)` -> `TlspritePack`
+- `compile_tlsprite_pack(source)` -> `TlspritePack` (`TLSPK003`)
 - `load_tlsprite_pack(bytes)` -> `TlspriteProgram`
 - `TlspriteProgramCache`:
   - deduplicates programs by source hash
@@ -98,6 +140,9 @@ Runtime now exposes precompiled pack + cache primitives:
 - `TlspriteProgram::merge_programs(...)`:
   - appends multiple compiled `.tlsprite` programs in deterministic order
   - used by `.tljoint` scene bundles for multi-file composition
+
+`load_tlsprite_pack(...)` keeps backward compatibility with old pack versions (`TLSPK001`,
+`TLSPK002`) while writing new light-aware packs as `TLSPK003`.
 
 `TlspriteWatchReloader::reload_into_cache(...)` bridges hot reload events into cache bindings.
 

@@ -486,6 +486,8 @@ fn resolve_path(base_dir: &Path, raw: &str) -> PathBuf {
 fn empty_frame_output() -> TlscriptShowcaseFrameOutput {
     TlscriptShowcaseFrameOutput {
         patch: BounceTankRuntimePatch::default(),
+        light_overrides: Vec::new(),
+        rt_mode: None,
         force_full_fbx_sphere: None,
         camera_move_speed: None,
         camera_look_sensitivity: None,
@@ -510,6 +512,10 @@ fn merge_frame_output(
     script_index: usize,
 ) {
     merge_patch(&mut merged.patch, next.patch);
+    merge_light_overrides(&mut merged.light_overrides, &next.light_overrides);
+    if next.rt_mode.is_some() {
+        merged.rt_mode = next.rt_mode;
+    }
     if next.force_full_fbx_sphere.is_some() {
         merged.force_full_fbx_sphere = next.force_full_fbx_sphere;
     }
@@ -565,6 +571,46 @@ fn merge_frame_output(
                 .push(format!("script[{script_index}] {warning}"));
         }
     }
+}
+
+fn merge_light_overrides(
+    target: &mut Vec<crate::scene::SceneLightOverride>,
+    incoming: &[crate::scene::SceneLightOverride],
+) {
+    for entry in incoming {
+        if let Some(existing) = target.iter_mut().find(|cur| cur.id == entry.id) {
+            if entry.enabled.is_some() {
+                existing.enabled = entry.enabled;
+            }
+            if entry.position.is_some() {
+                existing.position = entry.position;
+            }
+            if entry.direction.is_some() {
+                existing.direction = entry.direction;
+            }
+            if entry.color.is_some() {
+                existing.color = entry.color;
+            }
+            if entry.intensity.is_some() {
+                existing.intensity = entry.intensity;
+            }
+            if entry.range.is_some() {
+                existing.range = entry.range;
+            }
+            if entry.inner_cone_deg.is_some() {
+                existing.inner_cone_deg = entry.inner_cone_deg;
+            }
+            if entry.outer_cone_deg.is_some() {
+                existing.outer_cone_deg = entry.outer_cone_deg;
+            }
+            if entry.softness.is_some() {
+                existing.softness = entry.softness;
+            }
+            continue;
+        }
+        target.push(entry.clone());
+    }
+    target.sort_by_key(|entry| entry.id);
 }
 
 fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatch) {

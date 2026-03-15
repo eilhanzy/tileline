@@ -23,6 +23,7 @@ const COLLISION_GROUP_BALL: u16 = 1 << 0;
 const COLLISION_GROUP_WALL: u16 = 1 << 1;
 const SCATTER_MIN_LIVE_BALLS_BASE: usize = 600;
 const SCATTER_MIN_AFFECTED: usize = 12;
+pub const MAX_SCENE_LIGHTS: usize = 32;
 
 #[inline]
 fn collision_filter_tag(group: u16, mask: u16) -> u32 {
@@ -126,12 +127,220 @@ pub struct SpriteInstance {
     pub layer: i16,
 }
 
+/// Runtime scene light kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SceneLightKind {
+    Point,
+    Spot,
+}
+
+impl Default for SceneLightKind {
+    fn default() -> Self {
+        Self::Point
+    }
+}
+
+/// One runtime scene light used by renderer-side lighting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneLight {
+    pub id: u64,
+    pub enabled: bool,
+    pub kind: SceneLightKind,
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_cone_deg: f32,
+    pub outer_cone_deg: f32,
+    pub softness: f32,
+    pub casts_shadow: bool,
+    pub specular_strength: f32,
+    pub layer: i16,
+}
+
+impl Default for SceneLight {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            enabled: true,
+            kind: SceneLightKind::Point,
+            position: [0.0, 0.0, 0.0],
+            direction: [0.0, -1.0, 0.0],
+            color: [1.0, 1.0, 1.0],
+            intensity: 0.0,
+            range: 10.0,
+            inner_cone_deg: 18.0,
+            outer_cone_deg: 30.0,
+            softness: 0.35,
+            casts_shadow: true,
+            specular_strength: 1.0,
+            layer: 0,
+        }
+    }
+}
+
+/// Per-light partial override emitted from `.tlscript`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SceneLightOverride {
+    pub id: u64,
+    pub enabled: Option<bool>,
+    pub position: Option<[f32; 3]>,
+    pub direction: Option<[f32; 3]>,
+    pub color: Option<[f32; 3]>,
+    pub intensity: Option<f32>,
+    pub range: Option<f32>,
+    pub inner_cone_deg: Option<f32>,
+    pub outer_cone_deg: Option<f32>,
+    pub softness: Option<f32>,
+}
+
+impl SceneLightOverride {
+    pub fn apply_to(&self, light: &mut SceneLight) {
+        if let Some(enabled) = self.enabled {
+            light.enabled = enabled;
+        }
+        if let Some(position) = self.position {
+            light.position = position;
+        }
+        if let Some(direction) = self.direction {
+            light.direction = direction;
+        }
+        if let Some(color) = self.color {
+            light.color = color;
+        }
+        if let Some(intensity) = self.intensity {
+            light.intensity = intensity;
+        }
+        if let Some(range) = self.range {
+            light.range = range;
+        }
+        if let Some(inner_cone_deg) = self.inner_cone_deg {
+            light.inner_cone_deg = inner_cone_deg;
+        }
+        if let Some(outer_cone_deg) = self.outer_cone_deg {
+            light.outer_cone_deg = outer_cone_deg;
+        }
+        if let Some(softness) = self.softness {
+            light.softness = softness;
+        }
+    }
+}
+
+/// Runtime-facing RT mode for hybrid lighting path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RayTracingMode {
+    Off,
+    #[default]
+    Auto,
+    On,
+}
+
+impl RayTracingMode {
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" | "false" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            "on" | "1" | "true" => Some(Self::On),
+            _ => None,
+        }
+    }
+}
+
 /// Runtime scene batch for one render frame.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SceneFrameInstances {
     pub opaque_3d: Vec<SceneInstance3d>,
     pub transparent_3d: Vec<SceneInstance3d>,
     pub sprites: Vec<SpriteInstance>,
+    pub lights: Vec<SceneLight>,
+}
+
+/// Apply `.tlscript` light overrides onto frame lights.
+///
+/// Returns number of override ids that did not match any light in the frame.
+pub fn apply_scene_light_overrides(
+    frame: &mut SceneFrameInstances,
+    overrides: &[SceneLightOverride],
+) -> usize {
+    if overrides.is_empty() {
+        return 0;
+    }
+    let mut index_by_id = HashMap::<u64, usize>::with_capacity(frame.lights.len());
+    for (index, light) in frame.lights.iter().enumerate() {
+        index_by_id.insert(light.id, index);
+    }
+
+    let mut unknown = 0usize;
+    for override_entry in overrides {
+        let Some(&index) = index_by_id.get(&override_entry.id) else {
+            unknown = unknown.saturating_add(1);
+            continue;
+        };
+        override_entry.apply_to(&mut frame.lights[index]);
+    }
+    unknown
+}
+
+/// Keep at most `max_lights` lights using deterministic priority.
+///
+/// Priority order:
+/// 1. enabled lights first
+/// 2. higher intensity
+/// 3. closer to camera
+/// 4. higher layer
+/// 5. stable id tie-break
+pub fn clamp_scene_lights_for_camera(
+    frame: &mut SceneFrameInstances,
+    camera_eye: [f32; 3],
+    max_lights: usize,
+) -> usize {
+    if frame.lights.len() <= max_lights {
+        return 0;
+    }
+    frame.lights.sort_by(|left, right| {
+        let left_enabled = i32::from(left.enabled);
+        let right_enabled = i32::from(right.enabled);
+        let enabled_cmp = right_enabled.cmp(&left_enabled);
+        if !enabled_cmp.is_eq() {
+            return enabled_cmp;
+        }
+
+        let intensity_cmp = right
+            .intensity
+            .partial_cmp(&left.intensity)
+            .unwrap_or(std::cmp::Ordering::Equal);
+        if !intensity_cmp.is_eq() {
+            return intensity_cmp;
+        }
+
+        let ld = sq_distance(left.position, camera_eye);
+        let rd = sq_distance(right.position, camera_eye);
+        let distance_cmp = ld
+            .partial_cmp(&rd)
+            .unwrap_or(std::cmp::Ordering::Equal);
+        if !distance_cmp.is_eq() {
+            return distance_cmp;
+        }
+
+        let layer_cmp = right.layer.cmp(&left.layer);
+        if !layer_cmp.is_eq() {
+            return layer_cmp;
+        }
+        left.id.cmp(&right.id)
+    });
+
+    let removed = frame.lights.len().saturating_sub(max_lights);
+    frame.lights.truncate(max_lights);
+    removed
+}
+
+#[inline]
+fn sq_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
 }
 
 /// Render sync mode used for tick-rate policy decisions.
@@ -973,6 +1182,7 @@ impl BounceTankSceneController {
                 },
                 &mut frame.sprites,
             );
+            program.emit_lights(&mut frame.lights);
         }
 
         // Built-in fallback overlay (spawn progress bar), kept renderer-agnostic.
@@ -2173,6 +2383,81 @@ mod tests {
     }
 
     #[test]
+    fn light_overrides_apply_by_id_and_report_unknown_ids() {
+        let mut frame = SceneFrameInstances {
+            lights: vec![
+                SceneLight {
+                    id: 100,
+                    intensity: 1.0,
+                    ..SceneLight::default()
+                },
+                SceneLight {
+                    id: 200,
+                    intensity: 2.0,
+                    ..SceneLight::default()
+                },
+            ],
+            ..SceneFrameInstances::default()
+        };
+
+        let overrides = vec![
+            SceneLightOverride {
+                id: 100,
+                intensity: Some(6.5),
+                enabled: Some(false),
+                ..SceneLightOverride::default()
+            },
+            SceneLightOverride {
+                id: 777,
+                range: Some(44.0),
+                ..SceneLightOverride::default()
+            },
+        ];
+
+        let unknown = apply_scene_light_overrides(&mut frame, overrides.as_slice());
+        assert_eq!(unknown, 1);
+        assert!((frame.lights[0].intensity - 6.5).abs() < 1e-6);
+        assert!(!frame.lights[0].enabled);
+        assert!((frame.lights[1].intensity - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn light_clamp_prefers_enabled_intense_and_near_lights() {
+        let mut frame = SceneFrameInstances {
+            lights: vec![
+                SceneLight {
+                    id: 1,
+                    enabled: false,
+                    intensity: 100.0,
+                    position: [0.0, 0.0, 0.0],
+                    ..SceneLight::default()
+                },
+                SceneLight {
+                    id: 2,
+                    enabled: true,
+                    intensity: 2.0,
+                    position: [4.0, 0.0, 0.0],
+                    ..SceneLight::default()
+                },
+                SceneLight {
+                    id: 3,
+                    enabled: true,
+                    intensity: 1.0,
+                    position: [1.0, 0.0, 0.0],
+                    ..SceneLight::default()
+                },
+            ],
+            ..SceneFrameInstances::default()
+        };
+
+        let removed = clamp_scene_lights_for_camera(&mut frame, [0.0, 0.0, 0.0], 2);
+        assert_eq!(removed, 1);
+        assert_eq!(frame.lights.len(), 2);
+        assert_eq!(frame.lights[0].id, 2);
+        assert_eq!(frame.lights[1].id, 3);
+    }
+
+    #[test]
     fn bounce_scene_spawns_progressively_and_emits_instances() {
         let mut world = PhysicsWorld::new(PhysicsWorldConfig {
             fixed_dt: 1.0 / 120.0,
@@ -2198,7 +2483,7 @@ mod tests {
         assert!(scene.live_ball_count() <= 256);
 
         let frame = scene.build_frame_instances(&world, Some(0.5));
-        assert!(frame.transparent_3d.is_empty());
+        assert!(!frame.transparent_3d.is_empty());
         assert!(!frame.sprites.is_empty());
         assert!(!frame.opaque_3d.is_empty());
     }

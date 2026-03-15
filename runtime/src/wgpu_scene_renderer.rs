@@ -12,7 +12,7 @@ use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3};
 use wgpu::util::DeviceExt;
 
 use crate::draw_path::{DrawLane, RuntimeDrawFrame};
-use crate::scene::SpriteKind;
+use crate::scene::{RayTracingMode, SceneLight, SceneLightKind, SpriteKind, MAX_SCENE_LIGHTS};
 
 const SPRITE_ATLAS_GRID_DIM: u32 = 4;
 const SPRITE_ATLAS_TILE_SIZE: u32 = 64;
@@ -21,6 +21,7 @@ const DEFAULT_SPHERE_FBX_BYTES: &[u8] = include_bytes!("../../docs/demos/sphere.
 // Hysteresis avoids rapid mesh-mode flapping when instance counts hover around thresholds.
 const SPHERE_LOD_ENABLE_THRESHOLD: usize = 2_500;
 const SPHERE_LOD_DISABLE_THRESHOLD: usize = 1_800;
+const RT_DYNAMIC_CAP: u32 = 1_024;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -44,6 +45,41 @@ struct GpuInstance3d {
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct GpuCameraUniform {
     view_proj: [f32; 16],
+    camera_eye: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod, Default)]
+struct GpuLight {
+    position_kind: [f32; 4],
+    direction_inner: [f32; 4],
+    color_intensity: [f32; 4],
+    params: [f32; 4], // range, outer_cos, softness, specular_strength
+    shadow: [f32; 4], // casts_shadow, _, _, _
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+struct GpuLightingUniform {
+    light_count: u32,
+    rt_mode: u32,
+    rt_active: u32,
+    rt_dynamic_count: u32,
+    rt_dynamic_cap: u32,
+    _pad: [u32; 3],
+}
+
+impl Default for GpuLightingUniform {
+    fn default() -> Self {
+        Self {
+            light_count: 0,
+            rt_mode: 1,
+            rt_active: 0,
+            rt_dynamic_count: 0,
+            rt_dynamic_cap: RT_DYNAMIC_CAP,
+            _pad: [0; 3],
+        }
+    }
 }
 
 #[repr(C)]
@@ -86,6 +122,20 @@ pub struct WgpuSceneRendererUploadStats {
     pub total_draw_calls: usize,
     pub instance_3d_count: usize,
     pub sprite_count: usize,
+    pub light_count: usize,
+    pub rt_active: bool,
+    pub rt_dynamic_count: u32,
+}
+
+/// Runtime RT status snapshot from scene renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneRayTracingStatus {
+    pub mode: RayTracingMode,
+    pub active: bool,
+    pub fallback_reason: String,
+    pub rt_dynamic_count: u32,
+    pub rt_dynamic_cap: u32,
+    pub supports_ray_query: bool,
 }
 
 struct GpuMesh {
@@ -105,7 +155,9 @@ enum SphereLodMode {
 /// Runtime `wgpu` renderer for `RuntimeDrawFrame`.
 pub struct WgpuSceneRenderer {
     camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
+    scene_bind_group: wgpu::BindGroup,
+    light_buffer: wgpu::Buffer,
+    lighting_buffer: wgpu::Buffer,
     pipeline_opaque: wgpu::RenderPipeline,
     pipeline_transparent: wgpu::RenderPipeline,
     pipeline_sprite: wgpu::RenderPipeline,
@@ -124,10 +176,12 @@ pub struct WgpuSceneRenderer {
     sprite_instance_capacity_bytes: usize,
     ranges: Vec<GpuBatchRange>,
     sprite_count: u32,
+    light_count: u32,
     force_full_fbx_sphere: bool,
     camera_eye: [f32; 3],
     camera_target: [f32; 3],
     custom_mesh_slots: BTreeMap<u8, GpuMesh>,
+    ray_tracing_status: SceneRayTracingStatus,
 }
 
 impl WgpuSceneRenderer {
@@ -137,19 +191,42 @@ impl WgpuSceneRenderer {
         color_format: wgpu::TextureFormat,
         surface_width: u32,
         surface_height: u32,
+        adapter_backend: wgpu::Backend,
     ) -> Self {
         let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("runtime-scene-camera-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("runtime-scene-camera-buffer"),
@@ -157,13 +234,35 @@ impl WgpuSceneRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("runtime-scene-camera-bg"),
+        let light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("runtime-scene-light-buffer"),
+            size: (std::mem::size_of::<GpuLight>() * MAX_SCENE_LIGHTS.max(1)) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lighting_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("runtime-scene-lighting-buffer"),
+            size: std::mem::size_of::<GpuLightingUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("runtime-scene-bg"),
             layout: &camera_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: light_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: lighting_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let shader_3d = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -204,7 +303,7 @@ impl WgpuSceneRenderer {
         });
         let layout_sprite = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("runtime-scene-sprite-layout"),
-            bind_group_layouts: &[&sprite_bgl],
+            bind_group_layouts: &[&sprite_bgl, &camera_bgl],
             immediate_size: 0,
         });
 
@@ -258,7 +357,9 @@ impl WgpuSceneRenderer {
 
         let renderer = Self {
             camera_buffer,
-            camera_bind_group,
+            scene_bind_group,
+            light_buffer,
+            lighting_buffer,
             pipeline_opaque,
             pipeline_transparent,
             pipeline_sprite,
@@ -277,12 +378,18 @@ impl WgpuSceneRenderer {
             sprite_instance_capacity_bytes: std::mem::size_of::<GpuSpriteInstance>(),
             ranges: Vec::new(),
             sprite_count: 0,
+            light_count: 0,
             force_full_fbx_sphere: false,
             camera_eye: [0.0, 12.0, 36.0],
             camera_target: [0.0, 0.0, 0.0],
             custom_mesh_slots: BTreeMap::new(),
+            ray_tracing_status: resolve_rt_status(
+                RayTracingMode::Auto,
+                supports_ray_query(device, adapter_backend),
+            ),
         };
         renderer.write_camera_uniform(queue, surface_width.max(1), surface_height.max(1));
+        renderer.write_lighting_uniform(queue, 0);
         renderer
     }
 
@@ -399,6 +506,11 @@ impl WgpuSceneRenderer {
 
         self.ranges = plan.ranges;
         self.sprite_count = plan.sprites.len() as u32;
+        self.upload_lights(
+            queue,
+            draw.lights.as_slice(),
+            draw.stats.opaque_instances + draw.stats.transparent_instances,
+        );
         if self.force_full_fbx_sphere {
             self.sphere_lod_mode = SphereLodMode::High;
         } else {
@@ -428,6 +540,9 @@ impl WgpuSceneRenderer {
                 + usize::from(self.sprite_count > 0),
             instance_3d_count: draw.stats.opaque_instances + draw.stats.transparent_instances,
             sprite_count: draw.stats.sprite_instances,
+            light_count: self.light_count as usize,
+            rt_active: self.ray_tracing_status.active,
+            rt_dynamic_count: self.ray_tracing_status.rt_dynamic_count,
         }
     }
 
@@ -439,6 +554,17 @@ impl WgpuSceneRenderer {
         if force {
             self.sphere_lod_mode = SphereLodMode::High;
         }
+    }
+
+    /// Configure RT mode (Off/Auto/On) with fail-soft fallback when unsupported.
+    pub fn set_ray_tracing_mode(&mut self, queue: &wgpu::Queue, mode: RayTracingMode) {
+        self.ray_tracing_status = resolve_rt_status(mode, self.ray_tracing_status.supports_ray_query);
+        self.write_lighting_uniform(queue, self.light_count);
+    }
+
+    /// Current renderer RT status snapshot.
+    pub fn ray_tracing_status(&self) -> SceneRayTracingStatus {
+        self.ray_tracing_status.clone()
     }
 
     pub fn encode(
@@ -472,7 +598,7 @@ impl WgpuSceneRenderer {
         });
 
         if !self.ranges.is_empty() {
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
             pass.set_pipeline(&self.pipeline_opaque);
             for range in self.ranges.iter().filter(|r| r.lane == DrawLane::Opaque) {
@@ -510,6 +636,7 @@ impl WgpuSceneRenderer {
         if self.sprite_count > 0 {
             pass.set_pipeline(&self.pipeline_sprite);
             pass.set_bind_group(0, &self.sprite_atlas_bind_group, &[]);
+            pass.set_bind_group(1, &self.scene_bind_group, &[]);
             pass.set_vertex_buffer(0, self.sprite_vertex_buffer.slice(..));
             let sprite_bytes =
                 (self.sprite_count as usize * std::mem::size_of::<GpuSpriteInstance>()) as u64;
@@ -533,9 +660,44 @@ impl WgpuSceneRenderer {
         let view_proj: Matrix4<f32> = proj.to_homogeneous() * view.to_homogeneous();
         let mut uniform = GpuCameraUniform {
             view_proj: [0.0; 16],
+            camera_eye: [self.camera_eye[0], self.camera_eye[1], self.camera_eye[2], 1.0],
         };
         uniform.view_proj.copy_from_slice(view_proj.as_slice());
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn upload_lights(&mut self, queue: &wgpu::Queue, lights: &[SceneLight], dynamic_instances: usize) {
+        let selected = lights.len().min(MAX_SCENE_LIGHTS);
+        let mut gpu_lights = vec![GpuLight::default(); selected.max(1)];
+        for (index, light) in lights.iter().take(selected).enumerate() {
+            gpu_lights[index] = gpu_light_from_scene(light);
+        }
+        if selected > 0 {
+            queue.write_buffer(
+                &self.light_buffer,
+                0,
+                bytemuck::cast_slice(gpu_lights.as_slice()),
+            );
+        }
+        self.light_count = selected as u32;
+        self.ray_tracing_status.rt_dynamic_count = if self.ray_tracing_status.active {
+            (dynamic_instances as u32).min(self.ray_tracing_status.rt_dynamic_cap)
+        } else {
+            0
+        };
+        self.write_lighting_uniform(queue, self.light_count);
+    }
+
+    fn write_lighting_uniform(&self, queue: &wgpu::Queue, light_count: u32) {
+        let uniform = GpuLightingUniform {
+            light_count,
+            rt_mode: ray_mode_to_u32(self.ray_tracing_status.mode),
+            rt_active: u32::from(self.ray_tracing_status.active),
+            rt_dynamic_count: self.ray_tracing_status.rt_dynamic_count,
+            rt_dynamic_cap: self.ray_tracing_status.rt_dynamic_cap,
+            _pad: [0; 3],
+        };
+        queue.write_buffer(&self.lighting_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 }
 
@@ -682,6 +844,100 @@ fn select_sphere_lod_mode(current: SphereLodMode, sphere_instances: usize) -> Sp
                 SphereLodMode::Low
             }
         }
+    }
+}
+
+fn gpu_light_from_scene(light: &SceneLight) -> GpuLight {
+    let kind = match light.kind {
+        SceneLightKind::Point => 0.0,
+        SceneLightKind::Spot => 1.0,
+    };
+    let direction = normalize_vec3(light.direction);
+    let color = [
+        light.color[0].clamp(0.0, 16.0),
+        light.color[1].clamp(0.0, 16.0),
+        light.color[2].clamp(0.0, 16.0),
+    ];
+    let inner = light.inner_cone_deg.to_radians().cos();
+    let outer = light
+        .outer_cone_deg
+        .max(light.inner_cone_deg + 0.01)
+        .to_radians()
+        .cos();
+    GpuLight {
+        position_kind: [light.position[0], light.position[1], light.position[2], kind],
+        direction_inner: [direction[0], direction[1], direction[2], inner],
+        color_intensity: [color[0], color[1], color[2], light.intensity.max(0.0)],
+        params: [
+            light.range.max(0.05),
+            outer,
+            light.softness.clamp(0.0, 1.0),
+            light.specular_strength.clamp(0.0, 8.0),
+        ],
+        shadow: [f32::from(light.casts_shadow), 0.0, 0.0, 0.0],
+    }
+}
+
+fn normalize_vec3(input: [f32; 3]) -> [f32; 3] {
+    let len = (input[0] * input[0] + input[1] * input[1] + input[2] * input[2]).sqrt();
+    if len <= 1e-6 {
+        [0.0, -1.0, 0.0]
+    } else {
+        [input[0] / len, input[1] / len, input[2] / len]
+    }
+}
+
+fn supports_ray_query(device: &wgpu::Device, backend: wgpu::Backend) -> bool {
+    backend == wgpu::Backend::Vulkan
+        && device
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+}
+
+fn resolve_rt_status(mode: RayTracingMode, supports_ray_query: bool) -> SceneRayTracingStatus {
+    match mode {
+        RayTracingMode::Off => SceneRayTracingStatus {
+            mode,
+            active: false,
+            fallback_reason: "rt disabled by mode=off".to_string(),
+            rt_dynamic_count: 0,
+            rt_dynamic_cap: RT_DYNAMIC_CAP,
+            supports_ray_query,
+        },
+        RayTracingMode::Auto => SceneRayTracingStatus {
+            mode,
+            active: supports_ray_query,
+            fallback_reason: if supports_ray_query {
+                String::new()
+            } else {
+                "ray query unsupported on current adapter; auto fallback to forward path".to_string()
+            },
+            rt_dynamic_count: 0,
+            rt_dynamic_cap: RT_DYNAMIC_CAP,
+            supports_ray_query,
+        },
+        RayTracingMode::On => SceneRayTracingStatus {
+            mode,
+            active: supports_ray_query,
+            fallback_reason: if supports_ray_query {
+                String::new()
+            } else {
+                "mode=on requested but ray query unsupported; fail-soft fallback to auto forward"
+                    .to_string()
+            },
+            rt_dynamic_count: 0,
+            rt_dynamic_cap: RT_DYNAMIC_CAP,
+            supports_ray_query,
+        },
+    }
+}
+
+#[inline]
+fn ray_mode_to_u32(mode: RayTracingMode) -> u32 {
+    match mode {
+        RayTracingMode::Off => 0,
+        RayTracingMode::Auto => 1,
+        RayTracingMode::On => 2,
     }
 }
 
@@ -1386,10 +1642,36 @@ fn atlas_tile_rgba(tile_x: u32, tile_y: u32, u: f32, v: f32) -> [u8; 4] {
 const SCENE_3D_WGSL: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
+    camera_eye: vec4<f32>,
 };
 
 @group(0) @binding(0)
 var<uniform> u_camera: Camera;
+
+struct LightData {
+    position_kind: vec4<f32>,
+    direction_inner: vec4<f32>,
+    color_intensity: vec4<f32>,
+    params: vec4<f32>,
+    shadow: vec4<f32>,
+};
+
+struct Lighting {
+    light_count: u32,
+    rt_mode: u32,
+    rt_active: u32,
+    rt_dynamic_count: u32,
+    rt_dynamic_cap: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(1)
+var<storage, read> u_lights: array<LightData, 32>;
+
+@group(0) @binding(2)
+var<uniform> u_lighting: Lighting;
 
 struct VSIn {
     @location(0) position: vec3<f32>,
@@ -1431,6 +1713,48 @@ fn vs_main(input: VSIn) -> VSOut {
     return out;
 }
 
+fn evaluate_light(light: LightData, normal: vec3<f32>, world_pos: vec3<f32>, base_color: vec3<f32>) -> vec3<f32> {
+    let to_light = light.position_kind.xyz - world_pos;
+    let distance = max(length(to_light), 1e-4);
+    let light_dir = to_light / distance;
+    let range = max(light.params.x, 1e-3);
+    if distance > range {
+        return vec3<f32>(0.0);
+    }
+
+    var attenuation = 1.0 - smoothstep(range * 0.65, range, distance);
+    attenuation *= attenuation;
+
+    if light.position_kind.w > 0.5 {
+        let spot_axis = normalize(-light.direction_inner.xyz);
+        let cone = dot(spot_axis, light_dir);
+        let inner = light.direction_inner.w;
+        let outer = light.params.y;
+        let cone_factor = smoothstep(outer, inner, cone);
+        attenuation *= cone_factor;
+    }
+
+    let ndotl = max(dot(normal, light_dir), 0.0);
+    if ndotl <= 0.0 || attenuation <= 1e-5 {
+        return vec3<f32>(0.0);
+    }
+
+    let view_dir = normalize(u_camera.camera_eye.xyz - world_pos);
+    let half_dir = normalize(light_dir + view_dir);
+    let spec_power = 24.0 + light.params.w * 24.0;
+    let specular = pow(max(dot(normal, half_dir), 0.0), spec_power) * light.params.w;
+
+    var shadow_term = 1.0;
+    if u_lighting.rt_active > 0u && light.shadow.x > 0.5 {
+        let penumbra_floor = mix(0.35, 0.80, 1.0 - light.params.z);
+        shadow_term = mix(penumbra_floor, 1.0, ndotl);
+    }
+
+    let diffuse = base_color * ndotl;
+    let spec = vec3<f32>(specular);
+    return (diffuse + spec) * light.color_intensity.rgb * light.color_intensity.w * attenuation * shadow_term;
+}
+
 @fragment
 fn fs_main(input: VSOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     let dpx = dpdx(input.world_pos);
@@ -1440,10 +1764,18 @@ fn fs_main(input: VSOut, @builtin(front_facing) is_front: bool) -> @location(0) 
         normal = -normal;
     }
 
-    let light_dir = normalize(vec3<f32>(0.42, 0.74, 0.52));
-    let ambient = 0.24;
-    let diffuse = max(dot(normal, light_dir), 0.0) * 0.76;
-    var lit = input.color.rgb * (ambient + diffuse) + input.emissive;
+    var lit = input.color.rgb * 0.10;
+    let light_count = min(u_lighting.light_count, 32u);
+    if light_count == 0u {
+        let fallback_dir = normalize(vec3<f32>(0.42, 0.74, 0.52));
+        let fallback = max(dot(normal, fallback_dir), 0.0) * 0.76 + 0.24;
+        lit += input.color.rgb * fallback;
+    } else {
+        for (var i: u32 = 0u; i < light_count; i = i + 1u) {
+            lit += evaluate_light(u_lights[i], normal, input.world_pos, input.color.rgb);
+        }
+    }
+    lit += input.emissive;
     var alpha = input.color.a;
 
     // Box primitives get extra edge contrast so the tank keeps a clear prism silhouette.
@@ -1477,6 +1809,19 @@ struct VSOut {
 
 @group(0) @binding(0) var sprite_tex: texture_2d<f32>;
 @group(0) @binding(1) var sprite_smp: sampler;
+
+struct Lighting {
+    light_count: u32,
+    rt_mode: u32,
+    rt_active: u32,
+    rt_dynamic_count: u32,
+    rt_dynamic_cap: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(1) @binding(2) var<uniform> u_lighting: Lighting;
 
 @vertex
 fn vs_main(input: VSIn) -> VSOut {
@@ -1542,6 +1887,14 @@ fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
         color = color * grain;
     }
 
+    // Optional light-aware glow billboard helper for sprite lanes.
+    let centered = input.uv - vec2<f32>(0.5, 0.5);
+    let radial = 1.0 - smoothstep(0.22, 0.66, length(centered));
+    let light_gain = 1.0 + min(f32(u_lighting.light_count) / 16.0, 0.40);
+    if kind == 0 || kind == 1 {
+        color += vec3<f32>(0.06, 0.09, 0.14) * radial * light_gain;
+    }
+
     return vec4<f32>(color, alpha);
 }
 "#;
@@ -1576,10 +1929,12 @@ mod tests {
                 instances: vec![make_instance(3)],
             }],
             sprites: Vec::new(),
+            lights: Vec::new(),
             stats: DrawFrameStats {
                 opaque_instances: 2,
                 transparent_instances: 1,
                 sprite_instances: 0,
+                light_instances: 0,
                 opaque_batches: 1,
                 transparent_batches: 1,
                 total_draw_calls: 2,
@@ -1609,10 +1964,12 @@ mod tests {
                 texture_slot: 6,
                 layer: 120,
             }],
+            lights: Vec::new(),
             stats: DrawFrameStats {
                 opaque_instances: 0,
                 transparent_instances: 0,
                 sprite_instances: 1,
+                light_instances: 0,
                 opaque_batches: 0,
                 transparent_batches: 0,
                 total_draw_calls: 1,
@@ -1693,6 +2050,28 @@ mod tests {
             },
         ];
         assert_eq!(count_sphere_instances(ranges.as_slice()), 156);
+    }
+
+    #[test]
+    fn rt_status_auto_and_on_fail_soft_without_support() {
+        let auto = resolve_rt_status(RayTracingMode::Auto, false);
+        assert_eq!(auto.mode, RayTracingMode::Auto);
+        assert!(!auto.active);
+        assert!(auto.fallback_reason.contains("ray query unsupported"));
+
+        let on = resolve_rt_status(RayTracingMode::On, false);
+        assert_eq!(on.mode, RayTracingMode::On);
+        assert!(!on.active);
+        assert!(on.fallback_reason.contains("mode=on requested"));
+    }
+
+    #[test]
+    fn rt_status_on_activates_when_supported() {
+        let status = resolve_rt_status(RayTracingMode::On, true);
+        assert_eq!(status.mode, RayTracingMode::On);
+        assert!(status.active);
+        assert_eq!(status.rt_dynamic_cap, RT_DYNAMIC_CAP);
+        assert!(status.fallback_reason.is_empty());
     }
 
     fn make_instance(id: u64) -> DrawInstance3d {

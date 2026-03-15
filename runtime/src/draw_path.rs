@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use nalgebra::{Matrix4, Quaternion, Translation3, UnitQuaternion, Vector3};
 
 use crate::scene::{
-    SceneFrameInstances, SceneInstance3d, ScenePrimitive3d, ShadingModel, SpriteInstance,
-    SpriteKind,
+    SceneFrameInstances, SceneInstance3d, SceneLight, ScenePrimitive3d, ShadingModel,
+    SpriteInstance, SpriteKind,
 };
 
 /// Batched draw lane.
@@ -73,6 +73,7 @@ pub struct DrawFrameStats {
     pub opaque_instances: usize,
     pub transparent_instances: usize,
     pub sprite_instances: usize,
+    pub light_instances: usize,
     pub opaque_batches: usize,
     pub transparent_batches: usize,
     pub total_draw_calls: usize,
@@ -84,6 +85,7 @@ pub struct RuntimeDrawFrame {
     pub opaque_batches: Vec<DrawBatch3d>,
     pub transparent_batches: Vec<DrawBatch3d>,
     pub sprites: Vec<SpriteInstance>,
+    pub lights: Vec<SceneLight>,
     pub stats: DrawFrameStats,
 }
 
@@ -151,6 +153,7 @@ impl DrawPathCompiler {
             opaque_instances: frame.opaque_3d.len(),
             transparent_instances: frame.transparent_3d.len(),
             sprite_instances: self.sprite_scratch.len(),
+            light_instances: frame.lights.len(),
             opaque_batches: opaque_batches.len(),
             transparent_batches: transparent_batches.len(),
             total_draw_calls: opaque_batches.len()
@@ -158,10 +161,14 @@ impl DrawPathCompiler {
                 + self.sprite_scratch.len(),
         };
 
+        let mut lights = frame.lights.clone();
+        lights.sort_by_key(|light| (light.layer, light.id));
+
         RuntimeDrawFrame {
             opaque_batches,
             transparent_batches,
             sprites: std::mem::take(&mut self.sprite_scratch),
+            lights,
             stats,
         }
     }

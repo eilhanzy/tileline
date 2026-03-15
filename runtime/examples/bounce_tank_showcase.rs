@@ -117,6 +117,10 @@ fn main() {
                 draw_calls: frame.opaque_3d.len()
                     + frame.transparent_3d.len()
                     + frame.sprites.len(),
+                rt_mode: runtime::RayTracingMode::Off,
+                rt_active: false,
+                rt_dynamic_count: 0,
+                rt_fallback: false,
             },
             &mut frame.sprites,
         );
