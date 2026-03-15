@@ -154,15 +154,16 @@ fi
 popd >/dev/null
 
 score_line=""
-fps_line=""
+render_fps_line=""
 if [[ -f "${RUN_DIR}/mgs_benchmark.log" ]]; then
   score_line="$(grep -E '^Score: ' "${RUN_DIR}/mgs_benchmark.log" | tail -n 1 || true)"
-  fps_line="$(grep -E '^FPS: ' "${RUN_DIR}/mgs_benchmark.log" | tail -n 1 || true)"
+  # Support both historical `FPS:` and current `Render FPS:` summary formats.
+  render_fps_line="$(grep -E '^(Render FPS:|FPS: )' "${RUN_DIR}/mgs_benchmark.log" | tail -n 1 || true)"
 fi
-avg_fps="$(printf '%s' "${fps_line}" | sed -E 's/.*avg=([0-9]+\.?[0-9]*).*/\1/' || true)"
+avg_fps="$(printf '%s' "${render_fps_line}" | sed -E 's/.*avg=([0-9]+\.?[0-9]*).*/\1/' || true)"
 stability="$(printf '%s' "${score_line}" | sed -E 's/.*stability=([0-9]+\.?[0-9]*)%.*/\1/' || true)"
 
-if [[ -z "${avg_fps}" || "${avg_fps}" == "${fps_line}" ]]; then
+if [[ -z "${avg_fps}" || "${avg_fps}" == "${render_fps_line}" ]]; then
   avg_fps="n/a"
 fi
 if [[ -z "${stability}" || "${stability}" == "${score_line}" ]]; then
@@ -181,6 +182,9 @@ fi
   echo "benchmark_exit=${BENCH_EXIT}"
   echo "avg_fps=${avg_fps}"
   echo "stability_percent=${stability}"
+  if [[ -n "${render_fps_line}" ]]; then
+    echo "render_fps_line=${render_fps_line}"
+  fi
   if [[ -n "${score_line}" ]]; then
     echo "score_line=${score_line}"
   fi

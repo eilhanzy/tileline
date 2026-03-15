@@ -69,6 +69,16 @@ the active phase before broad beta feature expansion.
   - guide: `docs/mgs-orangepi5-validation.md`
 - prioritize integration bugs over new subsystem scope
 
+### Milestone Snapshot (2026-03-15)
+
+- `MGS` stabilization lane: mostly complete for pre-alpha transition
+- `MGS` memory-pressure controls: ZRAM spill layer + relaxed decrease policy integrated in `mgs/src`
+- Orange Pi 5 validation harness: active (`scripts/test_mgs_orangepi5.sh`) with updated parser for `Render FPS: avg=...`
+- Remaining gate before closing MGS lane:
+  - run the same validation script on actual Orange Pi 5 (Mali/Panthor path)
+  - archive one passing artifact bundle in `dist/mgs/orangepi5/<timestamp>/`
+  - record device-specific FPS/stability baseline in `docs/mgs-orangepi5-validation.md`
+
 ## Android Beta Track (Decision-Locked)
 
 Android is the official second platform in beta planning. This track runs in parallel with core
