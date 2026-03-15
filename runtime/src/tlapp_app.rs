@@ -1205,7 +1205,7 @@ impl TlAppRuntime {
         }
         let (render_distance_min, render_distance_max) = if let Some(base) = render_distance {
             (
-                (base * 0.45).clamp(10.0, base),
+                (base * 0.60).clamp(16.0, base),
                 (base * 1.40).clamp(base, 140.0),
             )
         } else {
@@ -1521,10 +1521,11 @@ impl TlAppRuntime {
 
         if overload > 0.04 {
             let shrink =
-                (0.04 + overload * 0.06).clamp(0.04, if mobile_path { 0.18 } else { 0.12 });
+                (0.025 + overload * 0.035).clamp(0.02, if mobile_path { 0.10 } else { 0.07 });
             current *= 1.0 - shrink;
         } else if headroom > 0.10 {
-            let grow = (0.01 + headroom * 0.03).clamp(0.01, if mobile_path { 0.08 } else { 0.05 });
+            let grow =
+                (0.008 + headroom * 0.025).clamp(0.008, if mobile_path { 0.06 } else { 0.04 });
             current *= 1.0 + grow;
         }
 
@@ -3002,50 +3003,56 @@ fn choose_runtime_load_plan(
         (logical_threads as f32 / 8.0).clamp(0.75, 4.0)
     };
     let cap = |base: usize| ((base as f32) * thread_scale).round() as usize;
+    let heavy_fill = framebuffer_fill_ema > 1.20;
+    let severe_fill = framebuffer_fill_ema > 1.55;
 
     match pressure {
         0..=2 => RuntimeLoadPlan {
-            visible_ball_limit: if mobile_path && live_balls > 1_800 {
-                Some(cap(1_800))
+            visible_ball_limit: if mobile_path && live_balls > 2_600 {
+                Some(cap(2_600))
             } else {
                 None
             },
-            live_ball_budget: if mobile_path { Some(cap(3_200)) } else { None },
+            live_ball_budget: if mobile_path { Some(cap(4_800)) } else { None },
             spawn_per_tick_cap: cap(if mobile_path { 96 } else { 420 }),
             max_substeps: if mobile_path { 6 } else { 14 },
-            force_low_poly_ball_mesh: mobile_path && live_balls > 1_200,
+            force_low_poly_ball_mesh: false,
             tick_scale: if mobile_path { 0.78 } else { 1.00 },
         },
         3..=4 => RuntimeLoadPlan {
-            visible_ball_limit: if mobile_path { Some(cap(1_600)) } else { None },
-            live_ball_budget: if mobile_path { Some(cap(2_800)) } else { None },
+            visible_ball_limit: if mobile_path && live_balls > 3_000 {
+                Some(cap(2_300))
+            } else {
+                None
+            },
+            live_ball_budget: if mobile_path { Some(cap(4_000)) } else { None },
             spawn_per_tick_cap: cap(if mobile_path { 72 } else { 360 }),
             max_substeps: if mobile_path { 5 } else { 12 },
-            force_low_poly_ball_mesh: mobile_path,
+            force_low_poly_ball_mesh: false,
             tick_scale: if mobile_path { 0.66 } else { 0.96 },
         },
         5..=6 => RuntimeLoadPlan {
-            visible_ball_limit: if mobile_path { Some(cap(1_400)) } else { None },
-            live_ball_budget: if mobile_path { Some(cap(2_200)) } else { None },
+            visible_ball_limit: if mobile_path { Some(cap(2_000)) } else { None },
+            live_ball_budget: if mobile_path { Some(cap(3_400)) } else { None },
             spawn_per_tick_cap: cap(if mobile_path { 48 } else { 260 }),
             max_substeps: if mobile_path { 4 } else { 10 },
-            force_low_poly_ball_mesh: mobile_path,
+            force_low_poly_ball_mesh: mobile_path && heavy_fill && live_balls > 2_600,
             tick_scale: if mobile_path { 0.56 } else { 0.82 },
         },
         7..=8 => RuntimeLoadPlan {
-            visible_ball_limit: if mobile_path { Some(cap(1_200)) } else { None },
-            live_ball_budget: if mobile_path { Some(cap(1_800)) } else { None },
+            visible_ball_limit: if mobile_path { Some(cap(1_700)) } else { None },
+            live_ball_budget: if mobile_path { Some(cap(2_900)) } else { None },
             spawn_per_tick_cap: cap(if mobile_path { 32 } else { 200 }),
             max_substeps: if mobile_path { 3 } else { 10 },
-            force_low_poly_ball_mesh: mobile_path,
+            force_low_poly_ball_mesh: mobile_path && (heavy_fill || live_balls > 3_200),
             tick_scale: if mobile_path { 0.46 } else { 0.72 },
         },
         _ => RuntimeLoadPlan {
-            visible_ball_limit: if mobile_path { Some(cap(900)) } else { None },
-            live_ball_budget: if mobile_path { Some(cap(1_400)) } else { None },
+            visible_ball_limit: if mobile_path { Some(cap(1_300)) } else { None },
+            live_ball_budget: if mobile_path { Some(cap(2_300)) } else { None },
             spawn_per_tick_cap: cap(if mobile_path { 24 } else { 160 }),
             max_substeps: if mobile_path { 2 } else { 10 },
-            force_low_poly_ball_mesh: mobile_path,
+            force_low_poly_ball_mesh: mobile_path && (severe_fill || live_balls > 3_600),
             tick_scale: if mobile_path { 0.38 } else { 0.60 },
         },
     }
@@ -3086,9 +3093,12 @@ fn apply_render_distance_haze(
     let Some(max_distance) = render_distance.filter(|distance| *distance > 0.25) else {
         return RenderDistanceStats::default();
     };
-    let blur_start_ratio = 0.62;
+    let blur_start_ratio = 0.74;
     let blur_start = (max_distance * blur_start_ratio).max(0.25);
+    // Keep a soft margin after render distance to reduce sudden popping.
+    let hard_cull_distance = max_distance * 1.18;
     let max_distance_sq = max_distance * max_distance;
+    let hard_cull_distance_sq = hard_cull_distance * hard_cull_distance;
     let blur_start_sq = blur_start * blur_start;
 
     let mut stats = RenderDistanceStats::default();
@@ -3106,15 +3116,22 @@ fn apply_render_distance_haze(
         let dz = p[2] - camera_eye[2];
         let distance_sq = dx * dx + dy * dy + dz * dz;
 
-        if distance_sq > max_distance_sq {
+        if distance_sq > hard_cull_distance_sq {
             stats.culled = stats.culled.saturating_add(1);
             continue;
         }
         if blur_enabled && distance_sq > blur_start_sq {
             let distance = distance_sq.sqrt();
-            let t =
-                ((distance - blur_start) / (max_distance - blur_start).max(1e-4)).clamp(0.0, 1.0);
+            let t = ((distance - blur_start) / (hard_cull_distance - blur_start).max(1e-4))
+                .clamp(0.0, 1.0);
             soften_instance_for_distance_haze(&mut instance, t);
+            blurred.push((distance_sq, instance));
+            stats.blurred = stats.blurred.saturating_add(1);
+        } else if distance_sq > max_distance_sq {
+            let distance = distance_sq.sqrt();
+            let t = ((distance - max_distance) / (hard_cull_distance - max_distance).max(1e-4))
+                .clamp(0.0, 1.0);
+            soften_instance_for_distance_haze(&mut instance, t * 0.85 + 0.15);
             blurred.push((distance_sq, instance));
             stats.blurred = stats.blurred.saturating_add(1);
         } else {
