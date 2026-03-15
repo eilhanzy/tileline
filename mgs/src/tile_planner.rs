@@ -99,17 +99,8 @@ impl MgsPlanner {
 
     /// Workload isteğinden bir `TilePlan` üretir.
     pub fn plan(&self, request: TileWorkloadRequest) -> TilePlan {
-        let tile_px = self.effective_tile_px();
-        let tiles_x = (request.target_width + tile_px - 1) / tile_px;
-        let tiles_y = (request.target_height + tile_px - 1) / tile_px;
-        let tile_count = tiles_x * tiles_y;
-
-        let draws_per_tile = if tile_count == 0 {
-            request.total_draw_calls
-        } else {
-            // Eşit dağıtım; kalan draw'lar son tile'a eklenir.
-            (request.total_draw_calls + tile_count - 1) / tile_count
-        };
+        let (tile_px, tiles_x, tiles_y, tile_count, draws_per_tile) =
+            self.select_adaptive_tiling(request);
 
         let mut assignments = Vec::with_capacity(tile_count as usize);
         let mut remaining_draws = request.total_draw_calls;
@@ -141,6 +132,34 @@ impl MgsPlanner {
             tile_px,
             tile_count,
             memory_pressure_detected,
+        }
+    }
+
+    /// Bellek baskısı algılandığında tile boyutunu düşürerek draw yoğunluğunu azaltır.
+    ///
+    /// Bu yaklaşım, aynı total workload'u korurken tile başına geçici bellek baskısını düşürür.
+    /// Amaç fallback zincirine daha geç düşmek ve stabilize edilmiş throughput sağlamaktır.
+    fn select_adaptive_tiling(
+        &self,
+        request: TileWorkloadRequest,
+    ) -> (u32, u32, u32, u32, u32) {
+        let mut tile_px = self.effective_tile_px().max(8);
+        let min_tile_px = 8;
+
+        loop {
+            let tiles_x = request.target_width.div_ceil(tile_px).max(1);
+            let tiles_y = request.target_height.div_ceil(tile_px).max(1);
+            let tile_count = tiles_x.saturating_mul(tiles_y).max(1);
+
+            let draws_per_tile = request.total_draw_calls.div_ceil(tile_count);
+            let estimated_tile_kb = draws_per_tile.saturating_mul(request.bytes_per_draw_kb);
+            let within_budget = estimated_tile_kb <= self.profile.tile_memory_kb;
+
+            if within_budget || tile_px <= min_tile_px {
+                return (tile_px, tiles_x, tiles_y, tile_count, draws_per_tile);
+            }
+
+            tile_px = (tile_px / 2).max(min_tile_px);
         }
     }
 
@@ -209,5 +228,20 @@ mod tests {
         };
         let plan = planner.plan(req);
         assert!(plan.memory_pressure_detected);
+    }
+
+    #[test]
+    fn adaptive_tiling_reduces_tile_size_under_heavy_pressure() {
+        let profile = MobileGpuProfile::detect("Mali-G78 MC24");
+        let planner = MgsPlanner::from_profile(profile);
+        let req = TileWorkloadRequest {
+            target_width: 1920,
+            target_height: 1080,
+            total_draw_calls: 8000,
+            bytes_per_draw_kb: 32,
+        };
+        let plan = planner.plan(req);
+        assert!(plan.tile_px <= 16);
+        assert!(plan.tile_count > 0);
     }
 }

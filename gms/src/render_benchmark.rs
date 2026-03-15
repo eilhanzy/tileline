@@ -879,6 +879,12 @@ impl Renderer {
 
         let adapter_info = adapter.get_info();
         let runtime_tuning = GmsRuntimeTuningProfile::from_adapter_info(&adapter_info);
+        if runtime_tuning.is_linux_panthor_like {
+            eprintln!(
+                "GMS: Linux Panthor profile enabled for adapter '{}'; using conservative burst/ring tuning.",
+                adapter_info.name
+            );
+        }
         let (required_limits, limit_clamp_report) =
             safe_default_required_limits_for_adapter(&adapter);
         if limit_clamp_report.any_clamped() {
@@ -1299,7 +1305,13 @@ fn select_throughput_burst(
     let max_units = match adapter_info.device_type {
         wgpu::DeviceType::DiscreteGpu => 768,
         wgpu::DeviceType::VirtualGpu => 128,
-        _ => 384,
+        _ => {
+            if runtime_tuning.is_linux_panthor_like {
+                192
+            } else {
+                384
+            }
+        }
     };
 
     let pixels_per_present = (options.resolution.width.max(1) as u64)
@@ -1328,7 +1340,7 @@ fn select_throughput_burst(
         .clamp(1, max_units as u64) as u32;
     let work_units_per_present = scaled_units.clamp(base_units.max(1), max_units.max(base_units));
     let passes_per_work_unit =
-        select_primary_passes_per_work_unit(adapter_info, options, present_mode);
+        select_primary_passes_per_work_unit(adapter_info, runtime_tuning, options, present_mode);
 
     Some(ThroughputBurst {
         work_units_per_present,
@@ -1339,6 +1351,7 @@ fn select_throughput_burst(
 
 fn select_primary_passes_per_work_unit(
     adapter_info: &wgpu::AdapterInfo,
+    runtime_tuning: &GmsRuntimeTuningProfile,
     options: CliOptions,
     present_mode: PresentMode,
 ) -> u32 {
@@ -1366,7 +1379,11 @@ fn select_primary_passes_per_work_unit(
             } else {
                 2_000_000u64
             },
-            10u32,
+            if runtime_tuning.is_linux_panthor_like {
+                6u32
+            } else {
+                10u32
+            },
         ),
     };
 

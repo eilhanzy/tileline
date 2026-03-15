@@ -112,7 +112,7 @@ pub fn select_throughput_burst(
         RuntimeMode::Stable => 1,
         RuntimeMode::MaxThroughput => match profile.architecture {
             TbdrArchitecture::AppleTbdr => 4,
-            TbdrArchitecture::MaliTbdr => 4,
+            TbdrArchitecture::MaliTbdr => mali_burst_from_cores(profile.estimated_cores, true),
             TbdrArchitecture::FlexRender => 8,
             TbdrArchitecture::PowerVrTbdr => 4,
             TbdrArchitecture::Unknown => 3,
@@ -121,6 +121,8 @@ pub fn select_throughput_burst(
             if profile.is_mobile_tbdr() {
                 if matches!(profile.architecture, TbdrArchitecture::AppleTbdr) {
                     2
+                } else if matches!(profile.architecture, TbdrArchitecture::MaliTbdr) {
+                    mali_burst_from_cores(profile.estimated_cores, false)
                 } else {
                     3
                 }
@@ -138,6 +140,22 @@ pub fn select_throughput_burst(
         });
     }
     burst.max(1)
+}
+
+fn mali_burst_from_cores(estimated_cores: u32, max_mode: bool) -> u32 {
+    if max_mode {
+        match estimated_cores {
+            0..=7 => 4,
+            8..=13 => 6,
+            _ => 8,
+        }
+    } else {
+        match estimated_cores {
+            0..=7 => 3,
+            8..=13 => 4,
+            _ => 5,
+        }
+    }
 }
 
 /// Startup easing to avoid first-frame spikes.
@@ -351,6 +369,24 @@ mod tests {
         let profile = MobileGpuProfile::detect("Apple M4");
         let burst = select_throughput_burst(&profile, RuntimeMode::Auto, true);
         assert_eq!(burst, 2);
+    }
+
+    #[test]
+    fn burst_profile_for_high_core_mali_scales_up() {
+        let profile = MobileGpuProfile::detect("Mali-G78 MC24");
+        let burst_auto = select_throughput_burst(&profile, RuntimeMode::Auto, false);
+        let burst_max = select_throughput_burst(&profile, RuntimeMode::MaxThroughput, false);
+        assert!(burst_auto >= 5);
+        assert!(burst_max >= 8);
+    }
+
+    #[test]
+    fn burst_profile_for_low_core_mali_stays_bounded() {
+        let profile = MobileGpuProfile::detect("Mali-G52");
+        let burst_auto = select_throughput_burst(&profile, RuntimeMode::Auto, false);
+        let burst_max = select_throughput_burst(&profile, RuntimeMode::MaxThroughput, false);
+        assert_eq!(burst_auto, 3);
+        assert_eq!(burst_max, 4);
     }
 }
 

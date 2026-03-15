@@ -136,3 +136,20 @@ GMS tuning and `AdaptiveBuffer` support provide UMA-aware behavior for Metal/App
 - stability recovery heuristics
 
 These policies are consumed by `tl-core` and `runtime` rather than being confined to benchmarks.
+
+## Linux Panthor Path (Mali / Immortalis)
+
+`gms/src/tuning.rs` now includes a dedicated Linux Panthor-oriented runtime profile:
+
+- activation heuristic:
+  - Vulkan backend
+  - ARM/Mali/Immortalis adapter name
+  - Panthor/Panfrost hint from driver text or `/sys/module/panthor`
+- tuning behavior:
+  - deeper frame-latency queue (`desired_maximum_frame_latency`)
+  - lower synthetic burst caps for integrated paths
+  - startup ramp + prewarm tuned for embedded SoC stability
+  - tighter pass-per-work-unit cap in benchmark stress mode
+
+Goal: reduce bursty frame-time spikes on RK3588-class systems while keeping throughput scaling
+predictable.
