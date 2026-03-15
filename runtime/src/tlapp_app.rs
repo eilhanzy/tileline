@@ -10,12 +10,12 @@ use crate::{
     app_runner, choose_scheduler_path_for_platform, compile_tljoint_scene_from_path,
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, BounceTankRuntimePatch,
     BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler, GraphicsSchedulerPath,
-    RenderSyncMode, RuntimePlatform, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
-    TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
-    TlscriptCoordinateSpace, TlscriptShowcaseConfig, TlscriptShowcaseControlInput,
-    TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
-    TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader,
-    WgpuSceneRenderer,
+    RenderSyncMode, RuntimePlatform, SceneFrameInstances, ScenePrimitive3d, TelemetryHudComposer,
+    TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle,
+    TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlscriptCoordinateSpace,
+    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
+    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram,
+    TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer,
 };
 use gms::safe_default_required_limits_for_adapter;
 use nalgebra::Vector3;
@@ -93,6 +93,9 @@ struct CliOptions {
     vsync: VsyncMode,
     fps_cap: Option<f32>,
     tick_profile: TickProfile,
+    render_distance: Option<f32>,
+    adaptive_distance: ToggleAuto,
+    distance_blur: ToggleAuto,
     fps_report_interval: Duration,
     project_path: Option<PathBuf>,
     joint_path: Option<PathBuf>,
@@ -108,6 +111,9 @@ impl Default for CliOptions {
             vsync: VsyncMode::Auto,
             fps_cap: Some(60.0),
             tick_profile: TickProfile::Max,
+            render_distance: None,
+            adaptive_distance: ToggleAuto::Auto,
+            distance_blur: ToggleAuto::Auto,
             fps_report_interval: Duration::from_secs_f32(1.0),
             project_path: None,
             joint_path: None,
@@ -144,6 +150,18 @@ impl CliOptions {
                 "--tick-profile" => {
                     let value = next_arg(&mut args, "--tick-profile")?;
                     options.tick_profile = TickProfile::parse(&value)?;
+                }
+                "--render-distance" => {
+                    let value = next_arg(&mut args, "--render-distance")?;
+                    options.render_distance = parse_render_distance(&value)?;
+                }
+                "--adaptive-distance" => {
+                    let value = next_arg(&mut args, "--adaptive-distance")?;
+                    options.adaptive_distance = ToggleAuto::parse(&value, "--adaptive-distance")?;
+                }
+                "--distance-blur" => {
+                    let value = next_arg(&mut args, "--distance-blur")?;
+                    options.distance_blur = ToggleAuto::parse(&value, "--distance-blur")?;
                 }
                 "--fps-report" => {
                     let value = next_arg(&mut args, "--fps-report")?;
@@ -202,6 +220,13 @@ enum VsyncMode {
 enum TickProfile {
     Balanced,
     Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToggleAuto {
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +385,25 @@ impl VsyncMode {
     }
 }
 
+impl ToggleAuto {
+    fn parse(value: &str, flag: &str) -> Result<Self, Box<dyn Error>> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "on" | "1" | "true" => Ok(Self::On),
+            "off" | "0" | "false" => Ok(Self::Off),
+            _ => Err(format!("invalid {flag} value: {value} (expected auto|on|off)").into()),
+        }
+    }
+
+    fn resolve(self, auto_default: bool) -> bool {
+        match self {
+            Self::Auto => auto_default,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Box<dyn Error>> {
     args.next()
         .ok_or_else(|| format!("missing value for {flag}").into())
@@ -405,6 +449,19 @@ fn parse_fps_cap(value: &str) -> Result<Option<f32>, Box<dyn Error>> {
     Ok(Some(fps))
 }
 
+fn parse_render_distance(value: &str) -> Result<Option<f32>, Box<dyn Error>> {
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let distance = value.parse::<f32>().map_err(|_| {
+        format!("invalid --render-distance value: {value} (expected number or off)")
+    })?;
+    if !distance.is_finite() || distance <= 0.0 {
+        return Err("--render-distance must be > 0.0 or 'off'".into());
+    }
+    Ok(Some(distance))
+}
+
 fn bootstrap_uncapped_fps_hint(logical_threads: usize) -> f32 {
     // Start from a conservative-but-fast target and let runtime sampling retune to hardware limit.
     (170.0 + logical_threads as f32 * 7.5).clamp(170.0, 420.0)
@@ -418,6 +475,9 @@ fn print_usage() {
     println!("  --vsync auto|on|off       Present mode preference (default: auto)");
     println!("  --fps-cap <N|off>         Frame cap target (default: 60)");
     println!("  --tick-profile <mode>     Physics tick planner: balanced|max (default: max)");
+    println!("  --render-distance <N|off> Distance cull radius for 3D balls (default: auto)");
+    println!("  --adaptive-distance <mode> Adaptive distance tuning: auto|on|off (default: auto)");
+    println!("  --distance-blur <mode>    Distance haze blur: auto|on|off (default: auto)");
     println!("  --fps-report <sec>        CLI FPS report cadence (default: 1.0)");
     println!("  --project <path>          .tlpfile manifest (GMS required for TLApp runtime)");
     println!("  --joint <path>            .tljoint manifest path (overrides --script/--sprite)");
@@ -649,6 +709,16 @@ struct TlAppRuntime {
     adaptive_ball_render_limit: Option<usize>,
     adaptive_live_ball_budget: Option<usize>,
     adaptive_low_poly_override: bool,
+    render_distance: Option<f32>,
+    render_distance_min: f32,
+    render_distance_max: f32,
+    adaptive_distance_enabled: bool,
+    distance_blur_mode: ToggleAuto,
+    distance_blur_enabled: bool,
+    last_distance_culled: usize,
+    last_distance_blurred: usize,
+    last_framebuffer_fill_ratio: f32,
+    framebuffer_fill_ema: f32,
     frame_time_ema_ms: f32,
     frame_time_jitter_ema_ms: f32,
     frame_time_budget_ms: f32,
@@ -1126,6 +1196,23 @@ impl TlAppRuntime {
             || mgs_like_path
             || cfg!(any(target_arch = "aarch64", target_arch = "arm"));
         let little_core_class = mobile_class_tuning && logical_threads <= 8;
+        let adaptive_distance_enabled = options.adaptive_distance.resolve(mobile_class_tuning);
+        let mut render_distance = options
+            .render_distance
+            .or_else(|| mobile_class_tuning.then_some(34.0));
+        if render_distance.is_none() && adaptive_distance_enabled {
+            render_distance = Some(if mobile_class_tuning { 34.0 } else { 58.0 });
+        }
+        let (render_distance_min, render_distance_max) = if let Some(base) = render_distance {
+            (
+                (base * 0.45).clamp(10.0, base),
+                (base * 1.40).clamp(base, 140.0),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let distance_blur_mode = options.distance_blur;
+        let distance_blur_enabled = distance_blur_mode.resolve(mobile_class_tuning);
         let uncapped_dynamic_fps_hint =
             options.fps_cap.is_none() && matches!(options.vsync, VsyncMode::Off);
         let display_refresh_hint_hz = window
@@ -1246,7 +1333,7 @@ impl TlAppRuntime {
             ..BounceTankSceneConfig::default()
         });
         eprintln!(
-            "[mps] cpu profile logical={} physical={} mobile_tuning={} little_core_class={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={}",
+            "[mps] cpu profile logical={} physical={} mobile_tuning={} little_core_class={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={} render_distance={:?} adaptive_distance={} distance_blur={:?} ({})",
             logical_threads,
             physical_threads,
             mobile_class_tuning,
@@ -1255,7 +1342,11 @@ impl TlAppRuntime {
             broadphase_chunk,
             max_pairs,
             solver_iterations,
-            tuned_max_substeps
+            tuned_max_substeps,
+            render_distance,
+            adaptive_distance_enabled,
+            distance_blur_mode,
+            distance_blur_enabled
         );
 
         let mut renderer =
@@ -1351,6 +1442,16 @@ impl TlAppRuntime {
             adaptive_ball_render_limit: None,
             adaptive_live_ball_budget: None,
             adaptive_low_poly_override: false,
+            render_distance,
+            render_distance_min,
+            render_distance_max,
+            adaptive_distance_enabled,
+            distance_blur_mode,
+            distance_blur_enabled,
+            last_distance_culled: 0,
+            last_distance_blurred: 0,
+            last_framebuffer_fill_ratio: 0.0,
+            framebuffer_fill_ema: 0.0,
             frame_time_ema_ms: 0.0,
             frame_time_jitter_ema_ms: 0.0,
             frame_time_budget_ms: (1_000.0 / fps_limit_hint.max(24.0)).clamp(3.0, 41.0),
@@ -1376,10 +1477,78 @@ impl TlAppRuntime {
                 return;
             }
             self.next_redraw_at = now + interval;
+        } else {
+            let mobile_path = matches!(self.platform, RuntimePlatform::Android)
+                || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
+            if mobile_path {
+                // Avoid uncapped busy-spin on mobile/TBDR paths; it can cause whole-system
+                // chopping even when the app's own FPS appears acceptable.
+                let next = Instant::now() + Duration::from_millis(2);
+                self.next_redraw_at = next;
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                self.window.request_redraw();
+                return;
+            }
         }
 
         event_loop.set_control_flow(ControlFlow::Poll);
         self.window.request_redraw();
+    }
+
+    fn retune_render_distance(&mut self, mobile_path: bool) {
+        if !self.adaptive_distance_enabled || self.frame_time_ema_ms <= f32::EPSILON {
+            return;
+        }
+        let Some(mut current) = self.render_distance else {
+            return;
+        };
+        if self.render_distance_max <= self.render_distance_min + f32::EPSILON {
+            return;
+        }
+
+        let target_ms = (1_000.0 / self.fps_limit_hint.max(24.0)).clamp(5.0, 42.0);
+        let frame_pressure = (self.frame_time_ema_ms / target_ms).clamp(0.4, 2.5);
+        let jitter_pressure =
+            (self.frame_time_jitter_ema_ms / (target_ms * 0.5).max(0.5)).clamp(0.0, 2.0);
+        let fill_pressure = self.framebuffer_fill_ema.clamp(0.0, 3.0);
+
+        let overload = (frame_pressure - 1.0).max(0.0)
+            + (fill_pressure - 1.0).max(0.0) * 0.75
+            + jitter_pressure * 0.18;
+        let headroom = (1.0 - frame_pressure).max(0.0)
+            + (0.85 - fill_pressure).max(0.0) * 0.65
+            + (0.12 - jitter_pressure).max(0.0) * 0.40;
+
+        if overload > 0.04 {
+            let shrink =
+                (0.04 + overload * 0.06).clamp(0.04, if mobile_path { 0.18 } else { 0.12 });
+            current *= 1.0 - shrink;
+        } else if headroom > 0.10 {
+            let grow = (0.01 + headroom * 0.03).clamp(0.01, if mobile_path { 0.08 } else { 0.05 });
+            current *= 1.0 + grow;
+        }
+
+        let snapped = (current * 2.0).round() * 0.5;
+        self.render_distance =
+            Some(snapped.clamp(self.render_distance_min, self.render_distance_max));
+    }
+
+    fn refresh_distance_blur_state(&mut self, mobile_path: bool) {
+        self.distance_blur_enabled = match self.distance_blur_mode {
+            ToggleAuto::On => true,
+            ToggleAuto::Off => false,
+            ToggleAuto::Auto => {
+                if self.distance_blur_enabled {
+                    !(self.framebuffer_fill_ema < 0.72
+                        && self.frame_time_ema_ms < self.frame_time_budget_ms * 0.90
+                        && !mobile_path)
+                } else {
+                    self.framebuffer_fill_ema > 0.92
+                        || self.frame_time_ema_ms > self.frame_time_budget_ms * 1.05
+                        || mobile_path
+                }
+            }
+        };
     }
 
     fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -1565,6 +1734,8 @@ impl TlAppRuntime {
 
     fn render_frame(&mut self) -> Result<(), Box<dyn Error>> {
         let frame_begin = Instant::now();
+        let mobile_path = matches!(self.platform, RuntimePlatform::Android)
+            || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
         let raw_dt = (frame_begin - self.frame_started_at).as_secs_f32();
         // Keep simulation time real-time (decoupled from render FPS) and only guard against large
         // stalls (alt-tab/debugger) so physics does not enter slow-motion at low FPS.
@@ -1667,12 +1838,13 @@ impl TlAppRuntime {
             .as_ref()
             .map(|d| d.is_parallel())
             .unwrap_or(false);
-        let mobile_path = matches!(self.platform, RuntimePlatform::Android)
-            || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
         let force_full_fbx = frame_eval
             .force_full_fbx_sphere
             .unwrap_or(self.force_full_fbx_from_sprite);
         let mut runtime_patch = frame_eval.patch;
+        self.frame_time_budget_ms = (1_000.0 / self.fps_limit_hint.max(24.0)).clamp(3.0, 41.0);
+        self.retune_render_distance(mobile_path);
+        self.refresh_distance_blur_state(mobile_path);
         let mut load_plan = choose_runtime_load_plan(
             self.fps_tracker.ema_fps(),
             raw_dt * 1_000.0,
@@ -1682,8 +1854,9 @@ impl TlAppRuntime {
             parallel_ready,
             self.mps_logical_threads,
             mobile_path,
+            self.framebuffer_fill_ema,
+            self.render_distance,
         );
-        self.frame_time_budget_ms = (1_000.0 / self.fps_limit_hint.max(24.0)).clamp(3.0, 41.0);
         let moderate_jitter = self.frame_time_ema_ms > self.frame_time_budget_ms * 1.10
             || self.frame_time_jitter_ema_ms > 1.8;
         let severe_jitter = self.frame_time_ema_ms > self.frame_time_budget_ms * 1.25
@@ -1704,7 +1877,9 @@ impl TlAppRuntime {
                 .max_substeps
                 .min(if severe_jitter { 4 } else { 6 });
             load_plan.spawn_per_tick_cap =
-                load_plan.spawn_per_tick_cap.min(if severe_jitter { 96 } else { 112 });
+                load_plan
+                    .spawn_per_tick_cap
+                    .min(if severe_jitter { 96 } else { 112 });
         }
         if matches!(self.tick_profile, TickProfile::Max) {
             let min_tick_scale = if severe_jitter {
@@ -1757,11 +1932,14 @@ impl TlAppRuntime {
             runtime_patch.linear_damping =
                 Some(runtime_patch.linear_damping.unwrap_or(0.018).max(0.020));
         }
+        let mut force_full_fbx_runtime = force_full_fbx;
         if self.adaptive_low_poly_override {
-            // Preserve FBX silhouette; shed load via body/render budgets instead of slot swapping.
-            runtime_patch.ball_mesh_slot = Some(DEFAULT_FBX_BALL_SLOT);
+            // On mobile/TBDR profiles, visual fallback is cheaper than frame-time collapse.
+            runtime_patch.ball_mesh_slot = Some(AUTO_LOW_POLY_BALL_SLOT);
+            force_full_fbx_runtime = false;
         }
-        self.renderer.set_force_full_fbx_sphere(force_full_fbx);
+        self.renderer
+            .set_force_full_fbx_sphere(force_full_fbx_runtime);
 
         if let Some(cap) = self.adaptive_live_ball_budget {
             let _ = self.scene.enforce_live_ball_budget(&mut self.world, cap);
@@ -1793,10 +1971,9 @@ impl TlAppRuntime {
             // Avoid fixed-step overload: if tick is too high for current FPS and max_substeps,
             // simulation falls behind (slow-motion). Clamp to catch-up-safe frequency.
             let catch_up_factor = if mobile_path { 0.78 } else { 0.88 };
-            let catch_up_hz = (self.fps_tracker.ema_fps().max(1.0)
-                * self.max_substeps as f32
-                * catch_up_factor)
-                .clamp(24.0, 900.0);
+            let catch_up_hz =
+                (self.fps_tracker.ema_fps().max(1.0) * self.max_substeps as f32 * catch_up_factor)
+                    .clamp(24.0, 900.0);
             desired_hz = desired_hz.min(catch_up_hz);
             let ramp_up = desired_hz > self.tick_hz;
             let smoothing = if mobile_path {
@@ -1842,7 +2019,11 @@ impl TlAppRuntime {
             self.world
                 .set_timestep(1.0 / self.tick_hz, self.max_substeps);
             self.tick_retune_timer = if mobile_path {
-                if ramp_up { 0.12 } else { 0.08 }
+                if ramp_up {
+                    0.12
+                } else {
+                    0.08
+                }
             } else if ramp_up {
                 0.08
             } else {
@@ -1866,7 +2047,26 @@ impl TlAppRuntime {
             Some(self.world.interpolation_alpha()),
             self.adaptive_ball_render_limit,
         );
-        let visible_ball_count = frame.opaque_3d.len().saturating_sub(12);
+        let distance_stats = apply_render_distance_haze(
+            &mut frame,
+            eye,
+            self.render_distance,
+            self.distance_blur_enabled,
+        );
+        self.last_distance_culled = distance_stats.culled;
+        self.last_distance_blurred = distance_stats.blurred;
+        let fill_ratio = estimate_framebuffer_fill_ratio(
+            &frame,
+            self.size.width.max(1),
+            self.size.height.max(1),
+        );
+        self.last_framebuffer_fill_ratio = fill_ratio;
+        if self.framebuffer_fill_ema <= f32::EPSILON {
+            self.framebuffer_fill_ema = fill_ratio;
+        } else {
+            self.framebuffer_fill_ema += (fill_ratio - self.framebuffer_fill_ema) * 0.18;
+        }
+        let visible_ball_count = count_rendered_balls(&frame);
         let _hud = self.hud.append_to_sprites(
             TelemetryHudSample {
                 fps: self.fps_tracker.ema_fps(),
@@ -1927,8 +2127,9 @@ impl TlAppRuntime {
         let report = self.fps_tracker.record(frame_end, frame_time);
         if self.uncapped_dynamic_fps_hint {
             let measured_hint = self.fps_tracker.dynamic_uncapped_fps_hint();
+            let upper_hint = if mobile_path { 144.0 } else { 1_200.0 };
             self.fps_limit_hint =
-                smooth_tick_hz(self.fps_limit_hint, measured_hint, 0.22).clamp(48.0, 1_200.0);
+                smooth_tick_hz(self.fps_limit_hint, measured_hint, 0.22).clamp(48.0, upper_hint);
         }
         let pacing_suffix = self
             .frame_cap_interval
@@ -1941,8 +2142,18 @@ impl TlAppRuntime {
                 }
             });
         let scheduler_label = scheduler_path_label(self.scheduler_path);
+        let distance_suffix = match self.render_distance {
+            Some(distance) => format!(
+                " | rd {:.0}m c{} b{} fill {:.2}",
+                distance,
+                self.last_distance_culled,
+                self.last_distance_blurred,
+                self.last_framebuffer_fill_ratio
+            ),
+            None => String::new(),
+        };
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Substeps {} | {:?} {} {:?}{}{}{}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Substeps {} | {:?} {} {:?}{}{}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
             self.tick_hz,
@@ -1967,6 +2178,7 @@ impl TlAppRuntime {
             } else {
                 String::new()
             },
+            distance_suffix,
             pacing_suffix,
         );
         self.window.set_title(&title);
@@ -1975,7 +2187,7 @@ impl TlAppRuntime {
             let broadphase = self.world.broadphase().stats();
             let narrowphase = self.world.narrowphase().stats();
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | substeps: {} | scattered: {:>4} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | substeps: {} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
@@ -1984,6 +2196,10 @@ impl TlAppRuntime {
                 visible_ball_count,
                 substeps,
                 tick.scattered_this_tick,
+                self.last_distance_culled,
+                self.last_distance_blurred,
+                self.last_framebuffer_fill_ratio,
+                self.framebuffer_fill_ema,
                 self.mps_logical_threads,
                 broadphase.shard_count,
                 broadphase.candidate_pairs,
@@ -2492,8 +2708,10 @@ impl FpsTracker {
         self.count = self.count.saturating_add(1).min(self.frame_times.len());
 
         let instant_fps = 1.0 / frame_time.max(1e-6);
+        // Guard EMA against startup/outlier spikes so scheduler tuning follows real throughput.
+        let ema_sample_fps = instant_fps.clamp(1.0, 180.0);
         let alpha = 0.12;
-        self.ema_fps += (instant_fps - self.ema_fps) * alpha;
+        self.ema_fps += (ema_sample_fps - self.ema_fps) * alpha;
 
         if now.duration_since(self.last_report_at) < self.report_interval {
             return None;
@@ -2713,6 +2931,8 @@ fn choose_runtime_load_plan(
     parallel_ready: bool,
     logical_threads: usize,
     mobile_path: bool,
+    framebuffer_fill_ema: f32,
+    render_distance: Option<f32>,
 ) -> RuntimeLoadPlan {
     let mut pressure = 0u32;
     let fps = ema_fps.clamp(1.0, 240.0);
@@ -2751,6 +2971,15 @@ fn choose_runtime_load_plan(
     if live_balls > 6_500 {
         pressure += 1;
     }
+    if framebuffer_fill_ema > 0.95 {
+        pressure += 1;
+    }
+    if framebuffer_fill_ema > 1.25 {
+        pressure += 1;
+    }
+    if framebuffer_fill_ema > 1.65 {
+        pressure += 1;
+    }
     if mobile_path {
         // Mobile scheduler should shed load earlier to avoid whole-system chopping.
         if fps < 62.0 {
@@ -2760,6 +2989,9 @@ fn choose_runtime_load_plan(
             pressure += 1;
         }
         if last_substeps >= max_substeps.saturating_sub(3) {
+            pressure += 1;
+        }
+        if render_distance.is_none() {
             pressure += 1;
         }
     }
@@ -2773,46 +3005,142 @@ fn choose_runtime_load_plan(
 
     match pressure {
         0..=2 => RuntimeLoadPlan {
-            visible_ball_limit: None,
-            live_ball_budget: None,
-            spawn_per_tick_cap: cap(if mobile_path { 280 } else { 420 }),
-            max_substeps: if mobile_path { 10 } else { 14 },
-            force_low_poly_ball_mesh: false,
-            tick_scale: if mobile_path { 0.92 } else { 1.00 },
+            visible_ball_limit: if mobile_path && live_balls > 1_800 {
+                Some(cap(1_800))
+            } else {
+                None
+            },
+            live_ball_budget: if mobile_path { Some(cap(3_200)) } else { None },
+            spawn_per_tick_cap: cap(if mobile_path { 96 } else { 420 }),
+            max_substeps: if mobile_path { 6 } else { 14 },
+            force_low_poly_ball_mesh: mobile_path && live_balls > 1_200,
+            tick_scale: if mobile_path { 0.78 } else { 1.00 },
         },
         3..=4 => RuntimeLoadPlan {
-            visible_ball_limit: None,
-            live_ball_budget: None,
-            spawn_per_tick_cap: cap(if mobile_path { 220 } else { 360 }),
-            max_substeps: if mobile_path { 8 } else { 12 },
-            force_low_poly_ball_mesh: false,
-            tick_scale: if mobile_path { 0.84 } else { 0.96 },
+            visible_ball_limit: if mobile_path { Some(cap(1_600)) } else { None },
+            live_ball_budget: if mobile_path { Some(cap(2_800)) } else { None },
+            spawn_per_tick_cap: cap(if mobile_path { 72 } else { 360 }),
+            max_substeps: if mobile_path { 5 } else { 12 },
+            force_low_poly_ball_mesh: mobile_path,
+            tick_scale: if mobile_path { 0.66 } else { 0.96 },
         },
         5..=6 => RuntimeLoadPlan {
-            visible_ball_limit: None,
-            live_ball_budget: None,
-            spawn_per_tick_cap: cap(if mobile_path { 180 } else { 260 }),
-            max_substeps: if mobile_path { 7 } else { 10 },
-            force_low_poly_ball_mesh: false,
-            tick_scale: if mobile_path { 0.72 } else { 0.82 },
+            visible_ball_limit: if mobile_path { Some(cap(1_400)) } else { None },
+            live_ball_budget: if mobile_path { Some(cap(2_200)) } else { None },
+            spawn_per_tick_cap: cap(if mobile_path { 48 } else { 260 }),
+            max_substeps: if mobile_path { 4 } else { 10 },
+            force_low_poly_ball_mesh: mobile_path,
+            tick_scale: if mobile_path { 0.56 } else { 0.82 },
         },
         7..=8 => RuntimeLoadPlan {
-            visible_ball_limit: None,
-            live_ball_budget: None,
-            spawn_per_tick_cap: cap(if mobile_path { 140 } else { 200 }),
-            max_substeps: if mobile_path { 6 } else { 10 },
-            force_low_poly_ball_mesh: false,
-            tick_scale: if mobile_path { 0.62 } else { 0.72 },
+            visible_ball_limit: if mobile_path { Some(cap(1_200)) } else { None },
+            live_ball_budget: if mobile_path { Some(cap(1_800)) } else { None },
+            spawn_per_tick_cap: cap(if mobile_path { 32 } else { 200 }),
+            max_substeps: if mobile_path { 3 } else { 10 },
+            force_low_poly_ball_mesh: mobile_path,
+            tick_scale: if mobile_path { 0.46 } else { 0.72 },
         },
         _ => RuntimeLoadPlan {
-            visible_ball_limit: None,
-            live_ball_budget: None,
-            spawn_per_tick_cap: cap(if mobile_path { 112 } else { 160 }),
-            max_substeps: if mobile_path { 5 } else { 10 },
-            force_low_poly_ball_mesh: false,
-            tick_scale: if mobile_path { 0.52 } else { 0.60 },
+            visible_ball_limit: if mobile_path { Some(cap(900)) } else { None },
+            live_ball_budget: if mobile_path { Some(cap(1_400)) } else { None },
+            spawn_per_tick_cap: cap(if mobile_path { 24 } else { 160 }),
+            max_substeps: if mobile_path { 2 } else { 10 },
+            force_low_poly_ball_mesh: mobile_path,
+            tick_scale: if mobile_path { 0.38 } else { 0.60 },
         },
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RenderDistanceStats {
+    culled: usize,
+    blurred: usize,
+}
+
+fn count_rendered_balls(frame: &SceneFrameInstances) -> usize {
+    frame
+        .opaque_3d
+        .iter()
+        .chain(frame.transparent_3d.iter())
+        .filter(|instance| !matches!(instance.primitive, ScenePrimitive3d::Box))
+        .count()
+}
+
+fn estimate_framebuffer_fill_ratio(frame: &SceneFrameInstances, width: u32, height: u32) -> f32 {
+    let pixels = (width.max(1) as f32) * (height.max(1) as f32);
+    let opaque = frame.opaque_3d.len() as f32;
+    let transparent = frame.transparent_3d.len() as f32;
+    let sprites = frame.sprites.len() as f32;
+    // Heuristic fill estimate: transparent passes are weighted higher due alpha blending and
+    // overdraw on tiled mobile GPUs.
+    let estimated_fragments = opaque * 560.0 + transparent * 1_140.0 + sprites * 180.0;
+    (estimated_fragments / pixels).clamp(0.0, 8.0)
+}
+
+fn apply_render_distance_haze(
+    frame: &mut SceneFrameInstances,
+    camera_eye: [f32; 3],
+    render_distance: Option<f32>,
+    blur_enabled: bool,
+) -> RenderDistanceStats {
+    let Some(max_distance) = render_distance.filter(|distance| *distance > 0.25) else {
+        return RenderDistanceStats::default();
+    };
+    let blur_start_ratio = 0.62;
+    let blur_start = (max_distance * blur_start_ratio).max(0.25);
+    let max_distance_sq = max_distance * max_distance;
+    let blur_start_sq = blur_start * blur_start;
+
+    let mut stats = RenderDistanceStats::default();
+    let mut next_opaque = Vec::with_capacity(frame.opaque_3d.len());
+    let mut blurred = Vec::<(f32, crate::scene::SceneInstance3d)>::new();
+
+    for mut instance in frame.opaque_3d.drain(..) {
+        if matches!(instance.primitive, ScenePrimitive3d::Box) {
+            next_opaque.push(instance);
+            continue;
+        }
+        let p = instance.transform.translation;
+        let dx = p[0] - camera_eye[0];
+        let dy = p[1] - camera_eye[1];
+        let dz = p[2] - camera_eye[2];
+        let distance_sq = dx * dx + dy * dy + dz * dz;
+
+        if distance_sq > max_distance_sq {
+            stats.culled = stats.culled.saturating_add(1);
+            continue;
+        }
+        if blur_enabled && distance_sq > blur_start_sq {
+            let distance = distance_sq.sqrt();
+            let t =
+                ((distance - blur_start) / (max_distance - blur_start).max(1e-4)).clamp(0.0, 1.0);
+            soften_instance_for_distance_haze(&mut instance, t);
+            blurred.push((distance_sq, instance));
+            stats.blurred = stats.blurred.saturating_add(1);
+        } else {
+            next_opaque.push(instance);
+        }
+    }
+
+    // Draw farther blurred objects first to reduce alpha-overdraw artifacts.
+    blurred.sort_by(|left, right| right.0.total_cmp(&left.0));
+
+    frame.opaque_3d = next_opaque;
+    frame
+        .transparent_3d
+        .extend(blurred.into_iter().map(|(_, instance)| instance));
+    stats
+}
+
+fn soften_instance_for_distance_haze(instance: &mut crate::scene::SceneInstance3d, t: f32) {
+    let t = t.clamp(0.0, 1.0);
+    let haze_rgb = [0.58, 0.64, 0.72];
+    for (index, haze) in haze_rgb.into_iter().enumerate() {
+        let current = instance.material.base_color_rgba[index];
+        instance.material.base_color_rgba[index] = current + (haze - current) * (t * 0.72);
+    }
+    let alpha = instance.material.base_color_rgba[3];
+    instance.material.base_color_rgba[3] = (alpha * (1.0 - t * 0.78)).clamp(0.10, 1.0);
 }
 
 fn print_tlsprite_event(prefix: &str, event: TlspriteHotReloadEvent) {
