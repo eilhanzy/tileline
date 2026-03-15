@@ -6,6 +6,8 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
     set_ball_mesh_slot(2)
     set_container_mesh_slot(3)
     set_virtual_barrier(false)
+    set_speculative_sweep(true, 0.90)
+    set_speculative_contacts(true, 0.05, 1.10)
     set_container_shape(48.0, 32.0, 48.0, 0.46)
     set_container_mesh_scale(1.0, 1.0, 1.0)
 

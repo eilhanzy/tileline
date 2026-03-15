@@ -1017,6 +1017,21 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
     if patch.virtual_barrier_enabled.is_some() {
         target.virtual_barrier_enabled = patch.virtual_barrier_enabled;
     }
+    if patch.speculative_sweep_enabled.is_some() {
+        target.speculative_sweep_enabled = patch.speculative_sweep_enabled;
+    }
+    if patch.speculative_sweep_max_distance.is_some() {
+        target.speculative_sweep_max_distance = patch.speculative_sweep_max_distance;
+    }
+    if patch.speculative_contacts_enabled.is_some() {
+        target.speculative_contacts_enabled = patch.speculative_contacts_enabled;
+    }
+    if patch.speculative_contact_distance.is_some() {
+        target.speculative_contact_distance = patch.speculative_contact_distance;
+    }
+    if patch.speculative_max_prediction_distance.is_some() {
+        target.speculative_max_prediction_distance = patch.speculative_max_prediction_distance;
+    }
     if patch.ball_mesh_slot.is_some() {
         target.ball_mesh_slot = patch.ball_mesh_slot;
     }
@@ -1376,6 +1391,8 @@ impl TlAppRuntime {
                 chunk_size: broadphase_chunk,
                 max_candidate_pairs: max_pairs,
                 shard_pair_reserve: if mobile_class_tuning { 768 } else { 1_536 },
+                speculative_sweep: true,
+                speculative_max_distance: if mobile_class_tuning { 0.75 } else { 1.20 },
             },
             narrowphase: NarrowphaseConfig {
                 max_manifolds,

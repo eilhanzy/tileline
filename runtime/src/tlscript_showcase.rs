@@ -20,7 +20,7 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 58] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 60] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_container_size",
@@ -62,6 +62,8 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 58] = [
     "set_scatter_interval",
     "set_scatter_strength",
     "set_virtual_barrier",
+    "set_speculative_sweep",
+    "set_speculative_contacts",
     "set_initial_speed",
     "set_initial_speed_min",
     "set_initial_speed_max",
@@ -1066,6 +1068,22 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
             [v] => state.patch.virtual_barrier_enabled = Some(v.to_bool()),
             _ => state.warn("set_virtual_barrier expects 1 arg"),
         },
+        "set_speculative_sweep" => match args {
+            [enabled, max_distance] => {
+                state.patch.speculative_sweep_enabled = Some(enabled.to_bool());
+                state.patch.speculative_sweep_max_distance = Some(max_distance.to_f64() as f32);
+            }
+            _ => state.warn("set_speculative_sweep expects 2 args"),
+        },
+        "set_speculative_contacts" => match args {
+            [enabled, contact_distance, max_prediction_distance] => {
+                state.patch.speculative_contacts_enabled = Some(enabled.to_bool());
+                state.patch.speculative_contact_distance = Some(contact_distance.to_f64() as f32);
+                state.patch.speculative_max_prediction_distance =
+                    Some(max_prediction_distance.to_f64() as f32);
+            }
+            _ => state.warn("set_speculative_contacts expects 3 args"),
+        },
         "set_initial_speed" => match args {
             [min_v, max_v] => {
                 state.patch.initial_speed_min = Some(min_v.to_f64() as f32);
@@ -1542,6 +1560,30 @@ mod tests {
             key_f_down: false,
         });
         assert_eq!(out.patch.virtual_barrier_enabled, Some(false));
+    }
+
+    #[test]
+    fn supports_speculative_collision_controls() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_speculative_sweep(true, 1.45)\n",
+            "    set_speculative_contacts(true, 0.07, 1.65)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.patch.speculative_sweep_enabled, Some(true));
+        assert!((out.patch.speculative_sweep_max_distance.unwrap_or(0.0) - 1.45).abs() < 1e-6);
+        assert_eq!(out.patch.speculative_contacts_enabled, Some(true));
+        assert!((out.patch.speculative_contact_distance.unwrap_or(0.0) - 0.07).abs() < 1e-6);
+        assert!((out.patch.speculative_max_prediction_distance.unwrap_or(0.0) - 1.65).abs() < 1e-6);
     }
 
     #[test]

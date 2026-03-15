@@ -668,6 +668,21 @@ fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatc
     if patch.virtual_barrier_enabled.is_some() {
         target.virtual_barrier_enabled = patch.virtual_barrier_enabled;
     }
+    if patch.speculative_sweep_enabled.is_some() {
+        target.speculative_sweep_enabled = patch.speculative_sweep_enabled;
+    }
+    if patch.speculative_sweep_max_distance.is_some() {
+        target.speculative_sweep_max_distance = patch.speculative_sweep_max_distance;
+    }
+    if patch.speculative_contacts_enabled.is_some() {
+        target.speculative_contacts_enabled = patch.speculative_contacts_enabled;
+    }
+    if patch.speculative_contact_distance.is_some() {
+        target.speculative_contact_distance = patch.speculative_contact_distance;
+    }
+    if patch.speculative_max_prediction_distance.is_some() {
+        target.speculative_max_prediction_distance = patch.speculative_max_prediction_distance;
+    }
     if patch.ball_mesh_slot.is_some() {
         target.ball_mesh_slot = patch.ball_mesh_slot;
     }

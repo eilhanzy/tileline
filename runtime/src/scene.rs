@@ -315,6 +315,11 @@ pub struct BounceTankRuntimePatch {
     pub scatter_interval_ticks: Option<u64>,
     pub scatter_strength: Option<f32>,
     pub virtual_barrier_enabled: Option<bool>,
+    pub speculative_sweep_enabled: Option<bool>,
+    pub speculative_sweep_max_distance: Option<f32>,
+    pub speculative_contacts_enabled: Option<bool>,
+    pub speculative_contact_distance: Option<f32>,
+    pub speculative_max_prediction_distance: Option<f32>,
     pub ball_mesh_slot: Option<u8>,
     pub container_mesh_slot: Option<u8>,
 }
@@ -691,6 +696,46 @@ impl BounceTankSceneController {
                 updated = true;
             }
         }
+        if patch.speculative_sweep_enabled.is_some()
+            || patch.speculative_sweep_max_distance.is_some()
+        {
+            let current = &world.config().broadphase;
+            let enabled = patch
+                .speculative_sweep_enabled
+                .unwrap_or(current.speculative_sweep);
+            let max_distance = patch
+                .speculative_sweep_max_distance
+                .unwrap_or(current.speculative_max_distance)
+                .clamp(0.0, 8.0);
+            if world.set_broadphase_speculative_sweep(enabled, max_distance) {
+                updated = true;
+            }
+        }
+        if patch.speculative_contacts_enabled.is_some()
+            || patch.speculative_contact_distance.is_some()
+            || patch.speculative_max_prediction_distance.is_some()
+        {
+            let current = &world.config().narrowphase;
+            let enabled = patch
+                .speculative_contacts_enabled
+                .unwrap_or(current.speculative_contacts);
+            let contact_distance = patch
+                .speculative_contact_distance
+                .unwrap_or(current.speculative_contact_distance)
+                .clamp(0.0, 2.0);
+            let max_prediction_distance = patch
+                .speculative_max_prediction_distance
+                .unwrap_or(current.speculative_max_prediction_distance)
+                .clamp(0.0, 8.0)
+                .max(contact_distance);
+            if world.set_narrowphase_speculative_contacts(
+                enabled,
+                contact_distance,
+                max_prediction_distance,
+            ) {
+                updated = true;
+            }
+        }
         if self.config.initial_speed_max < self.config.initial_speed_min {
             self.config.initial_speed_max = self.config.initial_speed_min;
             updated = true;
@@ -770,6 +815,7 @@ impl BounceTankSceneController {
         let spawned = self.spawn_batch(world);
         let scattered = self.maybe_scatter_burst(world);
         let _ = self.apply_levitation_field(world);
+        let _ = self.clamp_ball_velocity_for_collision_safety(world);
         BounceTankTickMetrics {
             spawned_this_tick: spawned,
             scattered_this_tick: scattered,
@@ -784,10 +830,13 @@ impl BounceTankSceneController {
     /// Call this right after `world.step(...)` to avoid one-frame visual pops where a high-energy
     /// body tunnels outside the prism before the next `physics_tick`.
     pub fn reconcile_after_step(&mut self, world: &mut PhysicsWorld) -> usize {
-        if !self.virtual_barrier_enabled() {
-            return 0;
-        }
-        let recycled = self.recycle_escaped_balls(world);
+        let recycled = if self.virtual_barrier_enabled() {
+            self.recycle_escaped_balls(world)
+        } else {
+            // Even with "virtual barrier off", keep a hard safety net for obvious tunnels so
+            // dynamic balls do not remain visibly outside the container.
+            self.recycle_hard_escaped_balls(world)
+        };
         if recycled > 0 {
             // Interpolation uses stored snapshots captured inside `world.step(...)`.
             // If we corrected positions after the step, push one fresh snapshot so render doesn't
@@ -1648,6 +1697,161 @@ impl BounceTankSceneController {
         recycled
     }
 
+    /// Hard safety recycle path used when `virtual_barrier` is disabled.
+    ///
+    /// This path is intentionally conservative: it only corrects bodies that clearly tunneled
+    /// outside the container by a wide margin, so normal wall interaction remains purely physics
+    /// driven in the common case.
+    fn recycle_hard_escaped_balls(&mut self, world: &mut PhysicsWorld) -> usize {
+        let hx = self.config.container_half_extents[0].max(0.5);
+        let hy = self.config.container_half_extents[1].max(0.5);
+        let hz = self.config.container_half_extents[2].max(0.5);
+        let wall_bounce = self.config.wall_restitution.clamp(0.45, 0.98);
+        let mut recycled = 0usize;
+
+        let mut i = 0usize;
+        while i < self.balls.len() {
+            let handle = self.balls[i].body;
+            let radius = self.balls[i].radius.max(0.02);
+            let Some(body) = world.body(handle) else {
+                self.balls.swap_remove(i);
+                continue;
+            };
+
+            let mut position = body.position;
+            let mut velocity = body.linear_velocity;
+            let limit_x = (hx - radius).max(radius * 0.5);
+            let limit_y = (hy - radius).max(radius * 0.5);
+            let limit_z = (hz - radius).max(radius * 0.5);
+            let hard_margin = (self.config.wall_thickness.max(radius * 0.45)).max(0.06) * 3.5;
+            let over_x = (position.x.abs() - limit_x).max(0.0);
+            let over_y = (position.y.abs() - limit_y).max(0.0);
+            let over_z = (position.z.abs() - limit_z).max(0.0);
+            let max_over = over_x.max(over_y.max(over_z));
+            if max_over <= hard_margin {
+                i += 1;
+                continue;
+            }
+
+            let contact_slop = (radius * 0.03).max(0.005);
+            let inset = (radius * 0.22).clamp(0.02, 0.12);
+            let mut corrected = false;
+
+            if position.x > limit_x + contact_slop {
+                position.x = (limit_x - inset).max(radius * 0.5);
+                velocity.x = -velocity.x.abs() * wall_bounce;
+                corrected = true;
+            } else if position.x < -(limit_x + contact_slop) {
+                position.x = -(limit_x - inset).max(radius * 0.5);
+                velocity.x = velocity.x.abs() * wall_bounce;
+                corrected = true;
+            }
+            if position.y > limit_y + contact_slop {
+                position.y = (limit_y - inset).max(radius * 0.5);
+                velocity.y = -velocity.y.abs() * wall_bounce;
+                corrected = true;
+            } else if position.y < -(limit_y + contact_slop) {
+                position.y = -(limit_y - inset).max(radius * 0.5);
+                velocity.y = velocity.y.abs() * wall_bounce;
+                corrected = true;
+            }
+            if position.z > limit_z + contact_slop {
+                position.z = (limit_z - inset).max(radius * 0.5);
+                velocity.z = -velocity.z.abs() * wall_bounce;
+                corrected = true;
+            } else if position.z < -(limit_z + contact_slop) {
+                position.z = -(limit_z - inset).max(radius * 0.5);
+                velocity.z = velocity.z.abs() * wall_bounce;
+                corrected = true;
+            }
+            if !corrected {
+                i += 1;
+                continue;
+            }
+
+            // Keep post-recycle rebound finite so one escaped body doesn't re-tunnel repeatedly.
+            let speed_cap = self.collision_safety_speed_cap(world) * 0.90;
+            let speed_sq = velocity.norm_squared();
+            let speed_cap_sq = speed_cap * speed_cap;
+            if speed_sq > speed_cap_sq {
+                velocity *= speed_cap / speed_sq.sqrt().max(1e-5);
+            }
+            let _ = world.set_position(handle, position);
+            let _ = world.set_velocity(handle, velocity);
+            recycled = recycled.saturating_add(1);
+            i += 1;
+        }
+
+        recycled
+    }
+
+    /// Clamp rare outlier velocities so one-step motion cannot regularly leap through thin walls.
+    ///
+    /// This protects against energy spikes from high restitution + burst combinations without
+    /// flattening normal motion under typical showcase settings.
+    fn clamp_ball_velocity_for_collision_safety(&mut self, world: &mut PhysicsWorld) -> usize {
+        let cap = self.collision_safety_speed_cap(world);
+        let cap_sq = cap * cap;
+        let axis_cap = cap * 0.86;
+        let mut clamped = 0usize;
+
+        for ball in &self.balls {
+            let Some(body) = world.body(ball.body) else {
+                continue;
+            };
+            let mut velocity = body.linear_velocity;
+            let mut changed = false;
+
+            if velocity.x.abs() > axis_cap {
+                velocity.x = velocity.x.signum() * axis_cap;
+                changed = true;
+            }
+            if velocity.y.abs() > axis_cap {
+                velocity.y = velocity.y.signum() * axis_cap;
+                changed = true;
+            }
+            if velocity.z.abs() > axis_cap {
+                velocity.z = velocity.z.signum() * axis_cap;
+                changed = true;
+            }
+
+            let speed_sq = velocity.norm_squared();
+            if speed_sq > cap_sq {
+                velocity *= cap / speed_sq.sqrt().max(1e-5);
+                changed = true;
+            }
+
+            if changed && world.set_velocity(ball.body, velocity) {
+                clamped = clamped.saturating_add(1);
+            }
+        }
+
+        clamped
+    }
+
+    #[inline]
+    fn collision_safety_speed_cap(&self, world: &PhysicsWorld) -> f32 {
+        let dt = world.config().fixed_dt.max(1e-4);
+        let radius = self
+            .config
+            .ball_radius_max
+            .max(self.config.ball_radius_min)
+            .max(0.02);
+        let wall = self
+            .config
+            .wall_thickness
+            .max(self.config.ball_radius_max.max(0.02) * 1.35)
+            .max(0.02);
+        let tunnel_cap = ((wall + radius * 1.25) / dt) * 0.92;
+        let design_cap = self
+            .config
+            .initial_speed_max
+            .max(self.config.initial_speed_min)
+            .max(1.0)
+            * (8.0 + self.config.scatter_strength.clamp(0.0, 1.0) * 18.0);
+        tunnel_cap.max(design_cap).clamp(12.0, 220.0)
+    }
+
     fn container_visual_instance(&self) -> SceneInstance3d {
         SceneInstance3d {
             instance_id: u64::MAX - 1,
@@ -2272,5 +2476,38 @@ mod tests {
         let radius = scene.balls[0].radius.max(0.02);
         let limit_x = (scene.config().container_half_extents[0] - radius).max(radius * 0.5);
         assert!(inst.transform.translation[0].abs() <= limit_x + 0.2);
+    }
+
+    #[test]
+    fn reconcile_after_step_hard_safety_recycles_with_virtual_barrier_disabled() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 24,
+            spawn_per_tick: 24,
+            container_half_extents: [8.0, 8.0, 8.0],
+            virtual_barrier_enabled: false,
+            ..BounceTankSceneConfig::default()
+        });
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+        let escaped = scene.balls[0].body;
+
+        let mut snapshot = world.capture_snapshot();
+        if let Some(frame) = snapshot.bodies.iter_mut().find(|b| b.handle == escaped) {
+            frame.position.z = -512.0;
+            frame.linear_velocity.z = -256.0;
+        }
+        let _ = world.restore_snapshot(&snapshot);
+        world.push_interpolation_snapshot();
+
+        let recycled = scene.reconcile_after_step(&mut world);
+        assert!(recycled > 0);
+        let body = world.body(escaped).expect("body should still exist");
+        let radius = scene.balls[0].radius.max(0.02);
+        let limit_z = (scene.config().container_half_extents[2] - radius).max(radius * 0.5);
+        assert!(body.position.z.abs() <= limit_z + 0.2);
     }
 }
