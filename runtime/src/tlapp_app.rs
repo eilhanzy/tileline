@@ -649,6 +649,9 @@ struct TlAppRuntime {
     adaptive_ball_render_limit: Option<usize>,
     adaptive_live_ball_budget: Option<usize>,
     adaptive_low_poly_override: bool,
+    frame_time_ema_ms: f32,
+    frame_time_jitter_ema_ms: f32,
+    frame_time_budget_ms: f32,
     frame_started_at: Instant,
     frame_cap_interval: Option<Duration>,
     next_redraw_at: Instant,
@@ -1296,6 +1299,9 @@ impl TlAppRuntime {
             adaptive_ball_render_limit: None,
             adaptive_live_ball_budget: None,
             adaptive_low_poly_override: false,
+            frame_time_ema_ms: 0.0,
+            frame_time_jitter_ema_ms: 0.0,
+            frame_time_budget_ms: (1_000.0 / fps_limit_hint.max(24.0)).clamp(3.0, 41.0),
             frame_started_at: now,
             frame_cap_interval,
             next_redraw_at: now,
@@ -1513,6 +1519,15 @@ impl TlAppRuntime {
         let sim_dt = raw_dt.clamp(1.0 / 1_000.0, 0.25);
         // Camera/input smoothing can use a separate clamped delta.
         let view_dt = raw_dt.clamp(1.0 / 500.0, 1.0 / 24.0);
+        let frame_ms = raw_dt * 1_000.0;
+        if self.frame_time_ema_ms <= f32::EPSILON {
+            self.frame_time_ema_ms = frame_ms;
+            self.frame_time_jitter_ema_ms = 0.0;
+        } else {
+            let frame_delta = (frame_ms - self.frame_time_ema_ms).abs();
+            self.frame_time_ema_ms += (frame_ms - self.frame_time_ema_ms) * 0.10;
+            self.frame_time_jitter_ema_ms += (frame_delta - self.frame_time_jitter_ema_ms) * 0.16;
+        }
         self.frame_started_at = frame_begin;
 
         self.poll_input_devices();
@@ -1613,10 +1628,50 @@ impl TlAppRuntime {
             parallel_ready,
             self.mps_logical_threads,
         );
+        let mobile_path = matches!(self.platform, RuntimePlatform::Android)
+            || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
+        self.frame_time_budget_ms = (1_000.0 / self.fps_limit_hint.max(24.0)).clamp(3.0, 41.0);
+        let moderate_jitter = self.frame_time_ema_ms > self.frame_time_budget_ms * 1.10
+            || self.frame_time_jitter_ema_ms > 1.8;
+        let severe_jitter = self.frame_time_ema_ms > self.frame_time_budget_ms * 1.25
+            || self.frame_time_jitter_ema_ms > 3.2;
+        if moderate_jitter {
+            load_plan.tick_scale *= 0.82;
+            load_plan.max_substeps = load_plan.max_substeps.min(8);
+            load_plan.spawn_per_tick_cap = load_plan.spawn_per_tick_cap.min(180);
+        }
+        if severe_jitter {
+            load_plan.tick_scale *= 0.68;
+            load_plan.max_substeps = load_plan.max_substeps.min(6);
+            load_plan.spawn_per_tick_cap = load_plan.spawn_per_tick_cap.min(120);
+        }
+        if mobile_path {
+            load_plan.tick_scale *= if severe_jitter { 0.78 } else { 0.86 };
+            load_plan.max_substeps = load_plan
+                .max_substeps
+                .min(if severe_jitter { 5 } else { 7 });
+            load_plan.spawn_per_tick_cap = load_plan.spawn_per_tick_cap.min(128);
+        }
         if matches!(self.tick_profile, TickProfile::Max) {
-            load_plan.tick_scale = load_plan.tick_scale.max(0.90);
-            let profile_cap = (10_u32 + (self.mps_logical_threads as u32 / 6)).clamp(10, 20);
-            load_plan.max_substeps = load_plan.max_substeps.clamp(10, profile_cap);
+            let min_tick_scale = if severe_jitter {
+                0.62
+            } else if moderate_jitter {
+                0.74
+            } else if mobile_path {
+                0.80
+            } else {
+                0.90
+            };
+            load_plan.tick_scale = load_plan.tick_scale.max(min_tick_scale);
+            let profile_cap = if mobile_path {
+                (6_u32 + (self.mps_logical_threads as u32 / 8)).clamp(6, 10)
+            } else {
+                (10_u32 + (self.mps_logical_threads as u32 / 6)).clamp(10, 20)
+            };
+            let min_substeps = if mobile_path { 4 } else { 10 };
+            load_plan.max_substeps = load_plan
+                .max_substeps
+                .clamp(min_substeps, profile_cap.max(min_substeps));
         }
         self.adaptive_ball_render_limit = load_plan.visible_ball_limit;
         self.adaptive_live_ball_budget = load_plan.live_ball_budget;
@@ -1673,6 +1728,13 @@ impl TlAppRuntime {
                 self.fps_limit_hint,
                 self.mps_logical_threads,
             );
+            if mobile_path {
+                let mobile_ceiling = match self.tick_profile {
+                    TickProfile::Balanced => 170.0,
+                    TickProfile::Max => 220.0,
+                };
+                desired_hz = desired_hz.min(mobile_ceiling);
+            }
             // Avoid fixed-step overload: if tick is too high for current FPS and max_substeps,
             // simulation falls behind (slow-motion). Clamp to catch-up-safe frequency.
             let catch_up_hz =
@@ -1690,13 +1752,19 @@ impl TlAppRuntime {
             let hard_floor = match self.tick_profile {
                 TickProfile::Balanced => 35.0,
                 TickProfile::Max => {
-                    let ema_floor = (self.fps_tracker.ema_fps().max(1.0) * 6.0).clamp(45.0, 180.0);
-                    let cap_floor = if self.uncapped_dynamic_fps_hint {
+                    let ema_floor = if mobile_path {
+                        (self.fps_tracker.ema_fps().max(1.0) * 2.6).clamp(36.0, 96.0)
+                    } else {
+                        (self.fps_tracker.ema_fps().max(1.0) * 6.0).clamp(45.0, 180.0)
+                    };
+                    let cap_floor = if mobile_path {
+                        self.fps_limit_hint * 0.38
+                    } else if self.uncapped_dynamic_fps_hint {
                         self.fps_limit_hint * 0.45
                     } else {
                         self.fps_limit_hint * 0.60
                     };
-                    ema_floor.min(cap_floor.clamp(45.0, 220.0))
+                    ema_floor.min(cap_floor.clamp(32.0, 220.0))
                 }
             };
             let floor_hz = hard_floor.min(catch_up_hz * 0.90).max(24.0);
