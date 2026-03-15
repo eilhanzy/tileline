@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -12,12 +13,12 @@ use crate::{
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, BounceTankRuntimePatch,
     BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler, FsrConfig, FsrMode,
     FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode, RuntimePlatform,
-    SceneFrameInstances, ScenePrimitive3d, TelemetryHudComposer, TelemetryHudSample,
-    TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel,
-    TlpfileGraphicsScheduler, TlscriptCoordinateSpace, TlscriptShowcaseConfig,
-    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
-    TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache,
-    TlspriteWatchReloader, WgpuSceneRenderer, MAX_SCENE_LIGHTS,
+    SceneFrameInstances, ScenePrimitive3d, SpriteInstance, SpriteKind, TelemetryHudComposer,
+    TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle,
+    TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlscriptCoordinateSpace,
+    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
+    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram,
+    TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer, MAX_SCENE_LIGHTS,
 };
 use gms::safe_default_required_limits_for_adapter;
 use nalgebra::Vector3;
@@ -27,7 +28,8 @@ use paradoxpe::{
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{
-    DeviceEvent, ElementState, KeyEvent, MouseButton, Touch, TouchPhase, WindowEvent,
+    DeviceEvent, ElementState, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase,
+    WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
@@ -40,6 +42,33 @@ use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
 
 const AUTO_LOW_POLY_BALL_SLOT: u8 = 250;
 const DEFAULT_FBX_BALL_SLOT: u8 = 2;
+const CONSOLE_SCRIPT_INDEX: usize = 9_999;
+const CONSOLE_MAX_LOG_LINES: usize = 320;
+const CONSOLE_ERROR_BLINK_MS: u128 = 320;
+const CONSOLE_WHEEL_PIXELS_PER_LINE: f64 = 24.0;
+const CONSOLE_TEXT_SLOT_BASE: u16 = 128;
+const CONSOLE_HELP_COMMANDS: &[&str] = &[
+    "help",
+    "status | gfx.status",
+    "clear | exit",
+    "gfx.vsync <auto|on|off>",
+    "gfx.fps_cap <off|N>",
+    "gfx.rt <off|auto|on>",
+    "gfx.fsr <off|auto|on>",
+    "gfx.fsr_quality <native|ultra|quality|balanced|performance>",
+    "gfx.fsr_sharpness <0..1>",
+    "gfx.fsr_scale <auto|0.5..1>",
+    "gfx.render_distance <off|N>",
+    "gfx.adaptive_distance <auto|on|off>",
+    "gfx.distance_blur <auto|on|off>",
+    "script.var <name> <expr>",
+    "script.unset <name>",
+    "script.vars",
+    "script.call <fn(args)>",
+    "script.exec <stmt>",
+    "script.uncall <idx|all>",
+    "script.list | script.clear",
+];
 #[cfg(feature = "gamepad")]
 const GAMEPAD_DEADZONE: f32 = 0.16;
 const GAMEPAD_LOOK_SPEED_RAD: f32 = 2.6;
@@ -47,6 +76,7 @@ const GAMEPAD_LOOK_SPEED_RAD: f32 = 2.6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeCommand {
     None,
+    Consumed,
     Exit,
 }
 
@@ -441,6 +471,17 @@ impl ToggleAuto {
     }
 }
 
+fn is_valid_tlscript_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Box<dyn Error>> {
     args.next()
         .ok_or_else(|| format!("missing value for {flag}").into())
@@ -555,13 +596,15 @@ fn print_usage() {
     println!("  -h, --help                Show help");
     println!();
     println!("Keyboard:");
-    println!("  Move: WASD / Arrows | Up: Space/E | Down: Ctrl/Q | Sprint: Shift");
+    println!("  Move: WASD / Arrows | Up: R/E | Down: F/Q/C | Sprint: Shift");
+    println!("  Demo action: G (particle/scatter burst)");
     println!("  Look: RMB hold + mouse");
     println!("  Combos: Ctrl+Q exit | Ctrl+F fullscreen | Alt+Enter fullscreen");
+    println!("          Ctrl+F1 / F1 / Ctrl+` in-app CLI console");
     println!("          Ctrl+R reset camera | Ctrl+L toggle look lock");
     println!("Gamepad:");
     println!("  Left stick move | Right stick look | D-Pad move");
-    println!("  South button mirrors F action | Trigger buttons add vertical move");
+    println!("  South button mirrors G action | Trigger buttons add vertical move");
 }
 
 struct TlApp {
@@ -579,6 +622,17 @@ impl TlApp {
             platform,
             exit_requested: false,
         }
+    }
+
+    fn shutdown_now(&mut self, event_loop: &ActiveEventLoop) {
+        self.exit_requested = true;
+        if let Some(runtime_state) = self.runtime.as_mut() {
+            runtime_state.prepare_for_exit();
+        }
+        // Drop runtime resources before exiting the event loop. This helps avoid
+        // backend teardown races on some Vulkan drivers.
+        self.runtime.take();
+        event_loop.exit();
     }
 }
 
@@ -599,6 +653,12 @@ impl TlAppRuntimeState {
         match self {
             Self::Ready(runtime) => runtime.schedule_next_redraw(event_loop),
             Self::FailSoft(runtime) => runtime.schedule_next_redraw(event_loop),
+        }
+    }
+
+    fn prepare_for_exit(&mut self) {
+        if let Self::Ready(runtime) = self {
+            runtime.prepare_for_exit();
         }
     }
 }
@@ -644,35 +704,31 @@ impl ApplicationHandler for TlApp {
             return;
         }
 
+        if let TlAppRuntimeState::Ready(runtime) = runtime_state {
+            if runtime.handle_console_window_event(&event) {
+                return;
+            }
+        }
+
+        let mut request_shutdown = false;
         match event {
             WindowEvent::CloseRequested => {
-                self.exit_requested = true;
-                event_loop.exit();
+                request_shutdown = true;
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                match runtime_state {
-                    TlAppRuntimeState::Ready(runtime) => {
-                        if matches!(runtime.on_keyboard_input(&event), RuntimeCommand::Exit) {
-                            self.exit_requested = true;
-                            event_loop.exit();
-                            return;
-                        }
+            WindowEvent::KeyboardInput { event, .. } => match runtime_state {
+                TlAppRuntimeState::Ready(runtime) => match runtime.on_keyboard_input(&event) {
+                    RuntimeCommand::Exit => {
+                        request_shutdown = true;
                     }
-                    TlAppRuntimeState::FailSoft(runtime) => {
-                        if runtime.on_keyboard_input(&event) {
-                            self.exit_requested = true;
-                            event_loop.exit();
-                            return;
-                        }
+                    RuntimeCommand::Consumed => return,
+                    RuntimeCommand::None => {}
+                },
+                TlAppRuntimeState::FailSoft(runtime) => {
+                    if runtime.on_keyboard_input(&event) {
+                        request_shutdown = true;
                     }
                 }
-                if matches!(event.logical_key, Key::Named(NamedKey::Escape))
-                    && event.state == ElementState::Pressed
-                {
-                    self.exit_requested = true;
-                    event_loop.exit();
-                }
-            }
+            },
             WindowEvent::ModifiersChanged(modifiers) => {
                 if let TlAppRuntimeState::Ready(runtime) = runtime_state {
                     runtime.on_modifiers_changed(modifiers.state());
@@ -681,6 +737,11 @@ impl ApplicationHandler for TlApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 if let TlAppRuntimeState::Ready(runtime) = runtime_state {
                     runtime.on_mouse_button(state, button);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let TlAppRuntimeState::Ready(runtime) = runtime_state {
+                    runtime.on_cursor_moved(position.x as f32, position.y as f32);
                 }
             }
             WindowEvent::Touch(touch) => {
@@ -696,8 +757,7 @@ impl ApplicationHandler for TlApp {
                 TlAppRuntimeState::Ready(runtime) => {
                     if let Err(err) = runtime.render_frame() {
                         eprintln!("Render error: {err}");
-                        self.exit_requested = true;
-                        event_loop.exit();
+                        request_shutdown = true;
                     }
                 }
                 TlAppRuntimeState::FailSoft(runtime) => {
@@ -705,6 +765,10 @@ impl ApplicationHandler for TlApp {
                 }
             },
             _ => {}
+        }
+
+        if request_shutdown {
+            self.shutdown_now(event_loop);
         }
     }
 
@@ -721,13 +785,20 @@ impl ApplicationHandler for TlApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.exit_requested {
-            event_loop.exit();
+            self.shutdown_now(event_loop);
             return;
         }
 
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.schedule_next_redraw(event_loop);
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(runtime_state) = self.runtime.as_mut() {
+            runtime_state.prepare_for_exit();
+        }
+        self.runtime.take();
     }
 }
 
@@ -752,6 +823,9 @@ struct TlAppRuntime {
     script_last_spawned: usize,
     script_frame_index: u64,
     script_key_f_keyboard: bool,
+    script_key_g_keyboard: bool,
+    console: RuntimeConsoleState,
+    console_overlay_sprites: Vec<SpriteInstance>,
     keyboard_camera: CameraInputState,
     mouse_look_held: bool,
     look_lock_active: bool,
@@ -761,6 +835,7 @@ struct TlAppRuntime {
     gamepad: GamepadManager,
     touch_look_id: Option<u64>,
     touch_last_position: Option<(f32, f32)>,
+    cursor_position: Option<(f32, f32)>,
     tick_policy: TickRatePolicy,
     tick_profile: TickProfile,
     tick_hz: f32,
@@ -802,6 +877,8 @@ struct TlAppRuntime {
     present_mode: wgpu::PresentMode,
     platform: RuntimePlatform,
     rt_mode: RayTracingMode,
+    fsr_config: FsrConfig,
+    shutdown_prepared: bool,
 }
 
 struct FailSoftRuntime {
@@ -847,8 +924,7 @@ impl FailSoftRuntime {
         if !pressed {
             return false;
         }
-        matches!(event.logical_key, Key::Named(NamedKey::Escape))
-            || matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyQ))
+        matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyQ))
     }
 
     fn schedule_next_redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -893,6 +969,148 @@ impl<'src> ScriptRuntime<'src> {
                 }
                 merged
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeConsoleState {
+    open: bool,
+    input_line: String,
+    history: Vec<String>,
+    history_cursor: Option<usize>,
+    last_feedback: String,
+    log_lines: Vec<RuntimeConsoleLogLine>,
+    script_vars: BTreeMap<String, String>,
+    script_statements: Vec<String>,
+    script_overlay: TlscriptShowcaseFrameOutput,
+    edit_target: RuntimeConsoleEditTarget,
+    quick_fps_cap: String,
+    quick_render_distance: String,
+    quick_fsr_sharpness: String,
+    log_scroll: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeConsoleLogLevel {
+    Info,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeConsoleLogLine {
+    timestamp: Instant,
+    level: RuntimeConsoleLogLevel,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConsoleUiLayout {
+    sx: f32,
+    sy: f32,
+    text_scale: f32,
+    command_center: (f32, f32),
+    command_size: (f32, f32),
+    send_center: (f32, f32),
+    send_size: (f32, f32),
+    fps_center: (f32, f32),
+    fps_size: (f32, f32),
+    distance_center: (f32, f32),
+    distance_size: (f32, f32),
+    sharpness_center: (f32, f32),
+    sharpness_size: (f32, f32),
+    apply_center: (f32, f32),
+    apply_size: (f32, f32),
+}
+
+impl ConsoleUiLayout {
+    fn from_size(size: PhysicalSize<u32>) -> Self {
+        let width = size.width.max(1) as f32;
+        let height = size.height.max(1) as f32;
+        // Scale with resolution: smaller windows shrink UI, larger windows can scale up.
+        let sx = (width / 1280.0).clamp(0.72, 1.34);
+        let sy = (height / 720.0).clamp(0.72, 1.34);
+        let text_scale = (sx.min(sy) * 0.98).clamp(0.72, 1.34);
+        Self {
+            sx,
+            sy,
+            text_scale,
+            command_center: (-0.13 * sx, -0.56 * sy),
+            command_size: (1.60 * text_scale, 0.12 * text_scale),
+            send_center: (0.81 * sx, -0.56 * sy),
+            send_size: (0.24 * text_scale, 0.12 * text_scale),
+            fps_center: (0.50 * sx, 0.57 * sy),
+            fps_size: (0.84 * text_scale, 0.06 * text_scale),
+            distance_center: (0.50 * sx, 0.515 * sy),
+            distance_size: (0.84 * text_scale, 0.06 * text_scale),
+            sharpness_center: (0.50 * sx, 0.46 * sy),
+            sharpness_size: (0.84 * text_scale, 0.06 * text_scale),
+            apply_center: (0.52 * sx, 0.32 * sy),
+            apply_size: (0.84 * text_scale, 0.06 * text_scale),
+        }
+    }
+
+    #[inline]
+    fn pos(self, x: f32, y: f32, z: f32) -> [f32; 3] {
+        [x * self.sx, y * self.sy, z]
+    }
+
+    #[inline]
+    fn rect_size(self, w: f32, h: f32) -> [f32; 2] {
+        [w * self.sx, h * self.sy]
+    }
+
+    #[inline]
+    fn glyph_size(self, w: f32, h: f32) -> [f32; 2] {
+        [w * self.text_scale, h * self.text_scale]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeConsoleEditTarget {
+    Command,
+    FpsCap,
+    RenderDistance,
+    FsrSharpness,
+}
+
+impl RuntimeConsoleEditTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::FpsCap => "fps_cap",
+            Self::RenderDistance => "render_distance",
+            Self::FsrSharpness => "fsr_sharpness",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Command => Self::FpsCap,
+            Self::FpsCap => Self::RenderDistance,
+            Self::RenderDistance => Self::FsrSharpness,
+            Self::FsrSharpness => Self::Command,
+        }
+    }
+}
+
+impl Default for RuntimeConsoleState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            input_line: String::new(),
+            history: Vec::new(),
+            history_cursor: None,
+            last_feedback: String::new(),
+            log_lines: Vec::new(),
+            script_vars: BTreeMap::new(),
+            script_statements: Vec::new(),
+            script_overlay: empty_showcase_output(),
+            edit_target: RuntimeConsoleEditTarget::Command,
+            quick_fps_cap: "60".to_string(),
+            quick_render_distance: "off".to_string(),
+            quick_fsr_sharpness: "0.35".to_string(),
+            log_scroll: 0,
         }
     }
 }
@@ -1551,15 +1769,13 @@ impl TlAppRuntime {
             adapter_info.backend,
         );
         renderer.set_ray_tracing_mode(&queue, RayTracingMode::Auto);
-        renderer.set_fsr_config(
-            &queue,
-            FsrConfig {
-                mode: options.fsr_mode,
-                quality: options.fsr_quality,
-                sharpness: options.fsr_sharpness,
-                render_scale_override: options.fsr_scale_override,
-            },
-        );
+        let fsr_config = FsrConfig {
+            mode: options.fsr_mode,
+            quality: options.fsr_quality,
+            sharpness: options.fsr_sharpness,
+            render_scale_override: options.fsr_scale_override,
+        };
+        renderer.set_fsr_config(&queue, fsr_config);
         // Always keep a deterministic high-quality FBX-equivalent mesh in slot 2 so script
         // `set_ball_mesh_slot(2)` stays stable even when tlsprite binding fails.
         renderer.bind_builtin_sphere_mesh_slot(&device, DEFAULT_FBX_BALL_SLOT, true);
@@ -1654,7 +1870,7 @@ impl TlAppRuntime {
         let frame_cap_interval = frame_cap_interval.map(Duration::from_secs_f32);
         let fps_report_interval = options.fps_report_interval;
 
-        Ok(Self {
+        let mut runtime = Self {
             window,
             _instance: instance,
             surface,
@@ -1675,6 +1891,9 @@ impl TlAppRuntime {
             script_last_spawned: 0,
             script_frame_index: 0,
             script_key_f_keyboard: false,
+            script_key_g_keyboard: false,
+            console: RuntimeConsoleState::default(),
+            console_overlay_sprites: Vec::new(),
             keyboard_camera: CameraInputState::default(),
             mouse_look_held: false,
             look_lock_active: false,
@@ -1684,6 +1903,7 @@ impl TlAppRuntime {
             gamepad,
             touch_look_id: None,
             touch_last_position: None,
+            cursor_position: None,
             tick_policy,
             tick_profile: options.tick_profile,
             tick_hz: 1.0 / fixed_dt.max(1e-6),
@@ -1725,7 +1945,11 @@ impl TlAppRuntime {
             present_mode: selected_present_mode,
             platform,
             rt_mode: RayTracingMode::Auto,
-        })
+            fsr_config,
+            shutdown_prepared: false,
+        };
+        runtime.sync_console_quick_fields_from_runtime();
+        Ok(runtime)
     }
 
     fn schedule_next_redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -1752,6 +1976,1306 @@ impl TlAppRuntime {
 
         event_loop.set_control_flow(ControlFlow::Poll);
         self.window.request_redraw();
+    }
+
+    fn prepare_for_exit(&mut self) {
+        if self.shutdown_prepared {
+            return;
+        }
+        self.shutdown_prepared = true;
+        self.console.open = false;
+        self.mouse_look_held = false;
+        self.look_lock_active = false;
+        self.keyboard_camera = CameraInputState::default();
+        self.script_key_f_keyboard = false;
+        self.script_key_g_keyboard = false;
+        self.console_overlay_sprites.clear();
+        self.frame_cap_interval = None;
+        self.adaptive_pacer_enabled = false;
+        self.queue.submit(std::iter::empty());
+        if let Err(err) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
+            eprintln!("[shutdown] device poll failed: {err}");
+        }
+    }
+
+    fn toggle_console(&mut self) {
+        self.console.open = !self.console.open;
+        self.console.history_cursor = None;
+        self.console.edit_target = RuntimeConsoleEditTarget::Command;
+        if self.console.open {
+            self.keyboard_camera = CameraInputState::default();
+            self.mouse_look_held = false;
+            self.script_key_f_keyboard = false;
+            self.script_key_g_keyboard = false;
+            self.cursor_position = None;
+            self.camera.set_look_active(&self.window, false);
+            self.sync_console_quick_fields_from_runtime();
+            self.console_feedback(
+                "console opened (Ctrl+F1 toggles, Enter runs command, 'help' lists commands)",
+            );
+        } else {
+            self.console_feedback("console closed");
+        }
+    }
+
+    fn sync_console_quick_fields_from_runtime(&mut self) {
+        self.console.quick_fps_cap = self
+            .frame_cap_interval
+            .map(|itv| format!("{:.0}", 1.0 / itv.as_secs_f32().max(1e-6)))
+            .unwrap_or_else(|| "off".to_string());
+        self.console.quick_render_distance = self
+            .render_distance
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "off".to_string());
+        self.console.quick_fsr_sharpness = format!("{:.2}", self.fsr_config.sharpness);
+    }
+
+    fn classify_console_feedback(message: &str) -> RuntimeConsoleLogLevel {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("error")
+            || lower.contains("failed")
+            || lower.contains("invalid")
+            || lower.contains("unknown")
+            || lower.contains("usage:")
+            || lower.contains("out of range")
+        {
+            RuntimeConsoleLogLevel::Error
+        } else {
+            RuntimeConsoleLogLevel::Info
+        }
+    }
+
+    fn push_console_log(
+        &mut self,
+        level: RuntimeConsoleLogLevel,
+        message: String,
+        print_to_stdout: bool,
+    ) {
+        self.console.last_feedback = message.clone();
+        self.console.log_lines.push(RuntimeConsoleLogLine {
+            timestamp: Instant::now(),
+            level,
+            message: message.clone(),
+        });
+        if self.console.log_lines.len() > CONSOLE_MAX_LOG_LINES {
+            let trim = self.console.log_lines.len() - CONSOLE_MAX_LOG_LINES;
+            self.console.log_lines.drain(0..trim);
+        }
+        let max_scroll = self.console.log_lines.len().saturating_sub(1);
+        self.console.log_scroll = self.console.log_scroll.min(max_scroll);
+        if print_to_stdout {
+            println!("[tlapp console] {message}");
+        }
+    }
+
+    fn console_feedback(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        let level = Self::classify_console_feedback(&message);
+        self.push_console_log(level, message, true);
+    }
+
+    fn submit_console_command(&mut self, command: String) -> RuntimeCommand {
+        let command = command.trim().to_string();
+        if !command.is_empty() {
+            self.console.history.push(command.clone());
+            if self.console.history.len() > 128 {
+                let trim = self.console.history.len() - 128;
+                self.console.history.drain(0..trim);
+            }
+            self.push_console_log(RuntimeConsoleLogLevel::Info, format!("> {command}"), false);
+        }
+        self.console.input_line.clear();
+        self.console.history_cursor = None;
+        self.console.log_scroll = 0;
+        if command.is_empty() {
+            return RuntimeCommand::Consumed;
+        }
+        self.execute_console_command(&command)
+    }
+
+    fn selected_console_edit_buffer_mut(&mut self) -> &mut String {
+        match self.console.edit_target {
+            RuntimeConsoleEditTarget::Command => &mut self.console.input_line,
+            RuntimeConsoleEditTarget::FpsCap => &mut self.console.quick_fps_cap,
+            RuntimeConsoleEditTarget::RenderDistance => &mut self.console.quick_render_distance,
+            RuntimeConsoleEditTarget::FsrSharpness => &mut self.console.quick_fsr_sharpness,
+        }
+    }
+
+    fn apply_active_console_edit_target(&mut self) -> RuntimeCommand {
+        match self.console.edit_target {
+            RuntimeConsoleEditTarget::Command => {
+                self.submit_console_command(self.console.input_line.clone())
+            }
+            RuntimeConsoleEditTarget::FpsCap => {
+                let value = self.console.quick_fps_cap.trim();
+                match parse_fps_cap(value) {
+                    Ok(cap) => {
+                        self.apply_fps_cap_runtime(cap);
+                        match cap {
+                            Some(fps) => self.console_feedback(format!("fps cap set to {fps:.1}")),
+                            None => self.console_feedback("fps cap disabled"),
+                        }
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+                RuntimeCommand::Consumed
+            }
+            RuntimeConsoleEditTarget::RenderDistance => {
+                let value = self.console.quick_render_distance.trim();
+                match parse_render_distance(value) {
+                    Ok(distance) => {
+                        self.render_distance = distance;
+                        if let Some(value) = distance {
+                            self.render_distance_min = (value * 0.72).clamp(28.0, value);
+                            self.render_distance_max =
+                                (value * 1.55).clamp(value, value.max(220.0));
+                            self.console_feedback(format!("render distance set to {value:.1}"));
+                        } else {
+                            self.console_feedback("render distance disabled");
+                        }
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+                RuntimeCommand::Consumed
+            }
+            RuntimeConsoleEditTarget::FsrSharpness => {
+                let value = self.console.quick_fsr_sharpness.trim();
+                match parse_fsr_sharpness(value) {
+                    Ok(sharpness) => {
+                        self.fsr_config.sharpness = sharpness;
+                        self.renderer.set_fsr_config(&self.queue, self.fsr_config);
+                        self.console_feedback(format!("fsr sharpness set to {sharpness:.2}"));
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+                RuntimeCommand::Consumed
+            }
+        }
+    }
+
+    fn handle_console_window_event(&mut self, event: &WindowEvent) -> bool {
+        if !self.console.open {
+            return false;
+        }
+
+        match event {
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (delta_y, line_steps) = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        let steps = y.abs().round().max(1.0) as i32;
+                        (*y as f64, steps)
+                    }
+                    MouseScrollDelta::PixelDelta(pixels) => {
+                        let steps = (pixels.y.abs() / CONSOLE_WHEEL_PIXELS_PER_LINE)
+                            .round()
+                            .max(1.0) as i32;
+                        (pixels.y, steps)
+                    }
+                };
+                if delta_y > 0.0 {
+                    self.scroll_console_logs(line_steps);
+                } else if delta_y < 0.0 {
+                    self.scroll_console_logs(-line_steps);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn max_console_log_scroll(&self) -> usize {
+        self.console.log_lines.len().saturating_sub(1)
+    }
+
+    fn scroll_console_logs(&mut self, delta_lines: i32) {
+        if delta_lines == 0 {
+            return;
+        }
+        let max_scroll = self.max_console_log_scroll();
+        if delta_lines > 0 {
+            self.console.log_scroll = self
+                .console
+                .log_scroll
+                .saturating_add(delta_lines as usize)
+                .min(max_scroll);
+        } else {
+            self.console.log_scroll = self
+                .console
+                .log_scroll
+                .saturating_sub(delta_lines.unsigned_abs() as usize);
+        }
+    }
+
+    fn apply_present_mode(&mut self, mode: wgpu::PresentMode) {
+        if self.present_mode == mode {
+            return;
+        }
+        self.present_mode = mode;
+        self.config.present_mode = mode;
+        self.surface.configure(&self.device, &self.config);
+    }
+
+    fn apply_fps_cap_runtime(&mut self, cap: Option<f32>) {
+        match cap {
+            Some(fps) => {
+                let clamped = fps.max(24.0);
+                self.frame_cap_interval = Some(Duration::from_secs_f32(1.0 / clamped));
+                self.fps_limit_hint = clamped;
+                self.uncapped_dynamic_fps_hint = false;
+                self.adaptive_pacer_enabled = false;
+            }
+            None => {
+                self.frame_cap_interval = None;
+                self.uncapped_dynamic_fps_hint = true;
+                self.fps_limit_hint = bootstrap_uncapped_fps_hint(self.mps_logical_threads);
+                self.adaptive_pacer_enabled = false;
+            }
+        }
+    }
+
+    fn console_status_line(&self) -> String {
+        let fsr = self.renderer.fsr_status();
+        let rt = self.renderer.ray_tracing_status();
+        let fps_cap = self
+            .frame_cap_interval
+            .map(|itv| format!("{:.0}", 1.0 / itv.as_secs_f32().max(1e-6)))
+            .unwrap_or_else(|| "off".to_string());
+        let render_distance = self
+            .render_distance
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "off".to_string());
+        format!(
+            "fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} script_vars={} script_calls={}",
+            self.present_mode,
+            self.rt_mode,
+            if rt.active { "on" } else { "off" },
+            fsr.requested_mode,
+            if fsr.active { "on" } else { "off" },
+            fsr.render_scale,
+            fsr.sharpness,
+            render_distance,
+            self.adaptive_distance_enabled,
+            self.distance_blur_mode,
+            self.console.script_vars.len(),
+            self.console.script_statements.len()
+        )
+    }
+
+    fn console_title_suffix(&self) -> String {
+        if !self.console.open {
+            return String::new();
+        }
+        if self.console.input_line.is_empty() {
+            return " | CLI ready".to_string();
+        }
+        let mut preview = self.console.input_line.clone();
+        if preview.chars().count() > 42 {
+            preview = preview.chars().take(42).collect::<String>() + "...";
+        }
+        format!(" | CLI> {preview}")
+    }
+
+    fn expand_console_script_vars(&self, statement: &str) -> Result<String, String> {
+        let mut out = String::with_capacity(statement.len() + 16);
+        let chars = statement.chars().collect::<Vec<_>>();
+        let mut i = 0usize;
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch != '$' {
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut end = start;
+            while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+                end += 1;
+            }
+            if end == start {
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            let name = chars[start..end].iter().collect::<String>();
+            let Some(value) = self.console.script_vars.get(&name) else {
+                return Err(format!("unknown script var '${name}'"));
+            };
+            out.push_str(value);
+            i = end;
+        }
+        Ok(out)
+    }
+
+    fn evaluate_console_statement(
+        &self,
+        statement: &str,
+    ) -> Result<TlscriptShowcaseFrameOutput, String> {
+        let source = format!("@export\ndef showcase_tick():\n    {statement}\n");
+        let compile = compile_tlscript_showcase(&source, TlscriptShowcaseConfig::default());
+        if !compile.errors.is_empty() {
+            return Err(compile.errors.join(" | "));
+        }
+        let Some(program) = compile.program else {
+            return Err("script statement produced no runnable program".to_string());
+        };
+        let mut output = program.evaluate_frame_with_controls(
+            TlscriptShowcaseFrameInput {
+                frame_index: self.script_frame_index,
+                live_balls: self.scene.live_ball_count(),
+                spawned_this_tick: self.script_last_spawned,
+                key_f_down: self.script_key_f_keyboard || self.gamepad.action_f_down(),
+            },
+            TlscriptShowcaseControlInput::default(),
+        );
+        if !compile.warnings.is_empty() {
+            output.warnings.extend(
+                compile
+                    .warnings
+                    .into_iter()
+                    .map(|warning| format!("compile warning: {warning}")),
+            );
+        }
+        Ok(output)
+    }
+
+    fn sanitize_console_overlay_output(output: &mut TlscriptShowcaseFrameOutput) {
+        output.camera_translate_delta = None;
+        output.camera_rotate_delta_deg = None;
+        output.camera_move_axis = None;
+        output.camera_look_delta = None;
+        output.camera_sprint = None;
+        output.camera_look_active = None;
+        output.camera_reset_pose = false;
+        output.dispatch_decision = None;
+        output.aborted_early = false;
+    }
+
+    fn normalize_script_call_statement(raw: &str) -> Result<String, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("script.call requires a function call".to_string());
+        }
+        if trimmed.contains('(') {
+            return Ok(trimmed.trim_end_matches(';').to_string());
+        }
+
+        let mut tokens = trimmed.split_whitespace();
+        let Some(name) = tokens.next() else {
+            return Err("script.call requires a function call".to_string());
+        };
+        if !is_valid_tlscript_ident(name) {
+            return Err(format!("invalid function name '{name}'"));
+        }
+        let args = tokens.collect::<Vec<_>>();
+        if args.is_empty() {
+            return Ok(format!("{name}()"));
+        }
+        Ok(format!("{name}({})", args.join(", ")))
+    }
+
+    fn rebuild_console_script_overlay(&mut self) -> Result<Vec<String>, String> {
+        let mut rebuilt = empty_showcase_output();
+        let mut notes = Vec::new();
+        for (index, statement_template) in self.console.script_statements.iter().enumerate() {
+            let expanded = self
+                .expand_console_script_vars(statement_template)
+                .map_err(|err| {
+                    format!("statement[{index}] '{statement_template}' variable error: {err}")
+                })?;
+            let mut output = self
+                .evaluate_console_statement(&expanded)
+                .map_err(|err| format!("statement[{index}] '{expanded}' failed: {err}"))?;
+            if !output.warnings.is_empty() {
+                notes.push(format!(
+                    "statement[{index}] warnings: {}",
+                    output.warnings.join(" | ")
+                ));
+            }
+            Self::sanitize_console_overlay_output(&mut output);
+            merge_showcase_output(&mut rebuilt, output, CONSOLE_SCRIPT_INDEX);
+        }
+        rebuilt.warnings.clear();
+        self.console.script_overlay = rebuilt;
+        Ok(notes)
+    }
+
+    fn execute_console_command(&mut self, command: &str) -> RuntimeCommand {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            self.console_feedback("empty command");
+            return RuntimeCommand::Consumed;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let Some(head) = parts.next() else {
+            self.console_feedback("empty command");
+            return RuntimeCommand::Consumed;
+        };
+        let head_lc = head.to_ascii_lowercase();
+        match head_lc.as_str() {
+            "help" | "?" => {
+                self.console_feedback(
+                    "commands: help | status | clear | exit | gfx.status | gfx.vsync <auto|on|off> | gfx.fps_cap <off|N> | gfx.rt <off|auto|on> | gfx.fsr <off|auto|on> | gfx.fsr_quality <native|ultra|quality|balanced|performance> | gfx.fsr_sharpness <0..1> | gfx.fsr_scale <auto|0.5..1> | gfx.render_distance <off|N> | gfx.adaptive_distance <auto|on|off> | gfx.distance_blur <auto|on|off> | script.var <name> <expr> | script.unset <name> | script.vars | script.call <fn(args)> | script.exec <stmt> | script.uncall <idx|all> | script.list | script.clear"
+                );
+            }
+            "status" | "gfx.status" => {
+                self.console_feedback(self.console_status_line());
+            }
+            "clear" => {
+                self.console.last_feedback.clear();
+                self.console_feedback("console status cleared");
+            }
+            "exit" | "quit" => {
+                self.console_feedback("exit requested from console");
+                return RuntimeCommand::Exit;
+            }
+            "gfx.vsync" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.vsync <auto|on|off>");
+                    return RuntimeCommand::Consumed;
+                };
+                match VsyncMode::parse(value) {
+                    Ok(mode) => {
+                        let present_mode = match mode {
+                            VsyncMode::Auto => wgpu::PresentMode::AutoVsync,
+                            VsyncMode::On => wgpu::PresentMode::Fifo,
+                            VsyncMode::Off => wgpu::PresentMode::AutoNoVsync,
+                        };
+                        self.apply_present_mode(present_mode);
+                        self.console_feedback(format!("vsync set to {mode:?} ({present_mode:?})"));
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+            }
+            "gfx.fps_cap" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.fps_cap <off|N>");
+                    return RuntimeCommand::Consumed;
+                };
+                match parse_fps_cap(value) {
+                    Ok(cap) => {
+                        self.apply_fps_cap_runtime(cap);
+                        if let Some(fps) = cap {
+                            self.console_feedback(format!("fps cap set to {fps:.1}"));
+                        } else {
+                            self.console_feedback("fps cap disabled".to_string());
+                        }
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+            }
+            "gfx.rt" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.rt <off|auto|on>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(mode) = RayTracingMode::from_str(value) else {
+                    self.console_feedback("invalid gfx.rt value (expected off|auto|on)");
+                    return RuntimeCommand::Consumed;
+                };
+                self.rt_mode = mode;
+                self.renderer.set_ray_tracing_mode(&self.queue, mode);
+                let status = self.renderer.ray_tracing_status();
+                self.console_feedback(format!(
+                    "rt set to {:?} (active={}, reason={})",
+                    mode,
+                    status.active,
+                    if status.fallback_reason.is_empty() {
+                        "none"
+                    } else {
+                        status.fallback_reason.as_str()
+                    }
+                ));
+            }
+            "gfx.fsr" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.fsr <off|auto|on>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(mode) = FsrMode::parse(value) else {
+                    self.console_feedback("invalid gfx.fsr value (expected off|auto|on)");
+                    return RuntimeCommand::Consumed;
+                };
+                self.fsr_config.mode = mode;
+                self.renderer.set_fsr_config(&self.queue, self.fsr_config);
+                self.console_feedback(format!("fsr mode set to {:?}", mode));
+            }
+            "gfx.fsr_quality" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback(
+                        "usage: gfx.fsr_quality <native|ultra|quality|balanced|performance>",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(quality) = FsrQualityPreset::parse(value) else {
+                    self.console_feedback("invalid gfx.fsr_quality preset");
+                    return RuntimeCommand::Consumed;
+                };
+                self.fsr_config.quality = quality;
+                self.renderer.set_fsr_config(&self.queue, self.fsr_config);
+                self.console_feedback(format!("fsr quality set to {:?}", quality));
+            }
+            "gfx.fsr_sharpness" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.fsr_sharpness <0..1>");
+                    return RuntimeCommand::Consumed;
+                };
+                match parse_fsr_sharpness(value) {
+                    Ok(sharpness) => {
+                        self.fsr_config.sharpness = sharpness;
+                        self.renderer.set_fsr_config(&self.queue, self.fsr_config);
+                        self.console_feedback(format!("fsr sharpness set to {sharpness:.2}"));
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+            }
+            "gfx.fsr_scale" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.fsr_scale <auto|0.5..1>");
+                    return RuntimeCommand::Consumed;
+                };
+                match parse_fsr_scale(value) {
+                    Ok(scale) => {
+                        self.fsr_config.render_scale_override = scale;
+                        self.renderer.set_fsr_config(&self.queue, self.fsr_config);
+                        match scale {
+                            Some(v) => self.console_feedback(format!("fsr scale override={v:.2}")),
+                            None => self.console_feedback("fsr scale override=auto"),
+                        }
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+            }
+            "gfx.render_distance" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.render_distance <off|N>");
+                    return RuntimeCommand::Consumed;
+                };
+                match parse_render_distance(value) {
+                    Ok(distance) => {
+                        self.render_distance = distance;
+                        if let Some(value) = distance {
+                            self.render_distance_min = (value * 0.72).clamp(28.0, value);
+                            self.render_distance_max =
+                                (value * 1.55).clamp(value, value.max(220.0));
+                            self.console_feedback(format!("render distance set to {value:.1}"));
+                        } else {
+                            self.console_feedback("render distance disabled");
+                        }
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+            }
+            "gfx.adaptive_distance" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.adaptive_distance <auto|on|off>");
+                    return RuntimeCommand::Consumed;
+                };
+                match ToggleAuto::parse(value, "gfx.adaptive_distance") {
+                    Ok(mode) => {
+                        self.adaptive_distance_enabled = mode.resolve(true);
+                        self.console_feedback(format!(
+                            "adaptive distance mode={mode:?} enabled={}",
+                            self.adaptive_distance_enabled
+                        ));
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+            }
+            "gfx.distance_blur" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.distance_blur <auto|on|off>");
+                    return RuntimeCommand::Consumed;
+                };
+                match ToggleAuto::parse(value, "gfx.distance_blur") {
+                    Ok(mode) => {
+                        self.distance_blur_mode = mode;
+                        self.distance_blur_enabled = mode.resolve(false);
+                        self.console_feedback(format!(
+                            "distance blur mode={mode:?} enabled={}",
+                            self.distance_blur_enabled
+                        ));
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+            }
+            "script.var" => {
+                let mut tokens = trimmed.splitn(3, char::is_whitespace);
+                let _ = tokens.next();
+                let Some(name) = tokens.next() else {
+                    self.console_feedback("usage: script.var <name> <expr>");
+                    return RuntimeCommand::Consumed;
+                };
+                if !is_valid_tlscript_ident(name) {
+                    self.console_feedback(format!("invalid variable name '{name}'"));
+                    return RuntimeCommand::Consumed;
+                }
+                let value = tokens.next().unwrap_or("").trim();
+                if value.is_empty() {
+                    self.console_feedback("usage: script.var <name> <expr>");
+                    return RuntimeCommand::Consumed;
+                }
+                self.console
+                    .script_vars
+                    .insert(name.to_string(), value.to_string());
+                match self.rebuild_console_script_overlay() {
+                    Ok(notes) => {
+                        self.console_feedback(format!("script var '{name}' set to '{value}'"));
+                        for note in notes {
+                            self.console_feedback(note);
+                        }
+                    }
+                    Err(err) => self.console_feedback(err),
+                }
+            }
+            "script.unset" => {
+                let Some(name) = parts.next() else {
+                    self.console_feedback("usage: script.unset <name>");
+                    return RuntimeCommand::Consumed;
+                };
+                self.console.script_vars.remove(name);
+                match self.rebuild_console_script_overlay() {
+                    Ok(notes) => {
+                        self.console_feedback(format!("script var '{name}' removed"));
+                        for note in notes {
+                            self.console_feedback(note);
+                        }
+                    }
+                    Err(err) => self.console_feedback(err),
+                }
+            }
+            "script.vars" => {
+                if self.console.script_vars.is_empty() {
+                    self.console_feedback("script vars: <empty>");
+                } else {
+                    let vars = self
+                        .console
+                        .script_vars
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.console_feedback(format!("script vars: {vars}"));
+                }
+            }
+            "script.call" | "script.exec" => {
+                let statement_raw = trimmed
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail.trim())
+                    .unwrap_or("");
+                if statement_raw.is_empty() {
+                    self.console_feedback(format!("usage: {head_lc} <statement>"));
+                    return RuntimeCommand::Consumed;
+                }
+                let statement_template = if head_lc == "script.call" {
+                    match Self::normalize_script_call_statement(statement_raw) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    }
+                } else {
+                    statement_raw.trim_end_matches(';').to_string()
+                };
+                self.console
+                    .script_statements
+                    .push(statement_template.clone());
+                match self.rebuild_console_script_overlay() {
+                    Ok(notes) => {
+                        self.console_feedback(format!(
+                            "script statement added [{}]: {}",
+                            self.console.script_statements.len() - 1,
+                            statement_template
+                        ));
+                        for note in notes {
+                            self.console_feedback(note);
+                        }
+                    }
+                    Err(err) => {
+                        let _ = self.console.script_statements.pop();
+                        self.console_feedback(err);
+                    }
+                }
+            }
+            "script.uncall" => {
+                let Some(target) = parts.next() else {
+                    self.console_feedback("usage: script.uncall <index|all>");
+                    return RuntimeCommand::Consumed;
+                };
+                if target.eq_ignore_ascii_case("all") {
+                    self.console.script_statements.clear();
+                    self.console.script_overlay = empty_showcase_output();
+                    self.console_feedback("all script statements removed");
+                    return RuntimeCommand::Consumed;
+                }
+                let Ok(index) = target.parse::<usize>() else {
+                    self.console_feedback("script.uncall expects numeric index or 'all'");
+                    return RuntimeCommand::Consumed;
+                };
+                if index >= self.console.script_statements.len() {
+                    self.console_feedback(format!(
+                        "script.uncall index out of range (0..{})",
+                        self.console.script_statements.len().saturating_sub(1)
+                    ));
+                    return RuntimeCommand::Consumed;
+                }
+                let removed = self.console.script_statements.remove(index);
+                match self.rebuild_console_script_overlay() {
+                    Ok(notes) => {
+                        self.console_feedback(format!(
+                            "removed script statement[{index}]: {removed}"
+                        ));
+                        for note in notes {
+                            self.console_feedback(note);
+                        }
+                    }
+                    Err(err) => self.console_feedback(err),
+                }
+            }
+            "script.list" => {
+                if self.console.script_statements.is_empty() {
+                    self.console_feedback("script statements: <empty>");
+                } else {
+                    let statements = self.console.script_statements.clone();
+                    for (index, statement) in statements.iter().enumerate() {
+                        self.console_feedback(format!("[{index}] {statement}"));
+                    }
+                }
+            }
+            "script.clear" => {
+                self.console.script_vars.clear();
+                self.console.script_statements.clear();
+                self.console.script_overlay = empty_showcase_output();
+                self.console_feedback("script vars and statements cleared");
+            }
+            _ => {
+                self.console_feedback(format!("unknown command '{head}' (run 'help')"));
+            }
+        }
+        RuntimeCommand::Consumed
+    }
+
+    fn on_console_keyboard_input(&mut self, event: &KeyEvent) -> RuntimeCommand {
+        if event.state != ElementState::Pressed {
+            return RuntimeCommand::Consumed;
+        }
+
+        match event.physical_key {
+            PhysicalKey::Code(KeyCode::Escape) => {
+                self.toggle_console();
+                return RuntimeCommand::Consumed;
+            }
+            PhysicalKey::Code(KeyCode::Tab) => {
+                self.console.edit_target = self.console.edit_target.next();
+                self.console_feedback(format!(
+                    "active edit box: {}",
+                    self.console.edit_target.label()
+                ));
+                return RuntimeCommand::Consumed;
+            }
+            PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                return self.apply_active_console_edit_target();
+            }
+            PhysicalKey::Code(KeyCode::Backspace) => {
+                self.selected_console_edit_buffer_mut().pop();
+                return RuntimeCommand::Consumed;
+            }
+            PhysicalKey::Code(KeyCode::ArrowUp) => {
+                if self.console.edit_target != RuntimeConsoleEditTarget::Command {
+                    return RuntimeCommand::Consumed;
+                }
+                if self.console.history.is_empty() {
+                    return RuntimeCommand::Consumed;
+                }
+                let next = match self.console.history_cursor {
+                    None => self.console.history.len().saturating_sub(1),
+                    Some(cur) => cur.saturating_sub(1),
+                };
+                self.console.history_cursor = Some(next);
+                self.console.input_line = self.console.history[next].clone();
+                return RuntimeCommand::Consumed;
+            }
+            PhysicalKey::Code(KeyCode::ArrowDown) => {
+                if self.console.edit_target != RuntimeConsoleEditTarget::Command {
+                    return RuntimeCommand::Consumed;
+                }
+                if self.console.history.is_empty() {
+                    return RuntimeCommand::Consumed;
+                }
+                let Some(cur) = self.console.history_cursor else {
+                    return RuntimeCommand::Consumed;
+                };
+                if cur + 1 >= self.console.history.len() {
+                    self.console.history_cursor = None;
+                    self.console.input_line.clear();
+                } else {
+                    let next = cur + 1;
+                    self.console.history_cursor = Some(next);
+                    self.console.input_line = self.console.history[next].clone();
+                }
+                return RuntimeCommand::Consumed;
+            }
+            PhysicalKey::Code(KeyCode::PageUp) => {
+                self.scroll_console_logs(4);
+                return RuntimeCommand::Consumed;
+            }
+            PhysicalKey::Code(KeyCode::PageDown) => {
+                self.scroll_console_logs(-4);
+                return RuntimeCommand::Consumed;
+            }
+            PhysicalKey::Code(KeyCode::Home) => {
+                self.console.log_scroll = self.max_console_log_scroll();
+                return RuntimeCommand::Consumed;
+            }
+            PhysicalKey::Code(KeyCode::End) => {
+                self.console.log_scroll = 0;
+                return RuntimeCommand::Consumed;
+            }
+            _ => {}
+        }
+
+        if self.keyboard_modifiers.control_key()
+            || self.keyboard_modifiers.alt_key()
+            || self.keyboard_modifiers.super_key()
+        {
+            return RuntimeCommand::Consumed;
+        }
+
+        if let Some(text) = &event.text {
+            for ch in text.chars() {
+                if !ch.is_control() {
+                    self.selected_console_edit_buffer_mut().push(ch);
+                }
+            }
+        }
+        RuntimeCommand::Consumed
+    }
+
+    fn console_glyph_slot(ch: char) -> u16 {
+        let code = ch as u32;
+        if (32..=126).contains(&code) {
+            CONSOLE_TEXT_SLOT_BASE + (code as u16 - 32)
+        } else {
+            CONSOLE_TEXT_SLOT_BASE + (u16::from(b'?') - 32)
+        }
+    }
+
+    fn push_console_text_line(
+        sprites: &mut Vec<SpriteInstance>,
+        sprite_id_seed: &mut u64,
+        text: &str,
+        x: f32,
+        y: f32,
+        z: f32,
+        glyph_size: [f32; 2],
+        color: [f32; 4],
+        layer: i16,
+    ) {
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            if ch == '\t' {
+                cursor_x += glyph_size[0] * 4.0;
+                continue;
+            }
+            if ch == ' ' {
+                cursor_x += glyph_size[0];
+                continue;
+            }
+            sprites.push(SpriteInstance {
+                sprite_id: *sprite_id_seed,
+                kind: SpriteKind::Generic,
+                position: [cursor_x, y, z],
+                size: glyph_size,
+                rotation_rad: 0.0,
+                color_rgba: color,
+                texture_slot: Self::console_glyph_slot(ch),
+                layer,
+            });
+            *sprite_id_seed = sprite_id_seed.saturating_add(1);
+            cursor_x += glyph_size[0] * 0.86;
+        }
+    }
+
+    fn push_console_rect(
+        sprites: &mut Vec<SpriteInstance>,
+        sprite_id_seed: &mut u64,
+        pos: [f32; 3],
+        size: [f32; 2],
+        color: [f32; 4],
+        layer: i16,
+    ) {
+        sprites.push(SpriteInstance {
+            sprite_id: *sprite_id_seed,
+            kind: SpriteKind::Hud,
+            position: pos,
+            size,
+            rotation_rad: 0.0,
+            color_rgba: color,
+            texture_slot: 1,
+            layer,
+        });
+        *sprite_id_seed = sprite_id_seed.saturating_add(1);
+    }
+
+    fn append_console_overlay_sprites(
+        console: &RuntimeConsoleState,
+        layout: ConsoleUiLayout,
+        sprites: &mut Vec<SpriteInstance>,
+    ) {
+        if !console.open {
+            return;
+        }
+        let mut sprite_id_seed = 9_200_000u64 + sprites.len() as u64;
+
+        // Full-screen semi-transparent console shell.
+        Self::push_console_rect(
+            sprites,
+            &mut sprite_id_seed,
+            [0.0, 0.0, 0.99],
+            [2.0, 2.0],
+            [0.02, 0.08, 0.03, 0.80],
+            29_000,
+        );
+        Self::push_console_rect(
+            sprites,
+            &mut sprite_id_seed,
+            layout.pos(0.0, 0.80, 0.98),
+            layout.rect_size(1.92, 0.26),
+            [0.06, 0.20, 0.09, 0.92],
+            29_001,
+        );
+        Self::push_console_rect(
+            sprites,
+            &mut sprite_id_seed,
+            layout.pos(-0.50, 0.37, 0.98),
+            layout.rect_size(0.92, 0.76),
+            [0.04, 0.12, 0.05, 0.92],
+            29_001,
+        );
+        Self::push_console_rect(
+            sprites,
+            &mut sprite_id_seed,
+            layout.pos(0.52, 0.37, 0.98),
+            layout.rect_size(0.90, 0.76),
+            [0.04, 0.12, 0.05, 0.92],
+            29_001,
+        );
+        Self::push_console_rect(
+            sprites,
+            &mut sprite_id_seed,
+            layout.pos(0.0, -0.72, 0.98),
+            layout.rect_size(1.92, 0.44),
+            [0.03, 0.10, 0.04, 0.94],
+            29_001,
+        );
+        // Input/editable box.
+        Self::push_console_rect(
+            sprites,
+            &mut sprite_id_seed,
+            [layout.command_center.0, layout.command_center.1, 0.97],
+            [layout.command_size.0, layout.command_size.1],
+            [0.02, 0.18, 0.05, 0.96],
+            29_002,
+        );
+        // Send button (right side of command input).
+        Self::push_console_rect(
+            sprites,
+            &mut sprite_id_seed,
+            [layout.send_center.0, layout.send_center.1, 0.97],
+            [layout.send_size.0, layout.send_size.1],
+            [0.04, 0.28, 0.08, 0.98],
+            29_003,
+        );
+
+        let header_color = [0.74, 1.0, 0.72, 1.0];
+        let info_color = [0.62, 0.96, 0.62, 1.0];
+        let mut y = 0.90;
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "TLAPP CLI OVERLAY",
+            -0.93 * layout.sx,
+            y * layout.sy,
+            0.96,
+            layout.glyph_size(0.028, 0.046),
+            header_color,
+            29_010,
+        );
+        y -= 0.065;
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "GREEN TEXT | FULLSCREEN SEMI-TRANSPARENT | ERRORS BLINK RED",
+            -0.93 * layout.sx,
+            y * layout.sy,
+            0.96,
+            layout.glyph_size(0.018, 0.032),
+            info_color,
+            29_010,
+        );
+        y -= 0.055;
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "HOTKEYS: CTRL+F1/F1 TOGGLE | ENTER RUN | ARROW UP/DOWN HISTORY",
+            -0.93 * layout.sx,
+            y * layout.sy,
+            0.96,
+            layout.glyph_size(0.018, 0.032),
+            info_color,
+            29_010,
+        );
+        y -= 0.055;
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "LOG SCROLL: WHEEL / PGUP/PGDN | HOME/END",
+            -0.93 * layout.sx,
+            y * layout.sy,
+            0.96,
+            layout.glyph_size(0.016, 0.029),
+            info_color,
+            29_010,
+        );
+        y -= 0.055;
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            &format!(
+                "TAB SWITCH BOX | ACTIVE: {}",
+                console.edit_target.label().to_uppercase()
+            ),
+            -0.93 * layout.sx,
+            y * layout.sy,
+            0.96,
+            layout.glyph_size(0.018, 0.032),
+            [0.84, 0.98, 0.74, 1.0],
+            29_010,
+        );
+
+        // Command list box.
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "COMMAND LIST",
+            -0.93 * layout.sx,
+            0.63 * layout.sy,
+            0.96,
+            layout.glyph_size(0.02, 0.036),
+            header_color,
+            29_010,
+        );
+        let mut cmd_y = 0.58;
+        for cmd in CONSOLE_HELP_COMMANDS.iter().take(14) {
+            Self::push_console_text_line(
+                sprites,
+                &mut sprite_id_seed,
+                cmd,
+                -0.93 * layout.sx,
+                cmd_y * layout.sy,
+                0.96,
+                layout.glyph_size(0.016, 0.029),
+                [0.58, 0.92, 0.58, 1.0],
+                29_010,
+            );
+            cmd_y -= 0.044;
+        }
+
+        // Quick settings / editable values.
+        let quick_left = 0.08;
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "EDIT BOXES",
+            quick_left * layout.sx,
+            0.63 * layout.sy,
+            0.96,
+            layout.glyph_size(0.02, 0.036),
+            header_color,
+            29_010,
+        );
+        let settings = [
+            format!("FPS CAP: {}", console.quick_fps_cap),
+            format!("RENDER DISTANCE: {}", console.quick_render_distance),
+            format!("FSR SHARPNESS: {}", console.quick_fsr_sharpness),
+        ];
+        let active_fps = console.edit_target == RuntimeConsoleEditTarget::FpsCap;
+        let active_rd = console.edit_target == RuntimeConsoleEditTarget::RenderDistance;
+        let active_sharp = console.edit_target == RuntimeConsoleEditTarget::FsrSharpness;
+        let mut settings_y = 0.57;
+        for (index, line) in settings.into_iter().enumerate() {
+            let is_active = match index {
+                0 => active_fps,
+                1 => active_rd,
+                _ => active_sharp,
+            };
+            Self::push_console_text_line(
+                sprites,
+                &mut sprite_id_seed,
+                &if is_active { format!("> {line}") } else { line },
+                quick_left * layout.sx,
+                settings_y * layout.sy,
+                0.96,
+                layout.glyph_size(0.018, 0.032),
+                if is_active {
+                    [0.90, 1.00, 0.82, 1.0]
+                } else {
+                    [0.64, 0.98, 0.64, 1.0]
+                },
+                29_010,
+            );
+            settings_y -= 0.055;
+        }
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "BOX INPUT: TYPE VALUE + COMMAND (GFX.FPS_CAP / GFX.RENDER_DISTANCE ...)",
+            quick_left * layout.sx,
+            0.39 * layout.sy,
+            0.96,
+            layout.glyph_size(0.014, 0.026),
+            [0.52, 0.86, 0.52, 1.0],
+            29_010,
+        );
+        Self::push_console_rect(
+            sprites,
+            &mut sprite_id_seed,
+            [layout.apply_center.0, layout.apply_center.1, 0.97],
+            [layout.apply_size.0, layout.apply_size.1],
+            [0.03, 0.22, 0.06, 0.96],
+            29_002,
+        );
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "[CLICK] APPLY ALL BOXES",
+            0.18 * layout.sx,
+            0.32 * layout.sy,
+            0.96,
+            layout.glyph_size(0.016, 0.028),
+            [0.84, 1.0, 0.84, 1.0],
+            29_011,
+        );
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "SEND",
+            layout.send_center.0 - layout.send_size.0 * 0.22,
+            layout.send_center.1,
+            0.96,
+            layout.glyph_size(0.020, 0.033),
+            [0.90, 1.0, 0.88, 1.0],
+            29_021,
+        );
+
+        // Live input line.
+        let glyph = layout.glyph_size(0.022, 0.038);
+        let max_chars = ((layout.command_size.0 * 0.90) / (glyph[0] * 0.86))
+            .floor()
+            .max(8.0) as usize;
+        let mut input_tail = console.input_line.clone();
+        let input_len = input_tail.chars().count();
+        if input_len > max_chars.saturating_sub(2) {
+            let keep = max_chars.saturating_sub(3);
+            input_tail = input_tail
+                .chars()
+                .rev()
+                .take(keep)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            input_tail = format!("...{input_tail}");
+        }
+        let input_line = format!("> {}", input_tail);
+        let input_active = console.edit_target == RuntimeConsoleEditTarget::Command;
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            &input_line,
+            layout.command_center.0 - layout.command_size.0 * 0.48,
+            layout.command_center.1,
+            0.96,
+            glyph,
+            if input_active {
+                [0.90, 1.0, 0.90, 1.0]
+            } else {
+                [0.66, 0.90, 0.66, 1.0]
+            },
+            29_020,
+        );
+
+        // Output list with blinking red errors.
+        Self::push_console_text_line(
+            sprites,
+            &mut sprite_id_seed,
+            "OUTPUT",
+            -0.93 * layout.sx,
+            -0.66 * layout.sy,
+            0.96,
+            layout.glyph_size(0.02, 0.036),
+            header_color,
+            29_010,
+        );
+        let now = Instant::now();
+        let line_step = (0.047 * layout.text_scale).max(0.026);
+        let out_top = -0.72f32;
+        let out_bottom = -0.90f32;
+        let visible_logs = (((out_top - out_bottom) / line_step).floor() as usize).max(3);
+        let total_logs = console.log_lines.len();
+        let end = total_logs.saturating_sub(console.log_scroll);
+        let start = end.saturating_sub(visible_logs);
+        let mut out_y = out_top;
+        for line in console
+            .log_lines
+            .iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+        {
+            let age_ms = now.saturating_duration_since(line.timestamp).as_millis();
+            let color = match line.level {
+                RuntimeConsoleLogLevel::Info => [0.70, 0.98, 0.70, 1.0],
+                RuntimeConsoleLogLevel::Error => {
+                    if ((age_ms / CONSOLE_ERROR_BLINK_MS) % 2) == 0 {
+                        [1.0, 0.32, 0.32, 1.0]
+                    } else {
+                        [0.68, 0.12, 0.12, 1.0]
+                    }
+                }
+            };
+            let text = format!("[{:>5}ms] {}", age_ms.min(99_999), line.message);
+            Self::push_console_text_line(
+                sprites,
+                &mut sprite_id_seed,
+                &text,
+                -0.93 * layout.sx,
+                out_y * layout.sy,
+                0.96,
+                layout.glyph_size(0.016, 0.028),
+                color,
+                29_010,
+            );
+            out_y -= line_step;
+            if out_y < out_bottom {
+                break;
+            }
+        }
+        if console.log_scroll > 0 {
+            Self::push_console_text_line(
+                sprites,
+                &mut sprite_id_seed,
+                &format!("SCROLL {}", console.log_scroll),
+                0.72 * layout.sx,
+                -0.66 * layout.sy,
+                0.96,
+                layout.glyph_size(0.013, 0.024),
+                [0.74, 0.96, 0.74, 1.0],
+                29_010,
+            );
+        }
     }
 
     fn retune_render_distance(&mut self, mobile_path: bool) {
@@ -1865,17 +3389,36 @@ impl TlAppRuntime {
 
     fn on_keyboard_input(&mut self, event: &KeyEvent) -> RuntimeCommand {
         let pressed = event.state == ElementState::Pressed;
+        let ctrl = self.keyboard_modifiers.control_key() || self.keyboard_camera.key_ctrl;
+        let alt = self.keyboard_modifiers.alt_key();
+        let is_f1 = matches!(event.physical_key, PhysicalKey::Code(KeyCode::F1))
+            || matches!(event.logical_key, Key::Named(NamedKey::F1));
+        let is_backquote = matches!(event.physical_key, PhysicalKey::Code(KeyCode::Backquote))
+            || matches!(&event.logical_key, Key::Character(raw) if raw.as_ref() == "`" || raw.as_ref() == "~");
+        let is_key_k = matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyK));
+        let toggle_console =
+            pressed && !event.repeat && (is_f1 || (ctrl && (is_backquote || is_key_k)));
+
+        if toggle_console {
+            self.toggle_console();
+            return RuntimeCommand::Consumed;
+        }
+
+        if self.console.open {
+            return self.on_console_keyboard_input(event);
+        }
+
         self.update_camera_keyboard_input(event.physical_key, pressed);
         if let PhysicalKey::Code(KeyCode::KeyF) = event.physical_key {
             self.script_key_f_keyboard = pressed;
+        }
+        if let PhysicalKey::Code(KeyCode::KeyG) = event.physical_key {
+            self.script_key_g_keyboard = pressed;
         }
 
         if !pressed || event.repeat {
             return RuntimeCommand::None;
         }
-
-        let ctrl = self.keyboard_modifiers.control_key();
-        let alt = self.keyboard_modifiers.alt_key();
 
         if alt && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Enter)) {
             self.toggle_fullscreen();
@@ -1908,13 +3451,91 @@ impl TlAppRuntime {
         self.window.set_fullscreen(next);
     }
 
+    fn on_cursor_moved(&mut self, x: f32, y: f32) {
+        self.cursor_position = Some((x, y));
+    }
+
+    fn cursor_ndc(&self) -> Option<(f32, f32)> {
+        let (x, y) = self.cursor_position?;
+        let width = self.size.width.max(1) as f32;
+        let height = self.size.height.max(1) as f32;
+        let ndc_x = (x / width) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (y / height) * 2.0;
+        Some((ndc_x, ndc_y))
+    }
+
+    fn point_in_rect(point: (f32, f32), center: (f32, f32), size: (f32, f32)) -> bool {
+        let (px, py) = point;
+        let (cx, cy) = center;
+        let (sx, sy) = size;
+        (px >= cx - sx * 0.5)
+            && (px <= cx + sx * 0.5)
+            && (py >= cy - sy * 0.5)
+            && (py <= cy + sy * 0.5)
+    }
+
+    fn apply_all_console_quick_boxes(&mut self) {
+        let previous_target = self.console.edit_target;
+        self.console.edit_target = RuntimeConsoleEditTarget::FpsCap;
+        let _ = self.apply_active_console_edit_target();
+        self.console.edit_target = RuntimeConsoleEditTarget::RenderDistance;
+        let _ = self.apply_active_console_edit_target();
+        self.console.edit_target = RuntimeConsoleEditTarget::FsrSharpness;
+        let _ = self.apply_active_console_edit_target();
+        self.console.edit_target = previous_target;
+    }
+
+    fn handle_console_left_click(&mut self) {
+        let Some(cursor) = self.cursor_ndc() else {
+            return;
+        };
+        let layout = ConsoleUiLayout::from_size(self.size);
+        if Self::point_in_rect(cursor, layout.send_center, layout.send_size) {
+            self.console.edit_target = RuntimeConsoleEditTarget::Command;
+            let _ = self.submit_console_command(self.console.input_line.clone());
+            return;
+        }
+        if Self::point_in_rect(cursor, layout.command_center, layout.command_size) {
+            self.console.edit_target = RuntimeConsoleEditTarget::Command;
+            self.console_feedback("active edit box: command");
+            return;
+        }
+        if Self::point_in_rect(cursor, layout.fps_center, layout.fps_size) {
+            self.console.edit_target = RuntimeConsoleEditTarget::FpsCap;
+            self.console_feedback("active edit box: fps_cap");
+            return;
+        }
+        if Self::point_in_rect(cursor, layout.distance_center, layout.distance_size) {
+            self.console.edit_target = RuntimeConsoleEditTarget::RenderDistance;
+            self.console_feedback("active edit box: render_distance");
+            return;
+        }
+        if Self::point_in_rect(cursor, layout.sharpness_center, layout.sharpness_size) {
+            self.console.edit_target = RuntimeConsoleEditTarget::FsrSharpness;
+            self.console_feedback("active edit box: fsr_sharpness");
+            return;
+        }
+        if Self::point_in_rect(cursor, layout.apply_center, layout.apply_size) {
+            self.apply_all_console_quick_boxes();
+        }
+    }
+
     fn on_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+        if self.console.open {
+            if button == MouseButton::Left && state == ElementState::Pressed {
+                self.handle_console_left_click();
+            }
+            return;
+        }
         if button == MouseButton::Right {
             self.mouse_look_held = state == ElementState::Pressed;
         }
     }
 
     fn on_touch(&mut self, touch: Touch) {
+        if self.console.open {
+            return;
+        }
         let id = touch.id;
         let current = (touch.location.x as f32, touch.location.y as f32);
         match touch.phase {
@@ -1943,6 +3564,9 @@ impl TlAppRuntime {
     }
 
     fn on_device_event(&mut self, event: DeviceEvent) {
+        if self.console.open {
+            return;
+        }
         if let DeviceEvent::MouseMotion { delta } = event {
             self.mouse_look_delta.0 += delta.0 as f32;
             self.mouse_look_delta.1 += delta.1 as f32;
@@ -2018,6 +3642,10 @@ impl TlAppRuntime {
     }
 
     fn script_camera_input(&mut self, view_dt: f32) -> TlscriptShowcaseControlInput {
+        if self.console.open {
+            self.mouse_look_delta = (0.0, 0.0);
+            return TlscriptShowcaseControlInput::default();
+        }
         let gamepad = self.gamepad.camera_state();
         let sensitivity = self.camera.mouse_sensitivity().max(0.0001);
         let pad_look_to_mouse = (GAMEPAD_LOOK_SPEED_RAD * view_dt.max(0.0)) / sensitivity;
@@ -2059,6 +3687,7 @@ impl TlAppRuntime {
             key_q_down: self.keyboard_camera.key_q,
             key_e_down: self.keyboard_camera.key_e,
             key_c_down: self.keyboard_camera.key_c,
+            key_g_down: self.script_key_g_keyboard || self.gamepad.action_f_down(),
             key_r_down: self.keyboard_camera.key_r,
             key_l_down: self.keyboard_camera.key_l,
             key_alt_down: self.keyboard_camera.key_alt,
@@ -2125,7 +3754,7 @@ impl TlAppRuntime {
             }
         }
 
-        let frame_eval = self.script_runtime.evaluate_frame(
+        let mut frame_eval = self.script_runtime.evaluate_frame(
             TlscriptShowcaseFrameInput {
                 frame_index: self.script_frame_index,
                 live_balls: self.scene.live_ball_count(),
@@ -2134,6 +3763,13 @@ impl TlAppRuntime {
             },
             script_camera_input,
         );
+        if !self.console.script_statements.is_empty() {
+            merge_showcase_output(
+                &mut frame_eval,
+                self.console.script_overlay.clone(),
+                CONSOLE_SCRIPT_INDEX,
+            );
+        }
 
         if let Some(speed) = frame_eval.camera_move_speed {
             self.camera.set_move_speed(speed);
@@ -2455,10 +4091,22 @@ impl TlAppRuntime {
             },
             &mut frame.sprites,
         );
+        self.console_overlay_sprites.clear();
+        let console_layout = ConsoleUiLayout::from_size(self.size);
+        Self::append_console_overlay_sprites(
+            &self.console,
+            console_layout,
+            &mut self.console_overlay_sprites,
+        );
         let draw = self.draw_compiler.compile(&frame);
         let upload = self
             .renderer
             .upload_draw_frame(&self.device, &self.queue, &draw);
+        self.renderer.upload_overlay_sprites(
+            &self.device,
+            &self.queue,
+            self.console_overlay_sprites.as_slice(),
+        );
         let rt_status = self.renderer.ray_tracing_status();
         let fsr_status = self.renderer.fsr_status();
 
@@ -2497,6 +4145,7 @@ impl TlAppRuntime {
                 a: 1.0,
             },
         );
+        self.renderer.encode_overlay_sprites(&mut encoder, &view);
         self.queue.submit(Some(encoder.finish()));
         output.present();
 
@@ -2530,8 +4179,9 @@ impl TlAppRuntime {
             ),
             None => String::new(),
         };
+        let console_suffix = self.console_title_suffix();
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | {:?} {} {:?}{}{}{}{}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | {:?} {} {:?}{}{}{}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
             self.tick_hz,
@@ -2565,6 +4215,7 @@ impl TlAppRuntime {
             },
             distance_suffix,
             pacing_suffix,
+            console_suffix,
         );
         self.window.set_title(&title);
 
@@ -2646,6 +4297,12 @@ fn bind_renderer_meshes_from_tlsprite(
                 );
             }
         }
+    }
+}
+
+impl Drop for TlAppRuntime {
+    fn drop(&mut self) {
+        self.prepare_for_exit();
     }
 }
 
