@@ -11,11 +11,11 @@ use crate::{
     app_runner, apply_scene_light_overrides, choose_scheduler_path_for_platform,
     clamp_scene_lights_for_camera, compile_tljoint_scene_from_path,
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, BounceTankRuntimePatch,
-    BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler, FsrConfig, FsrMode,
-    FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode, RuntimePlatform,
-    SceneFrameInstances, ScenePrimitive3d, SpriteInstance, SpriteKind, TelemetryHudComposer,
-    TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle,
-    TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlscriptCoordinateSpace,
+    BounceTankSceneConfig, BounceTankSceneController, BounceTankTickMetrics, DrawPathCompiler,
+    FsrConfig, FsrMode, FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode,
+    RuntimePlatform, SceneFrameInstances, ScenePrimitive3d, SpriteInstance, SpriteKind,
+    TelemetryHudComposer, TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel,
+    TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlscriptCoordinateSpace,
     TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
     TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram,
     TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer, MAX_SCENE_LIGHTS,
@@ -50,6 +50,15 @@ const CONSOLE_TEXT_SLOT_BASE: u16 = 128;
 const CONSOLE_HELP_COMMANDS: &[&str] = &[
     "help",
     "status | gfx.status",
+    "sim.status | sim.pause | sim.resume | sim.step <n> | sim.reset",
+    "phys.gravity <x y z>",
+    "phys.substeps <auto|n>",
+    "cam.speed <v>",
+    "cam.sens <v>",
+    "cam.reset",
+    "log.clear",
+    "log.tail <off|n>",
+    "log.level <all|info|error>",
     "clear | exit",
     "gfx.vsync <auto|on|off>",
     "gfx.fps_cap <off|N>",
@@ -563,6 +572,26 @@ fn parse_fsr_scale(value: &str) -> Result<Option<f32>, Box<dyn Error>> {
     Ok(Some(parsed))
 }
 
+fn parse_console_f32_in_range(value: &str, label: &str, min: f32, max: f32) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| format!("invalid {label}: {value}"))?;
+    if !parsed.is_finite() || parsed < min || parsed > max {
+        return Err(format!("{label} must be in [{min}..{max}]"));
+    }
+    Ok(parsed)
+}
+
+fn parse_console_u32_in_range(value: &str, label: &str, min: u32, max: u32) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid {label}: {value}"))?;
+    if parsed < min || parsed > max {
+        return Err(format!("{label} must be in [{min}..{max}]"));
+    }
+    Ok(parsed)
+}
+
 fn bootstrap_uncapped_fps_hint(logical_threads: usize) -> f32 {
     // Start from a conservative-but-fast target and let runtime sampling retune to hardware limit.
     (170.0 + logical_threads as f32 * 7.5).clamp(170.0, 420.0)
@@ -847,6 +876,9 @@ struct TlAppRuntime {
     mps_logical_threads: usize,
     max_substeps: u32,
     last_substeps: u32,
+    manual_max_substeps: Option<u32>,
+    simulation_paused: bool,
+    simulation_step_budget: u32,
     tick_retune_timer: f32,
     adaptive_ball_render_limit: Option<usize>,
     adaptive_live_ball_budget: Option<usize>,
@@ -989,12 +1021,31 @@ struct RuntimeConsoleState {
     quick_render_distance: String,
     quick_fsr_sharpness: String,
     log_scroll: usize,
+    log_filter: RuntimeConsoleLogFilter,
+    log_tail_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeConsoleLogLevel {
     Info,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeConsoleLogFilter {
+    All,
+    Info,
+    Error,
+}
+
+impl RuntimeConsoleLogFilter {
+    fn matches(self, level: RuntimeConsoleLogLevel) -> bool {
+        match self {
+            Self::All => true,
+            Self::Info => matches!(level, RuntimeConsoleLogLevel::Info),
+            Self::Error => matches!(level, RuntimeConsoleLogLevel::Error),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1111,6 +1162,8 @@ impl Default for RuntimeConsoleState {
             quick_render_distance: "off".to_string(),
             quick_fsr_sharpness: "0.35".to_string(),
             log_scroll: 0,
+            log_filter: RuntimeConsoleLogFilter::All,
+            log_tail_limit: None,
         }
     }
 }
@@ -1915,6 +1968,9 @@ impl TlAppRuntime {
             mps_logical_threads: logical_threads,
             max_substeps: tuned_max_substeps,
             last_substeps: 0,
+            manual_max_substeps: None,
+            simulation_paused: false,
+            simulation_step_budget: 0,
             tick_retune_timer: 0.0,
             adaptive_ball_render_limit: None,
             adaptive_live_ball_budget: None,
@@ -2061,7 +2117,7 @@ impl TlAppRuntime {
             let trim = self.console.log_lines.len() - CONSOLE_MAX_LOG_LINES;
             self.console.log_lines.drain(0..trim);
         }
-        let max_scroll = self.console.log_lines.len().saturating_sub(1);
+        let max_scroll = self.max_console_log_scroll();
         self.console.log_scroll = self.console.log_scroll.min(max_scroll);
         if print_to_stdout {
             println!("[tlapp console] {message}");
@@ -2186,7 +2242,7 @@ impl TlAppRuntime {
 
     #[inline]
     fn max_console_log_scroll(&self) -> usize {
-        self.console.log_lines.len().saturating_sub(1)
+        self.visible_console_log_count().saturating_sub(1)
     }
 
     fn scroll_console_logs(&mut self, delta_lines: i32) {
@@ -2206,6 +2262,48 @@ impl TlAppRuntime {
                 .log_scroll
                 .saturating_sub(delta_lines.unsigned_abs() as usize);
         }
+    }
+
+    fn visible_console_log_count(&self) -> usize {
+        let mut count = self
+            .console
+            .log_lines
+            .iter()
+            .filter(|line| self.console.log_filter.matches(line.level))
+            .count();
+        if let Some(limit) = self.console.log_tail_limit {
+            count = count.min(limit);
+        }
+        count
+    }
+
+    fn reset_simulation_state(&mut self) {
+        let world_config = self.world.config().clone();
+        let scene_config = self.scene.config();
+        let sprite_program = self.scene.sprite_program_cloned();
+        let ball_mesh_slot = self.scene.ball_mesh_slot();
+        let container_mesh_slot = self.scene.container_mesh_slot();
+        self.world = PhysicsWorld::new(world_config);
+        self.scene = BounceTankSceneController::new(scene_config);
+        if let Some(program) = sprite_program {
+            self.scene.set_sprite_program(program);
+        }
+        if ball_mesh_slot.is_some() || container_mesh_slot.is_some() {
+            let _ = self.scene.apply_runtime_patch(
+                &mut self.world,
+                BounceTankRuntimePatch {
+                    ball_mesh_slot,
+                    container_mesh_slot,
+                    ..BounceTankRuntimePatch::default()
+                },
+            );
+        }
+        self.script_last_spawned = 0;
+        self.script_frame_index = 0;
+        self.last_substeps = 0;
+        self.simulation_step_budget = 0;
+        self.tick_retune_timer = 0.0;
+        self.distance_retune_timer = 0.0;
     }
 
     fn apply_present_mode(&mut self, mode: wgpu::PresentMode) {
@@ -2246,8 +2344,22 @@ impl TlAppRuntime {
             .render_distance
             .map(|v| format!("{v:.1}"))
             .unwrap_or_else(|| "off".to_string());
+        let log_tail = self
+            .console
+            .log_tail_limit
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "off".to_string());
+        let log_filter = match self.console.log_filter {
+            RuntimeConsoleLogFilter::All => "all",
+            RuntimeConsoleLogFilter::Info => "info",
+            RuntimeConsoleLogFilter::Error => "error",
+        };
+        let substeps = self
+            .manual_max_substeps
+            .map(|n| format!("manual:{n}"))
+            .unwrap_or_else(|| format!("auto:{}", self.max_substeps));
         format!(
-            "fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} script_vars={} script_calls={}",
+            "fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} script_vars={} script_calls={}",
             self.present_mode,
             self.rt_mode,
             if rt.active { "on" } else { "off" },
@@ -2258,6 +2370,11 @@ impl TlAppRuntime {
             render_distance,
             self.adaptive_distance_enabled,
             self.distance_blur_mode,
+            self.simulation_paused,
+            self.simulation_step_budget,
+            substeps,
+            log_filter,
+            log_tail,
             self.console.script_vars.len(),
             self.console.script_statements.len()
         )
@@ -2416,12 +2533,195 @@ impl TlAppRuntime {
         let head_lc = head.to_ascii_lowercase();
         match head_lc.as_str() {
             "help" | "?" => {
-                self.console_feedback(
-                    "commands: help | status | clear | exit | gfx.status | gfx.vsync <auto|on|off> | gfx.fps_cap <off|N> | gfx.rt <off|auto|on> | gfx.fsr <off|auto|on> | gfx.fsr_quality <native|ultra|quality|balanced|performance> | gfx.fsr_sharpness <0..1> | gfx.fsr_scale <auto|0.5..1> | gfx.render_distance <off|N> | gfx.adaptive_distance <auto|on|off> | gfx.distance_blur <auto|on|off> | script.var <name> <expr> | script.unset <name> | script.vars | script.call <fn(args)> | script.exec <stmt> | script.uncall <idx|all> | script.list | script.clear"
-                );
+                self.console_feedback(format!("commands: {}", CONSOLE_HELP_COMMANDS.join(" | ")));
             }
             "status" | "gfx.status" => {
                 self.console_feedback(self.console_status_line());
+            }
+            "sim.status" => {
+                self.console_feedback(format!(
+                    "sim paused={} step_budget={} tick_hz={:.1} max_substeps={} manual_substeps={:?}",
+                    self.simulation_paused,
+                    self.simulation_step_budget,
+                    self.tick_hz,
+                    self.max_substeps,
+                    self.manual_max_substeps
+                ));
+            }
+            "sim.pause" => {
+                self.simulation_paused = true;
+                self.console_feedback("simulation paused");
+            }
+            "sim.resume" => {
+                self.simulation_paused = false;
+                self.simulation_step_budget = 0;
+                self.console_feedback("simulation resumed");
+            }
+            "sim.step" => {
+                let steps = match parts.next() {
+                    Some(value) => match parse_console_u32_in_range(value, "sim.step", 1, 240) {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => 1,
+                };
+                self.simulation_paused = true;
+                self.simulation_step_budget = self.simulation_step_budget.saturating_add(steps);
+                self.console_feedback(format!(
+                    "simulation step budget increased by {steps} (pending={})",
+                    self.simulation_step_budget
+                ));
+            }
+            "sim.reset" => {
+                self.reset_simulation_state();
+                self.console_feedback("simulation reset (world + scene)");
+            }
+            "phys.gravity" => {
+                let Some(x_raw) = parts.next() else {
+                    self.console_feedback("usage: phys.gravity <x> <y> <z>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(y_raw) = parts.next() else {
+                    self.console_feedback("usage: phys.gravity <x> <y> <z>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(z_raw) = parts.next() else {
+                    self.console_feedback("usage: phys.gravity <x> <y> <z>");
+                    return RuntimeCommand::Consumed;
+                };
+                let x = match parse_console_f32_in_range(x_raw, "phys.gravity.x", -120.0, 120.0) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let y = match parse_console_f32_in_range(y_raw, "phys.gravity.y", -120.0, 120.0) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let z = match parse_console_f32_in_range(z_raw, "phys.gravity.z", -120.0, 120.0) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                self.world.set_gravity(Vector3::new(x, y, z));
+                self.console_feedback(format!("gravity set to [{x:.3}, {y:.3}, {z:.3}]"));
+            }
+            "phys.substeps" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: phys.substeps <auto|n>");
+                    return RuntimeCommand::Consumed;
+                };
+                if value.eq_ignore_ascii_case("auto") {
+                    self.manual_max_substeps = None;
+                    self.tick_retune_timer = 0.0;
+                    self.console_feedback("substeps override cleared (auto)");
+                } else {
+                    let substeps = match parse_console_u32_in_range(value, "phys.substeps", 1, 64) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    };
+                    self.manual_max_substeps = Some(substeps);
+                    self.max_substeps = substeps;
+                    self.world
+                        .set_timestep(1.0 / self.tick_hz.max(1.0), self.max_substeps);
+                    self.console_feedback(format!("manual max_substeps={substeps}"));
+                }
+            }
+            "cam.speed" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: cam.speed <1..200>");
+                    return RuntimeCommand::Consumed;
+                };
+                match parse_console_f32_in_range(value, "cam.speed", 1.0, 200.0) {
+                    Ok(speed) => {
+                        self.camera.set_move_speed(speed);
+                        self.console_feedback(format!("camera speed set to {speed:.2}"));
+                    }
+                    Err(err) => self.console_feedback(err),
+                }
+            }
+            "cam.sens" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: cam.sens <0.0001..0.02>");
+                    return RuntimeCommand::Consumed;
+                };
+                match parse_console_f32_in_range(value, "cam.sens", 0.0001, 0.02) {
+                    Ok(sens) => {
+                        self.camera.set_mouse_sensitivity(sens);
+                        self.console_feedback(format!("camera sensitivity set to {sens:.5}"));
+                    }
+                    Err(err) => self.console_feedback(err),
+                }
+            }
+            "cam.reset" => {
+                self.camera.reset_pose();
+                self.console_feedback("camera pose reset");
+            }
+            "log.clear" => {
+                self.console.log_lines.clear();
+                self.console.log_scroll = 0;
+                self.console_feedback("log buffer cleared");
+            }
+            "log.tail" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: log.tail <off|n>");
+                    return RuntimeCommand::Consumed;
+                };
+                if value.eq_ignore_ascii_case("off") {
+                    self.console.log_tail_limit = None;
+                    self.console.log_scroll = 0;
+                    self.console_feedback("log tail disabled");
+                } else {
+                    match parse_console_u32_in_range(value, "log.tail", 1, 320) {
+                        Ok(limit) => {
+                            self.console.log_tail_limit = Some(limit as usize);
+                            self.console.log_scroll =
+                                self.console.log_scroll.min(self.max_console_log_scroll());
+                            self.console_feedback(format!("log tail set to last {limit} lines"));
+                        }
+                        Err(err) => self.console_feedback(err),
+                    }
+                }
+            }
+            "log.level" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: log.level <all|info|error>");
+                    return RuntimeCommand::Consumed;
+                };
+                let next = if value.eq_ignore_ascii_case("all") {
+                    Some(RuntimeConsoleLogFilter::All)
+                } else if value.eq_ignore_ascii_case("info") {
+                    Some(RuntimeConsoleLogFilter::Info)
+                } else if value.eq_ignore_ascii_case("error") {
+                    Some(RuntimeConsoleLogFilter::Error)
+                } else {
+                    None
+                };
+                match next {
+                    Some(filter) => {
+                        self.console.log_filter = filter;
+                        self.console.log_scroll =
+                            self.console.log_scroll.min(self.max_console_log_scroll());
+                        self.console_feedback(format!(
+                            "log filter set to {}",
+                            value.to_ascii_lowercase()
+                        ));
+                    }
+                    None => self.console_feedback("usage: log.level <all|info|error>"),
+                }
             }
             "clear" => {
                 self.console.last_feedback.clear();
@@ -3225,12 +3525,21 @@ impl TlAppRuntime {
         let out_top = -0.72f32;
         let out_bottom = -0.90f32;
         let visible_logs = (((out_top - out_bottom) / line_step).floor() as usize).max(3);
-        let total_logs = console.log_lines.len();
-        let end = total_logs.saturating_sub(console.log_scroll);
-        let start = end.saturating_sub(visible_logs);
-        let mut out_y = out_top;
-        for line in console
+        let filtered_logs = console
             .log_lines
+            .iter()
+            .filter(|line| console.log_filter.matches(line.level))
+            .collect::<Vec<_>>();
+        let total_logs = filtered_logs.len();
+        let tail_start = if let Some(limit) = console.log_tail_limit {
+            total_logs.saturating_sub(limit)
+        } else {
+            0
+        };
+        let end = total_logs.saturating_sub(console.log_scroll);
+        let start = end.saturating_sub(visible_logs).max(tail_start);
+        let mut out_y = out_top;
+        for line in filtered_logs
             .iter()
             .skip(start)
             .take(end.saturating_sub(start))
@@ -3263,11 +3572,26 @@ impl TlAppRuntime {
                 break;
             }
         }
-        if console.log_scroll > 0 {
+        let filter_label = match console.log_filter {
+            RuntimeConsoleLogFilter::All => "all",
+            RuntimeConsoleLogFilter::Info => "info",
+            RuntimeConsoleLogFilter::Error => "error",
+        };
+        let tail_label = console
+            .log_tail_limit
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "off".to_string());
+        if console.log_scroll > 0
+            || !matches!(console.log_filter, RuntimeConsoleLogFilter::All)
+            || console.log_tail_limit.is_some()
+        {
             Self::push_console_text_line(
                 sprites,
                 &mut sprite_id_seed,
-                &format!("SCROLL {}", console.log_scroll),
+                &format!(
+                    "SCROLL {} | FILTER {} | TAIL {}",
+                    console.log_scroll, filter_label, tail_label
+                ),
                 0.72 * layout.sx,
                 -0.66 * layout.sy,
                 0.96,
@@ -3935,7 +4259,9 @@ impl TlAppRuntime {
 
         self.tick_retune_timer -= sim_dt;
         if self.tick_retune_timer <= 0.0 {
-            self.max_substeps = load_plan.max_substeps.max(2);
+            self.max_substeps = self
+                .manual_max_substeps
+                .unwrap_or_else(|| load_plan.max_substeps.max(2));
             let mut desired_hz = choose_aggressive_tick_hz(
                 self.tick_policy,
                 self.tick_profile,
@@ -4019,16 +4345,48 @@ impl TlAppRuntime {
             };
         }
 
-        let _patch_metrics = self
-            .scene
-            .apply_runtime_patch(&mut self.world, runtime_patch);
-        let tick = self.scene.physics_tick(&mut self.world);
-        self.script_last_spawned = tick.spawned_this_tick;
         self.script_frame_index = self.script_frame_index.saturating_add(1);
+        let allow_physics_step = if self.simulation_paused {
+            if self.simulation_step_budget > 0 {
+                self.simulation_step_budget = self.simulation_step_budget.saturating_sub(1);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
 
-        let substeps = self.world.step(sim_dt);
-        self.last_substeps = substeps;
-        let _ = self.scene.reconcile_after_step(&mut self.world);
+        let (tick, substeps) = if allow_physics_step {
+            let _patch_metrics = self
+                .scene
+                .apply_runtime_patch(&mut self.world, runtime_patch);
+            let tick = self.scene.physics_tick(&mut self.world);
+            self.script_last_spawned = tick.spawned_this_tick;
+            let step_dt = if self.simulation_paused {
+                self.world.config().fixed_dt
+            } else {
+                sim_dt
+            };
+            let substeps = self.world.step(step_dt);
+            self.last_substeps = substeps;
+            let _ = self.scene.reconcile_after_step(&mut self.world);
+            (tick, substeps)
+        } else {
+            self.script_last_spawned = 0;
+            self.last_substeps = 0;
+            (
+                BounceTankTickMetrics {
+                    spawned_this_tick: 0,
+                    scattered_this_tick: 0,
+                    live_balls: self.scene.live_ball_count(),
+                    target_balls: self.scene.config().target_ball_count,
+                    fully_spawned: self.scene.live_ball_count()
+                        >= self.scene.config().target_ball_count,
+                },
+                0,
+            )
+        };
 
         let mut frame = self.scene.build_frame_instances_with_ball_limit(
             &self.world,

@@ -635,6 +635,21 @@ impl BounceTankSceneController {
         self.sprite_program.is_some()
     }
 
+    /// Clone current optional `.tlsprite` program for runtime reset/rebuild flows.
+    pub fn sprite_program_cloned(&self) -> Option<TlspriteProgram> {
+        self.sprite_program.clone()
+    }
+
+    /// Active mesh override slot for balls, if any.
+    pub fn ball_mesh_slot(&self) -> Option<u8> {
+        self.ball_mesh_slot
+    }
+
+    /// Active mesh override slot for the container, if any.
+    pub fn container_mesh_slot(&self) -> Option<u8> {
+        self.container_mesh_slot
+    }
+
     /// Apply a bounded runtime patch and propagate dynamic damping changes to existing bodies.
     pub fn apply_runtime_patch(
         &mut self,
