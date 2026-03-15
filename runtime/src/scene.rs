@@ -223,6 +223,7 @@ pub struct BounceTankSceneConfig {
     pub initial_speed_max: f32,
     pub scatter_interval_ticks: u64,
     pub scatter_strength: f32,
+    pub virtual_barrier_enabled: bool,
     pub seed: u64,
 }
 
@@ -260,6 +261,7 @@ impl Default for BounceTankSceneConfig {
             initial_speed_max: 1.25,
             scatter_interval_ticks: 420,
             scatter_strength: 0.16,
+            virtual_barrier_enabled: true,
             seed: 0x5EED_C0DE_u64,
         }
     }
@@ -307,6 +309,7 @@ pub struct BounceTankRuntimePatch {
     pub initial_speed_max: Option<f32>,
     pub scatter_interval_ticks: Option<u64>,
     pub scatter_strength: Option<f32>,
+    pub virtual_barrier_enabled: Option<bool>,
     pub ball_mesh_slot: Option<u8>,
     pub container_mesh_slot: Option<u8>,
 }
@@ -342,6 +345,7 @@ pub struct BounceTankSceneController {
     config: BounceTankSceneConfig,
     rng_state: u64,
     walls: Vec<BodyHandle>,
+    edge_barriers: Vec<BodyHandle>,
     balls: Vec<BallVisual>,
     sprite_program: Option<TlspriteProgram>,
     ball_mesh_slot: Option<u8>,
@@ -361,6 +365,7 @@ impl BounceTankSceneController {
             rng_state: config.seed,
             config,
             walls: Vec::with_capacity(6),
+            edge_barriers: Vec::with_capacity(12),
             balls: Vec::new(),
             sprite_program: None,
             ball_mesh_slot: None,
@@ -385,6 +390,18 @@ impl BounceTankSceneController {
 
     pub fn wall_count(&self) -> usize {
         self.walls.len()
+    }
+
+    pub fn edge_barrier_count(&self) -> usize {
+        self.edge_barriers.len()
+    }
+
+    fn virtual_barrier_enabled(&self) -> bool {
+        self.config.virtual_barrier_enabled
+    }
+
+    fn set_virtual_barrier_enabled(&mut self, enabled: bool) {
+        self.config.virtual_barrier_enabled = enabled;
     }
 
     /// Override the default HUD sprite emission with a compiled `.tlsprite` program.
@@ -583,8 +600,7 @@ impl BounceTankSceneController {
         }
         if let Some(max_speed) = patch.levitation_lateral_max_horizontal_speed {
             let clamped = max_speed.clamp(0.05, 120.0);
-            if (self.config.levitation_lateral_max_horizontal_speed - clamped).abs()
-                > f32::EPSILON
+            if (self.config.levitation_lateral_max_horizontal_speed - clamped).abs() > f32::EPSILON
             {
                 self.config.levitation_lateral_max_horizontal_speed = clamped;
                 updated = true;
@@ -629,6 +645,12 @@ impl BounceTankSceneController {
             let clamped = scatter_strength.clamp(0.0, 1.0);
             if (self.config.scatter_strength - clamped).abs() > f32::EPSILON {
                 self.config.scatter_strength = clamped;
+                updated = true;
+            }
+        }
+        if let Some(enabled) = patch.virtual_barrier_enabled {
+            if self.virtual_barrier_enabled() != enabled {
+                self.set_virtual_barrier_enabled(enabled);
                 updated = true;
             }
         }
@@ -695,8 +717,11 @@ impl BounceTankSceneController {
     /// Ensure static physics walls exist and then spawn a progressive ball batch.
     pub fn physics_tick(&mut self, world: &mut PhysicsWorld) -> BounceTankTickMetrics {
         self.ensure_container_walls(world);
+        self.ensure_container_edge_barriers(world);
         self.cull_missing(world);
-        let _ = self.recycle_escaped_balls(world);
+        if self.virtual_barrier_enabled() {
+            let _ = self.recycle_escaped_balls(world);
+        }
         let spawned = self.spawn_batch(world);
         let scattered = self.maybe_scatter_burst(world);
         let _ = self.apply_levitation_field(world);
@@ -714,6 +739,9 @@ impl BounceTankSceneController {
     /// Call this right after `world.step(...)` to avoid one-frame visual pops where a high-energy
     /// body tunnels outside the prism before the next `physics_tick`.
     pub fn reconcile_after_step(&mut self, world: &mut PhysicsWorld) -> usize {
+        if !self.virtual_barrier_enabled() {
+            return 0;
+        }
         let recycled = self.recycle_escaped_balls(world);
         if recycled > 0 {
             // Interpolation uses stored snapshots captured inside `world.step(...)`.
@@ -872,6 +900,8 @@ impl BounceTankSceneController {
     fn cull_missing(&mut self, world: &PhysicsWorld) {
         self.balls.retain(|ball| world.body(ball.body).is_some());
         self.walls.retain(|wall| world.body(*wall).is_some());
+        self.edge_barriers
+            .retain(|barrier| world.body(*barrier).is_some());
     }
 
     fn ensure_container_walls(&mut self, world: &mut PhysicsWorld) {
@@ -936,6 +966,70 @@ impl BounceTankSceneController {
                 user_tag: collision_filter_tag(COLLISION_GROUP_WALL, COLLISION_GROUP_BALL),
             });
             self.walls.push(body);
+        }
+    }
+
+    fn ensure_container_edge_barriers(&mut self, world: &mut PhysicsWorld) {
+        if self.edge_barriers.len() == 12
+            && self
+                .edge_barriers
+                .iter()
+                .all(|barrier| world.body(*barrier).is_some())
+        {
+            return;
+        }
+        self.edge_barriers.clear();
+
+        let hx = self.config.container_half_extents[0].max(0.5);
+        let hy = self.config.container_half_extents[1].max(0.5);
+        let hz = self.config.container_half_extents[2].max(0.5);
+        let edge = self.config.wall_thickness.max(0.03) * 0.30;
+        let edge_half = edge.max(0.01) * 0.5;
+
+        let x_edges = [
+            ([0.0, hy, hz], [hx * 0.5, edge_half, edge_half]),
+            ([0.0, hy, -hz], [hx * 0.5, edge_half, edge_half]),
+            ([0.0, -hy, hz], [hx * 0.5, edge_half, edge_half]),
+            ([0.0, -hy, -hz], [hx * 0.5, edge_half, edge_half]),
+        ];
+        let y_edges = [
+            ([hx, 0.0, hz], [edge_half, hy * 0.5, edge_half]),
+            ([hx, 0.0, -hz], [edge_half, hy * 0.5, edge_half]),
+            ([-hx, 0.0, hz], [edge_half, hy * 0.5, edge_half]),
+            ([-hx, 0.0, -hz], [edge_half, hy * 0.5, edge_half]),
+        ];
+        let z_edges = [
+            ([hx, hy, 0.0], [edge_half, edge_half, hz * 0.5]),
+            ([hx, -hy, 0.0], [edge_half, edge_half, hz * 0.5]),
+            ([-hx, hy, 0.0], [edge_half, edge_half, hz * 0.5]),
+            ([-hx, -hy, 0.0], [edge_half, edge_half, hz * 0.5]),
+        ];
+
+        let wall_material = ColliderMaterial {
+            restitution: self.config.wall_restitution.max(0.0),
+            friction: self.config.wall_friction.max(0.0),
+        };
+
+        for (center, half_extents) in x_edges
+            .into_iter()
+            .chain(y_edges.into_iter())
+            .chain(z_edges.into_iter())
+        {
+            let half_extents = Vector3::new(half_extents[0], half_extents[1], half_extents[2]);
+            let body = world.spawn_body(BodyDesc {
+                kind: BodyKind::Static,
+                position: Vector3::new(center[0], center[1], center[2]),
+                local_bounds: Aabb::from_center_half_extents(Vector3::zeros(), half_extents),
+                ..BodyDesc::default()
+            });
+            let _ = world.spawn_collider(ColliderDesc {
+                body: Some(body),
+                shape: ColliderShape::Aabb { half_extents },
+                material: wall_material,
+                is_sensor: false,
+                user_tag: collision_filter_tag(COLLISION_GROUP_WALL, COLLISION_GROUP_BALL),
+            });
+            self.edge_barriers.push(body);
         }
     }
 
@@ -1192,7 +1286,8 @@ impl BounceTankSceneController {
         let reaction_strength = self.config.levitation_reaction_strength.max(0.0);
         let reaction_radius = self.config.levitation_reaction_radius.max(0.0);
         let reaction_damping = self.config.levitation_reaction_damping.max(0.0);
-        let reaction_enabled = vertical_enabled && reaction_strength > 1e-5 && reaction_radius > 0.05;
+        let reaction_enabled =
+            vertical_enabled && reaction_strength > 1e-5 && reaction_radius > 0.05;
         let reaction_r2 = reaction_radius * reaction_radius;
         let inv_cell = if reaction_enabled {
             1.0 / reaction_radius.max(0.05)
@@ -1541,6 +1636,10 @@ impl BounceTankSceneController {
         let hy = self.config.container_half_extents[1] * 2.0;
         let hz = self.config.container_half_extents[2] * 2.0;
         let edge = self.config.wall_thickness.max(0.03) * 0.30;
+        let primitive = self
+            .container_mesh_slot
+            .map(|slot| ScenePrimitive3d::Mesh { slot })
+            .unwrap_or(ScenePrimitive3d::Box);
 
         // X-axis edges (y/z corners).
         let x_edges = [
@@ -1656,14 +1755,14 @@ impl BounceTankSceneController {
         {
             out.push(SceneInstance3d {
                 instance_id: (u64::MAX - 20).saturating_sub(edge_index),
-                primitive: ScenePrimitive3d::Box,
+                primitive,
                 transform: SceneTransform3d {
                     translation,
                     rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
                     scale,
                 },
                 material: SceneMaterial {
-                    base_color_rgba: [0.90, 0.96, 1.0, 0.72],
+                    base_color_rgba: [0.90, 0.96, 1.0, 0.56],
                     roughness: 0.06,
                     metallic: 0.0,
                     emissive_rgb: [0.06, 0.09, 0.12],
@@ -1782,6 +1881,7 @@ mod tests {
         }
 
         assert_eq!(scene.wall_count(), 6);
+        assert_eq!(scene.edge_barrier_count(), 12);
         assert!(total_spawned > 0);
         assert!(scene.live_ball_count() <= 256);
 

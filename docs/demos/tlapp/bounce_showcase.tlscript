@@ -4,6 +4,8 @@
 def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool, key_w_down: bool, key_s_down: bool, key_a_down: bool, key_d_down: bool, key_up_down: bool, key_down_down: bool, key_left_down: bool, key_right_down: bool, key_space_down: bool, key_ctrl_down: bool, key_shift_down: bool, key_q_down: bool, key_e_down: bool, key_c_down: bool, key_r_down: bool, key_l_down: bool, key_alt_down: bool, key_enter_down: bool, key_escape_down: bool, key_tab_down: bool, mouse_look_down: bool, pad_move_x: float, pad_move_y: float, pad_rise: float, pad_descend: float, pad_look_x: float, pad_look_y: float, pad_sprint_down: bool):
     set_fbx_full_render(true)
     set_ball_mesh_slot(2)
+    set_container_mesh_slot(3)
+    set_virtual_barrier(false)
 
     if frame == 0:
         set_camera_pose(0.0, 12.0, 36.0, 0.0, 0.0, 0.0)

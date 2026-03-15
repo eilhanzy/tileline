@@ -1005,6 +1005,9 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
     if patch.scatter_strength.is_some() {
         target.scatter_strength = patch.scatter_strength;
     }
+    if patch.virtual_barrier_enabled.is_some() {
+        target.virtual_barrier_enabled = patch.virtual_barrier_enabled;
+    }
     if patch.ball_mesh_slot.is_some() {
         target.ball_mesh_slot = patch.ball_mesh_slot;
     }

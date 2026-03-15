@@ -20,7 +20,7 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 52] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 53] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_linear_damping",
@@ -56,6 +56,7 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 52] = [
     "set_friction_kinetic_scale",
     "set_scatter_interval",
     "set_scatter_strength",
+    "set_virtual_barrier",
     "set_initial_speed",
     "set_initial_speed_min",
     "set_initial_speed_max",
@@ -1019,6 +1020,10 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
             [v] => state.patch.scatter_strength = Some(v.to_f64() as f32),
             _ => state.warn("set_scatter_strength expects 1 arg"),
         },
+        "set_virtual_barrier" => match args {
+            [v] => state.patch.virtual_barrier_enabled = Some(v.to_bool()),
+            _ => state.warn("set_virtual_barrier expects 1 arg"),
+        },
         "set_initial_speed" => match args {
             [min_v, max_v] => {
                 state.patch.initial_speed_min = Some(min_v.to_f64() as f32);
@@ -1476,6 +1481,25 @@ mod tests {
         assert!((out.patch.scatter_strength.unwrap_or(0.0) - 0.16).abs() < 1e-6);
         assert!((out.patch.initial_speed_min.unwrap_or(0.0) - 0.35).abs() < 1e-6);
         assert!((out.patch.initial_speed_max.unwrap_or(0.0) - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn supports_virtual_barrier_toggle() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_virtual_barrier(false)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.patch.virtual_barrier_enabled, Some(false));
     }
 
     #[test]

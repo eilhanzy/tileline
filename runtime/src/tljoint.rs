@@ -635,7 +635,8 @@ fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatc
         target.levitation_lateral_damping = patch.levitation_lateral_damping;
     }
     if patch.levitation_lateral_max_horizontal_speed.is_some() {
-        target.levitation_lateral_max_horizontal_speed = patch.levitation_lateral_max_horizontal_speed;
+        target.levitation_lateral_max_horizontal_speed =
+            patch.levitation_lateral_max_horizontal_speed;
     }
     if patch.levitation_lateral_wall_push.is_some() {
         target.levitation_lateral_wall_push = patch.levitation_lateral_wall_push;
@@ -654,6 +655,9 @@ fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatc
     }
     if patch.scatter_strength.is_some() {
         target.scatter_strength = patch.scatter_strength;
+    }
+    if patch.virtual_barrier_enabled.is_some() {
+        target.virtual_barrier_enabled = patch.virtual_barrier_enabled;
     }
     if patch.ball_mesh_slot.is_some() {
         target.ball_mesh_slot = patch.ball_mesh_slot;
