@@ -7,6 +7,11 @@
 //! GMS paralel, çok-GPU hesaplama için tasarlanmıştır; MGS ise tek-GPU, serial
 //! fallback zinciri ve mobil güç/termal kısıtları için yazılmıştır.
 
+/// Canonical module id used by runtime version commands.
+pub const MODULE_ID: &str = "mgs";
+/// Crate version resolved at compile time.
+pub const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod bridge;
 pub mod fallback;
 pub mod hardware;

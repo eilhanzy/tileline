@@ -50,6 +50,7 @@ mod tlsprite;
 mod tlsprite_editor;
 mod tlsprite_editor_cli;
 mod upscaler;
+mod versioning;
 mod wgpu_render_loop;
 mod wgpu_scene_renderer;
 
@@ -142,6 +143,10 @@ pub use tlsprite_editor::{
 };
 pub use tlsprite_editor_cli::run_from_env as run_tlsprite_editor_from_env;
 pub use upscaler::{resolve_fsr_status, FsrConfig, FsrMode, FsrQualityPreset, FsrStatus};
+pub use versioning::{
+    resolve_tileline_version_query, tileline_version_entries, TilelineVersionEntry, ENGINE_ID,
+    ENGINE_VERSION,
+};
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,
     SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,

@@ -8,6 +8,11 @@
 //! - UMA/Apple Silicon adaptive buffer regulation
 //! - runtime tuning profiles shared by benchmarks and engine runtime code
 
+/// Canonical module id used by runtime version commands.
+pub const MODULE_ID: &str = "gms";
+/// Crate version resolved at compile time.
+pub const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod adaptive_buffer;
 pub mod bridge;
 pub mod hardware;

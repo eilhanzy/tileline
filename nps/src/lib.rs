@@ -9,6 +9,11 @@
 //! - lightweight UDP reliability for lifecycle events while keeping physics updates unreliable
 //! - non-blocking packet encode/decode offload through the MPS scheduler
 
+/// Canonical module id used by runtime version commands.
+pub const MODULE_ID: &str = "nps";
+/// Crate version resolved at compile time.
+pub const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod bitpack;
 pub mod manager;
 pub mod model;

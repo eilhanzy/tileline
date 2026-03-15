@@ -44,6 +44,7 @@ Mouse usage:
 
 - `help`
 - `help <file|gfx|sim|script|cam|log>`
+- `version [module|all]`
 - `status`
 - `clear`
 - `exit` / `quit`
@@ -113,6 +114,12 @@ Safety rules:
 
 These commands update live runtime state (no restart required).
 
+### Versioning
+
+- `version` or `version all`: engine + all module versions
+- `version <module>`: module-specific version query
+  - modules: `tileline`, `runtime`, `tl-core`, `mps`, `gms`, `mgs`, `nps`, `paradoxpe`
+
 ### `.tlscript` Control (`script.*`)
 
 - `script.var <name> <expr>`: set a reusable variable (`$name`) for CLI script statements
@@ -129,6 +136,12 @@ scene script evaluation. This means runtime CLI statements can override gameplay
 without editing source files.
 
 ## Examples
+
+```text
+version
+version mps
+version tl-core
+```
 
 ```text
 gfx.vsync off

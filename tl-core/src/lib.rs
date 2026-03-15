@@ -10,6 +10,11 @@
 //! - [`graphics::multigpu::sync`] for portable explicit multi-GPU synchronization and UMA hooks
 //! - [`tlscript`] for the in-memory, zero-copy `.tlscript` frontend lexer/token layer
 
+/// Canonical module id used by runtime version commands.
+pub const MODULE_ID: &str = "tl-core";
+/// Crate version resolved at compile time.
+pub const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod core;
 pub mod graphics;
 pub mod tlscript;

@@ -7,6 +7,11 @@
 //! - generic handle release for script/runtime integration
 //! - a small host ABI surface that `.tlscript` can target without raw pointers
 
+/// Canonical module id used by runtime version commands.
+pub const MODULE_ID: &str = "paradoxpe";
+/// Crate version resolved at compile time.
+pub const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod abi;
 pub mod body;
 pub mod broadphase;

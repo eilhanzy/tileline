@@ -11,15 +11,17 @@ use std::time::{Duration, Instant};
 use crate::{
     app_runner, apply_scene_light_overrides, choose_scheduler_path_for_platform,
     clamp_scene_lights_for_camera, compile_tljoint_scene_from_path,
-    compile_tlpfile_scene_from_path, compile_tlscript_showcase, BounceTankRuntimePatch,
-    BounceTankSceneConfig, BounceTankSceneController, BounceTankTickMetrics, DrawPathCompiler,
-    FsrConfig, FsrMode, FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode,
-    RuntimePlatform, SceneFrameInstances, ScenePrimitive3d, SpriteInstance, SpriteKind,
-    TelemetryHudComposer, TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel,
-    TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlscriptCoordinateSpace,
+    compile_tlpfile_scene_from_path, compile_tlscript_showcase, resolve_tileline_version_query,
+    tileline_version_entries, BounceTankRuntimePatch, BounceTankSceneConfig,
+    BounceTankSceneController, BounceTankTickMetrics, DrawPathCompiler, FsrConfig, FsrMode,
+    FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode, RuntimePlatform,
+    SceneFrameInstances, ScenePrimitive3d, SpriteInstance, SpriteKind, TelemetryHudComposer,
+    TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle,
+    TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlscriptCoordinateSpace,
     TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
     TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram,
-    TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer, MAX_SCENE_LIGHTS,
+    TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION,
+    MAX_SCENE_LIGHTS,
 };
 use gms::safe_default_required_limits_for_adapter;
 use nalgebra::Vector3;
@@ -72,6 +74,7 @@ const CONSOLE_FILE_GREP_MAX_CONTEXT: usize = 8;
 const CONSOLE_HELP_COMMANDS: &[&str] = &[
     "help",
     "help <file|gfx|sim|script|cam|log>",
+    "version [module|all]",
     "status | gfx.status",
     "sim.status | sim.pause | sim.resume | sim.step <n> | sim.reset",
     "scene.reload | sprite.reload | script.reload",
@@ -219,6 +222,10 @@ impl CliOptions {
             match arg.as_str() {
                 "-h" | "--help" => {
                     print_usage();
+                    std::process::exit(0);
+                }
+                "-V" | "--version" => {
+                    print_version_overview();
                     std::process::exit(0);
                 }
                 "--resolution" => {
@@ -674,6 +681,7 @@ fn print_usage() {
     println!(
         "  --sprite <path>           .tlsprite path (default: docs/demos/tlapp/bounce_hud.tlsprite)"
     );
+    println!("  -V, --version             Show engine + module versions");
     println!("  -h, --help                Show help");
     println!();
     println!("Keyboard:");
@@ -686,6 +694,13 @@ fn print_usage() {
     println!("Gamepad:");
     println!("  Left stick move | Right stick look | D-Pad move");
     println!("  South button mirrors G action | Trigger buttons add vertical move");
+}
+
+fn print_version_overview() {
+    println!("Tileline Engine: v{ENGINE_VERSION}");
+    for entry in tileline_version_entries() {
+        println!("  {:<10} v{}", entry.module, entry.version);
+    }
 }
 
 struct TlApp {
@@ -3431,6 +3446,21 @@ impl TlAppRuntime {
                         "commands: {}",
                         CONSOLE_HELP_COMMANDS.join(" | ")
                     ));
+                }
+            }
+            "version" | "ver" => {
+                let query = parts.next().unwrap_or("all");
+                if query.eq_ignore_ascii_case("all") {
+                    self.console_feedback(format!("{ENGINE_ID} engine v{ENGINE_VERSION}"));
+                    for entry in tileline_version_entries() {
+                        self.console_feedback(format!("  {:<10} v{}", entry.module, entry.version));
+                    }
+                } else if let Some(entry) = resolve_tileline_version_query(query) {
+                    self.console_feedback(format!("{} v{}", entry.module, entry.version));
+                } else {
+                    self.console_feedback(
+                        "usage: version [module|all] (module: tileline|runtime|tl-core|mps|gms|mgs|nps|paradoxpe)",
+                    );
                 }
             }
             "status" | "gfx.status" => {

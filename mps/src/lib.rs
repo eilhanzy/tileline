@@ -10,6 +10,11 @@
 //! - execute native Rust closures and WASM tasks in memory
 //! - expose scheduler metrics for bridge/runtime feedback loops
 
+/// Canonical module id used by runtime version commands.
+pub const MODULE_ID: &str = "mps";
+/// Crate version resolved at compile time.
+pub const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod balancer;
 pub mod key_bruteforce;
 pub mod key_decode;
