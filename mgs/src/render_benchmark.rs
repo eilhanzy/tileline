@@ -1129,7 +1129,8 @@ impl Renderer {
             units = units.saturating_mul(tile_factor);
         }
         if plan.memory_pressure {
-            units = (units / 2).max(1);
+            // Relax pressure decrease so short spikes do not collapse throughput.
+            units = units.saturating_mul(3).div_ceil(4).max(1);
         }
         units.clamp(1, 24)
     }

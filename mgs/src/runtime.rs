@@ -686,8 +686,8 @@ impl AdaptiveBurstController {
 
         if memory_pressure {
             self.cap_units = self.cap_units.saturating_sub(1).max(lower_bound);
-            self.cooldown_frames = if self.uma_shared_memory { 36 } else { 24 };
-            self.recovery_frames = if self.uma_shared_memory { 48 } else { 0 };
+            self.cooldown_frames = if self.uma_shared_memory { 28 } else { 20 };
+            self.recovery_frames = if self.uma_shared_memory { 32 } else { 0 };
             self.low_jitter_streak = 0;
             return;
         }
@@ -714,21 +714,22 @@ impl AdaptiveBurstController {
         };
 
         if high_jitter {
+            // Keep decrease policy relaxed to avoid over-correcting on short spikes.
             let reduction = if self.uma_shared_memory {
-                if jitter_ratio > 0.26 || sample > self.ema_ms_per_unit * 2.0 {
+                if jitter_ratio > 0.34 || sample > self.ema_ms_per_unit * 2.25 {
                     2
                 } else {
                     1
                 }
-            } else if jitter_ratio > 0.35 || sample > self.ema_ms_per_unit * 2.20 {
+            } else if jitter_ratio > 0.45 || sample > self.ema_ms_per_unit * 2.40 {
                 2
             } else {
                 1
             };
             self.cap_units = self.cap_units.saturating_sub(reduction).max(lower_bound);
-            self.cooldown_frames = if self.uma_shared_memory { 30 } else { 18 };
+            self.cooldown_frames = if self.uma_shared_memory { 22 } else { 14 };
             if self.uma_shared_memory {
-                self.recovery_frames = 36;
+                self.recovery_frames = 24;
             }
             self.low_jitter_streak = 0;
         } else if (if self.uma_shared_memory {
