@@ -719,6 +719,7 @@ struct TlAppRuntime {
     last_distance_blurred: usize,
     last_framebuffer_fill_ratio: f32,
     framebuffer_fill_ema: f32,
+    distance_retune_timer: f32,
     frame_time_ema_ms: f32,
     frame_time_jitter_ema_ms: f32,
     frame_time_budget_ms: f32,
@@ -1199,18 +1200,16 @@ impl TlAppRuntime {
         let adaptive_distance_enabled = options.adaptive_distance.resolve(mobile_class_tuning);
         let mut render_distance = options
             .render_distance
-            .or_else(|| mobile_class_tuning.then_some(34.0));
+            .or_else(|| mobile_class_tuning.then_some(72.0));
         if render_distance.is_none() && adaptive_distance_enabled {
-            render_distance = Some(if mobile_class_tuning { 34.0 } else { 58.0 });
+            render_distance = Some(if mobile_class_tuning { 84.0 } else { 96.0 });
         }
-        let (render_distance_min, render_distance_max) = if let Some(base) = render_distance {
-            (
-                (base * 0.60).clamp(16.0, base),
-                (base * 1.40).clamp(base, 140.0),
-            )
-        } else {
-            (0.0, 0.0)
-        };
+        let mut render_distance_min = 0.0;
+        let mut render_distance_max = 0.0;
+        if let Some(base) = render_distance {
+            render_distance_min = (base * 0.72).clamp(28.0, base);
+            render_distance_max = (base * 1.55).clamp(base, 220.0);
+        }
         let distance_blur_mode = options.distance_blur;
         let distance_blur_enabled = distance_blur_mode.resolve(mobile_class_tuning);
         let uncapped_dynamic_fps_hint =
@@ -1332,6 +1331,31 @@ impl TlAppRuntime {
             initial_speed_max: 1.25,
             ..BounceTankSceneConfig::default()
         });
+        let mut renderer =
+            WgpuSceneRenderer::new(&device, &queue, config.format, size.width, size.height);
+        // Always keep a deterministic high-quality FBX-equivalent mesh in slot 2 so script
+        // `set_ball_mesh_slot(2)` stays stable even when tlsprite binding fails.
+        renderer.bind_builtin_sphere_mesh_slot(&device, DEFAULT_FBX_BALL_SLOT, true);
+        renderer.bind_builtin_sphere_mesh_slot(&device, AUTO_LOW_POLY_BALL_SLOT, false);
+        let camera = FreeCameraController::default();
+        let gamepad = GamepadManager::new();
+        let (eye, target) = camera.eye_target();
+        if let Some(current_distance) = render_distance {
+            let ext = scene.config().container_half_extents;
+            let tank_radius = (ext[0] * ext[0] + ext[1] * ext[1] + ext[2] * ext[2]).sqrt();
+            let camera_to_center = (eye[0] * eye[0] + eye[1] * eye[1] + eye[2] * eye[2]).sqrt();
+            let stable_distance_floor = (camera_to_center + tank_radius + 6.0).clamp(40.0, 180.0);
+            let guarded_distance = current_distance.max(stable_distance_floor);
+            render_distance = Some(guarded_distance);
+            render_distance_min = render_distance_min
+                .max(stable_distance_floor * 0.86)
+                .min(guarded_distance);
+            render_distance_max = render_distance_max
+                .max(stable_distance_floor * 1.20)
+                .max(guarded_distance)
+                .clamp(guarded_distance, 260.0);
+        }
+        renderer.set_camera_view(&queue, size.width.max(1), size.height.max(1), eye, target);
         eprintln!(
             "[mps] cpu profile logical={} physical={} mobile_tuning={} little_core_class={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={} render_distance={:?} adaptive_distance={} distance_blur={:?} ({})",
             logical_threads,
@@ -1348,17 +1372,6 @@ impl TlAppRuntime {
             distance_blur_mode,
             distance_blur_enabled
         );
-
-        let mut renderer =
-            WgpuSceneRenderer::new(&device, &queue, config.format, size.width, size.height);
-        // Always keep a deterministic high-quality FBX-equivalent mesh in slot 2 so script
-        // `set_ball_mesh_slot(2)` stays stable even when tlsprite binding fails.
-        renderer.bind_builtin_sphere_mesh_slot(&device, DEFAULT_FBX_BALL_SLOT, true);
-        renderer.bind_builtin_sphere_mesh_slot(&device, AUTO_LOW_POLY_BALL_SLOT, false);
-        let camera = FreeCameraController::default();
-        let gamepad = GamepadManager::new();
-        let (eye, target) = camera.eye_target();
-        renderer.set_camera_view(&queue, size.width.max(1), size.height.max(1), eye, target);
 
         let draw_compiler = DrawPathCompiler::new();
         let hud = TelemetryHudComposer::new(Default::default());
@@ -1452,6 +1465,7 @@ impl TlAppRuntime {
             last_distance_blurred: 0,
             last_framebuffer_fill_ratio: 0.0,
             framebuffer_fill_ema: 0.0,
+            distance_retune_timer: 0.0,
             frame_time_ema_ms: 0.0,
             frame_time_jitter_ema_ms: 0.0,
             frame_time_budget_ms: (1_000.0 / fps_limit_hint.max(24.0)).clamp(3.0, 41.0),
@@ -1844,7 +1858,11 @@ impl TlAppRuntime {
             .unwrap_or(self.force_full_fbx_from_sprite);
         let mut runtime_patch = frame_eval.patch;
         self.frame_time_budget_ms = (1_000.0 / self.fps_limit_hint.max(24.0)).clamp(3.0, 41.0);
-        self.retune_render_distance(mobile_path);
+        self.distance_retune_timer -= sim_dt;
+        if self.distance_retune_timer <= 0.0 {
+            self.retune_render_distance(mobile_path);
+            self.distance_retune_timer = if mobile_path { 0.22 } else { 0.28 };
+        }
         self.refresh_distance_blur_state(mobile_path);
         let mut load_plan = choose_runtime_load_plan(
             self.fps_tracker.ema_fps(),
@@ -3008,7 +3026,7 @@ fn choose_runtime_load_plan(
 
     match pressure {
         0..=2 => RuntimeLoadPlan {
-            visible_ball_limit: if mobile_path && live_balls > 2_600 {
+            visible_ball_limit: if mobile_path && heavy_fill && live_balls > 3_600 {
                 Some(cap(2_600))
             } else {
                 None
@@ -3020,7 +3038,7 @@ fn choose_runtime_load_plan(
             tick_scale: if mobile_path { 0.78 } else { 1.00 },
         },
         3..=4 => RuntimeLoadPlan {
-            visible_ball_limit: if mobile_path && live_balls > 3_000 {
+            visible_ball_limit: if mobile_path && heavy_fill && live_balls > 3_200 {
                 Some(cap(2_300))
             } else {
                 None
@@ -3032,7 +3050,11 @@ fn choose_runtime_load_plan(
             tick_scale: if mobile_path { 0.66 } else { 0.96 },
         },
         5..=6 => RuntimeLoadPlan {
-            visible_ball_limit: if mobile_path { Some(cap(2_000)) } else { None },
+            visible_ball_limit: if mobile_path && (heavy_fill || live_balls > 4_200) {
+                Some(cap(2_000))
+            } else {
+                None
+            },
             live_ball_budget: if mobile_path { Some(cap(3_400)) } else { None },
             spawn_per_tick_cap: cap(if mobile_path { 48 } else { 260 }),
             max_substeps: if mobile_path { 4 } else { 10 },
@@ -3040,7 +3062,11 @@ fn choose_runtime_load_plan(
             tick_scale: if mobile_path { 0.56 } else { 0.82 },
         },
         7..=8 => RuntimeLoadPlan {
-            visible_ball_limit: if mobile_path { Some(cap(1_700)) } else { None },
+            visible_ball_limit: if mobile_path && (heavy_fill || live_balls > 3_600) {
+                Some(cap(1_700))
+            } else {
+                None
+            },
             live_ball_budget: if mobile_path { Some(cap(2_900)) } else { None },
             spawn_per_tick_cap: cap(if mobile_path { 32 } else { 200 }),
             max_substeps: if mobile_path { 3 } else { 10 },
@@ -3093,17 +3119,26 @@ fn apply_render_distance_haze(
     let Some(max_distance) = render_distance.filter(|distance| *distance > 0.25) else {
         return RenderDistanceStats::default();
     };
-    let blur_start_ratio = 0.74;
+    let blur_start_ratio = 0.80;
     let blur_start = (max_distance * blur_start_ratio).max(0.25);
-    // Keep a soft margin after render distance to reduce sudden popping.
-    let hard_cull_distance = max_distance * 1.18;
+    // Keep a large soft margin after render distance to avoid sudden popping/flicker.
+    let hard_cull_distance = max_distance * if blur_enabled { 1.42 } else { 1.24 };
     let max_distance_sq = max_distance * max_distance;
     let hard_cull_distance_sq = hard_cull_distance * hard_cull_distance;
     let blur_start_sq = blur_start * blur_start;
+    let total_candidates = frame
+        .opaque_3d
+        .iter()
+        .filter(|instance| !matches!(instance.primitive, ScenePrimitive3d::Box))
+        .count();
+    let min_keep = ((total_candidates as f32) * 0.18)
+        .round()
+        .clamp(120.0, 640.0) as usize;
 
     let mut stats = RenderDistanceStats::default();
     let mut next_opaque = Vec::with_capacity(frame.opaque_3d.len());
     let mut blurred = Vec::<(f32, crate::scene::SceneInstance3d)>::new();
+    let mut hard_culled = Vec::<(f32, crate::scene::SceneInstance3d)>::new();
 
     for mut instance in frame.opaque_3d.drain(..) {
         if matches!(instance.primitive, ScenePrimitive3d::Box) {
@@ -3117,7 +3152,7 @@ fn apply_render_distance_haze(
         let distance_sq = dx * dx + dy * dy + dz * dz;
 
         if distance_sq > hard_cull_distance_sq {
-            stats.culled = stats.culled.saturating_add(1);
+            hard_culled.push((distance_sq, instance));
             continue;
         }
         if blur_enabled && distance_sq > blur_start_sq {
@@ -3131,7 +3166,7 @@ fn apply_render_distance_haze(
             let distance = distance_sq.sqrt();
             let t = ((distance - max_distance) / (hard_cull_distance - max_distance).max(1e-4))
                 .clamp(0.0, 1.0);
-            soften_instance_for_distance_haze(&mut instance, t * 0.85 + 0.15);
+            soften_instance_for_distance_haze(&mut instance, t * 0.80 + 0.20);
             blurred.push((distance_sq, instance));
             stats.blurred = stats.blurred.saturating_add(1);
         } else {
@@ -3139,6 +3174,18 @@ fn apply_render_distance_haze(
         }
     }
 
+    let rendered_count = next_opaque.len() + blurred.len();
+    if rendered_count < min_keep && !hard_culled.is_empty() {
+        hard_culled.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let rescue_count = (min_keep - rendered_count).min(hard_culled.len());
+        for (distance_sq, mut instance) in hard_culled.drain(..rescue_count) {
+            soften_instance_for_distance_haze(&mut instance, 0.96);
+            blurred.push((distance_sq, instance));
+            stats.blurred = stats.blurred.saturating_add(1);
+        }
+    }
+
+    stats.culled = stats.culled.saturating_add(hard_culled.len());
     // Draw farther blurred objects first to reduce alpha-overdraw artifacts.
     blurred.sort_by(|left, right| right.0.total_cmp(&left.0));
 
