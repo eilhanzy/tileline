@@ -20,9 +20,11 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 55] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 57] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
+    "set_container_size",
+    "set_container_shape",
     "set_container_half_extents",
     "set_wall_thickness",
     "set_linear_damping",
@@ -837,6 +839,25 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
             [v] => state.patch.target_ball_count = Some(v.to_i64().max(0) as usize),
             _ => state.warn("set_target_ball_count expects 1 arg"),
         },
+        "set_container_size" => match args {
+            [x, y, z] => {
+                let sx = (x.to_f64() as f32).max(0.0);
+                let sy = (y.to_f64() as f32).max(0.0);
+                let sz = (z.to_f64() as f32).max(0.0);
+                state.patch.container_half_extents = Some([sx * 0.5, sy * 0.5, sz * 0.5]);
+            }
+            _ => state.warn("set_container_size expects 3 args"),
+        },
+        "set_container_shape" => match args {
+            [x, y, z, thickness] => {
+                let sx = (x.to_f64() as f32).max(0.0);
+                let sy = (y.to_f64() as f32).max(0.0);
+                let sz = (z.to_f64() as f32).max(0.0);
+                state.patch.container_half_extents = Some([sx * 0.5, sy * 0.5, sz * 0.5]);
+                state.patch.wall_thickness = Some(thickness.to_f64() as f32);
+            }
+            _ => state.warn("set_container_shape expects 4 args"),
+        },
         "set_container_half_extents" => match args {
             [x, y, z] => {
                 state.patch.container_half_extents =
@@ -1520,8 +1541,7 @@ mod tests {
         let src = concat!(
             "@export\n",
             "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
-            "    set_container_half_extents(24.0, 16.0, 24.0)\n",
-            "    set_wall_thickness(0.46)\n",
+            "    set_container_shape(48.0, 32.0, 48.0, 0.46)\n",
         );
         let outcome = compile_tlscript_showcase(src, Default::default());
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);

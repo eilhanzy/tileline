@@ -826,8 +826,9 @@ impl BounceTankSceneController {
         ball_render_limit: Option<usize>,
     ) -> SceneFrameInstances {
         let mut frame = SceneFrameInstances::default();
-        // Default to edge-only prism rendering; full shell is opt-in via container mesh slot.
         if self.container_mesh_slot.is_some() {
+            self.append_container_wall_instances(&mut frame.transparent_3d);
+        } else {
             frame.transparent_3d.push(self.container_visual_instance());
         }
         self.append_container_edge_instances(&mut frame.opaque_3d);
@@ -1636,10 +1637,7 @@ impl BounceTankSceneController {
     fn container_visual_instance(&self) -> SceneInstance3d {
         SceneInstance3d {
             instance_id: u64::MAX - 1,
-            primitive: self
-                .container_mesh_slot
-                .map(|slot| ScenePrimitive3d::Mesh { slot })
-                .unwrap_or(ScenePrimitive3d::Box),
+            primitive: ScenePrimitive3d::Box,
             transform: SceneTransform3d {
                 translation: [0.0, 0.0, 0.0],
                 rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
@@ -1661,16 +1659,75 @@ impl BounceTankSceneController {
         }
     }
 
+    /// Adds six wall panel mesh instances (three pairs) so custom FBX walls form a clean box.
+    fn append_container_wall_instances(&self, out: &mut Vec<SceneInstance3d>) {
+        let Some(slot) = self.container_mesh_slot else {
+            return;
+        };
+        let hx = self.config.container_half_extents[0].max(0.5);
+        let hy = self.config.container_half_extents[1].max(0.5);
+        let hz = self.config.container_half_extents[2].max(0.5);
+        let t = self
+            .config
+            .wall_thickness
+            .max(self.config.ball_radius_max.max(0.02) * 1.35)
+            .max(0.02);
+        let primitive = ScenePrimitive3d::Mesh { slot };
+        let faces = [
+            (
+                [hx + t * 0.5, 0.0, 0.0],
+                [t, (hy + t) * 2.0, (hz + t) * 2.0],
+            ),
+            (
+                [-hx - t * 0.5, 0.0, 0.0],
+                [t, (hy + t) * 2.0, (hz + t) * 2.0],
+            ),
+            (
+                [0.0, hy + t * 0.5, 0.0],
+                [(hx + t) * 2.0, t, (hz + t) * 2.0],
+            ),
+            (
+                [0.0, -hy - t * 0.5, 0.0],
+                [(hx + t) * 2.0, t, (hz + t) * 2.0],
+            ),
+            (
+                [0.0, 0.0, hz + t * 0.5],
+                [(hx + t) * 2.0, (hy + t) * 2.0, t],
+            ),
+            (
+                [0.0, 0.0, -hz - t * 0.5],
+                [(hx + t) * 2.0, (hy + t) * 2.0, t],
+            ),
+        ];
+        for (index, (translation, scale)) in faces.into_iter().enumerate() {
+            out.push(SceneInstance3d {
+                instance_id: (u64::MAX - 200).saturating_sub(index as u64),
+                primitive,
+                transform: SceneTransform3d {
+                    translation,
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    scale,
+                },
+                material: SceneMaterial {
+                    base_color_rgba: [0.80, 0.89, 1.0, 0.26],
+                    roughness: 0.06,
+                    metallic: 0.0,
+                    emissive_rgb: [0.05, 0.07, 0.10],
+                    shading: ShadingModel::LitPbr,
+                },
+                casts_shadow: false,
+                receives_shadow: true,
+            });
+        }
+    }
+
     /// Adds 12 thin edge prisms so the tank silhouette remains readable from every camera angle.
     fn append_container_edge_instances(&self, out: &mut Vec<SceneInstance3d>) {
         let hx = self.config.container_half_extents[0] * 2.0;
         let hy = self.config.container_half_extents[1] * 2.0;
         let hz = self.config.container_half_extents[2] * 2.0;
         let edge = self.config.wall_thickness.max(0.03) * 0.30;
-        let primitive = self
-            .container_mesh_slot
-            .map(|slot| ScenePrimitive3d::Mesh { slot })
-            .unwrap_or(ScenePrimitive3d::Box);
+        let primitive = ScenePrimitive3d::Box;
 
         // X-axis edges (y/z corners).
         let x_edges = [
