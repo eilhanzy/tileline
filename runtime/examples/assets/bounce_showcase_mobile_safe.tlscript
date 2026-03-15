@@ -1,21 +1,23 @@
 @export
 @parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=96, schedule="performance")
 @deterministic
-def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool, key_w_down: bool, key_s_down: bool, key_a_down: bool, key_d_down: bool, key_up_down: bool, key_down_down: bool, key_left_down: bool, key_right_down: bool, key_space_down: bool, key_ctrl_down: bool, key_shift_down: bool, key_q_down: bool, key_e_down: bool, key_c_down: bool, key_r_down: bool, key_l_down: bool, mouse_look_down: bool, pad_move_x: float, pad_move_y: float, pad_rise: float, pad_descend: float, pad_look_x: float, pad_look_y: float, pad_sprint_down: bool):
+def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool, key_w_down: bool, key_s_down: bool, key_a_down: bool, key_d_down: bool, key_up_down: bool, key_down_down: bool, key_left_down: bool, key_right_down: bool, key_space_down: bool, key_ctrl_down: bool, key_shift_down: bool, key_q_down: bool, key_e_down: bool, key_c_down: bool, key_r_down: bool, key_l_down: bool, key_alt_down: bool, key_enter_down: bool, key_escape_down: bool, key_tab_down: bool, mouse_look_down: bool, pad_move_x: float, pad_move_y: float, pad_rise: float, pad_descend: float, pad_look_x: float, pad_look_y: float, pad_sprint_down: bool):
     set_fbx_full_render(true)
     set_ball_mesh_slot(2)
 
     if frame == 0:
         set_camera_pose(0.0, 12.0, 36.0, 0.0, 0.0, 0.0)
         set_target_ball_count(4500)
-        set_initial_speed(0.22, 0.90)
-        set_scatter_interval(420)
-        set_scatter_strength(0.08)
-        set_levitation(1.60, 5.20, 2.80, 4.80)
-        set_bounce(0.84, 0.90)
-        set_friction(0.24, 0.17)
-        set_friction_profile(1.85, 1.28, 0.88)
-        set_restitution_threshold(0.26)
+        set_initial_speed(0.28, 1.10)
+        set_scatter_interval(380)
+        set_scatter_strength(0.10)
+        set_levitation(-9.60, 2.30, 1.10, 6.60)
+        set_levitation_reaction(0.90, 1.08, 2.10)
+        set_levitation_lateral(2.90, 0.72, 8.40, 8.60, 0.34)
+        set_bounce(0.88, 0.96)
+        set_friction(0.18, 0.12)
+        set_friction_profile(1.24, 1.18, 0.78)
+        set_restitution_threshold(0.22)
 
     set_camera_move_speed(16.0)
     set_camera_look_sensitivity(0.0016)
@@ -61,6 +63,8 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
         move_z = move_z - 1.0
     if key_c_down:
         move_z = move_z - 1.0
+    if key_alt_down:
+        move_z = move_z - 0.25
     move_z = move_z + pad_rise - pad_descend
     if move_z > 1.0:
         move_z = 1.0
@@ -80,6 +84,8 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
         look_on = true
     if input_look_active:
         look_on = true
+    if key_l_down:
+        look_on = true
     if pad_look_x > 0.001:
         look_on = true
     if pad_look_x < -0.001:
@@ -89,6 +95,11 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
     if pad_look_y < -0.001:
         look_on = true
 
+    if key_tab_down:
+        set_coordinate_space("local")
+    else:
+        set_coordinate_space("world")
+
     set_camera_move_axis(move_x, move_y, move_z)
     set_camera_look_delta(input_look_dx, input_look_dy)
     set_camera_sprint(sprinting)
@@ -97,68 +108,73 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
     if key_ctrl_down:
         if key_r_down:
             reset_camera_pose()
+    if key_alt_down:
+        if key_enter_down:
+            reset_camera_pose()
+    if key_escape_down:
+        reset_camera_pose()
     if input_reset_camera:
         reset_camera_pose()
 
-    set_levitation(1.60, 5.20, 2.80, 4.80)
-    set_levitation_reaction(0.95, 1.10, 2.80)
-    set_levitation_lateral(2.20, 1.20, 7.00, 7.20, 0.38)
+    set_levitation(-9.60, 2.30, 1.10, 6.60)
+    set_levitation_reaction(0.90, 1.08, 2.10)
+    set_levitation_lateral(2.90, 0.72, 8.40, 8.60, 0.34)
 
-    set_gravity(0.0, -10.80, 0.0)
+    set_gravity(0.0, -12.20, 0.0)
     if live_balls > 4200:
-        set_gravity_ramp(frame, 0, 22000, -10.80, -13.00)
+        set_gravity_ramp(frame, 0, 22000, -12.20, -14.80)
     else:
-        set_gravity_ramp(frame, 0, 16000, -10.80, -12.40)
+        set_gravity_ramp(frame, 0, 16000, -12.20, -14.00)
 
     if key_f_down:
         set_contact_guard(0.98)
-        set_levitation(5.20, 9.80, 2.20, 8.00)
-        set_levitation_reaction(0.30, 1.30, 3.10)
-        set_levitation_lateral(3.80, 1.32, 9.80, 10.00, 0.72)
+        set_levitation(-4.20, 5.00, 1.34, 9.60)
+        set_levitation_reaction(0.25, 1.34, 2.70)
+        set_levitation_lateral(4.40, 0.62, 11.20, 11.00, 0.62)
         set_bounce(0.94, 1.00)
         set_friction(0.03, 0.02)
-        set_friction_profile(0.78, 1.04, 0.44)
+        set_friction_profile(0.72, 1.04, 0.46)
         set_restitution_threshold(0.05)
         set_scatter_interval(2)
-        set_scatter_strength(0.78)
-        set_initial_speed(1.8, 7.2)
-        set_linear_damping(0.0)
+        set_scatter_strength(0.72)
+        set_initial_speed(1.9, 7.0)
+        set_linear_damping(0.000)
     elif live_balls < 1400:
         set_contact_guard(0.90)
-        set_levitation_reaction(1.05, 1.14, 2.90)
-        set_levitation_lateral(2.40, 1.22, 7.20, 7.50, 0.40)
-        set_bounce(0.88, 0.94)
-        set_friction(0.22, 0.16)
-        set_friction_profile(1.72, 1.26, 0.90)
-        set_restitution_threshold(0.24)
+        set_levitation_reaction(0.98, 1.10, 2.20)
+        set_levitation_lateral(3.10, 0.74, 8.60, 8.80, 0.36)
+        set_bounce(0.90, 0.98)
+        set_friction(0.18, 0.12)
+        set_friction_profile(1.20, 1.16, 0.80)
+        set_restitution_threshold(0.20)
         set_scatter_interval(220)
         set_scatter_strength(0.14)
-        set_initial_speed(0.30, 1.10)
-        set_linear_damping(0.016)
+        set_initial_speed(0.34, 1.20)
+        set_linear_damping(0.008)
     elif live_balls < 3000:
         set_contact_guard(0.93)
-        set_levitation_reaction(0.98, 1.12, 3.00)
-        set_levitation_lateral(2.30, 1.20, 7.00, 7.20, 0.39)
-        set_bounce(0.86, 0.92)
-        set_friction(0.20, 0.14)
-        set_friction_profile(1.66, 1.24, 0.88)
-        set_restitution_threshold(0.20)
+        set_levitation_reaction(0.94, 1.09, 2.16)
+        set_levitation_lateral(3.00, 0.73, 8.50, 8.70, 0.35)
+        set_bounce(0.88, 0.96)
+        set_friction(0.17, 0.11)
+        set_friction_profile(1.18, 1.15, 0.79)
+        set_restitution_threshold(0.18)
         set_scatter_interval(190)
         set_scatter_strength(0.16)
-        set_initial_speed(0.35, 1.18)
-        set_linear_damping(0.014)
+        set_initial_speed(0.40, 1.30)
+        set_linear_damping(0.007)
     else:
         set_contact_guard(0.95)
-        set_levitation_reaction(0.90, 1.08, 3.10)
-        set_levitation_lateral(2.10, 1.18, 6.80, 7.00, 0.37)
-        set_bounce(0.84, 0.90)
-        set_friction(0.18, 0.13)
-        set_friction_profile(1.60, 1.22, 0.86)
+        set_levitation_reaction(0.90, 1.08, 2.12)
+        set_levitation_lateral(2.90, 0.72, 8.40, 8.60, 0.34)
+        set_bounce(0.86, 0.94)
+        set_friction(0.16, 0.10)
+        set_friction_profile(1.16, 1.14, 0.78)
         set_restitution_threshold(0.16)
         set_scatter_interval(170)
         set_scatter_strength(0.18)
-        set_initial_speed(0.40, 1.26)
-        set_linear_damping(0.013)
+        set_initial_speed(0.46, 1.40)
+        set_linear_damping(0.006)
 
     let burst: int = 14
     if frame > 180:

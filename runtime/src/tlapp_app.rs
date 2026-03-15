@@ -984,7 +984,8 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
         target.levitation_lateral_damping = patch.levitation_lateral_damping;
     }
     if patch.levitation_lateral_max_horizontal_speed.is_some() {
-        target.levitation_lateral_max_horizontal_speed = patch.levitation_lateral_max_horizontal_speed;
+        target.levitation_lateral_max_horizontal_speed =
+            patch.levitation_lateral_max_horizontal_speed;
     }
     if patch.levitation_lateral_wall_push.is_some() {
         target.levitation_lateral_wall_push = patch.levitation_lateral_wall_push;
@@ -1827,8 +1828,9 @@ impl TlAppRuntime {
                     self.keyboard_camera.key_e = pressed;
                 }
             }
-            PhysicalKey::Code(KeyCode::ControlLeft)
-            | PhysicalKey::Code(KeyCode::ControlRight) => self.keyboard_camera.key_ctrl = pressed,
+            PhysicalKey::Code(KeyCode::ControlLeft) | PhysicalKey::Code(KeyCode::ControlRight) => {
+                self.keyboard_camera.key_ctrl = pressed
+            }
             PhysicalKey::Code(KeyCode::KeyQ) => self.keyboard_camera.key_q = pressed,
             PhysicalKey::Code(KeyCode::KeyC) => self.keyboard_camera.key_c = pressed,
             PhysicalKey::Code(KeyCode::ShiftLeft) | PhysicalKey::Code(KeyCode::ShiftRight) => {
@@ -1836,6 +1838,14 @@ impl TlAppRuntime {
             }
             PhysicalKey::Code(KeyCode::KeyR) => self.keyboard_camera.key_r = pressed,
             PhysicalKey::Code(KeyCode::KeyL) => self.keyboard_camera.key_l = pressed,
+            PhysicalKey::Code(KeyCode::AltLeft) | PhysicalKey::Code(KeyCode::AltRight) => {
+                self.keyboard_camera.key_alt = pressed
+            }
+            PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                self.keyboard_camera.key_enter = pressed
+            }
+            PhysicalKey::Code(KeyCode::Escape) => self.keyboard_camera.key_escape = pressed,
+            PhysicalKey::Code(KeyCode::Tab) => self.keyboard_camera.key_tab = pressed,
             _ => {}
         }
     }
@@ -1884,6 +1894,10 @@ impl TlAppRuntime {
             key_c_down: self.keyboard_camera.key_c,
             key_r_down: self.keyboard_camera.key_r,
             key_l_down: self.keyboard_camera.key_l,
+            key_alt_down: self.keyboard_camera.key_alt,
+            key_enter_down: self.keyboard_camera.key_enter,
+            key_escape_down: self.keyboard_camera.key_escape,
+            key_tab_down: self.keyboard_camera.key_tab,
             mouse_look_down: self.mouse_look_held,
             pad_move_x: gamepad.move_x,
             pad_move_y: gamepad.move_y,
@@ -2456,6 +2470,10 @@ struct CameraInputState {
     key_c: bool,
     key_r: bool,
     key_l: bool,
+    key_alt: bool,
+    key_enter: bool,
+    key_escape: bool,
+    key_tab: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

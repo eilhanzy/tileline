@@ -156,6 +156,10 @@ pub struct TlscriptShowcaseControlInput {
     pub key_c_down: bool,
     pub key_r_down: bool,
     pub key_l_down: bool,
+    pub key_alt_down: bool,
+    pub key_enter_down: bool,
+    pub key_escape_down: bool,
+    pub key_tab_down: bool,
     pub mouse_look_down: bool,
     pub pad_move_x: f32,
     pub pad_move_y: f32,
@@ -193,6 +197,10 @@ impl Default for TlscriptShowcaseControlInput {
             key_c_down: false,
             key_r_down: false,
             key_l_down: false,
+            key_alt_down: false,
+            key_enter_down: false,
+            key_escape_down: false,
+            key_tab_down: false,
             mouse_look_down: false,
             pad_move_x: 0.0,
             pad_move_y: 0.0,
@@ -327,30 +335,38 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             "input_reset_camera".to_string(),
             DemoValue::Bool(controls.reset_camera),
         );
-        state
-            .vars
-            .insert("key_w_down".to_string(), DemoValue::Bool(controls.key_w_down));
-        state
-            .vars
-            .insert("key_s_down".to_string(), DemoValue::Bool(controls.key_s_down));
-        state
-            .vars
-            .insert("key_a_down".to_string(), DemoValue::Bool(controls.key_a_down));
-        state
-            .vars
-            .insert("key_d_down".to_string(), DemoValue::Bool(controls.key_d_down));
-        state
-            .vars
-            .insert("key_up_down".to_string(), DemoValue::Bool(controls.key_up_down));
-        state
-            .vars
-            .insert("key_down_down".to_string(), DemoValue::Bool(controls.key_down_down));
-        state
-            .vars
-            .insert("key_left_down".to_string(), DemoValue::Bool(controls.key_left_down));
-        state
-            .vars
-            .insert("key_right_down".to_string(), DemoValue::Bool(controls.key_right_down));
+        state.vars.insert(
+            "key_w_down".to_string(),
+            DemoValue::Bool(controls.key_w_down),
+        );
+        state.vars.insert(
+            "key_s_down".to_string(),
+            DemoValue::Bool(controls.key_s_down),
+        );
+        state.vars.insert(
+            "key_a_down".to_string(),
+            DemoValue::Bool(controls.key_a_down),
+        );
+        state.vars.insert(
+            "key_d_down".to_string(),
+            DemoValue::Bool(controls.key_d_down),
+        );
+        state.vars.insert(
+            "key_up_down".to_string(),
+            DemoValue::Bool(controls.key_up_down),
+        );
+        state.vars.insert(
+            "key_down_down".to_string(),
+            DemoValue::Bool(controls.key_down_down),
+        );
+        state.vars.insert(
+            "key_left_down".to_string(),
+            DemoValue::Bool(controls.key_left_down),
+        );
+        state.vars.insert(
+            "key_right_down".to_string(),
+            DemoValue::Bool(controls.key_right_down),
+        );
         state.vars.insert(
             "key_space_down".to_string(),
             DemoValue::Bool(controls.key_space_down),
@@ -363,21 +379,42 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             "key_shift_down".to_string(),
             DemoValue::Bool(controls.key_shift_down),
         );
-        state
-            .vars
-            .insert("key_q_down".to_string(), DemoValue::Bool(controls.key_q_down));
-        state
-            .vars
-            .insert("key_e_down".to_string(), DemoValue::Bool(controls.key_e_down));
-        state
-            .vars
-            .insert("key_c_down".to_string(), DemoValue::Bool(controls.key_c_down));
-        state
-            .vars
-            .insert("key_r_down".to_string(), DemoValue::Bool(controls.key_r_down));
-        state
-            .vars
-            .insert("key_l_down".to_string(), DemoValue::Bool(controls.key_l_down));
+        state.vars.insert(
+            "key_q_down".to_string(),
+            DemoValue::Bool(controls.key_q_down),
+        );
+        state.vars.insert(
+            "key_e_down".to_string(),
+            DemoValue::Bool(controls.key_e_down),
+        );
+        state.vars.insert(
+            "key_c_down".to_string(),
+            DemoValue::Bool(controls.key_c_down),
+        );
+        state.vars.insert(
+            "key_r_down".to_string(),
+            DemoValue::Bool(controls.key_r_down),
+        );
+        state.vars.insert(
+            "key_l_down".to_string(),
+            DemoValue::Bool(controls.key_l_down),
+        );
+        state.vars.insert(
+            "key_alt_down".to_string(),
+            DemoValue::Bool(controls.key_alt_down),
+        );
+        state.vars.insert(
+            "key_enter_down".to_string(),
+            DemoValue::Bool(controls.key_enter_down),
+        );
+        state.vars.insert(
+            "key_escape_down".to_string(),
+            DemoValue::Bool(controls.key_escape_down),
+        );
+        state.vars.insert(
+            "key_tab_down".to_string(),
+            DemoValue::Bool(controls.key_tab_down),
+        );
         state.vars.insert(
             "mouse_look_down".to_string(),
             DemoValue::Bool(controls.mouse_look_down),
