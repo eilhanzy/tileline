@@ -4,9 +4,9 @@
 //! strategy, and adaptive throughput burst control so applications can share
 //! the same behavior without duplicating benchmark-local code.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use wgpu::{PresentMode, StoreOp};
+use wgpu::{Limits, PresentMode, StoreOp};
 
 use crate::hardware::{MobileGpuFamily, MobileGpuProfile, TbdrArchitecture};
 
@@ -31,6 +31,125 @@ pub enum VsyncMode {
 pub enum RuntimePacingMode {
     Stable,
     MaxThroughput,
+}
+
+/// Device-limit clamp report for portability-sensitive limits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeviceLimitClampReport {
+    pub max_texture_dimension_1d: bool,
+    pub max_texture_dimension_2d: bool,
+    pub max_texture_dimension_3d: bool,
+    pub max_texture_array_layers: bool,
+}
+
+impl DeviceLimitClampReport {
+    #[inline]
+    pub fn any_clamped(self) -> bool {
+        self.max_texture_dimension_1d
+            || self.max_texture_dimension_2d
+            || self.max_texture_dimension_3d
+            || self.max_texture_array_layers
+    }
+}
+
+/// Clamp requested `wgpu::Limits` to supported adapter limits.
+pub fn clamp_required_limits_to_supported(
+    mut requested: Limits,
+    supported: &Limits,
+) -> (Limits, DeviceLimitClampReport) {
+    let mut report = DeviceLimitClampReport::default();
+
+    if requested.max_texture_dimension_1d > supported.max_texture_dimension_1d {
+        requested.max_texture_dimension_1d = supported.max_texture_dimension_1d;
+        report.max_texture_dimension_1d = true;
+    }
+    if requested.max_texture_dimension_2d > supported.max_texture_dimension_2d {
+        requested.max_texture_dimension_2d = supported.max_texture_dimension_2d;
+        report.max_texture_dimension_2d = true;
+    }
+    if requested.max_texture_dimension_3d > supported.max_texture_dimension_3d {
+        requested.max_texture_dimension_3d = supported.max_texture_dimension_3d;
+        report.max_texture_dimension_3d = true;
+    }
+    if requested.max_texture_array_layers > supported.max_texture_array_layers {
+        requested.max_texture_array_layers = supported.max_texture_array_layers;
+        report.max_texture_array_layers = true;
+    }
+
+    (requested, report)
+}
+
+/// Conservative default required-limits policy for MGS device creation.
+pub fn safe_default_required_limits_for_adapter(
+    adapter: &wgpu::Adapter,
+) -> (Limits, DeviceLimitClampReport) {
+    let supported = adapter.limits();
+    clamp_required_limits_to_supported(Limits::default(), &supported)
+}
+
+/// Frame pacer used by runtime clients to avoid busy-poll CPU saturation.
+#[derive(Debug, Clone)]
+pub struct ThroughputFramePacer {
+    pacing_mode: RuntimePacingMode,
+    min_frame_interval: Duration,
+    cpu_relief_interval: Duration,
+    next_frame_at: Instant,
+}
+
+impl ThroughputFramePacer {
+    /// Create a new frame pacer.
+    pub fn new(
+        pacing_mode: RuntimePacingMode,
+        min_frame_interval: Duration,
+        cpu_relief_interval: Duration,
+        now: Instant,
+    ) -> Self {
+        Self {
+            pacing_mode,
+            min_frame_interval,
+            cpu_relief_interval,
+            next_frame_at: now,
+        }
+    }
+
+    /// Returns true when render work should execute at `now`.
+    pub fn ready_for_next_frame(&self, now: Instant) -> bool {
+        if !matches!(self.pacing_mode, RuntimePacingMode::MaxThroughput) {
+            return true;
+        }
+        now >= self.next_frame_at
+    }
+
+    /// Returns the next wake target for event loops in max-throughput mode.
+    pub fn preferred_wait_until(&self, now: Instant) -> Option<Instant> {
+        if !matches!(self.pacing_mode, RuntimePacingMode::MaxThroughput) {
+            return None;
+        }
+        let floor = self.cpu_relief_interval.max(Duration::from_micros(500));
+        Some(if self.next_frame_at > now {
+            self.next_frame_at
+        } else {
+            now + floor
+        })
+    }
+
+    /// Updates next-frame target after one frame completes.
+    pub fn on_frame_complete(&mut self, frame_start: Instant, frame_end: Instant) {
+        if !matches!(self.pacing_mode, RuntimePacingMode::MaxThroughput) {
+            return;
+        }
+        let target = if self.min_frame_interval.is_zero() {
+            frame_end + self.cpu_relief_interval.max(Duration::from_micros(500))
+        } else {
+            let elapsed = frame_end.saturating_duration_since(frame_start);
+            if elapsed >= self.min_frame_interval {
+                frame_end + self.cpu_relief_interval.max(Duration::from_micros(500))
+            } else {
+                frame_start + self.min_frame_interval
+            }
+        };
+        self.next_frame_at = target;
+    }
 }
 
 /// Detects whether the adapter/profile is likely backed by unified memory.
@@ -436,6 +555,33 @@ mod tests {
             wgpu::DeviceType::DiscreteGpu,
         );
         assert!(!is_unified_memory_profile(&profile, &info));
+    }
+
+    #[test]
+    fn clamps_3d_dimension_to_supported_limit() {
+        let requested = Limits::default();
+        let mut supported = Limits::default();
+        supported.max_texture_dimension_3d = 512;
+        let (clamped, report) = clamp_required_limits_to_supported(requested, &supported);
+        assert!(report.max_texture_dimension_3d);
+        assert_eq!(clamped.max_texture_dimension_3d, 512);
+    }
+
+    #[test]
+    fn frame_pacer_wait_target_advances_in_max_mode() {
+        let now = Instant::now();
+        let mut pacer = ThroughputFramePacer::new(
+            RuntimePacingMode::MaxThroughput,
+            Duration::from_millis(2),
+            Duration::from_millis(1),
+            now,
+        );
+        let wait_until = pacer
+            .preferred_wait_until(now)
+            .expect("max mode should provide wait target");
+        assert!(wait_until >= now);
+        pacer.on_frame_complete(now, now + Duration::from_millis(1));
+        assert!(pacer.preferred_wait_until(now).is_some());
     }
 }
 
