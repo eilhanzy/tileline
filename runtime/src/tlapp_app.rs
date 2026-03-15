@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Once;
@@ -25,6 +26,7 @@ use nalgebra::Vector3;
 use paradoxpe::{
     BroadphaseConfig, ContactSolverConfig, NarrowphaseConfig, PhysicsWorld, PhysicsWorldConfig,
 };
+use regex::RegexBuilder;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{
@@ -47,8 +49,29 @@ const CONSOLE_MAX_LOG_LINES: usize = 320;
 const CONSOLE_ERROR_BLINK_MS: u128 = 320;
 const CONSOLE_WHEEL_PIXELS_PER_LINE: f64 = 24.0;
 const CONSOLE_TEXT_SLOT_BASE: u16 = 128;
+const CONSOLE_FILE_HEAD_DEFAULT_LINES: usize = 32;
+const CONSOLE_FILE_HEAD_MAX_LINES: usize = 256;
+const CONSOLE_FILE_LIST_DEFAULT_LIMIT: usize = 48;
+const CONSOLE_FILE_LIST_MAX_LIMIT: usize = 256;
+const CONSOLE_FILE_READ_DEFAULT_BYTES: usize = 4 * 1024;
+const CONSOLE_FILE_READ_MAX_BYTES: usize = 128 * 1024;
+const CONSOLE_FILE_TAIL_DEFAULT_LINES: usize = 40;
+const CONSOLE_FILE_TAIL_MAX_LINES: usize = 300;
+const CONSOLE_FILE_TAIL_DEFAULT_WINDOW_BYTES: usize = 64 * 1024;
+const CONSOLE_FILE_TAIL_MAX_WINDOW_BYTES: usize = 512 * 1024;
+const CONSOLE_FILE_FIND_DEFAULT_MATCHES: usize = 32;
+const CONSOLE_FILE_FIND_MAX_MATCHES: usize = 256;
+const CONSOLE_FILE_FIND_DEFAULT_BYTES: usize = 128 * 1024;
+const CONSOLE_FILE_FIND_MAX_BYTES: usize = 512 * 1024;
+const CONSOLE_FILE_HEAD_MAX_WINDOW_BYTES: usize = 256 * 1024;
+const CONSOLE_FILE_TAILF_DEFAULT_POLL_MS: u64 = 220;
+const CONSOLE_FILE_TAILF_MAX_LINES_PER_POLL: usize = 64;
+const CONSOLE_FILE_WATCH_DEFAULT_POLL_MS: u64 = 350;
+const CONSOLE_FILE_GREP_DEFAULT_CONTEXT: usize = 0;
+const CONSOLE_FILE_GREP_MAX_CONTEXT: usize = 8;
 const CONSOLE_HELP_COMMANDS: &[&str] = &[
     "help",
+    "help <file|gfx|sim|script|cam|log>",
     "status | gfx.status",
     "sim.status | sim.pause | sim.resume | sim.step <n> | sim.reset",
     "scene.reload | sprite.reload | script.reload",
@@ -61,6 +84,17 @@ const CONSOLE_HELP_COMMANDS: &[&str] = &[
     "log.clear",
     "log.tail <off|n>",
     "log.level <all|info|error>",
+    "file.exists <path>",
+    "file.head <path> [lines]",
+    "file.tail <path> [lines] [max_bytes]",
+    "file.find <path> <pattern> [max_matches] [max_bytes]",
+    "file.findi <path> <pattern> [max_matches] [max_bytes]",
+    "file.findr <path> <regex> [max_matches] [max_bytes]",
+    "file.grep <path> <pattern> [context] [max_matches] [max_bytes]",
+    "file.tailf <path>|stop [poll_ms] [max_lines]",
+    "file.watch <path>|stop [poll_ms]",
+    "file.read <path> [max_bytes]",
+    "file.list <dir> [limit]",
     "clear | exit",
     "gfx.vsync <auto|on|off>",
     "gfx.fps_cap <off|N>",
@@ -595,6 +629,21 @@ fn parse_console_u32_in_range(value: &str, label: &str, min: u32, max: u32) -> R
     Ok(parsed)
 }
 
+fn parse_console_usize_in_range(
+    value: &str,
+    label: &str,
+    min: usize,
+    max: usize,
+) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {label}: {value}"))?;
+    if parsed < min || parsed > max {
+        return Err(format!("{label} must be in [{min}..{max}]"));
+    }
+    Ok(parsed)
+}
+
 fn bootstrap_uncapped_fps_hint(logical_threads: usize) -> f32 {
     // Start from a conservative-but-fast target and let runtime sampling retune to hardware limit.
     (170.0 + logical_threads as f32 * 7.5).clamp(170.0, 420.0)
@@ -836,6 +885,7 @@ impl ApplicationHandler for TlApp {
 
 struct TlAppRuntime {
     cli_options: CliOptions,
+    file_io_root: PathBuf,
     window: Arc<Window>,
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
@@ -1027,6 +1077,8 @@ struct RuntimeConsoleState {
     log_scroll: usize,
     log_filter: RuntimeConsoleLogFilter,
     log_tail_limit: Option<usize>,
+    tail_follow: Option<RuntimeConsoleTailFollow>,
+    file_watch: Option<RuntimeConsoleFileWatch>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1057,6 +1109,27 @@ struct RuntimeConsoleLogLine {
     timestamp: Instant,
     level: RuntimeConsoleLogLevel,
     message: String,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeConsoleTailFollow {
+    path: PathBuf,
+    poll_interval: Duration,
+    max_lines_per_poll: usize,
+    cursor: u64,
+    partial_line: String,
+    last_poll: Instant,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeConsoleFileWatch {
+    path: PathBuf,
+    poll_interval: Duration,
+    last_modified: Option<std::time::SystemTime>,
+    last_len: u64,
+    last_poll: Instant,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1168,6 +1241,8 @@ impl Default for RuntimeConsoleState {
             log_scroll: 0,
             log_filter: RuntimeConsoleLogFilter::All,
             log_tail_limit: None,
+            tail_follow: None,
+            file_watch: None,
         }
     }
 }
@@ -1432,6 +1507,10 @@ impl TlAppRuntime {
         options: CliOptions,
         platform: RuntimePlatform,
     ) -> Result<Self, Box<dyn Error>> {
+        let file_io_root = env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
         let window = Arc::new(
             event_loop.create_window(
                 WindowAttributes::default()
@@ -1929,6 +2008,7 @@ impl TlAppRuntime {
 
         let mut runtime = Self {
             cli_options: options.clone(),
+            file_io_root,
             window,
             _instance: instance,
             surface,
@@ -2594,6 +2674,473 @@ impl TlAppRuntime {
         }
     }
 
+    fn resolve_console_candidate_path(&self, raw_path: &str) -> Result<PathBuf, String> {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() {
+            return Err("path must not be empty".to_string());
+        }
+        let candidate = PathBuf::from(trimmed);
+        Ok(if candidate.is_absolute() {
+            candidate
+        } else {
+            self.file_io_root.join(candidate)
+        })
+    }
+
+    fn resolve_console_existing_path(&self, raw_path: &str, op: &str) -> Result<PathBuf, String> {
+        let candidate = self.resolve_console_candidate_path(raw_path)?;
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|err| format!("{op}: failed to access '{raw_path}': {err}"))?;
+        if !canonical.starts_with(&self.file_io_root) {
+            return Err(format!(
+                "{op}: denied (path escapes workspace root '{}')",
+                self.file_io_root.display()
+            ));
+        }
+        Ok(canonical)
+    }
+
+    fn emit_console_text_lines(&mut self, prefix: &str, text: &str, max_lines: usize) {
+        let mut lines = text.lines();
+        let mut emitted = 0usize;
+        while emitted < max_lines {
+            let Some(line) = lines.next() else {
+                break;
+            };
+            self.console_feedback(format!("{prefix}{line}"));
+            emitted += 1;
+        }
+        if emitted == 0 {
+            self.console_feedback(format!("{prefix}<empty>"));
+        } else if lines.next().is_some() {
+            self.console_feedback(format!("{prefix}... output truncated to {max_lines} lines"));
+        }
+    }
+
+    fn read_file_prefix_bytes(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), String> {
+        let mut file = fs::File::open(path)
+            .map_err(|err| format!("failed to open '{}': {err}", path.display()))?;
+        let file_len = file.metadata().ok().map(|meta| meta.len());
+        let mut buf = vec![0u8; max_bytes];
+        let read_len = file
+            .read(&mut buf)
+            .map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
+        buf.truncate(read_len);
+        let truncated = file_len.map(|len| len > read_len as u64).unwrap_or(false);
+        Ok((buf, truncated))
+    }
+
+    fn read_file_tail_window(
+        &self,
+        path: &Path,
+        max_window_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), String> {
+        let mut file = fs::File::open(path)
+            .map_err(|err| format!("failed to open '{}': {err}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .map(|meta| meta.len())
+            .map_err(|err| format!("failed to query metadata '{}': {err}", path.display()))?;
+        if file_len == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let start_offset = file_len.saturating_sub(max_window_bytes as u64);
+        file.seek(SeekFrom::Start(start_offset))
+            .map_err(|err| format!("failed to seek '{}': {err}", path.display()))?;
+        let mut buf = Vec::with_capacity((file_len - start_offset) as usize);
+        file.read_to_end(&mut buf)
+            .map_err(|err| format!("failed to read tail '{}': {err}", path.display()))?;
+        Ok((buf, start_offset > 0))
+    }
+
+    fn run_file_find(
+        &mut self,
+        path: &Path,
+        pattern: &str,
+        max_matches: usize,
+        max_bytes: usize,
+        case_insensitive: bool,
+    ) {
+        match self.read_file_prefix_bytes(path, max_bytes) {
+            Ok((bytes, truncated)) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let mut total_matches = 0usize;
+                let mut shown = 0usize;
+                let pattern_cmp = if case_insensitive {
+                    pattern.to_ascii_lowercase()
+                } else {
+                    String::new()
+                };
+                self.console_feedback(format!(
+                    "{} '{}' pattern='{}' scan={} byte(s) max_matches={}{}",
+                    if case_insensitive {
+                        "file.findi"
+                    } else {
+                        "file.find"
+                    },
+                    path.display(),
+                    pattern,
+                    bytes.len(),
+                    max_matches,
+                    if truncated {
+                        ", truncated scan window"
+                    } else {
+                        ""
+                    }
+                ));
+                for (line_idx, line) in text.lines().enumerate() {
+                    let matched = if case_insensitive {
+                        line.to_ascii_lowercase().contains(&pattern_cmp)
+                    } else {
+                        line.contains(pattern)
+                    };
+                    if !matched {
+                        continue;
+                    }
+                    total_matches += 1;
+                    if shown < max_matches {
+                        shown += 1;
+                        self.console_feedback(format!("  L{}: {}", line_idx + 1, line));
+                    }
+                }
+                if total_matches == 0 {
+                    self.console_feedback("  <no matches>");
+                } else if total_matches > max_matches {
+                    self.console_feedback(format!(
+                        "  ... {} additional match(es) hidden",
+                        total_matches - max_matches
+                    ));
+                }
+            }
+            Err(err) => self.console_feedback(format!(
+                "{}: {err}",
+                if case_insensitive {
+                    "file.findi"
+                } else {
+                    "file.find"
+                }
+            )),
+        }
+    }
+
+    fn run_file_find_regex(
+        &mut self,
+        path: &Path,
+        pattern: &str,
+        max_matches: usize,
+        max_bytes: usize,
+    ) {
+        let regex = match RegexBuilder::new(pattern).size_limit(1_000_000).build() {
+            Ok(regex) => regex,
+            Err(err) => {
+                self.console_feedback(format!("file.findr: invalid regex '{pattern}': {err}"));
+                return;
+            }
+        };
+        match self.read_file_prefix_bytes(path, max_bytes) {
+            Ok((bytes, truncated)) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let mut total_matches = 0usize;
+                let mut shown = 0usize;
+                self.console_feedback(format!(
+                    "file.findr '{}' regex='{}' scan={} byte(s) max_matches={}{}",
+                    path.display(),
+                    pattern,
+                    bytes.len(),
+                    max_matches,
+                    if truncated {
+                        ", truncated scan window"
+                    } else {
+                        ""
+                    }
+                ));
+                for (line_idx, line) in text.lines().enumerate() {
+                    if !regex.is_match(line) {
+                        continue;
+                    }
+                    total_matches += 1;
+                    if shown < max_matches {
+                        shown += 1;
+                        self.console_feedback(format!("  L{}: {}", line_idx + 1, line));
+                    }
+                }
+                if total_matches == 0 {
+                    self.console_feedback("  <no matches>");
+                } else if total_matches > max_matches {
+                    self.console_feedback(format!(
+                        "  ... {} additional match(es) hidden",
+                        total_matches - max_matches
+                    ));
+                }
+            }
+            Err(err) => self.console_feedback(format!("file.findr: {err}")),
+        }
+    }
+
+    fn run_file_grep(
+        &mut self,
+        path: &Path,
+        pattern: &str,
+        context: usize,
+        max_matches: usize,
+        max_bytes: usize,
+    ) {
+        match self.read_file_prefix_bytes(path, max_bytes) {
+            Ok((bytes, truncated)) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let lines = text.lines().collect::<Vec<_>>();
+                let mut total_matches = 0usize;
+                let mut shown_matches = 0usize;
+                let mut printed = vec![false; lines.len()];
+                self.console_feedback(format!(
+                    "file.grep '{}' pattern='{}' context={} scan={} byte(s) max_matches={}{}",
+                    path.display(),
+                    pattern,
+                    context,
+                    bytes.len(),
+                    max_matches,
+                    if truncated {
+                        ", truncated scan window"
+                    } else {
+                        ""
+                    }
+                ));
+                for (idx, line) in lines.iter().enumerate() {
+                    if !line.contains(pattern) {
+                        continue;
+                    }
+                    total_matches += 1;
+                    if shown_matches >= max_matches {
+                        continue;
+                    }
+                    shown_matches += 1;
+                    let start = idx.saturating_sub(context);
+                    let end = (idx + context).min(lines.len().saturating_sub(1));
+                    for i in start..=end {
+                        if printed[i] {
+                            continue;
+                        }
+                        printed[i] = true;
+                        let marker = if i == idx { ">" } else { " " };
+                        self.console_feedback(format!(" {marker} L{}: {}", i + 1, lines[i]));
+                    }
+                }
+                if total_matches == 0 {
+                    self.console_feedback("  <no matches>");
+                } else if total_matches > max_matches {
+                    self.console_feedback(format!(
+                        "  ... {} additional match(es) hidden",
+                        total_matches - max_matches
+                    ));
+                }
+            }
+            Err(err) => self.console_feedback(format!("file.grep: {err}")),
+        }
+    }
+
+    fn poll_console_tail_follow(&mut self) {
+        let (path, cursor, poll_interval, max_lines_per_poll, partial_line, last_poll, last_error) =
+            match self.console.tail_follow.as_ref() {
+                Some(follow) => (
+                    follow.path.clone(),
+                    follow.cursor,
+                    follow.poll_interval,
+                    follow.max_lines_per_poll,
+                    follow.partial_line.clone(),
+                    follow.last_poll,
+                    follow.last_error.clone(),
+                ),
+                None => return,
+            };
+
+        let now = Instant::now();
+        if now.saturating_duration_since(last_poll) < poll_interval {
+            return;
+        }
+
+        let mut next_cursor = cursor;
+        let mut next_partial = partial_line;
+        let mut next_error: Option<String> = None;
+
+        let metadata = match fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                let msg = format!("tailf metadata failed for '{}': {err}", path.display());
+                if last_error.as_deref() != Some(msg.as_str()) {
+                    self.console_feedback(format!("[tailf] {msg}"));
+                }
+                if let Some(follow) = self.console.tail_follow.as_mut() {
+                    follow.last_poll = now;
+                    follow.last_error = Some(msg);
+                }
+                return;
+            }
+        };
+
+        if !metadata.is_file() {
+            let msg = format!("tailf target is no longer a file: '{}'", path.display());
+            if last_error.as_deref() != Some(msg.as_str()) {
+                self.console_feedback(format!("[tailf] {msg}"));
+            }
+            if let Some(follow) = self.console.tail_follow.as_mut() {
+                follow.last_poll = now;
+                follow.last_error = Some(msg);
+            }
+            return;
+        }
+
+        let file_len = metadata.len();
+        if file_len < next_cursor {
+            next_cursor = 0;
+            next_partial.clear();
+            self.console_feedback(format!(
+                "[tailf] file was truncated/rotated, rewinding '{}'",
+                path.display()
+            ));
+        }
+
+        let bytes_to_read_u64 =
+            (file_len - next_cursor).min(CONSOLE_FILE_TAIL_MAX_WINDOW_BYTES as u64);
+        if bytes_to_read_u64 > 0 {
+            match fs::File::open(&path) {
+                Ok(mut file) => {
+                    if let Err(err) = file.seek(SeekFrom::Start(next_cursor)) {
+                        let msg = format!("tailf seek failed '{}': {err}", path.display());
+                        if last_error.as_deref() != Some(msg.as_str()) {
+                            self.console_feedback(format!("[tailf] {msg}"));
+                        }
+                        next_error = Some(msg);
+                    } else {
+                        let mut buf = vec![0u8; bytes_to_read_u64 as usize];
+                        match file.read_exact(&mut buf) {
+                            Ok(()) => {
+                                next_cursor = next_cursor.saturating_add(bytes_to_read_u64);
+                                let chunk = String::from_utf8_lossy(&buf);
+                                next_partial.push_str(&chunk);
+
+                                let mut lines = Vec::new();
+                                while let Some(pos) = next_partial.find('\n') {
+                                    let mut line = next_partial[..pos].to_string();
+                                    if line.ends_with('\r') {
+                                        line.pop();
+                                    }
+                                    lines.push(line);
+                                    next_partial.drain(..=pos);
+                                }
+                                if lines.len() > max_lines_per_poll {
+                                    let skipped = lines.len() - max_lines_per_poll;
+                                    self.console_feedback(format!(
+                                        "[tailf] ... {skipped} line(s) skipped this poll"
+                                    ));
+                                }
+                                let start = lines.len().saturating_sub(max_lines_per_poll);
+                                for line in lines.into_iter().skip(start) {
+                                    self.console_feedback(format!("[tailf] {line}"));
+                                }
+                                if next_partial.len() > 8 * 1024 {
+                                    let keep_from = next_partial.len().saturating_sub(8 * 1024);
+                                    next_partial = next_partial[keep_from..].to_string();
+                                }
+                            }
+                            Err(err) => {
+                                let msg = format!("tailf read failed '{}': {err}", path.display());
+                                if last_error.as_deref() != Some(msg.as_str()) {
+                                    self.console_feedback(format!("[tailf] {msg}"));
+                                }
+                                next_error = Some(msg);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let msg = format!("tailf open failed '{}': {err}", path.display());
+                    if last_error.as_deref() != Some(msg.as_str()) {
+                        self.console_feedback(format!("[tailf] {msg}"));
+                    }
+                    next_error = Some(msg);
+                }
+            }
+        }
+
+        if let Some(follow) = self.console.tail_follow.as_mut() {
+            follow.cursor = next_cursor;
+            follow.partial_line = next_partial;
+            follow.last_poll = now;
+            follow.last_error = next_error;
+        }
+    }
+
+    fn poll_console_file_watch(&mut self) {
+        let (path, poll_interval, last_modified, last_len, last_poll, last_error) =
+            match self.console.file_watch.as_ref() {
+                Some(watch) => (
+                    watch.path.clone(),
+                    watch.poll_interval,
+                    watch.last_modified,
+                    watch.last_len,
+                    watch.last_poll,
+                    watch.last_error.clone(),
+                ),
+                None => return,
+            };
+
+        let now = Instant::now();
+        if now.saturating_duration_since(last_poll) < poll_interval {
+            return;
+        }
+
+        let metadata = match fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                let msg = format!("watch metadata failed for '{}': {err}", path.display());
+                if last_error.as_deref() != Some(msg.as_str()) {
+                    self.console_feedback(format!("[watch] {msg}"));
+                }
+                if let Some(watch) = self.console.file_watch.as_mut() {
+                    watch.last_poll = now;
+                    watch.last_error = Some(msg);
+                }
+                return;
+            }
+        };
+
+        if !metadata.is_file() {
+            let msg = format!("watch target is no longer a file: '{}'", path.display());
+            if last_error.as_deref() != Some(msg.as_str()) {
+                self.console_feedback(format!("[watch] {msg}"));
+            }
+            if let Some(watch) = self.console.file_watch.as_mut() {
+                watch.last_poll = now;
+                watch.last_error = Some(msg);
+            }
+            return;
+        }
+
+        let modified = metadata.modified().ok();
+        let len = metadata.len();
+        let changed = len != last_len || modified != last_modified;
+        if changed {
+            self.console_feedback(format!(
+                "[watch] changed '{}' size={} (delta={:+})",
+                path.display(),
+                len,
+                len as i64 - last_len as i64
+            ));
+        }
+
+        if let Some(watch) = self.console.file_watch.as_mut() {
+            watch.last_modified = modified;
+            watch.last_len = len;
+            watch.last_poll = now;
+            watch.last_error = None;
+        }
+    }
+
     fn console_status_line(&self) -> String {
         let fsr = self.renderer.fsr_status();
         let rt = self.renderer.ray_tracing_status();
@@ -2619,8 +3166,20 @@ impl TlAppRuntime {
             .manual_max_substeps
             .map(|n| format!("manual:{n}"))
             .unwrap_or_else(|| format!("auto:{}", self.max_substeps));
+        let tailf_state = self
+            .console
+            .tail_follow
+            .as_ref()
+            .map(|f| f.path.display().to_string())
+            .unwrap_or_else(|| "off".to_string());
+        let watch_state = self
+            .console
+            .file_watch
+            .as_ref()
+            .map(|w| w.path.display().to_string())
+            .unwrap_or_else(|| "off".to_string());
         format!(
-            "fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} script_vars={} script_calls={}",
+            "fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={}",
             self.present_mode,
             self.rt_mode,
             if rt.active { "on" } else { "off" },
@@ -2636,6 +3195,8 @@ impl TlAppRuntime {
             substeps,
             log_filter,
             log_tail,
+            tailf_state,
+            watch_state,
             self.console.script_vars.len(),
             self.console.script_statements.len()
         )
@@ -2794,7 +3355,83 @@ impl TlAppRuntime {
         let head_lc = head.to_ascii_lowercase();
         match head_lc.as_str() {
             "help" | "?" => {
-                self.console_feedback(format!("commands: {}", CONSOLE_HELP_COMMANDS.join(" | ")));
+                if let Some(topic) = parts.next() {
+                    let topic = topic.to_ascii_lowercase();
+                    let topic_list = match topic.as_str() {
+                        "file" => Some(vec![
+                            "file.exists <path>",
+                            "file.head <path> [lines]",
+                            "file.tail <path> [lines] [max_bytes]",
+                            "file.tailf <path>|stop [poll_ms] [max_lines]",
+                            "file.watch <path>|stop [poll_ms]",
+                            "file.read <path> [max_bytes]",
+                            "file.list <dir> [limit]",
+                            "file.find <path> <pattern> [max_matches] [max_bytes]",
+                            "file.findi <path> <pattern> [max_matches] [max_bytes]",
+                            "file.findr <path> <regex> [max_matches] [max_bytes]",
+                            "file.grep <path> <pattern> [context] [max_matches] [max_bytes]",
+                        ]),
+                        "gfx" => Some(vec![
+                            "gfx.status",
+                            "gfx.vsync <auto|on|off>",
+                            "gfx.fps_cap <off|N>",
+                            "gfx.rt <off|auto|on>",
+                            "gfx.fsr <off|auto|on>",
+                            "gfx.fsr_quality <native|ultra|quality|balanced|performance>",
+                            "gfx.fsr_sharpness <0..1>",
+                            "gfx.fsr_scale <auto|0.5..1>",
+                            "gfx.profile <low|med|high|ultra>",
+                            "gfx.render_distance <off|N>",
+                            "gfx.adaptive_distance <auto|on|off>",
+                            "gfx.distance_blur <auto|on|off>",
+                        ]),
+                        "sim" => Some(vec![
+                            "sim.status",
+                            "sim.pause",
+                            "sim.resume",
+                            "sim.step <n>",
+                            "sim.reset",
+                            "scene.reload | script.reload | sprite.reload",
+                            "perf.snapshot",
+                            "phys.gravity <x y z>",
+                            "phys.substeps <auto|n>",
+                        ]),
+                        "script" => Some(vec![
+                            "script.var <name> <expr>",
+                            "script.unset <name>",
+                            "script.vars",
+                            "script.call <fn(args)>",
+                            "script.exec <stmt>",
+                            "script.uncall <idx|all>",
+                            "script.list",
+                            "script.clear",
+                        ]),
+                        "cam" | "camera" => {
+                            Some(vec!["cam.speed <v>", "cam.sens <v>", "cam.reset"])
+                        }
+                        "log" => Some(vec![
+                            "log.clear",
+                            "log.tail <off|n>",
+                            "log.level <all|info|error>",
+                        ]),
+                        _ => None,
+                    };
+                    if let Some(commands) = topic_list {
+                        self.console_feedback(format!("help {topic}:"));
+                        for cmd in commands {
+                            self.console_feedback(format!("  {cmd}"));
+                        }
+                    } else {
+                        self.console_feedback(
+                            "unknown help topic (use: file|gfx|sim|script|cam|log)",
+                        );
+                    }
+                } else {
+                    self.console_feedback(format!(
+                        "commands: {}",
+                        CONSOLE_HELP_COMMANDS.join(" | ")
+                    ));
+                }
             }
             "status" | "gfx.status" => {
                 self.console_feedback(self.console_status_line());
@@ -3061,6 +3698,665 @@ impl TlAppRuntime {
                         ));
                     }
                     None => self.console_feedback("usage: log.level <all|info|error>"),
+                }
+            }
+            "file.exists" => {
+                let Some(path_raw) = parts.next() else {
+                    self.console_feedback("usage: file.exists <path>");
+                    return RuntimeCommand::Consumed;
+                };
+                let candidate = match self.resolve_console_candidate_path(path_raw) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !candidate.exists() {
+                    self.console_feedback(format!("file.exists '{path_raw}' => false"));
+                    return RuntimeCommand::Consumed;
+                }
+                match candidate.canonicalize() {
+                    Ok(canonical) => {
+                        if !canonical.starts_with(&self.file_io_root) {
+                            self.console_feedback(format!(
+                                "file.exists denied: '{}' is outside workspace root '{}'",
+                                canonical.display(),
+                                self.file_io_root.display()
+                            ));
+                        } else {
+                            self.console_feedback(format!(
+                                "file.exists '{path_raw}' => true ({})",
+                                canonical.display()
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        self.console_feedback(format!("file.exists failed for '{path_raw}': {err}"))
+                    }
+                }
+            }
+            "file.head" => {
+                let Some(path_raw) = parts.next() else {
+                    self.console_feedback("usage: file.head <path> [lines]");
+                    return RuntimeCommand::Consumed;
+                };
+                let line_limit = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.head.lines",
+                        1,
+                        CONSOLE_FILE_HEAD_MAX_LINES,
+                    ) {
+                        Ok(limit) => limit,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_HEAD_DEFAULT_LINES,
+                };
+                let path = match self.resolve_console_existing_path(path_raw, "file.head") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !path.is_file() {
+                    self.console_feedback(format!("file.head: '{}' is not a file", path.display()));
+                    return RuntimeCommand::Consumed;
+                }
+                match self.read_file_prefix_bytes(&path, CONSOLE_FILE_HEAD_MAX_WINDOW_BYTES) {
+                    Ok((bytes, truncated)) => {
+                        self.console_feedback(format!(
+                            "file.head '{}' ({} byte(s) window, lines={line_limit}{})",
+                            path.display(),
+                            bytes.len(),
+                            if truncated { ", truncated window" } else { "" }
+                        ));
+                        let text = String::from_utf8_lossy(&bytes);
+                        self.emit_console_text_lines("  ", &text, line_limit);
+                    }
+                    Err(err) => self.console_feedback(format!("file.head: {err}")),
+                }
+            }
+            "file.tail" => {
+                let Some(path_raw) = parts.next() else {
+                    self.console_feedback("usage: file.tail <path> [lines] [max_bytes]");
+                    return RuntimeCommand::Consumed;
+                };
+                let line_limit = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.tail.lines",
+                        1,
+                        CONSOLE_FILE_TAIL_MAX_LINES,
+                    ) {
+                        Ok(limit) => limit,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_TAIL_DEFAULT_LINES,
+                };
+                let max_window_bytes = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.tail.max_bytes",
+                        64,
+                        CONSOLE_FILE_TAIL_MAX_WINDOW_BYTES,
+                    ) {
+                        Ok(limit) => limit,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_TAIL_DEFAULT_WINDOW_BYTES,
+                };
+                let path = match self.resolve_console_existing_path(path_raw, "file.tail") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !path.is_file() {
+                    self.console_feedback(format!("file.tail: '{}' is not a file", path.display()));
+                    return RuntimeCommand::Consumed;
+                }
+                match self.read_file_tail_window(&path, max_window_bytes) {
+                    Ok((bytes, truncated_window)) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        let lines = text.lines().collect::<Vec<_>>();
+                        self.console_feedback(format!(
+                            "file.tail '{}' ({} byte(s) window, lines={line_limit}{})",
+                            path.display(),
+                            bytes.len(),
+                            if truncated_window {
+                                ", truncated window"
+                            } else {
+                                ""
+                            }
+                        ));
+                        if lines.is_empty() {
+                            self.console_feedback("  <empty>");
+                            return RuntimeCommand::Consumed;
+                        }
+                        let start = lines.len().saturating_sub(line_limit);
+                        for line in lines.iter().skip(start) {
+                            self.console_feedback(format!("  {line}"));
+                        }
+                        if lines.len() > line_limit {
+                            self.console_feedback(format!(
+                                "  ... showing last {line_limit} line(s) from window"
+                            ));
+                        }
+                    }
+                    Err(err) => self.console_feedback(format!("file.tail: {err}")),
+                }
+            }
+            "file.find" | "file.findi" => {
+                let case_insensitive = matches!(head_lc.as_str(), "file.findi");
+                let Some(path_raw) = parts.next() else {
+                    self.console_feedback(
+                        "usage: file.find <path> <pattern> [max_matches] [max_bytes]",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(pattern) = parts.next() else {
+                    self.console_feedback(
+                        "usage: file.find <path> <pattern> [max_matches] [max_bytes]",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let max_matches = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        if case_insensitive {
+                            "file.findi.max_matches"
+                        } else {
+                            "file.find.max_matches"
+                        },
+                        1,
+                        CONSOLE_FILE_FIND_MAX_MATCHES,
+                    ) {
+                        Ok(limit) => limit,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_FIND_DEFAULT_MATCHES,
+                };
+                let max_bytes = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        if case_insensitive {
+                            "file.findi.max_bytes"
+                        } else {
+                            "file.find.max_bytes"
+                        },
+                        64,
+                        CONSOLE_FILE_FIND_MAX_BYTES,
+                    ) {
+                        Ok(limit) => limit,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_FIND_DEFAULT_BYTES,
+                };
+                let path = match self.resolve_console_existing_path(
+                    path_raw,
+                    if case_insensitive {
+                        "file.findi"
+                    } else {
+                        "file.find"
+                    },
+                ) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !path.is_file() {
+                    self.console_feedback(format!(
+                        "{}: '{}' is not a file",
+                        if case_insensitive {
+                            "file.findi"
+                        } else {
+                            "file.find"
+                        },
+                        path.display()
+                    ));
+                    return RuntimeCommand::Consumed;
+                }
+                self.run_file_find(&path, pattern, max_matches, max_bytes, case_insensitive);
+            }
+            "file.findr" => {
+                let Some(path_raw) = parts.next() else {
+                    self.console_feedback(
+                        "usage: file.findr <path> <regex> [max_matches] [max_bytes]",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(pattern) = parts.next() else {
+                    self.console_feedback(
+                        "usage: file.findr <path> <regex> [max_matches] [max_bytes]",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let max_matches = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.findr.max_matches",
+                        1,
+                        CONSOLE_FILE_FIND_MAX_MATCHES,
+                    ) {
+                        Ok(limit) => limit,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_FIND_DEFAULT_MATCHES,
+                };
+                let max_bytes = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.findr.max_bytes",
+                        64,
+                        CONSOLE_FILE_FIND_MAX_BYTES,
+                    ) {
+                        Ok(limit) => limit,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_FIND_DEFAULT_BYTES,
+                };
+                let path = match self.resolve_console_existing_path(path_raw, "file.findr") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !path.is_file() {
+                    self.console_feedback(format!(
+                        "file.findr: '{}' is not a file",
+                        path.display()
+                    ));
+                    return RuntimeCommand::Consumed;
+                }
+                self.run_file_find_regex(&path, pattern, max_matches, max_bytes);
+            }
+            "file.grep" => {
+                let Some(path_raw) = parts.next() else {
+                    self.console_feedback(
+                        "usage: file.grep <path> <pattern> [context] [max_matches] [max_bytes]",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(pattern) = parts.next() else {
+                    self.console_feedback(
+                        "usage: file.grep <path> <pattern> [context] [max_matches] [max_bytes]",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let context = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.grep.context",
+                        0,
+                        CONSOLE_FILE_GREP_MAX_CONTEXT,
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_GREP_DEFAULT_CONTEXT,
+                };
+                let max_matches = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.grep.max_matches",
+                        1,
+                        CONSOLE_FILE_FIND_MAX_MATCHES,
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_FIND_DEFAULT_MATCHES,
+                };
+                let max_bytes = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.grep.max_bytes",
+                        64,
+                        CONSOLE_FILE_FIND_MAX_BYTES,
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_FIND_DEFAULT_BYTES,
+                };
+                let path = match self.resolve_console_existing_path(path_raw, "file.grep") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !path.is_file() {
+                    self.console_feedback(format!("file.grep: '{}' is not a file", path.display()));
+                    return RuntimeCommand::Consumed;
+                }
+                self.run_file_grep(&path, pattern, context, max_matches, max_bytes);
+            }
+            "file.tailf" => {
+                let Some(arg) = parts.next() else {
+                    if let Some(follow) = self.console.tail_follow.as_ref() {
+                        self.console_feedback(format!(
+                            "tailf active path='{}' poll={}ms lines/poll={}",
+                            follow.path.display(),
+                            follow.poll_interval.as_millis(),
+                            follow.max_lines_per_poll
+                        ));
+                    } else {
+                        self.console_feedback(
+                            "usage: file.tailf <path>|stop [poll_ms] [max_lines]",
+                        );
+                    }
+                    return RuntimeCommand::Consumed;
+                };
+                if arg.eq_ignore_ascii_case("stop") || arg.eq_ignore_ascii_case("off") {
+                    if let Some(prev) = self.console.tail_follow.take() {
+                        self.console_feedback(format!(
+                            "tailf stopped for '{}'",
+                            prev.path.display()
+                        ));
+                    } else {
+                        self.console_feedback("tailf already inactive");
+                    }
+                    return RuntimeCommand::Consumed;
+                }
+
+                let poll_ms = match parts.next() {
+                    Some(raw) => {
+                        match parse_console_usize_in_range(raw, "file.tailf.poll_ms", 50, 10_000) {
+                            Ok(v) => v as u64,
+                            Err(err) => {
+                                self.console_feedback(err);
+                                return RuntimeCommand::Consumed;
+                            }
+                        }
+                    }
+                    None => CONSOLE_FILE_TAILF_DEFAULT_POLL_MS,
+                };
+                let max_lines_per_poll = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.tailf.max_lines",
+                        1,
+                        CONSOLE_FILE_TAILF_MAX_LINES_PER_POLL,
+                    ) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_TAILF_MAX_LINES_PER_POLL / 2,
+                };
+                let path = match self.resolve_console_existing_path(arg, "file.tailf") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !path.is_file() {
+                    self.console_feedback(format!(
+                        "file.tailf: '{}' is not a file",
+                        path.display()
+                    ));
+                    return RuntimeCommand::Consumed;
+                }
+                let start_cursor = match fs::metadata(&path) {
+                    Ok(meta) => meta.len(),
+                    Err(err) => {
+                        self.console_feedback(format!(
+                            "file.tailf: failed to read metadata '{}': {err}",
+                            path.display()
+                        ));
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                self.console.tail_follow = Some(RuntimeConsoleTailFollow {
+                    path: path.clone(),
+                    poll_interval: Duration::from_millis(poll_ms),
+                    max_lines_per_poll,
+                    cursor: start_cursor,
+                    partial_line: String::new(),
+                    last_poll: Instant::now(),
+                    last_error: None,
+                });
+                self.console_feedback(format!(
+                    "tailf started for '{}' poll={}ms max_lines={}",
+                    path.display(),
+                    poll_ms,
+                    max_lines_per_poll
+                ));
+            }
+            "file.watch" => {
+                let Some(arg) = parts.next() else {
+                    if let Some(watch) = self.console.file_watch.as_ref() {
+                        self.console_feedback(format!(
+                            "watch active path='{}' poll={}ms size={}",
+                            watch.path.display(),
+                            watch.poll_interval.as_millis(),
+                            watch.last_len
+                        ));
+                    } else {
+                        self.console_feedback("usage: file.watch <path>|stop [poll_ms]");
+                    }
+                    return RuntimeCommand::Consumed;
+                };
+                if arg.eq_ignore_ascii_case("stop") || arg.eq_ignore_ascii_case("off") {
+                    if let Some(prev) = self.console.file_watch.take() {
+                        self.console_feedback(format!(
+                            "watch stopped for '{}'",
+                            prev.path.display()
+                        ));
+                    } else {
+                        self.console_feedback("watch already inactive");
+                    }
+                    return RuntimeCommand::Consumed;
+                }
+
+                let poll_ms = match parts.next() {
+                    Some(raw) => {
+                        match parse_console_usize_in_range(raw, "file.watch.poll_ms", 50, 10_000) {
+                            Ok(v) => v as u64,
+                            Err(err) => {
+                                self.console_feedback(err);
+                                return RuntimeCommand::Consumed;
+                            }
+                        }
+                    }
+                    None => CONSOLE_FILE_WATCH_DEFAULT_POLL_MS,
+                };
+                let path = match self.resolve_console_existing_path(arg, "file.watch") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !path.is_file() {
+                    self.console_feedback(format!(
+                        "file.watch: '{}' is not a file",
+                        path.display()
+                    ));
+                    return RuntimeCommand::Consumed;
+                }
+                let (modified, len) = match fs::metadata(&path) {
+                    Ok(meta) => (meta.modified().ok(), meta.len()),
+                    Err(err) => {
+                        self.console_feedback(format!(
+                            "file.watch: failed to read metadata '{}': {err}",
+                            path.display()
+                        ));
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                self.console.file_watch = Some(RuntimeConsoleFileWatch {
+                    path: path.clone(),
+                    poll_interval: Duration::from_millis(poll_ms),
+                    last_modified: modified,
+                    last_len: len,
+                    last_poll: Instant::now(),
+                    last_error: None,
+                });
+                self.console_feedback(format!(
+                    "watch started for '{}' poll={}ms baseline_size={}",
+                    path.display(),
+                    poll_ms,
+                    len
+                ));
+            }
+            "file.read" => {
+                let Some(path_raw) = parts.next() else {
+                    self.console_feedback("usage: file.read <path> [max_bytes]");
+                    return RuntimeCommand::Consumed;
+                };
+                let max_bytes = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.read.max_bytes",
+                        64,
+                        CONSOLE_FILE_READ_MAX_BYTES,
+                    ) {
+                        Ok(limit) => limit,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_READ_DEFAULT_BYTES,
+                };
+                let path = match self.resolve_console_existing_path(path_raw, "file.read") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !path.is_file() {
+                    self.console_feedback(format!("file.read: '{}' is not a file", path.display()));
+                    return RuntimeCommand::Consumed;
+                }
+                match self.read_file_prefix_bytes(&path, max_bytes) {
+                    Ok((buf, truncated)) => {
+                        let preview = String::from_utf8_lossy(&buf);
+                        self.console_feedback(format!(
+                            "file.read '{}' (preview {} byte(s), limit {max_bytes}{})",
+                            path.display(),
+                            buf.len(),
+                            if truncated { ", truncated" } else { "" }
+                        ));
+                        self.emit_console_text_lines(
+                            "  ",
+                            &preview,
+                            CONSOLE_FILE_HEAD_DEFAULT_LINES,
+                        );
+                    }
+                    Err(err) => self.console_feedback(format!("file.read: {err}")),
+                }
+            }
+            "file.list" => {
+                let dir_raw = parts.next().unwrap_or(".");
+                let limit = match parts.next() {
+                    Some(raw) => match parse_console_usize_in_range(
+                        raw,
+                        "file.list.limit",
+                        1,
+                        CONSOLE_FILE_LIST_MAX_LIMIT,
+                    ) {
+                        Ok(limit) => limit,
+                        Err(err) => {
+                            self.console_feedback(err);
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => CONSOLE_FILE_LIST_DEFAULT_LIMIT,
+                };
+                let dir = match self.resolve_console_existing_path(dir_raw, "file.list") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                if !dir.is_dir() {
+                    self.console_feedback(format!(
+                        "file.list: '{}' is not a directory",
+                        dir.display()
+                    ));
+                    return RuntimeCommand::Consumed;
+                }
+                let mut entries = match fs::read_dir(&dir) {
+                    Ok(read_dir) => read_dir
+                        .filter_map(|entry| entry.ok())
+                        .map(|entry| {
+                            let path = entry.path();
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let is_dir = path.is_dir();
+                            (name, is_dir)
+                        })
+                        .collect::<Vec<_>>(),
+                    Err(err) => {
+                        self.console_feedback(format!(
+                            "file.list failed for '{}': {err}",
+                            dir.display()
+                        ));
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                self.console_feedback(format!(
+                    "file.list '{}' total={} showing={}",
+                    dir.display(),
+                    entries.len(),
+                    entries.len().min(limit)
+                ));
+                for (name, is_dir) in entries.iter().take(limit) {
+                    self.console_feedback(format!(
+                        "  [{}] {}",
+                        if *is_dir { "d" } else { "f" },
+                        name
+                    ));
+                }
+                if entries.len() > limit {
+                    self.console_feedback(format!(
+                        "  ... {} more entrie(s) hidden",
+                        entries.len() - limit
+                    ));
                 }
             }
             "clear" => {
@@ -4402,6 +5698,10 @@ impl TlAppRuntime {
         self.frame_started_at = frame_begin;
 
         self.poll_input_devices();
+        if self.console.open {
+            self.poll_console_tail_follow();
+            self.poll_console_file_watch();
+        }
         let script_camera_input = self.script_camera_input(view_dt);
 
         if let (Some(sprite_loader), Some(sprite_cache)) =
