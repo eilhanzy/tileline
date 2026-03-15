@@ -702,6 +702,9 @@ struct TlAppRuntime {
     tick_hz: f32,
     fps_limit_hint: f32,
     uncapped_dynamic_fps_hint: bool,
+    adaptive_pacer_enabled: bool,
+    adaptive_pacer_fps: f32,
+    adaptive_pacer_timer: f32,
     mps_logical_threads: usize,
     max_substeps: u32,
     last_substeps: u32,
@@ -1212,12 +1215,20 @@ impl TlAppRuntime {
         }
         let distance_blur_mode = options.distance_blur;
         let distance_blur_enabled = distance_blur_mode.resolve(mobile_class_tuning);
-        let uncapped_dynamic_fps_hint =
-            options.fps_cap.is_none() && matches!(options.vsync, VsyncMode::Off);
+        let adaptive_pacer_enabled = mobile_class_tuning
+            && options.fps_cap.is_none()
+            && matches!(options.vsync, VsyncMode::Off);
         let display_refresh_hint_hz = window
             .current_monitor()
             .and_then(|monitor| monitor.refresh_rate_millihertz())
             .map(|mhz| (mhz as f32 / 1_000.0).max(24.0));
+        let mut adaptive_pacer_fps = display_refresh_hint_hz.unwrap_or(60.0).clamp(48.0, 90.0);
+        if little_core_class {
+            adaptive_pacer_fps = adaptive_pacer_fps.min(72.0);
+        }
+        let uncapped_dynamic_fps_hint = options.fps_cap.is_none()
+            && matches!(options.vsync, VsyncMode::Off)
+            && !adaptive_pacer_enabled;
         let initial_fps_hint = match (options.fps_cap, options.vsync) {
             (Some(fps), _) => fps.max(24.0),
             (None, VsyncMode::Off) => bootstrap_uncapped_fps_hint(logical_threads),
@@ -1357,7 +1368,7 @@ impl TlAppRuntime {
         }
         renderer.set_camera_view(&queue, size.width.max(1), size.height.max(1), eye, target);
         eprintln!(
-            "[mps] cpu profile logical={} physical={} mobile_tuning={} little_core_class={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={} render_distance={:?} adaptive_distance={} distance_blur={:?} ({})",
+            "[mps] cpu profile logical={} physical={} mobile_tuning={} little_core_class={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={} render_distance={:?} adaptive_distance={} distance_blur={:?} ({}) adaptive_pacer={} ({:.0} fps)",
             logical_threads,
             physical_threads,
             mobile_class_tuning,
@@ -1370,7 +1381,9 @@ impl TlAppRuntime {
             render_distance,
             adaptive_distance_enabled,
             distance_blur_mode,
-            distance_blur_enabled
+            distance_blur_enabled,
+            adaptive_pacer_enabled,
+            adaptive_pacer_fps
         );
 
         let draw_compiler = DrawPathCompiler::new();
@@ -1410,7 +1423,9 @@ impl TlAppRuntime {
         let now = Instant::now();
         let frame_cap_interval = options
             .fps_cap
-            .map(|fps| Duration::from_secs_f32(1.0 / fps.max(1.0)));
+            .map(|fps| 1.0 / fps.max(1.0))
+            .or_else(|| adaptive_pacer_enabled.then_some(1.0 / adaptive_pacer_fps.max(1.0)));
+        let frame_cap_interval = frame_cap_interval.map(Duration::from_secs_f32);
         let fps_report_interval = options.fps_report_interval;
 
         Ok(Self {
@@ -1448,6 +1463,9 @@ impl TlAppRuntime {
             tick_hz: 1.0 / fixed_dt.max(1e-6),
             fps_limit_hint,
             uncapped_dynamic_fps_hint,
+            adaptive_pacer_enabled,
+            adaptive_pacer_fps,
+            adaptive_pacer_timer: 0.0,
             mps_logical_threads: logical_threads,
             max_substeps: tuned_max_substeps,
             last_substeps: 0,
@@ -1564,6 +1582,42 @@ impl TlAppRuntime {
                 }
             }
         };
+    }
+
+    fn retune_adaptive_pacer(&mut self, dt: f32, mobile_path: bool) {
+        if !self.adaptive_pacer_enabled {
+            return;
+        }
+
+        self.adaptive_pacer_timer -= dt.max(0.0);
+        if self.adaptive_pacer_timer > 0.0 {
+            return;
+        }
+
+        let target_ms = (1_000.0 / self.adaptive_pacer_fps.max(1.0)).clamp(6.0, 42.0);
+        let overload = self.frame_time_ema_ms > target_ms * 1.03
+            || self.frame_time_jitter_ema_ms > target_ms * 0.20
+            || self.framebuffer_fill_ema > 0.95;
+        let headroom = self.frame_time_ema_ms < target_ms * 0.82
+            && self.frame_time_jitter_ema_ms < target_ms * 0.10
+            && self.framebuffer_fill_ema < 0.70;
+
+        if overload {
+            self.adaptive_pacer_fps *= 0.93;
+            self.adaptive_pacer_timer = 0.18;
+        } else if headroom {
+            self.adaptive_pacer_fps *= 1.03;
+            self.adaptive_pacer_timer = 0.42;
+        } else {
+            self.adaptive_pacer_timer = 0.28;
+        }
+
+        let min_cap = if mobile_path { 45.0 } else { 55.0 };
+        let max_cap = if mobile_path { 90.0 } else { 120.0 };
+        self.adaptive_pacer_fps = self.adaptive_pacer_fps.clamp(min_cap, max_cap);
+        self.frame_cap_interval = Some(Duration::from_secs_f32(
+            1.0 / self.adaptive_pacer_fps.max(1.0),
+        ));
     }
 
     fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -2085,6 +2139,7 @@ impl TlAppRuntime {
         } else {
             self.framebuffer_fill_ema += (fill_ratio - self.framebuffer_fill_ema) * 0.18;
         }
+        self.retune_adaptive_pacer(sim_dt, mobile_path);
         let visible_ball_count = count_rendered_balls(&frame);
         let _hud = self.hud.append_to_sprites(
             TelemetryHudSample {
