@@ -8,14 +8,17 @@
 use std::{collections::BTreeMap, fs, io::Cursor, path::Path};
 
 use fbx::Property as FbxProperty;
+use font8x8::{UnicodeFonts, BASIC_FONTS};
 use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3};
 use wgpu::util::DeviceExt;
 
 use crate::draw_path::{DrawLane, RuntimeDrawFrame};
-use crate::scene::{RayTracingMode, SceneLight, SceneLightKind, SpriteKind, MAX_SCENE_LIGHTS};
+use crate::scene::{
+    RayTracingMode, SceneLight, SceneLightKind, SpriteInstance, SpriteKind, MAX_SCENE_LIGHTS,
+};
 use crate::upscaler::{resolve_fsr_status, FsrConfig, FsrStatus};
 
-const SPRITE_ATLAS_GRID_DIM: u32 = 4;
+const SPRITE_ATLAS_GRID_DIM: u32 = 16;
 const SPRITE_ATLAS_TILE_SIZE: u32 = 64;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const DEFAULT_SPHERE_FBX_BYTES: &[u8] = include_bytes!("../../docs/demos/sphere.fbx");
@@ -23,6 +26,7 @@ const DEFAULT_SPHERE_FBX_BYTES: &[u8] = include_bytes!("../../docs/demos/sphere.
 const SPHERE_LOD_ENABLE_THRESHOLD: usize = 2_500;
 const SPHERE_LOD_DISABLE_THRESHOLD: usize = 1_800;
 const RT_DYNAMIC_CAP: u32 = 1_024;
+const TEXT_GLYPH_SLOT_BASE: u16 = 128;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -186,6 +190,7 @@ pub struct WgpuSceneRenderer {
     pipeline_opaque: wgpu::RenderPipeline,
     pipeline_transparent: wgpu::RenderPipeline,
     pipeline_sprite: wgpu::RenderPipeline,
+    pipeline_sprite_overlay: wgpu::RenderPipeline,
     pipeline_upscale: wgpu::RenderPipeline,
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
@@ -197,6 +202,7 @@ pub struct WgpuSceneRenderer {
     fsr_uniform_buffer: wgpu::Buffer,
     _sprite_atlas_texture: wgpu::Texture,
     sprite_atlas_bind_group: wgpu::BindGroup,
+    sprite_atlas_overlay_bind_group: wgpu::BindGroup,
     box_mesh: GpuMesh,
     sphere_mesh_high: GpuMesh,
     sphere_mesh_low: GpuMesh,
@@ -206,8 +212,11 @@ pub struct WgpuSceneRenderer {
     instance_3d_capacity_bytes: usize,
     sprite_instance_buffer: wgpu::Buffer,
     sprite_instance_capacity_bytes: usize,
+    overlay_sprite_instance_buffer: wgpu::Buffer,
+    overlay_sprite_instance_capacity_bytes: usize,
     ranges: Vec<GpuBatchRange>,
     sprite_count: u32,
+    overlay_sprite_count: u32,
     light_count: u32,
     force_full_fbx_sphere: bool,
     camera_eye: [f32; 3],
@@ -405,6 +414,8 @@ impl WgpuSceneRenderer {
         );
         let pipeline_sprite =
             create_sprite_pipeline(device, &layout_sprite, &shader_sprite, color_format);
+        let pipeline_sprite_overlay =
+            create_sprite_overlay_pipeline(device, &layout_sprite, &shader_sprite, color_format);
         let pipeline_upscale =
             create_upscale_pipeline(device, &layout_upscale, &shader_upscale, color_format);
         let (depth_texture, depth_view) = create_depth_resources(
@@ -454,7 +465,7 @@ impl WgpuSceneRenderer {
                 },
             ],
         });
-        let (sprite_atlas_texture, sprite_atlas_bind_group) =
+        let (sprite_atlas_texture, sprite_atlas_bind_group, sprite_atlas_overlay_bind_group) =
             create_default_sprite_atlas_resources(device, queue, &sprite_bgl);
 
         let box_mesh = create_box_mesh(device);
@@ -473,6 +484,12 @@ impl WgpuSceneRenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let overlay_sprite_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("runtime-scene-overlay-sprite-instance-buffer"),
+            size: std::mem::size_of::<GpuSpriteInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let renderer = Self {
             adapter_backend,
@@ -484,6 +501,7 @@ impl WgpuSceneRenderer {
             pipeline_opaque,
             pipeline_transparent,
             pipeline_sprite,
+            pipeline_sprite_overlay,
             pipeline_upscale,
             _depth_texture: depth_texture,
             depth_view,
@@ -495,6 +513,7 @@ impl WgpuSceneRenderer {
             fsr_uniform_buffer,
             _sprite_atlas_texture: sprite_atlas_texture,
             sprite_atlas_bind_group,
+            sprite_atlas_overlay_bind_group,
             box_mesh,
             sphere_mesh_high,
             sphere_mesh_low,
@@ -504,8 +523,11 @@ impl WgpuSceneRenderer {
             instance_3d_capacity_bytes: std::mem::size_of::<GpuInstance3d>(),
             sprite_instance_buffer,
             sprite_instance_capacity_bytes: std::mem::size_of::<GpuSpriteInstance>(),
+            overlay_sprite_instance_buffer,
+            overlay_sprite_instance_capacity_bytes: std::mem::size_of::<GpuSpriteInstance>(),
             ranges: Vec::new(),
             sprite_count: 0,
+            overlay_sprite_count: 0,
             light_count: 0,
             force_full_fbx_sphere: false,
             camera_eye: [0.0, 12.0, 36.0],
@@ -715,6 +737,56 @@ impl WgpuSceneRenderer {
         }
     }
 
+    /// Upload console/UI overlay sprites that must be rendered at native surface resolution.
+    ///
+    /// This bypasses the FSR render-scale path by being drawn in a separate pass after upscale.
+    pub fn upload_overlay_sprites(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sprites: &[SpriteInstance],
+    ) {
+        let mut overlay = Vec::with_capacity(sprites.len());
+        for sprite in sprites {
+            overlay.push(GpuSpriteInstance {
+                translate_size: [
+                    sprite.position[0],
+                    sprite.position[1],
+                    sprite.size[0],
+                    sprite.size[1],
+                ],
+                rot_z: [sprite.rotation_rad, sprite.position[2], 0.0, 0.0],
+                color: sprite.color_rgba,
+                atlas_rect: sprite_kind_atlas_rect(sprite.kind, sprite.texture_slot),
+                kind_params: [
+                    sprite_kind_code(sprite.kind) as f32,
+                    sprite.texture_slot as f32,
+                    0.0,
+                    0.0,
+                ],
+            });
+        }
+
+        let required_bytes = overlay.len() * std::mem::size_of::<GpuSpriteInstance>();
+        ensure_buffer_capacity(
+            device,
+            &mut self.overlay_sprite_instance_buffer,
+            &mut self.overlay_sprite_instance_capacity_bytes,
+            required_bytes.max(std::mem::size_of::<GpuSpriteInstance>()),
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            "runtime-scene-overlay-sprite-instance-buffer",
+        );
+
+        if !overlay.is_empty() {
+            queue.write_buffer(
+                &self.overlay_sprite_instance_buffer,
+                0,
+                bytemuck::cast_slice(overlay.as_slice()),
+            );
+        }
+        self.overlay_sprite_count = overlay.len() as u32;
+    }
+
     /// Force all sphere primitives to render with the full FBX mesh.
     ///
     /// When enabled, adaptive low-LOD sphere fallback is disabled.
@@ -865,6 +937,44 @@ impl WgpuSceneRenderer {
             upscale.set_bind_group(0, &self.fsr_bind_group, &[]);
             upscale.draw(0..3, 0..1);
         }
+    }
+
+    /// Render native-resolution HUD/console overlay sprites after scene and optional FSR upscale.
+    pub fn encode_overlay_sprites(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+    ) {
+        if self.overlay_sprite_count == 0 {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("runtime-scene-overlay-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipeline_sprite_overlay);
+        pass.set_bind_group(0, &self.sprite_atlas_overlay_bind_group, &[]);
+        pass.set_bind_group(1, &self.scene_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.sprite_vertex_buffer.slice(..));
+        let sprite_bytes =
+            (self.overlay_sprite_count as usize * std::mem::size_of::<GpuSpriteInstance>()) as u64;
+        pass.set_vertex_buffer(
+            1,
+            self.overlay_sprite_instance_buffer.slice(0..sprite_bytes),
+        );
+        pass.draw(0..6, 0..self.overlay_sprite_count);
     }
 
     fn write_camera_uniform(&self, queue: &wgpu::Queue, width: u32, height: u32) {
@@ -1342,6 +1452,59 @@ fn create_sprite_pipeline(
     })
 }
 
+fn create_sprite_overlay_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("runtime-scene-sprite-overlay-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuSpriteVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuSpriteInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        1 => Float32x4,
+                        2 => Float32x4,
+                        3 => Float32x4,
+                        4 => Float32x4,
+                        5 => Float32x4
+                    ],
+                },
+            ],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_upscale_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1400,10 +1563,19 @@ fn sprite_kind_atlas_row(kind: SpriteKind) -> u32 {
 
 #[inline]
 fn sprite_kind_atlas_rect(kind: SpriteKind, texture_slot: u16) -> [f32; 4] {
-    const ATLAS_COLS: u16 = 4;
-    const INV_ATLAS: f32 = 0.25; // 1.0 / 4.0
-    let col = texture_slot % ATLAS_COLS;
-    let row = sprite_kind_atlas_row(kind);
+    const ATLAS_COLS: u16 = SPRITE_ATLAS_GRID_DIM as u16;
+    const INV_ATLAS: f32 = 1.0 / SPRITE_ATLAS_GRID_DIM as f32;
+    let (col, row) = if texture_slot >= TEXT_GLYPH_SLOT_BASE {
+        (
+            texture_slot % ATLAS_COLS,
+            (texture_slot / ATLAS_COLS).min(ATLAS_COLS - 1),
+        )
+    } else {
+        (
+            texture_slot % ATLAS_COLS,
+            sprite_kind_atlas_row(kind) as u16,
+        )
+    };
     let u0 = col as f32 * INV_ATLAS;
     let v0 = row as f32 * INV_ATLAS;
     [u0, v0, u0 + INV_ATLAS, v0 + INV_ATLAS]
@@ -1873,7 +2045,7 @@ fn create_default_sprite_atlas_resources(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     bind_group_layout: &wgpu::BindGroupLayout,
-) -> (wgpu::Texture, wgpu::BindGroup) {
+) -> (wgpu::Texture, wgpu::BindGroup, wgpu::BindGroup) {
     let width = SPRITE_ATLAS_GRID_DIM * SPRITE_ATLAS_TILE_SIZE;
     let height = SPRITE_ATLAS_GRID_DIM * SPRITE_ATLAS_TILE_SIZE;
     let pixels = build_default_sprite_atlas_pixels(width, height);
@@ -1912,8 +2084,8 @@ fn create_default_sprite_atlas_resources(
     );
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("runtime-scene-sprite-atlas-sampler"),
+    let sampler_linear = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("runtime-scene-sprite-atlas-sampler-linear"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
         address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -1922,9 +2094,19 @@ fn create_default_sprite_atlas_resources(
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     });
+    let sampler_nearest = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("runtime-scene-sprite-atlas-sampler-nearest"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
 
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("runtime-scene-sprite-atlas-bg"),
+    let bind_group_linear = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("runtime-scene-sprite-atlas-bg-linear"),
         layout: bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -1933,11 +2115,26 @@ fn create_default_sprite_atlas_resources(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
+                resource: wgpu::BindingResource::Sampler(&sampler_linear),
             },
         ],
     });
-    (texture, bind_group)
+
+    let bind_group_nearest = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("runtime-scene-sprite-atlas-bg-nearest"),
+        layout: bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler_nearest),
+            },
+        ],
+    });
+    (texture, bind_group_linear, bind_group_nearest)
 }
 
 fn build_default_sprite_atlas_pixels(width: u32, height: u32) -> Vec<u8> {
@@ -1948,9 +2145,15 @@ fn build_default_sprite_atlas_pixels(width: u32, height: u32) -> Vec<u8> {
         for x in 0..width {
             let tile_x = (x / tile).min(SPRITE_ATLAS_GRID_DIM - 1);
             let tile_y = (y / tile).min(SPRITE_ATLAS_GRID_DIM - 1);
+            let slot = (tile_y * SPRITE_ATLAS_GRID_DIM + tile_x) as u16;
             let u = (x % tile) as f32 / (tile - 1) as f32;
             let v = (y % tile) as f32 / (tile - 1) as f32;
-            let rgba = atlas_tile_rgba(tile_x, tile_y, u, v);
+            let mut rgba = atlas_tile_rgba(tile_x, tile_y, u, v);
+            if let Some(glyph_rgba) =
+                atlas_ascii_glyph_rgba(slot, (x % tile) as u32, (y % tile) as u32, tile)
+            {
+                rgba = glyph_rgba;
+            }
             let idx = ((y * width + x) * 4) as usize;
             pixels[idx] = rgba[0];
             pixels[idx + 1] = rgba[1];
@@ -1974,6 +2177,36 @@ fn atlas_tile_rgba(tile_x: u32, tile_y: u32, u: f32, v: f32) -> [u8; 4] {
     let g = (base_g * shade).clamp(0.0, 255.0) as u8;
     let b = (base_b * shade).clamp(0.0, 255.0) as u8;
     [r, g, b, 255]
+}
+
+fn atlas_ascii_glyph_rgba(slot: u16, px: u32, py: u32, tile: u32) -> Option<[u8; 4]> {
+    if slot < TEXT_GLYPH_SLOT_BASE {
+        return None;
+    }
+    let glyph_index = slot - TEXT_GLYPH_SLOT_BASE;
+    if glyph_index >= 95 {
+        return Some([0, 0, 0, 0]);
+    }
+    let ch = (glyph_index as u8 + 32) as char;
+    let Some(bitmap) = BASIC_FONTS.get(ch) else {
+        return Some([0, 0, 0, 0]);
+    };
+    let gx = ((px as usize * 8) / tile.max(1) as usize).min(7);
+    let gy = ((py as usize * 8) / tile.max(1) as usize).min(7);
+    // Sprite UV space samples glyph rows upside-down relative to font8x8 row order.
+    // Flip only glyph Y here so CLI text is upright without changing other sprite lanes.
+    let row = bitmap[7 - gy];
+    let bit = (row >> gx) & 1;
+    if bit == 0 {
+        return Some([0, 0, 0, 0]);
+    }
+    // Soft edge to avoid aggressive aliasing at small sprite sizes.
+    let edge = ((px % (tile / 8).max(1)) == 0) || ((py % (tile / 8).max(1)) == 0);
+    if edge {
+        Some([204, 255, 204, 220])
+    } else {
+        Some([232, 255, 232, 255])
+    }
 }
 
 const SCENE_3D_WGSL: &str = r#"
@@ -2368,10 +2601,10 @@ mod tests {
         let sprite = plan.sprites[0];
         assert!((sprite.kind_params[0] - 2.0).abs() < 1e-6); // camera
         assert!((sprite.kind_params[1] - 6.0).abs() < 1e-6); // texture_slot
-        assert!((sprite.atlas_rect[0] - 0.5).abs() < 1e-6); // col 2 / 4
-        assert!((sprite.atlas_rect[1] - 0.5).abs() < 1e-6); // row 2 / 4
-        assert!((sprite.atlas_rect[2] - 0.75).abs() < 1e-6);
-        assert!((sprite.atlas_rect[3] - 0.75).abs() < 1e-6);
+        assert!((sprite.atlas_rect[0] - 0.375).abs() < 1e-6); // col 6 / 16
+        assert!((sprite.atlas_rect[1] - 0.125).abs() < 1e-6); // row 2 / 16
+        assert!((sprite.atlas_rect[2] - 0.4375).abs() < 1e-6);
+        assert!((sprite.atlas_rect[3] - 0.1875).abs() < 1e-6);
     }
 
     #[test]

@@ -26,6 +26,7 @@ in `src/` crates (not benchmark-only code).
 - `runtime-android.md`: Android beta-track runtime policy, scheduler precedence, and fail-soft behavior
 - `runtime-draw-hud.md`: `SceneFrameInstances` -> draw-batch compile path and telemetry HUD overlay flow
 - `runtime-upscaler.md`: runtime FSR policy surface and TLApp integration points
+- `runtime-tlapp-console.md`: in-app `Ctrl+F1` CLI for live graphics and `.tlscript` overrides
 - `runtime-pak.md`: `.pak` archive format and pack/list/unpack runtime toolchain
 - `runtime-tlpfile-gui.md`: `.tlpfile` project manifest + general-purpose runtime GUI shell
 - `runtime-tlsprite.md`: `.tlsprite` parser, runtime sprite program flow, and HUD scaling signals
@@ -36,7 +37,9 @@ in `src/` crates (not benchmark-only code).
 - `runtime-tlscript-showcase.md`: `.tlscript` showcase compile/evaluate bootstrap for scene control
 - `mgs-scene-workload.md`: runtime/mobile scene density to MGS bridge hint and tile planning mapping
 - `mgs-orangepi5-validation.md`: repeatable Orange Pi 5 validation runner and pass gates for MGS
-- `releases/v0.2.0.md`: current release notes with pre-beta `.pak` packaging additions
+- `releases/v0.3.0.md`: current release notes with runtime version commands and CLI file tooling
+- `releases/v0.3.0-github.md`: GitHub-ready release summary for `v0.3.0`
+- `releases/v0.2.1.md`: stabilization release notes for collision robustness
 - `releases/v0.1.0.md`: first pre-alpha release notes and binary packaging flow
 - `demos/tlapp/*`: TLApp show-scene assets (`bounce_showcase.tlscript`, `bounce_hud.tlsprite`)
 - `demos/`: demo-specific flow notes and show scripts (`docs/demos/*`)

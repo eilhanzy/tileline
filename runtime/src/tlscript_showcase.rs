@@ -171,6 +171,7 @@ pub struct TlscriptShowcaseControlInput {
     pub key_q_down: bool,
     pub key_e_down: bool,
     pub key_c_down: bool,
+    pub key_g_down: bool,
     pub key_r_down: bool,
     pub key_l_down: bool,
     pub key_alt_down: bool,
@@ -212,6 +213,7 @@ impl Default for TlscriptShowcaseControlInput {
             key_q_down: false,
             key_e_down: false,
             key_c_down: false,
+            key_g_down: false,
             key_r_down: false,
             key_l_down: false,
             key_alt_down: false,
@@ -410,6 +412,13 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             "key_c_down".to_string(),
             DemoValue::Bool(controls.key_c_down),
         );
+        state.vars.insert(
+            "key_g_down".to_string(),
+            DemoValue::Bool(controls.key_g_down),
+        );
+        state
+            .vars
+            .insert("key_g".to_string(), DemoValue::Bool(controls.key_g_down));
         state.vars.insert(
             "key_r_down".to_string(),
             DemoValue::Bool(controls.key_r_down),

@@ -1,7 +1,7 @@
 @export
 @parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=128, schedule="performance")
 @deterministic
-def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool, key_w_down: bool, key_s_down: bool, key_a_down: bool, key_d_down: bool, key_up_down: bool, key_down_down: bool, key_left_down: bool, key_right_down: bool, key_space_down: bool, key_ctrl_down: bool, key_shift_down: bool, key_q_down: bool, key_e_down: bool, key_c_down: bool, key_r_down: bool, key_l_down: bool, key_alt_down: bool, key_enter_down: bool, key_escape_down: bool, key_tab_down: bool, mouse_look_down: bool, pad_move_x: float, pad_move_y: float, pad_rise: float, pad_descend: float, pad_look_x: float, pad_look_y: float, pad_sprint_down: bool):
+def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, key_g_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool, key_w_down: bool, key_s_down: bool, key_a_down: bool, key_d_down: bool, key_up_down: bool, key_down_down: bool, key_left_down: bool, key_right_down: bool, key_space_down: bool, key_ctrl_down: bool, key_shift_down: bool, key_q_down: bool, key_e_down: bool, key_c_down: bool, key_r_down: bool, key_l_down: bool, key_alt_down: bool, key_enter_down: bool, key_escape_down: bool, key_tab_down: bool, mouse_look_down: bool, pad_move_x: float, pad_move_y: float, pad_rise: float, pad_descend: float, pad_look_x: float, pad_look_y: float, pad_sprint_down: bool):
     set_fbx_full_render(true)
     set_ball_mesh_slot(2)
     set_container_mesh_slot(3)
@@ -58,11 +58,11 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
         move_y = -1.0
 
     let move_z: float = 0.0
-    if key_space_down:
+    if key_r_down:
         move_z = move_z + 1.0
     if key_e_down:
         move_z = move_z + 1.0
-    if key_ctrl_down:
+    if key_f_down:
         move_z = move_z - 1.0
     if key_q_down:
         move_z = move_z - 1.0
@@ -130,8 +130,7 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
         set_gravity_ramp(frame, 0, 26000, -13.80, -18.60)
     else:
         set_gravity_ramp(frame, 0, 20000, -13.80, -17.20)
-
-    if key_f_down:
+    if key_g_down:
         set_contact_guard(1.0)
         set_levitation(-5.80, 8.60, 1.60, 16.00)
         set_levitation_reaction(0.45, 1.80, 2.60)
