@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use wgpu::{Limits, PresentMode, StoreOp};
 
 use crate::hardware::{MobileGpuFamily, MobileGpuProfile, TbdrArchitecture};
+use crate::zram::MpsZramConfig;
 
 /// Runtime throughput mode preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,6 +421,15 @@ impl ThroughputMemoryPolicy {
     pub fn is_uma(&self) -> bool {
         self.uma_shared_memory
     }
+
+    /// Recommended MPS-style compressed spill policy for this memory profile.
+    pub fn recommended_zram_config(
+        &self,
+        profile: &MobileGpuProfile,
+        logical_threads: usize,
+    ) -> MpsZramConfig {
+        MpsZramConfig::for_profile(profile, logical_threads, self.uma_shared_memory)
+    }
 }
 
 /// Adaptive controller for throughput burst stability.
@@ -494,6 +504,15 @@ mod tests {
         assert_eq!(w, 640);
         assert_eq!(h, 360);
         assert_eq!(policy.throughput_store_op(), StoreOp::Discard);
+    }
+
+    #[test]
+    fn uma_memory_policy_recommends_conservative_zram_budget() {
+        let policy = ThroughputMemoryPolicy::new(true);
+        let profile = MobileGpuProfile::detect("Mali-G610");
+        let cfg = policy.recommended_zram_config(&profile, 8);
+        assert!(cfg.enabled);
+        assert!(cfg.target_compressed_bytes <= 24 * 1024 * 1024);
     }
 
     #[test]

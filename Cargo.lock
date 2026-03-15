@@ -2520,7 +2520,9 @@ name = "mgs"
 version = "0.2.0"
 dependencies = [
  "criterion",
+ "miniz_oxide",
  "pollster",
+ "rayon",
  "wgpu 28.0.0",
  "winit",
 ]

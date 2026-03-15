@@ -15,6 +15,7 @@ pub mod runtime;
 pub mod scene_workload;
 pub mod tile_planner;
 pub mod tuning;
+pub mod zram;
 
 pub use bridge::{MgsBridge, MgsBridgePlan, MpsWorkloadHint};
 pub use fallback::FallbackChain;
@@ -33,3 +34,4 @@ pub use tile_planner::MgsPlanner;
 pub use tuning::{
     BackendRenderHints, LoadAction, MetalPassHints, MgsTuningProfile, StoreAction, VulkanPassHints,
 };
+pub use zram::{MpsZramConfig, MpsZramError, MpsZramSpillOutcome, MpsZramSpillPool, MpsZramStats};

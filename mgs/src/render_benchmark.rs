@@ -12,7 +12,7 @@ use crate::runtime::{
 use crate::{
     is_unified_memory_profile, safe_default_required_limits_for_adapter, select_present_mode,
     select_throughput_burst, startup_ramp, AdaptiveBurstController, AggressiveNoVsyncPolicy,
-    MgsBridge, MobileGpuProfile,
+    MgsBridge, MobileGpuProfile, MpsZramSpillPool, MpsZramStats,
 };
 use wgpu::{Color, CompositeAlphaMode, PresentMode, SurfaceError, TextureFormat};
 use winit::application::ApplicationHandler;
@@ -546,6 +546,7 @@ impl BenchmarkRuntime {
         let computed = self.stats.compute_summary();
         let score = compute_render_score(&computed, &self.renderer.profile);
         let adaptive_burst_cap = self.renderer.adaptive_burst_cap();
+        let zram_stats = self.renderer.zram_stats();
 
         BenchmarkSummary {
             adapter_name: self.renderer.adapter_info.name.clone(),
@@ -576,6 +577,7 @@ impl BenchmarkRuntime {
             fallback_counts: self.renderer.fallback_counts,
             last_tile_count: self.renderer.last_tile_count,
             last_memory_pressure: self.renderer.last_memory_pressure,
+            zram_stats,
             mode_override: self.options.mode_override,
             vsync_override: self.options.vsync_override,
             warmup_duration: self.options.warmup_duration,
@@ -661,6 +663,7 @@ struct Renderer {
     throughput_target_burst: u32,
     adaptive_burst: AdaptiveBurstController,
     memory_policy: ThroughputMemoryPolicy,
+    zram_pool: MpsZramSpillPool,
     throughput_targets: Vec<wgpu::Texture>,
     throughput_target_views: Vec<wgpu::TextureView>,
     throughput_target_signature: Option<ThroughputTargetSignature>,
@@ -705,6 +708,20 @@ impl Renderer {
         let profile = MobileGpuProfile::detect(&adapter_info.name);
         let uma_shared_memory = is_unified_memory_profile(&profile, &adapter_info);
         let memory_policy = ThroughputMemoryPolicy::new(uma_shared_memory);
+        let logical_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        let zram_config = memory_policy.recommended_zram_config(&profile, logical_threads);
+        if zram_config.enabled {
+            eprintln!(
+                "MGS note: MPS-zram enabled (target={} MB hard={} MB shards={} chunk={} KB)",
+                zram_config.target_compressed_bytes / (1024 * 1024),
+                zram_config.hard_compressed_bytes / (1024 * 1024),
+                zram_config.compression_shards,
+                zram_config.chunk_bytes / 1024
+            );
+        }
         let runtime_mode = runtime_mode_from_override(options.mode_override);
         let vsync_mode = runtime_vsync_from_override(options.vsync_override);
         let tuning = crate::MgsTuningProfile::from_profile(&profile);
@@ -812,6 +829,7 @@ impl Renderer {
             throughput_target_burst,
             adaptive_burst,
             memory_policy,
+            zram_pool: MpsZramSpillPool::new(zram_config),
             throughput_targets: Vec::new(),
             throughput_target_views: Vec::new(),
             throughput_target_signature: None,
@@ -927,6 +945,9 @@ impl Renderer {
             if plan.memory_pressure {
                 self.trim_throughput_targets(keep_len);
             }
+        }
+        if plan.memory_pressure && self.total_frames_submitted % 8 == 0 {
+            self.spill_plan_snapshot_to_zram(&plan);
         }
 
         let mut planned_units = self.derive_work_units_from_plan(&plan);
@@ -1137,6 +1158,53 @@ impl Renderer {
             self.throughput_target_cursor = 0;
         }
     }
+
+    fn spill_plan_snapshot_to_zram(&mut self, plan: &crate::bridge::MgsBridgePlan) {
+        if !self.zram_pool.is_enabled() {
+            return;
+        }
+
+        let snapshot = encode_plan_snapshot(
+            self.size,
+            plan.tile_plan.tile_px,
+            plan.tile_plan.tile_count,
+            plan.memory_pressure,
+            &plan.tile_plan.assignments,
+        );
+        let _ = self
+            .zram_pool
+            .spill(self.total_frames_submitted.max(1), &snapshot);
+    }
+
+    fn zram_stats(&self) -> MpsZramStats {
+        self.zram_pool.stats()
+    }
+}
+
+fn encode_plan_snapshot(
+    size: PhysicalSize<u32>,
+    tile_px: u32,
+    tile_count: u32,
+    memory_pressure: bool,
+    assignments: &[crate::tile_planner::TileAssignment],
+) -> Vec<u8> {
+    let max_assignments = assignments.len().min(768);
+    let mut out = Vec::with_capacity(32 + max_assignments * 24);
+    out.extend_from_slice(&size.width.to_le_bytes());
+    out.extend_from_slice(&size.height.to_le_bytes());
+    out.extend_from_slice(&tile_px.to_le_bytes());
+    out.extend_from_slice(&tile_count.to_le_bytes());
+    out.push(u8::from(memory_pressure));
+    out.extend_from_slice(&(max_assignments as u32).to_le_bytes());
+    for assignment in assignments.iter().take(max_assignments) {
+        out.extend_from_slice(&assignment.origin_x.to_le_bytes());
+        out.extend_from_slice(&assignment.origin_y.to_le_bytes());
+        out.extend_from_slice(&assignment.tile_w.to_le_bytes());
+        out.extend_from_slice(&assignment.tile_h.to_le_bytes());
+        out.extend_from_slice(&assignment.draw_calls.to_le_bytes());
+        out.extend_from_slice(&assignment.estimated_tile_memory_kb.to_le_bytes());
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1465,6 +1533,7 @@ struct BenchmarkSummary {
     fallback_counts: [u64; 4],
     last_tile_count: u32,
     last_memory_pressure: bool,
+    zram_stats: MpsZramStats,
     mode_override: ModeOverride,
     vsync_override: VsyncOverride,
     warmup_duration: Duration,
@@ -1670,6 +1739,15 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.fallback_counts[FallbackLevel::SoftwareRasterize as usize],
         summary.last_tile_count,
         summary.last_memory_pressure
+    );
+    println!(
+        "MPS-ZRAM: pages={} spill={} restore={} evict={} ratio={:.3} saved={} KB",
+        summary.zram_stats.stored_pages,
+        summary.zram_stats.spill_events,
+        summary.zram_stats.restore_events,
+        summary.zram_stats.evict_events,
+        summary.zram_stats.compression_ratio(),
+        summary.zram_stats.saved_bytes() / 1024
     );
     println!(
         "Score: {} [{}] | stability={:.2}% work_stability={:.2}%",
