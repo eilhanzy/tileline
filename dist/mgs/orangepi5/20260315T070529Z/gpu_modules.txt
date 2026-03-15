@@ -1,0 +1,18 @@
+$ bash -lc lsmod | grep -Ei 'panthor|panfrost|mali|nvidia|amdgpu' || true
+nvidia_drm            147456  96
+nvidia_modeset       2121728  37 nvidia_drm
+nvidia_uvm           2568192  8
+nvidia              16306176  750 nvidia_uvm,nvidia_modeset
+amdgpu              15716352  14
+amdxcp                 12288  1 amdgpu
+i2c_algo_bit           24576  1 amdgpu
+drm_ttm_helper         16384  3 amdgpu,nvidia_drm
+ttm                   122880  2 amdgpu,drm_ttm_helper
+drm_exec               12288  1 amdgpu
+drm_panel_backlight_quirks    12288  1 amdgpu
+gpu_sched              69632  1 amdgpu
+drm_suballoc_helper    16384  1 amdgpu
+drm_buddy              28672  1 amdgpu
+drm_display_helper    278528  1 amdgpu
+cec                    94208  2 drm_display_helper,amdgpu
+video                  81920  2 amdgpu,nvidia_modeset

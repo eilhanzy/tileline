@@ -9,8 +9,8 @@ use rayon::prelude::*;
 
 use crate::abi::ParadoxScriptHostAbi;
 use crate::body::{
-    Aabb, BodyDesc, BodyKind, ColliderDesc, ColliderShape, ColliderShapeKind, ContactPair,
-    ContactSnapshot, RigidBody,
+    Aabb, BodyDesc, BodyKind, ColliderDesc, ColliderMaterial, ColliderShape, ColliderShapeKind,
+    ContactPair, ContactSnapshot, RigidBody,
 };
 use crate::broadphase::{BroadphaseConfig, BroadphasePipeline};
 use crate::handle::{
@@ -239,6 +239,9 @@ impl PhysicsWorld {
         solver.iterations = lerp_u32(4, 10, level);
         solver.baumgarte = lerp_f32(0.22, 0.62, level);
         solver.penetration_slop = lerp_f32(0.0035, 0.0005, level);
+        solver.max_position_correction_per_iteration = lerp_f32(0.06, 0.18, level);
+        solver.warmstart_impulse_decay = lerp_f32(0.86, 0.96, level);
+        solver.persistent_contact_boost = lerp_f32(0.12, 0.34, level);
         solver.parallel_contact_push_strength = lerp_f32(0.18, 0.62, level);
         solver.parallel_contact_push_threshold = lerp_usize(640, 96, level);
         solver.hard_position_projection_strength = lerp_f32(0.90, 1.85, level);
@@ -249,6 +252,52 @@ impl PhysicsWorld {
             return false;
         }
         self.set_solver_config(solver);
+        true
+    }
+
+    /// Update broadphase swept-AABB speculative settings.
+    pub fn set_broadphase_speculative_sweep(&mut self, enabled: bool, max_distance: f32) -> bool {
+        let max_distance = max_distance.max(0.0);
+        if self.config.broadphase.speculative_sweep == enabled
+            && (self.config.broadphase.speculative_max_distance - max_distance).abs()
+                <= f32::EPSILON
+        {
+            return false;
+        }
+        self.config.broadphase.speculative_sweep = enabled;
+        self.config.broadphase.speculative_max_distance = max_distance;
+        self.broadphase
+            .set_speculative_sweep_config(enabled, max_distance);
+        true
+    }
+
+    /// Update narrowphase speculative contact settings.
+    pub fn set_narrowphase_speculative_contacts(
+        &mut self,
+        enabled: bool,
+        contact_distance: f32,
+        max_prediction_distance: f32,
+    ) -> bool {
+        let contact_distance = contact_distance.max(0.0);
+        let max_prediction_distance = max_prediction_distance.max(contact_distance);
+        if self.config.narrowphase.speculative_contacts == enabled
+            && (self.config.narrowphase.speculative_contact_distance - contact_distance).abs()
+                <= f32::EPSILON
+            && (self.config.narrowphase.speculative_max_prediction_distance
+                - max_prediction_distance)
+                .abs()
+                <= f32::EPSILON
+        {
+            return false;
+        }
+        self.config.narrowphase.speculative_contacts = enabled;
+        self.config.narrowphase.speculative_contact_distance = contact_distance;
+        self.config.narrowphase.speculative_max_prediction_distance = max_prediction_distance;
+        self.narrowphase.set_speculative_contact_config(
+            enabled,
+            contact_distance,
+            max_prediction_distance,
+        );
         true
     }
 
@@ -407,6 +456,61 @@ impl PhysicsWorld {
         removed
     }
 
+    /// Update one collider's material in-place.
+    ///
+    /// Returns `true` when the collider exists and the material changed.
+    pub fn set_collider_material(
+        &mut self,
+        handle: ColliderHandle,
+        material: ColliderMaterial,
+    ) -> bool {
+        let Some(slot) = get_slot_mut(&mut self.colliders, handle.erased()) else {
+            return false;
+        };
+        let Some(record) = slot.value.as_mut() else {
+            return false;
+        };
+        let material = ColliderMaterial {
+            restitution: material.restitution.max(0.0),
+            friction: material.friction.max(0.0),
+        };
+        if record.desc.material == material {
+            return false;
+        }
+        record.desc.material = material;
+        true
+    }
+
+    /// Bulk-update collider materials by packed collision filter group (`user_tag` lower 16 bits).
+    ///
+    /// Returns number of colliders whose material changed.
+    pub fn set_collider_material_for_collision_group(
+        &mut self,
+        group: u16,
+        material: ColliderMaterial,
+    ) -> usize {
+        let group = group as u32;
+        let material = ColliderMaterial {
+            restitution: material.restitution.max(0.0),
+            friction: material.friction.max(0.0),
+        };
+        let mut updated = 0usize;
+        for slot in &mut self.colliders {
+            let Some(record) = slot.value.as_mut() else {
+                continue;
+            };
+            if (record.desc.user_tag & 0xFFFF) != group {
+                continue;
+            }
+            if record.desc.material == material {
+                continue;
+            }
+            record.desc.material = material;
+            updated = updated.saturating_add(1);
+        }
+        updated
+    }
+
     pub fn destroy_joint(&mut self, handle: JointHandle) -> bool {
         let removed = free_slot(&mut self.joints, &mut self.free_joints, handle.erased()).is_some();
         if removed {
@@ -513,6 +617,8 @@ impl PhysicsWorld {
         let sleep_update_stride = if body_count >= 3_500 { 2 } else { 1 };
         for step_index in 0..substeps {
             self.bodies.integrate(fixed_dt, self.config.gravity);
+            self.broadphase.set_predictive_dt(fixed_dt);
+            self.narrowphase.set_predictive_dt(fixed_dt);
             let bodies = &self.bodies;
             self.broadphase.rebuild_pairs_parallel(bodies);
             let candidate_pairs = self.broadphase.candidate_pairs();
@@ -809,6 +915,15 @@ fn get_slot<T>(slots: &[Slot<T>], handle: PhysicsHandle) -> Option<&Slot<T>> {
     }
 }
 
+fn get_slot_mut<T>(slots: &mut [Slot<T>], handle: PhysicsHandle) -> Option<&mut Slot<T>> {
+    let slot = slots.get_mut(handle.index())?;
+    if slot.generation == handle.generation() && slot.value.is_some() {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
 fn free_slot<T>(
     slots: &mut [Slot<T>],
     free_list: &mut Vec<u16>,
@@ -956,5 +1071,36 @@ mod tests {
         assert_eq!(world.config().max_substeps, 24);
         assert!((world.fixed_step_clock().fixed_dt() - (1.0 / 480.0)).abs() < 1e-6);
         assert_eq!(world.fixed_step_clock().max_substeps(), 24);
+    }
+
+    #[test]
+    fn collider_material_can_be_retuned_by_collision_group() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
+        let body = world.spawn_body(BodyDesc::default());
+        let collider = world
+            .spawn_collider(ColliderDesc {
+                body: Some(body),
+                shape: ColliderShape::Sphere { radius: 0.5 },
+                material: crate::body::ColliderMaterial {
+                    restitution: 0.2,
+                    friction: 0.4,
+                },
+                is_sensor: false,
+                user_tag: (3u32) | ((0xFFFFu32) << 16),
+            })
+            .expect("collider");
+        let changed = world.set_collider_material_for_collision_group(
+            3,
+            crate::body::ColliderMaterial {
+                restitution: 0.85,
+                friction: 0.12,
+            },
+        );
+        assert_eq!(changed, 1);
+        let slot = get_slot(&world.colliders, collider.erased())
+            .and_then(|slot| slot.value.as_ref())
+            .expect("slot");
+        assert!((slot.desc.material.restitution - 0.85).abs() < 1e-6);
+        assert!((slot.desc.material.friction - 0.12).abs() < 1e-6);
     }
 }

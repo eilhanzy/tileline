@@ -574,6 +574,15 @@ fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatc
     if patch.spawn_per_tick.is_some() {
         target.spawn_per_tick = patch.spawn_per_tick;
     }
+    if patch.container_half_extents.is_some() {
+        target.container_half_extents = patch.container_half_extents;
+    }
+    if patch.wall_thickness.is_some() {
+        target.wall_thickness = patch.wall_thickness;
+    }
+    if patch.container_mesh_scale.is_some() {
+        target.container_mesh_scale = patch.container_mesh_scale;
+    }
     if patch.linear_damping.is_some() {
         target.linear_damping = patch.linear_damping;
     }
@@ -586,8 +595,63 @@ fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatc
     if patch.ball_restitution.is_some() {
         target.ball_restitution = patch.ball_restitution;
     }
+    if patch.ball_friction.is_some() {
+        target.ball_friction = patch.ball_friction;
+    }
     if patch.wall_restitution.is_some() {
         target.wall_restitution = patch.wall_restitution;
+    }
+    if patch.wall_friction.is_some() {
+        target.wall_friction = patch.wall_friction;
+    }
+    if patch.friction_transition_speed.is_some() {
+        target.friction_transition_speed = patch.friction_transition_speed;
+    }
+    if patch.friction_static_boost.is_some() {
+        target.friction_static_boost = patch.friction_static_boost;
+    }
+    if patch.friction_kinetic_scale.is_some() {
+        target.friction_kinetic_scale = patch.friction_kinetic_scale;
+    }
+    if patch.restitution_velocity_threshold.is_some() {
+        target.restitution_velocity_threshold = patch.restitution_velocity_threshold;
+    }
+    if patch.levitation_height.is_some() {
+        target.levitation_height = patch.levitation_height;
+    }
+    if patch.levitation_strength.is_some() {
+        target.levitation_strength = patch.levitation_strength;
+    }
+    if patch.levitation_damping.is_some() {
+        target.levitation_damping = patch.levitation_damping;
+    }
+    if patch.levitation_max_vertical_speed.is_some() {
+        target.levitation_max_vertical_speed = patch.levitation_max_vertical_speed;
+    }
+    if patch.levitation_reaction_strength.is_some() {
+        target.levitation_reaction_strength = patch.levitation_reaction_strength;
+    }
+    if patch.levitation_reaction_radius.is_some() {
+        target.levitation_reaction_radius = patch.levitation_reaction_radius;
+    }
+    if patch.levitation_reaction_damping.is_some() {
+        target.levitation_reaction_damping = patch.levitation_reaction_damping;
+    }
+    if patch.levitation_lateral_strength.is_some() {
+        target.levitation_lateral_strength = patch.levitation_lateral_strength;
+    }
+    if patch.levitation_lateral_damping.is_some() {
+        target.levitation_lateral_damping = patch.levitation_lateral_damping;
+    }
+    if patch.levitation_lateral_max_horizontal_speed.is_some() {
+        target.levitation_lateral_max_horizontal_speed =
+            patch.levitation_lateral_max_horizontal_speed;
+    }
+    if patch.levitation_lateral_wall_push.is_some() {
+        target.levitation_lateral_wall_push = patch.levitation_lateral_wall_push;
+    }
+    if patch.levitation_lateral_frequency.is_some() {
+        target.levitation_lateral_frequency = patch.levitation_lateral_frequency;
     }
     if patch.initial_speed_min.is_some() {
         target.initial_speed_min = patch.initial_speed_min;
@@ -600,6 +664,24 @@ fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatc
     }
     if patch.scatter_strength.is_some() {
         target.scatter_strength = patch.scatter_strength;
+    }
+    if patch.virtual_barrier_enabled.is_some() {
+        target.virtual_barrier_enabled = patch.virtual_barrier_enabled;
+    }
+    if patch.speculative_sweep_enabled.is_some() {
+        target.speculative_sweep_enabled = patch.speculative_sweep_enabled;
+    }
+    if patch.speculative_sweep_max_distance.is_some() {
+        target.speculative_sweep_max_distance = patch.speculative_sweep_max_distance;
+    }
+    if patch.speculative_contacts_enabled.is_some() {
+        target.speculative_contacts_enabled = patch.speculative_contacts_enabled;
+    }
+    if patch.speculative_contact_distance.is_some() {
+        target.speculative_contact_distance = patch.speculative_contact_distance;
+    }
+    if patch.speculative_max_prediction_distance.is_some() {
+        target.speculative_max_prediction_distance = patch.speculative_max_prediction_distance;
     }
     if patch.ball_mesh_slot.is_some() {
         target.ball_mesh_slot = patch.ball_mesh_slot;

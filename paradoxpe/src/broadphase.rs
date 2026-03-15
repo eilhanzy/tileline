@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
-use crate::body::Aabb;
+use crate::body::{Aabb, BodyKind};
 use crate::handle::BodyHandle;
 use crate::storage::BodyRegistry;
 
 /// Broadphase configuration tuned for shard-parallel sweep-and-prune.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BroadphaseConfig {
     /// Number of sorted bodies processed by one parallel shard.
     pub chunk_size: usize,
@@ -21,6 +21,10 @@ pub struct BroadphaseConfig {
     pub max_candidate_pairs: usize,
     /// Minimum reserved pair slots per shard.
     pub shard_pair_reserve: usize,
+    /// Enables swept AABB broadphase for high-speed anti-tunneling candidate capture.
+    pub speculative_sweep: bool,
+    /// Maximum per-axis sweep distance (world units) used by speculative broadphase.
+    pub speculative_max_distance: f32,
 }
 
 impl Default for BroadphaseConfig {
@@ -29,6 +33,8 @@ impl Default for BroadphaseConfig {
             chunk_size: 128,
             max_candidate_pairs: 16_384,
             shard_pair_reserve: 512,
+            speculative_sweep: true,
+            speculative_max_distance: 1.0,
         }
     }
 }
@@ -47,7 +53,9 @@ pub struct BroadphaseStats {
 #[derive(Debug, Clone)]
 pub struct BroadphasePipeline {
     config: BroadphaseConfig,
+    predictive_dt: f32,
     sorted_dense: Vec<usize>,
+    swept_aabbs: Vec<Aabb>,
     shard_pairs: Vec<Vec<(BodyHandle, BodyHandle)>>,
     merged_pairs: Vec<(BodyHandle, BodyHandle)>,
     stats: BroadphaseStats,
@@ -57,7 +65,9 @@ impl BroadphasePipeline {
     pub fn new(config: BroadphaseConfig) -> Self {
         Self {
             config,
+            predictive_dt: 0.0,
             sorted_dense: Vec::new(),
+            swept_aabbs: Vec::new(),
             shard_pairs: Vec::new(),
             merged_pairs: Vec::new(),
             stats: BroadphaseStats::default(),
@@ -80,6 +90,17 @@ impl BroadphasePipeline {
         self.merged_pairs.capacity()
     }
 
+    /// Update per-step predictive delta for swept broadphase.
+    pub fn set_predictive_dt(&mut self, dt: f32) {
+        self.predictive_dt = dt.max(0.0);
+    }
+
+    /// Update swept broadphase speculative parameters at runtime.
+    pub fn set_speculative_sweep_config(&mut self, enabled: bool, max_distance: f32) {
+        self.config.speculative_sweep = enabled;
+        self.config.speculative_max_distance = max_distance.max(0.0);
+    }
+
     #[inline]
     fn effective_chunk_size(&self, body_count: usize) -> usize {
         let base = self.config.chunk_size.max(16);
@@ -100,6 +121,10 @@ impl BroadphasePipeline {
         if self.sorted_dense.capacity() < body_count {
             self.sorted_dense
                 .reserve(body_count.saturating_sub(self.sorted_dense.capacity()));
+        }
+        if self.swept_aabbs.capacity() < body_count {
+            self.swept_aabbs
+                .reserve(body_count.saturating_sub(self.swept_aabbs.capacity()));
         }
         let chunk_size = self.effective_chunk_size(body_count);
         let shard_count = shard_count_for(body_count, chunk_size);
@@ -144,10 +169,32 @@ impl BroadphasePipeline {
         self.sync_for_body_count(body_count);
         self.sorted_dense.clear();
         self.sorted_dense.extend(0..body_count);
-        let aabbs = bodies.aabbs();
-        let handles = bodies.handles();
-        self.sorted_dense
-            .sort_unstable_by(|left, right| aabbs[*left].min.x.total_cmp(&aabbs[*right].min.x));
+        let read = bodies.read_domain();
+        let aabbs = read.aabbs;
+        let handles = read.handles;
+        let velocities = read.linear_velocities;
+        let kinds = read.kinds;
+        self.swept_aabbs.clear();
+        self.swept_aabbs.extend(aabbs.iter().copied());
+        if self.config.speculative_sweep && self.predictive_dt > 1e-6 {
+            for dense in 0..body_count {
+                if matches!(kinds[dense], BodyKind::Dynamic | BodyKind::Kinematic) {
+                    self.swept_aabbs[dense] = swept_aabb(
+                        aabbs[dense],
+                        velocities[dense],
+                        self.predictive_dt,
+                        self.config.speculative_max_distance,
+                    );
+                }
+            }
+        }
+        let swept_aabbs = &self.swept_aabbs;
+        self.sorted_dense.sort_unstable_by(|left, right| {
+            swept_aabbs[*left]
+                .min
+                .x
+                .total_cmp(&swept_aabbs[*right].min.x)
+        });
 
         let chunk_size = self.effective_chunk_size(body_count);
         let shard_count = shard_count_for(body_count, chunk_size);
@@ -166,11 +213,11 @@ impl BroadphasePipeline {
                 for sorted_index in (shard_index..body_count).step_by(shard_count.max(1)) {
                     let dense_a = sorted_dense[sorted_index];
                     let handle_a = handles[dense_a];
-                    let aabb_a = aabbs[dense_a];
+                    let aabb_a = swept_aabbs[dense_a];
                     let max_x = aabb_a.max.x;
                     for candidate_index in (sorted_index + 1)..body_count {
                         let dense_b = sorted_dense[candidate_index];
-                        let aabb_b = aabbs[dense_b];
+                        let aabb_b = swept_aabbs[dense_b];
                         if aabb_b.min.x > max_x {
                             break;
                         }
@@ -229,12 +276,42 @@ fn order_pair(left: BodyHandle, right: BodyHandle) -> (BodyHandle, BodyHandle) {
     }
 }
 
+#[inline]
+fn swept_aabb(aabb: Aabb, velocity: nalgebra::Vector3<f32>, dt: f32, max_distance: f32) -> Aabb {
+    let dt = dt.max(0.0);
+    let max_distance = max_distance.max(0.0);
+    if dt <= 1e-6 || max_distance <= 1e-6 {
+        return aabb;
+    }
+
+    let mut travel = velocity * dt;
+    travel.x = travel.x.clamp(-max_distance, max_distance);
+    travel.y = travel.y.clamp(-max_distance, max_distance);
+    travel.z = travel.z.clamp(-max_distance, max_distance);
+    if travel.x.abs() <= 1e-6 && travel.y.abs() <= 1e-6 && travel.z.abs() <= 1e-6 {
+        return aabb;
+    }
+
+    Aabb {
+        min: nalgebra::Vector3::new(
+            aabb.min.x.min(aabb.min.x + travel.x),
+            aabb.min.y.min(aabb.min.y + travel.y),
+            aabb.min.z.min(aabb.min.z + travel.z),
+        ),
+        max: nalgebra::Vector3::new(
+            aabb.max.x.max(aabb.max.x + travel.x),
+            aabb.max.y.max(aabb.max.y + travel.y),
+            aabb.max.z.max(aabb.max.z + travel.z),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nalgebra::Vector3;
 
     use super::*;
-    use crate::body::{Aabb, BodyDesc};
+    use crate::body::{Aabb, BodyDesc, BodyKind};
 
     #[test]
     fn broadphase_emits_overlapping_body_pairs() {
@@ -259,5 +336,29 @@ mod tests {
         let pairs = broadphase.rebuild_pairs_parallel(&bodies);
         assert_eq!(pairs, &[(a, b)]);
         assert!(!broadphase.stats().overflowed);
+    }
+
+    #[test]
+    fn broadphase_swept_mode_catches_fast_approach_pair() {
+        let mut bodies = BodyRegistry::new();
+        let moving = bodies.spawn(BodyDesc {
+            kind: BodyKind::Dynamic,
+            position: Vector3::new(0.0, 0.0, 0.0),
+            linear_velocity: Vector3::new(32.0, 0.0, 0.0),
+            local_bounds: Aabb::from_center_half_extents(Vector3::zeros(), Vector3::repeat(0.2)),
+            ..BodyDesc::default()
+        });
+        let wall = bodies.spawn(BodyDesc {
+            kind: BodyKind::Static,
+            position: Vector3::new(1.1, 0.0, 0.0),
+            local_bounds: Aabb::from_center_half_extents(Vector3::zeros(), Vector3::repeat(0.2)),
+            ..BodyDesc::default()
+        });
+
+        let mut broadphase = BroadphasePipeline::new(BroadphaseConfig::default());
+        broadphase.set_predictive_dt(1.0 / 30.0);
+        broadphase.sync_for_body_count(bodies.len());
+        let pairs = broadphase.rebuild_pairs_parallel(&bodies);
+        assert!(pairs.contains(&(moving, wall)));
     }
 }

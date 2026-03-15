@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "gms"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "pollster",
@@ -2517,7 +2517,7 @@ dependencies = [
 
 [[package]]
 name = "mgs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "miniz_oxide",
@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "mps"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "nps"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam",
  "mps",
@@ -3252,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "paradoxpe"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "nalgebra",
  "rayon",
@@ -3751,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytemuck",
  "crossbeam",
@@ -4350,7 +4350,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tl-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam",
  "gms",

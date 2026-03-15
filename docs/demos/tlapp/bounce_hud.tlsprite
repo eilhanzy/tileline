@@ -33,3 +33,13 @@ layer = 150
 position = 0.88, 0.84, 0.0
 rotation_rad = 0.0
 color = 0.76, 0.90, 1.0, 0.92
+
+[scene.mesh_corner_prism]
+sprite_id = 103
+kind = camera
+texture_slot = 3
+fbx = ../cube-prism.fbx
+layer = 151
+position = 0.78, 0.84, 0.0
+rotation_rad = 0.0
+color = 0.88, 0.94, 1.0, 0.80

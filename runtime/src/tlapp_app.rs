@@ -923,6 +923,15 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
     if patch.spawn_per_tick.is_some() {
         target.spawn_per_tick = patch.spawn_per_tick;
     }
+    if patch.container_half_extents.is_some() {
+        target.container_half_extents = patch.container_half_extents;
+    }
+    if patch.wall_thickness.is_some() {
+        target.wall_thickness = patch.wall_thickness;
+    }
+    if patch.container_mesh_scale.is_some() {
+        target.container_mesh_scale = patch.container_mesh_scale;
+    }
     if patch.linear_damping.is_some() {
         target.linear_damping = patch.linear_damping;
     }
@@ -935,8 +944,63 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
     if patch.ball_restitution.is_some() {
         target.ball_restitution = patch.ball_restitution;
     }
+    if patch.ball_friction.is_some() {
+        target.ball_friction = patch.ball_friction;
+    }
     if patch.wall_restitution.is_some() {
         target.wall_restitution = patch.wall_restitution;
+    }
+    if patch.wall_friction.is_some() {
+        target.wall_friction = patch.wall_friction;
+    }
+    if patch.friction_transition_speed.is_some() {
+        target.friction_transition_speed = patch.friction_transition_speed;
+    }
+    if patch.friction_static_boost.is_some() {
+        target.friction_static_boost = patch.friction_static_boost;
+    }
+    if patch.friction_kinetic_scale.is_some() {
+        target.friction_kinetic_scale = patch.friction_kinetic_scale;
+    }
+    if patch.restitution_velocity_threshold.is_some() {
+        target.restitution_velocity_threshold = patch.restitution_velocity_threshold;
+    }
+    if patch.levitation_height.is_some() {
+        target.levitation_height = patch.levitation_height;
+    }
+    if patch.levitation_strength.is_some() {
+        target.levitation_strength = patch.levitation_strength;
+    }
+    if patch.levitation_damping.is_some() {
+        target.levitation_damping = patch.levitation_damping;
+    }
+    if patch.levitation_max_vertical_speed.is_some() {
+        target.levitation_max_vertical_speed = patch.levitation_max_vertical_speed;
+    }
+    if patch.levitation_reaction_strength.is_some() {
+        target.levitation_reaction_strength = patch.levitation_reaction_strength;
+    }
+    if patch.levitation_reaction_radius.is_some() {
+        target.levitation_reaction_radius = patch.levitation_reaction_radius;
+    }
+    if patch.levitation_reaction_damping.is_some() {
+        target.levitation_reaction_damping = patch.levitation_reaction_damping;
+    }
+    if patch.levitation_lateral_strength.is_some() {
+        target.levitation_lateral_strength = patch.levitation_lateral_strength;
+    }
+    if patch.levitation_lateral_damping.is_some() {
+        target.levitation_lateral_damping = patch.levitation_lateral_damping;
+    }
+    if patch.levitation_lateral_max_horizontal_speed.is_some() {
+        target.levitation_lateral_max_horizontal_speed =
+            patch.levitation_lateral_max_horizontal_speed;
+    }
+    if patch.levitation_lateral_wall_push.is_some() {
+        target.levitation_lateral_wall_push = patch.levitation_lateral_wall_push;
+    }
+    if patch.levitation_lateral_frequency.is_some() {
+        target.levitation_lateral_frequency = patch.levitation_lateral_frequency;
     }
     if patch.initial_speed_min.is_some() {
         target.initial_speed_min = patch.initial_speed_min;
@@ -949,6 +1013,24 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
     }
     if patch.scatter_strength.is_some() {
         target.scatter_strength = patch.scatter_strength;
+    }
+    if patch.virtual_barrier_enabled.is_some() {
+        target.virtual_barrier_enabled = patch.virtual_barrier_enabled;
+    }
+    if patch.speculative_sweep_enabled.is_some() {
+        target.speculative_sweep_enabled = patch.speculative_sweep_enabled;
+    }
+    if patch.speculative_sweep_max_distance.is_some() {
+        target.speculative_sweep_max_distance = patch.speculative_sweep_max_distance;
+    }
+    if patch.speculative_contacts_enabled.is_some() {
+        target.speculative_contacts_enabled = patch.speculative_contacts_enabled;
+    }
+    if patch.speculative_contact_distance.is_some() {
+        target.speculative_contact_distance = patch.speculative_contact_distance;
+    }
+    if patch.speculative_max_prediction_distance.is_some() {
+        target.speculative_max_prediction_distance = patch.speculative_max_prediction_distance;
     }
     if patch.ball_mesh_slot.is_some() {
         target.ball_mesh_slot = patch.ball_mesh_slot;
@@ -1309,6 +1391,8 @@ impl TlAppRuntime {
                 chunk_size: broadphase_chunk,
                 max_candidate_pairs: max_pairs,
                 shard_pair_reserve: if mobile_class_tuning { 768 } else { 1_536 },
+                speculative_sweep: true,
+                speculative_max_distance: if mobile_class_tuning { 0.75 } else { 1.20 },
             },
             narrowphase: NarrowphaseConfig {
                 max_manifolds,
@@ -1336,7 +1420,12 @@ impl TlAppRuntime {
                 (96.0 * thread_scale).round() as usize
             },
             ball_restitution: 0.74,
+            ball_friction: 0.28,
             wall_restitution: 0.78,
+            wall_friction: 0.20,
+            friction_transition_speed: 1.2,
+            friction_static_boost: 1.10,
+            friction_kinetic_scale: 0.92,
             linear_damping: 0.012,
             initial_speed_min: 0.35,
             initial_speed_max: 1.25,
@@ -1662,14 +1751,6 @@ impl TlAppRuntime {
                     self.toggle_fullscreen();
                     return RuntimeCommand::None;
                 }
-                PhysicalKey::Code(KeyCode::KeyR) => {
-                    self.camera_reset_requested = true;
-                    return RuntimeCommand::None;
-                }
-                PhysicalKey::Code(KeyCode::KeyL) => {
-                    self.look_lock_active = !self.look_lock_active;
-                    return RuntimeCommand::None;
-                }
                 _ => {}
             }
         }
@@ -1737,27 +1818,63 @@ impl TlAppRuntime {
     fn update_camera_keyboard_input(&mut self, key: PhysicalKey, pressed: bool) {
         match key {
             PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
-                self.keyboard_camera.forward = pressed
+                if matches!(key, PhysicalKey::Code(KeyCode::KeyW)) {
+                    self.keyboard_camera.key_w = pressed;
+                }
+                if matches!(key, PhysicalKey::Code(KeyCode::ArrowUp)) {
+                    self.keyboard_camera.key_up = pressed;
+                }
             }
             PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::ArrowDown) => {
-                self.keyboard_camera.backward = pressed
+                if matches!(key, PhysicalKey::Code(KeyCode::KeyS)) {
+                    self.keyboard_camera.key_s = pressed;
+                }
+                if matches!(key, PhysicalKey::Code(KeyCode::ArrowDown)) {
+                    self.keyboard_camera.key_down = pressed;
+                }
             }
             PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                self.keyboard_camera.left = pressed
+                if matches!(key, PhysicalKey::Code(KeyCode::KeyA)) {
+                    self.keyboard_camera.key_a = pressed;
+                }
+                if matches!(key, PhysicalKey::Code(KeyCode::ArrowLeft)) {
+                    self.keyboard_camera.key_left = pressed;
+                }
             }
             PhysicalKey::Code(KeyCode::KeyD) | PhysicalKey::Code(KeyCode::ArrowRight) => {
-                self.keyboard_camera.right = pressed
+                if matches!(key, PhysicalKey::Code(KeyCode::KeyD)) {
+                    self.keyboard_camera.key_d = pressed;
+                }
+                if matches!(key, PhysicalKey::Code(KeyCode::ArrowRight)) {
+                    self.keyboard_camera.key_right = pressed;
+                }
             }
             PhysicalKey::Code(KeyCode::Space) | PhysicalKey::Code(KeyCode::KeyE) => {
-                self.keyboard_camera.up = pressed
+                if matches!(key, PhysicalKey::Code(KeyCode::Space)) {
+                    self.keyboard_camera.key_space = pressed;
+                }
+                if matches!(key, PhysicalKey::Code(KeyCode::KeyE)) {
+                    self.keyboard_camera.key_e = pressed;
+                }
             }
-            PhysicalKey::Code(KeyCode::ControlLeft)
-            | PhysicalKey::Code(KeyCode::ControlRight)
-            | PhysicalKey::Code(KeyCode::KeyQ)
-            | PhysicalKey::Code(KeyCode::KeyC) => self.keyboard_camera.down = pressed,
+            PhysicalKey::Code(KeyCode::ControlLeft) | PhysicalKey::Code(KeyCode::ControlRight) => {
+                self.keyboard_camera.key_ctrl = pressed
+            }
+            PhysicalKey::Code(KeyCode::KeyQ) => self.keyboard_camera.key_q = pressed,
+            PhysicalKey::Code(KeyCode::KeyC) => self.keyboard_camera.key_c = pressed,
             PhysicalKey::Code(KeyCode::ShiftLeft) | PhysicalKey::Code(KeyCode::ShiftRight) => {
-                self.keyboard_camera.sprint = pressed
+                self.keyboard_camera.key_shift = pressed
             }
+            PhysicalKey::Code(KeyCode::KeyR) => self.keyboard_camera.key_r = pressed,
+            PhysicalKey::Code(KeyCode::KeyL) => self.keyboard_camera.key_l = pressed,
+            PhysicalKey::Code(KeyCode::AltLeft) | PhysicalKey::Code(KeyCode::AltRight) => {
+                self.keyboard_camera.key_alt = pressed
+            }
+            PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                self.keyboard_camera.key_enter = pressed
+            }
+            PhysicalKey::Code(KeyCode::Escape) => self.keyboard_camera.key_escape = pressed,
+            PhysicalKey::Code(KeyCode::Tab) => self.keyboard_camera.key_tab = pressed,
             _ => {}
         }
     }
@@ -1767,18 +1884,10 @@ impl TlAppRuntime {
         let sensitivity = self.camera.mouse_sensitivity().max(0.0001);
         let pad_look_to_mouse = (GAMEPAD_LOOK_SPEED_RAD * view_dt.max(0.0)) / sensitivity;
 
-        let move_x = merge_axis_inputs(
-            axis_from_bools(self.keyboard_camera.right, self.keyboard_camera.left),
-            gamepad.move_x,
-        );
-        let move_y = merge_axis_inputs(
-            axis_from_bools(self.keyboard_camera.forward, self.keyboard_camera.backward),
-            gamepad.move_y,
-        );
-        let move_z = merge_axis_inputs(
-            axis_from_bools(self.keyboard_camera.up, self.keyboard_camera.down),
-            gamepad.rise - gamepad.descend,
-        );
+        // Keyboard layout is script-driven now; keep legacy move_* channels fed from gamepad only.
+        let move_x = gamepad.move_x;
+        let move_y = gamepad.move_y;
+        let move_z = gamepad.rise - gamepad.descend;
         let look_dx = self.mouse_look_delta.0 + gamepad.look_x * pad_look_to_mouse;
         let look_dy = self.mouse_look_delta.1 + gamepad.look_y * pad_look_to_mouse;
         self.mouse_look_delta = (0.0, 0.0);
@@ -1795,9 +1904,37 @@ impl TlAppRuntime {
             move_z,
             look_dx,
             look_dy,
-            sprint_down: self.keyboard_camera.sprint || gamepad.sprint,
+            sprint_down: self.keyboard_camera.key_shift || gamepad.sprint,
             look_active,
             reset_camera,
+            key_w_down: self.keyboard_camera.key_w,
+            key_s_down: self.keyboard_camera.key_s,
+            key_a_down: self.keyboard_camera.key_a,
+            key_d_down: self.keyboard_camera.key_d,
+            key_up_down: self.keyboard_camera.key_up,
+            key_down_down: self.keyboard_camera.key_down,
+            key_left_down: self.keyboard_camera.key_left,
+            key_right_down: self.keyboard_camera.key_right,
+            key_space_down: self.keyboard_camera.key_space,
+            key_ctrl_down: self.keyboard_camera.key_ctrl,
+            key_shift_down: self.keyboard_camera.key_shift,
+            key_q_down: self.keyboard_camera.key_q,
+            key_e_down: self.keyboard_camera.key_e,
+            key_c_down: self.keyboard_camera.key_c,
+            key_r_down: self.keyboard_camera.key_r,
+            key_l_down: self.keyboard_camera.key_l,
+            key_alt_down: self.keyboard_camera.key_alt,
+            key_enter_down: self.keyboard_camera.key_enter,
+            key_escape_down: self.keyboard_camera.key_escape,
+            key_tab_down: self.keyboard_camera.key_tab,
+            mouse_look_down: self.mouse_look_held,
+            pad_move_x: gamepad.move_x,
+            pad_move_y: gamepad.move_y,
+            pad_rise: gamepad.rise,
+            pad_descend: gamepad.descend,
+            pad_look_x: gamepad.look_x,
+            pad_look_y: gamepad.look_y,
+            pad_sprint_down: gamepad.sprint,
         }
     }
 
@@ -2337,16 +2474,6 @@ fn resolve_asset_path(base_file: &Path, raw_path: &str) -> PathBuf {
 }
 
 #[inline]
-fn axis_from_bools(positive: bool, negative: bool) -> f32 {
-    (positive as i8 - negative as i8) as f32
-}
-
-#[inline]
-fn merge_axis_inputs(primary: f32, secondary: f32) -> f32 {
-    (primary + secondary).clamp(-1.0, 1.0)
-}
-
-#[inline]
 fn scheduler_path_label(path: GraphicsSchedulerPath) -> &'static str {
     match path {
         GraphicsSchedulerPath::Gms => "gms",
@@ -2356,13 +2483,26 @@ fn scheduler_path_label(path: GraphicsSchedulerPath) -> &'static str {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CameraInputState {
-    forward: bool,
-    backward: bool,
-    left: bool,
-    right: bool,
-    up: bool,
-    down: bool,
-    sprint: bool,
+    key_w: bool,
+    key_s: bool,
+    key_a: bool,
+    key_d: bool,
+    key_up: bool,
+    key_down: bool,
+    key_left: bool,
+    key_right: bool,
+    key_space: bool,
+    key_ctrl: bool,
+    key_shift: bool,
+    key_q: bool,
+    key_e: bool,
+    key_c: bool,
+    key_r: bool,
+    key_l: bool,
+    key_alt: bool,
+    key_enter: bool,
+    key_escape: bool,
+    key_tab: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3352,13 +3492,6 @@ mod tests {
         )
         .expect("mgs scheduler should resolve");
         assert_eq!(resolved.selected, GraphicsSchedulerPath::Mgs);
-    }
-
-    #[test]
-    fn merged_axis_inputs_are_clamped() {
-        assert_eq!(merge_axis_inputs(0.9, 0.8), 1.0);
-        assert_eq!(merge_axis_inputs(-0.9, -0.8), -1.0);
-        assert_eq!(merge_axis_inputs(0.2, -0.1), 0.1);
     }
 
     #[test]

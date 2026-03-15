@@ -24,6 +24,12 @@ pub struct NarrowphaseConfig {
     pub restitution_combine_rule: MaterialCombineRule,
     /// Global friction combine rule.
     pub friction_combine_rule: MaterialCombineRule,
+    /// Enables speculative contact generation for fast bodies that would otherwise tunnel.
+    pub speculative_contacts: bool,
+    /// Extra contact slack used by speculative generation (world units).
+    pub speculative_contact_distance: f32,
+    /// Maximum predicted sweep distance used per step (world units).
+    pub speculative_max_prediction_distance: f32,
 }
 
 impl Default for NarrowphaseConfig {
@@ -32,6 +38,9 @@ impl Default for NarrowphaseConfig {
             max_manifolds: 16_384,
             restitution_combine_rule: MaterialCombineRule::Max,
             friction_combine_rule: MaterialCombineRule::Average,
+            speculative_contacts: true,
+            speculative_contact_distance: 0.05,
+            speculative_max_prediction_distance: 1.25,
         }
     }
 }
@@ -46,20 +55,23 @@ pub struct NarrowphaseStats {
     pub overflowed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct PersistentManifoldState {
     contact_id: ContactId,
     persisted_frames: u16,
+    normal: [f32; 3],
+    point: [f32; 3],
 }
 
 /// Reusable manifold builder.
 #[derive(Debug, Clone)]
 pub struct NarrowphasePipeline {
     config: NarrowphaseConfig,
+    predictive_dt: f32,
     manifolds: Vec<ContactManifold>,
     previous_states: Vec<PersistentManifoldState>,
     next_states: Vec<PersistentManifoldState>,
-    persisted_lookup: HashMap<ContactId, u16>,
+    persisted_lookup: HashMap<ContactId, PersistentManifoldState>,
     stats: NarrowphaseStats,
 }
 
@@ -70,6 +82,7 @@ impl NarrowphasePipeline {
             previous_states: Vec::new(),
             next_states: Vec::new(),
             persisted_lookup: HashMap::new(),
+            predictive_dt: 1.0 / 120.0,
             config,
             stats: NarrowphaseStats::default(),
         }
@@ -89,6 +102,24 @@ impl NarrowphasePipeline {
 
     pub fn max_manifolds_capacity(&self) -> usize {
         self.manifolds.capacity()
+    }
+
+    /// Update per-step prediction delta for speculative contact generation.
+    pub fn set_predictive_dt(&mut self, dt: f32) {
+        self.predictive_dt = dt.max(0.0);
+    }
+
+    /// Update speculative contact parameters at runtime.
+    pub fn set_speculative_contact_config(
+        &mut self,
+        enabled: bool,
+        contact_distance: f32,
+        max_prediction_distance: f32,
+    ) {
+        self.config.speculative_contacts = enabled;
+        self.config.speculative_contact_distance = contact_distance.max(0.0);
+        self.config.speculative_max_prediction_distance =
+            max_prediction_distance.max(self.config.speculative_contact_distance);
     }
 
     pub fn sync_for_pair_capacity(&mut self, pair_capacity: usize) {
@@ -136,8 +167,7 @@ impl NarrowphasePipeline {
         self.sync_for_pair_capacity(candidate_pairs.len());
         self.persisted_lookup.clear();
         for state in &self.previous_states {
-            self.persisted_lookup
-                .insert(state.contact_id, state.persisted_frames);
+            self.persisted_lookup.insert(state.contact_id, *state);
         }
         let persisted_lookup = &self.persisted_lookup;
 
@@ -153,16 +183,32 @@ impl NarrowphasePipeline {
                 let center_b = bodies.position_for(body_b)?;
                 let aabb_a = bodies.aabb_for(body_a)?;
                 let aabb_b = bodies.aabb_for(body_b)?;
-                let (point, normal, penetration) =
-                    collide_shapes(center_a, &shape_a, aabb_a, center_b, &shape_b, aabb_b)?;
+                let relative_velocity = bodies.relative_velocity(body_a, body_b);
+                let (mut point, mut normal, penetration) = collide_shapes_speculative(
+                    center_a,
+                    &shape_a,
+                    aabb_a,
+                    center_b,
+                    &shape_b,
+                    aabb_b,
+                    relative_velocity,
+                    self.predictive_dt,
+                    self.config.speculative_contacts,
+                    self.config.speculative_contact_distance,
+                    self.config.speculative_max_prediction_distance,
+                )?;
 
                 let feature_tag = feature_tag_for_contact(&shape_a, &shape_b, normal);
                 let contact_id = build_contact_id(collider_a, collider_b, feature_tag);
-                let persisted_frames = persisted_lookup
-                    .get(&contact_id)
-                    .copied()
+                let previous = persisted_lookup.get(&contact_id).copied();
+                let persisted_frames = previous
+                    .map(|state| state.persisted_frames)
                     .unwrap_or(0)
                     .saturating_add(1);
+                if let Some(state) = previous {
+                    normal = stabilize_contact_normal(normal, state.normal, persisted_frames);
+                    point = stabilize_contact_point(point, state.point, persisted_frames);
+                }
                 let restitution = self
                     .config
                     .restitution_combine_rule
@@ -210,6 +256,8 @@ impl NarrowphasePipeline {
                 self.next_states.push(PersistentManifoldState {
                     contact_id: manifold.contact_id,
                     persisted_frames: manifold.persisted_frames,
+                    normal: [manifold.normal.x, manifold.normal.y, manifold.normal.z],
+                    point: [manifold.point.x, manifold.point.y, manifold.point.z],
                 });
             } else {
                 self.stats.overflowed = true;
@@ -266,6 +314,71 @@ fn collide_shapes(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn collide_shapes_speculative(
+    center_a: Vector3<f32>,
+    shape_a: &ColliderShape,
+    aabb_a: Aabb,
+    center_b: Vector3<f32>,
+    shape_b: &ColliderShape,
+    aabb_b: Aabb,
+    relative_velocity_ab: Vector3<f32>,
+    predictive_dt: f32,
+    speculative_enabled: bool,
+    speculative_contact_distance: f32,
+    speculative_max_prediction_distance: f32,
+) -> Option<(Vector3<f32>, Vector3<f32>, f32)> {
+    if let Some(overlap) = collide_shapes(center_a, shape_a, aabb_a, center_b, shape_b, aabb_b) {
+        return Some(overlap);
+    }
+    if !speculative_enabled {
+        return None;
+    }
+    let dt = predictive_dt.max(0.0);
+    if dt <= 1e-6 {
+        return None;
+    }
+    let margin = speculative_contact_distance.max(0.0);
+    let max_prediction = speculative_max_prediction_distance.max(margin);
+
+    match (shape_a, shape_b) {
+        (ColliderShape::Sphere { radius: ra }, ColliderShape::Sphere { radius: rb }) => {
+            speculative_sphere_sphere(
+                center_a,
+                *ra,
+                center_b,
+                *rb,
+                relative_velocity_ab,
+                dt,
+                margin,
+                max_prediction,
+            )
+        }
+        (ColliderShape::Sphere { radius }, ColliderShape::Aabb { .. }) => speculative_sphere_aabb(
+            center_a,
+            *radius,
+            aabb_b,
+            relative_velocity_ab,
+            dt,
+            margin,
+            max_prediction,
+        ),
+        (ColliderShape::Aabb { .. }, ColliderShape::Sphere { radius }) => {
+            let (point, normal, penetration) = speculative_sphere_aabb(
+                center_b,
+                *radius,
+                aabb_a,
+                -relative_velocity_ab,
+                dt,
+                margin,
+                max_prediction,
+            )?;
+            Some((point, -normal, penetration))
+        }
+        (ColliderShape::Aabb { .. }, ColliderShape::Aabb { .. }) => None,
+    }
+}
+
 fn sphere_sphere(
     center_a: Vector3<f32>,
     radius_a: f32,
@@ -286,6 +399,43 @@ fn sphere_sphere(
     };
     let penetration = radius_sum - distance;
     let point = center_a + normal * (radius_a.max(0.0) - penetration * 0.5);
+    Some((point, normal, penetration))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn speculative_sphere_sphere(
+    center_a: Vector3<f32>,
+    radius_a: f32,
+    center_b: Vector3<f32>,
+    radius_b: f32,
+    relative_velocity_ab: Vector3<f32>,
+    dt: f32,
+    margin: f32,
+    max_prediction: f32,
+) -> Option<(Vector3<f32>, Vector3<f32>, f32)> {
+    let delta = center_b - center_a;
+    let distance_sq = delta.norm_squared();
+    if distance_sq <= 1e-10 {
+        return None;
+    }
+    let distance = distance_sq.sqrt();
+    let radius_sum = radius_a.max(0.0) + radius_b.max(0.0);
+    let separation = distance - radius_sum;
+    if separation <= 0.0 {
+        return None;
+    }
+
+    let normal = delta / distance;
+    let closing_speed = (-relative_velocity_ab.dot(&normal)).max(0.0);
+    if closing_speed <= 1e-5 {
+        return None;
+    }
+    let predicted = (closing_speed * dt).min(max_prediction.max(0.0));
+    if predicted + margin < separation {
+        return None;
+    }
+    let penetration = (predicted + margin - separation).max(1e-4);
+    let point = center_a + normal * radius_a.max(0.0);
     Some((point, normal, penetration))
 }
 
@@ -365,6 +515,46 @@ fn sphere_aabb(
     Some((point, normal, penetration))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn speculative_sphere_aabb(
+    sphere_center: Vector3<f32>,
+    radius: f32,
+    box_aabb: Aabb,
+    relative_velocity_ab: Vector3<f32>,
+    dt: f32,
+    margin: f32,
+    max_prediction: f32,
+) -> Option<(Vector3<f32>, Vector3<f32>, f32)> {
+    let clamped = Vector3::new(
+        sphere_center.x.clamp(box_aabb.min.x, box_aabb.max.x),
+        sphere_center.y.clamp(box_aabb.min.y, box_aabb.max.y),
+        sphere_center.z.clamp(box_aabb.min.z, box_aabb.max.z),
+    );
+    let delta = clamped - sphere_center;
+    let distance_sq = delta.norm_squared();
+    if distance_sq <= 1e-10 {
+        return None;
+    }
+    let distance = distance_sq.sqrt();
+    let radius = radius.max(0.0);
+    let separation = distance - radius;
+    if separation <= 0.0 {
+        return None;
+    }
+
+    let normal = delta / distance; // Sphere -> box.
+    let closing_speed = (-relative_velocity_ab.dot(&normal)).max(0.0);
+    if closing_speed <= 1e-5 {
+        return None;
+    }
+    let predicted = (closing_speed * dt).min(max_prediction.max(0.0));
+    if predicted + margin < separation {
+        return None;
+    }
+    let penetration = (predicted + margin - separation).max(1e-4);
+    Some((clamped, normal, penetration))
+}
+
 fn aabb_aabb(a: Aabb, b: Aabb) -> Option<(Vector3<f32>, Vector3<f32>, f32)> {
     if !a.intersects(b) {
         return None;
@@ -434,6 +624,51 @@ fn axis_feature_tag(normal: Vector3<f32>) -> u8 {
     } else {
         0x6
     }
+}
+
+#[inline]
+fn stabilize_contact_normal(
+    current: Vector3<f32>,
+    previous: [f32; 3],
+    persisted_frames: u16,
+) -> Vector3<f32> {
+    let prev = Vector3::new(previous[0], previous[1], previous[2]);
+    let prev_len_sq = prev.norm_squared();
+    if prev_len_sq <= 1e-6 {
+        return current;
+    }
+    let prev = prev / prev_len_sq.sqrt();
+    let cur_len_sq = current.norm_squared();
+    if cur_len_sq <= 1e-6 {
+        return prev;
+    }
+    let cur = current / cur_len_sq.sqrt();
+    if cur.dot(&prev) < 0.0 {
+        // Keep the freshly computed normal if winding flipped.
+        return cur;
+    }
+
+    let persistence = persisted_frames.saturating_sub(1).min(10) as f32;
+    let blend = (0.18 + persistence * 0.04).clamp(0.18, 0.52);
+    let mixed = cur * (1.0 - blend) + prev * blend;
+    let mixed_len_sq = mixed.norm_squared();
+    if mixed_len_sq > 1e-6 {
+        mixed / mixed_len_sq.sqrt()
+    } else {
+        cur
+    }
+}
+
+#[inline]
+fn stabilize_contact_point(
+    current: Vector3<f32>,
+    previous: [f32; 3],
+    persisted_frames: u16,
+) -> Vector3<f32> {
+    let prev = Vector3::new(previous[0], previous[1], previous[2]);
+    let persistence = persisted_frames.saturating_sub(1).min(10) as f32;
+    let blend = (0.08 + persistence * 0.03).clamp(0.08, 0.32);
+    current * (1.0 - blend) + prev * blend
 }
 
 #[cfg(test)]
@@ -609,5 +844,56 @@ mod tests {
         // Nearest face is +X, so sphere -> box normal should be +X.
         assert!(normal.x > 0.9);
         assert!(penetration > radius);
+    }
+
+    #[test]
+    fn narrowphase_emits_speculative_manifold_for_fast_sphere_box_approach() {
+        let mut bodies = BodyRegistry::new();
+        let sphere = bodies.spawn(BodyDesc {
+            position: Vector3::new(0.0, 0.0, 0.0),
+            linear_velocity: Vector3::new(96.0, 0.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let wall = bodies.spawn(BodyDesc {
+            position: Vector3::new(2.0, 0.0, 0.0),
+            ..BodyDesc::default()
+        });
+        let candidate_pairs = vec![(sphere, wall)];
+
+        let mut narrowphase = NarrowphasePipeline::new(NarrowphaseConfig::default());
+        narrowphase.set_predictive_dt(1.0 / 60.0);
+        let manifolds = narrowphase.rebuild_manifolds(&bodies, &candidate_pairs, |body| {
+            if body == sphere {
+                Some((
+                    ColliderHandle::new(body.index() as u16, body.generation()),
+                    ColliderShape::Sphere { radius: 0.4 },
+                    ColliderMaterial::default(),
+                    0,
+                ))
+            } else {
+                Some((
+                    ColliderHandle::new(body.index() as u16, body.generation()),
+                    ColliderShape::Aabb {
+                        half_extents: Vector3::new(0.15, 1.0, 1.0),
+                    },
+                    ColliderMaterial::default(),
+                    0,
+                ))
+            }
+        });
+
+        assert_eq!(manifolds.len(), 1);
+        assert!(manifolds[0].penetration > 0.0);
+        assert!(manifolds[0].normal.x > 0.8);
+    }
+
+    #[test]
+    fn persistent_normal_stabilization_blends_without_flipping() {
+        let current = Vector3::new(0.8, 0.2, 0.0).normalize();
+        let previous = [1.0, 0.0, 0.0];
+        let stabilized = stabilize_contact_normal(current, previous, 6);
+        // For persistent contacts we keep a bias toward previous normal.
+        assert!(stabilized.dot(&Vector3::new(1.0, 0.0, 0.0)) > current.x);
+        assert!(stabilized.norm() > 0.99);
     }
 }

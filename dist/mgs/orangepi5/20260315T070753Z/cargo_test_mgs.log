@@ -1,0 +1,50 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/mgs-41090180557f5cd2)
+
+running 37 tests
+test fallback::tests::chain_reports_failure_when_all_skip ... ok
+test fallback::tests::chain_resolves_at_first_handled_step ... ok
+test bridge::tests::translate_returns_valid_plan_for_adreno ... ok
+test fallback::tests::tbdr_profile_starts_at_optimized_level ... ok
+test fallback::tests::unknown_profile_starts_at_simple_tile ... ok
+test hardware::tests::detects_adreno_750_as_flex_render ... ok
+test hardware::tests::detects_apple_as_metal_backend ... ok
+test hardware::tests::detects_mali_g78_as_tbdr ... ok
+test hardware::tests::unknown_gpu_not_mobile_tbdr ... ok
+test runtime::tests::adaptive_burst_controller_clamps_to_bounds ... ok
+test runtime::tests::aggressive_no_vsync_enables_when_uncapped_unavailable ... ok
+test runtime::tests::burst_profile_for_apple_auto_is_conservative ... ok
+test runtime::tests::burst_profile_for_high_core_mali_scales_up ... ok
+test bridge::tests::translate_covers_all_objects ... ok
+test runtime::tests::burst_profile_for_low_core_mali_stays_bounded ... ok
+test runtime::tests::clamps_3d_dimension_to_supported_limit ... ok
+test runtime::tests::discrete_desktop_profile_is_not_unified_by_mobile_rule ... ok
+test runtime::tests::frame_pacer_wait_target_advances_in_max_mode ... ok
+test runtime::tests::mali_integrated_profile_is_treated_as_unified_memory ... ok
+test runtime::tests::uma_memory_policy_recommends_conservative_zram_budget ... ok
+test runtime::tests::uma_memory_policy_scales_offscreen_target ... ok
+test runtime::tests::vsync_off_prefers_immediate ... ok
+test scene_workload::tests::hint_scales_with_density ... ok
+test tuning::tests::apple_profile_uses_merged_passes ... ok
+test scene_workload::tests::scene_can_be_planned_with_bridge ... ok
+test tile_planner::tests::plan_covers_all_draw_calls ... ok
+test tuning::tests::mali_vulkan_hints_have_two_subpasses ... ok
+test tuning::tests::hot_thermal_state_reduces_draw_calls ... ok
+test tuning::tests::metal_hints_enable_tile_shaders_for_apple ... ok
+test tuning::tests::vulkan_hints_use_depth_dont_care ... ok
+test tuning::tests::nominal_thermal_state_keeps_full_budget ... ok
+test zram::tests::profile_config_is_more_conservative_on_uma ... ok
+test tile_planner::tests::plan_tile_px_matches_architecture_default ... ok
+test tile_planner::tests::adaptive_tiling_reduces_tile_size_under_heavy_pressure ... ok
+test tile_planner::tests::memory_pressure_detected_when_over_budget ... ok
+test zram::tests::spill_and_restore_roundtrip ... ok
+test zram::tests::enforce_budget_evicts_oldest_pages ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mgs
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

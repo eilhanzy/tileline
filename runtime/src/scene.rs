@@ -7,6 +7,7 @@
 //!   thousands of colored balls using ParadoxPE bodies/colliders
 //! - render/present vs physics tick-rate policy helper
 
+use std::collections::HashMap;
 use std::f32::consts::TAU;
 
 use nalgebra::Vector3;
@@ -195,17 +196,35 @@ pub struct BounceTankSceneConfig {
     pub spawn_per_tick: usize,
     pub container_half_extents: [f32; 3],
     pub wall_thickness: f32,
+    pub container_mesh_scale: [f32; 3],
     pub ball_radius_min: f32,
     pub ball_radius_max: f32,
     pub ball_restitution: f32,
     pub ball_friction: f32,
     pub wall_restitution: f32,
     pub wall_friction: f32,
+    pub friction_transition_speed: f32,
+    pub friction_static_boost: f32,
+    pub friction_kinetic_scale: f32,
+    pub restitution_velocity_threshold: f32,
+    pub levitation_height: f32,
+    pub levitation_strength: f32,
+    pub levitation_damping: f32,
+    pub levitation_max_vertical_speed: f32,
+    pub levitation_reaction_strength: f32,
+    pub levitation_reaction_radius: f32,
+    pub levitation_reaction_damping: f32,
+    pub levitation_lateral_strength: f32,
+    pub levitation_lateral_damping: f32,
+    pub levitation_lateral_max_horizontal_speed: f32,
+    pub levitation_lateral_wall_push: f32,
+    pub levitation_lateral_frequency: f32,
     pub linear_damping: f32,
     pub initial_speed_min: f32,
     pub initial_speed_max: f32,
     pub scatter_interval_ticks: u64,
     pub scatter_strength: f32,
+    pub virtual_barrier_enabled: bool,
     pub seed: u64,
 }
 
@@ -216,17 +235,35 @@ impl Default for BounceTankSceneConfig {
             spawn_per_tick: 120,
             container_half_extents: [24.0, 16.0, 24.0],
             wall_thickness: 0.40,
+            container_mesh_scale: [1.0, 1.0, 1.0],
             ball_radius_min: 0.10,
             ball_radius_max: 0.24,
             ball_restitution: 0.74,
             ball_friction: 0.28,
             wall_restitution: 0.78,
             wall_friction: 0.20,
+            friction_transition_speed: 1.2,
+            friction_static_boost: 1.10,
+            friction_kinetic_scale: 0.92,
+            restitution_velocity_threshold: 0.35,
+            levitation_height: 0.0,
+            levitation_strength: 0.0,
+            levitation_damping: 0.0,
+            levitation_max_vertical_speed: 4.5,
+            levitation_reaction_strength: 0.0,
+            levitation_reaction_radius: 1.2,
+            levitation_reaction_damping: 0.0,
+            levitation_lateral_strength: 0.0,
+            levitation_lateral_damping: 1.2,
+            levitation_lateral_max_horizontal_speed: 10.0,
+            levitation_lateral_wall_push: 0.0,
+            levitation_lateral_frequency: 0.35,
             linear_damping: 0.012,
             initial_speed_min: 0.35,
             initial_speed_max: 1.25,
             scatter_interval_ticks: 420,
             scatter_strength: 0.16,
+            virtual_barrier_enabled: true,
             seed: 0x5EED_C0DE_u64,
         }
     }
@@ -247,15 +284,42 @@ pub struct BounceTankTickMetrics {
 pub struct BounceTankRuntimePatch {
     pub target_ball_count: Option<usize>,
     pub spawn_per_tick: Option<usize>,
+    pub container_half_extents: Option<[f32; 3]>,
+    pub wall_thickness: Option<f32>,
+    pub container_mesh_scale: Option<[f32; 3]>,
     pub linear_damping: Option<f32>,
     pub gravity: Option<[f32; 3]>,
     pub contact_guard: Option<f32>,
     pub ball_restitution: Option<f32>,
+    pub ball_friction: Option<f32>,
     pub wall_restitution: Option<f32>,
+    pub wall_friction: Option<f32>,
+    pub friction_transition_speed: Option<f32>,
+    pub friction_static_boost: Option<f32>,
+    pub friction_kinetic_scale: Option<f32>,
+    pub restitution_velocity_threshold: Option<f32>,
+    pub levitation_height: Option<f32>,
+    pub levitation_strength: Option<f32>,
+    pub levitation_damping: Option<f32>,
+    pub levitation_max_vertical_speed: Option<f32>,
+    pub levitation_reaction_strength: Option<f32>,
+    pub levitation_reaction_radius: Option<f32>,
+    pub levitation_reaction_damping: Option<f32>,
+    pub levitation_lateral_strength: Option<f32>,
+    pub levitation_lateral_damping: Option<f32>,
+    pub levitation_lateral_max_horizontal_speed: Option<f32>,
+    pub levitation_lateral_wall_push: Option<f32>,
+    pub levitation_lateral_frequency: Option<f32>,
     pub initial_speed_min: Option<f32>,
     pub initial_speed_max: Option<f32>,
     pub scatter_interval_ticks: Option<u64>,
     pub scatter_strength: Option<f32>,
+    pub virtual_barrier_enabled: Option<bool>,
+    pub speculative_sweep_enabled: Option<bool>,
+    pub speculative_sweep_max_distance: Option<f32>,
+    pub speculative_contacts_enabled: Option<bool>,
+    pub speculative_contact_distance: Option<f32>,
+    pub speculative_max_prediction_distance: Option<f32>,
     pub ball_mesh_slot: Option<u8>,
     pub container_mesh_slot: Option<u8>,
 }
@@ -265,6 +329,7 @@ pub struct BounceTankRuntimePatch {
 pub struct BounceTankPatchMetrics {
     pub config_updated: bool,
     pub dynamic_bodies_retuned: usize,
+    pub collider_materials_retuned: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -276,6 +341,13 @@ struct BallVisual {
     metallic: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LevitationCellKey {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
 /// Scene controller for a transparent 3D tank that progressively fills with bouncing balls.
 ///
 /// Physics uses ParadoxPE dynamic sphere bodies and static AABB wall colliders.
@@ -283,11 +355,18 @@ pub struct BounceTankSceneController {
     config: BounceTankSceneConfig,
     rng_state: u64,
     walls: Vec<BodyHandle>,
+    edge_barriers: Vec<BodyHandle>,
     balls: Vec<BallVisual>,
     sprite_program: Option<TlspriteProgram>,
     ball_mesh_slot: Option<u8>,
     container_mesh_slot: Option<u8>,
     last_scatter_tick: u64,
+    scatter_face_cursor: u8,
+    levitation_body_handles: Vec<BodyHandle>,
+    levitation_positions: Vec<[f32; 3]>,
+    levitation_velocities: Vec<[f32; 3]>,
+    levitation_reaction_cells: HashMap<LevitationCellKey, Vec<usize>>,
+    levitation_lateral_phase: f32,
 }
 
 impl BounceTankSceneController {
@@ -296,11 +375,18 @@ impl BounceTankSceneController {
             rng_state: config.seed,
             config,
             walls: Vec::with_capacity(6),
+            edge_barriers: Vec::with_capacity(12),
             balls: Vec::new(),
             sprite_program: None,
             ball_mesh_slot: None,
             container_mesh_slot: None,
             last_scatter_tick: 0,
+            scatter_face_cursor: 0,
+            levitation_body_handles: Vec::new(),
+            levitation_positions: Vec::new(),
+            levitation_velocities: Vec::new(),
+            levitation_reaction_cells: HashMap::new(),
+            levitation_lateral_phase: 0.0,
         }
     }
 
@@ -314,6 +400,18 @@ impl BounceTankSceneController {
 
     pub fn wall_count(&self) -> usize {
         self.walls.len()
+    }
+
+    pub fn edge_barrier_count(&self) -> usize {
+        self.edge_barriers.len()
+    }
+
+    fn virtual_barrier_enabled(&self) -> bool {
+        self.config.virtual_barrier_enabled
+    }
+
+    fn set_virtual_barrier_enabled(&mut self, enabled: bool) {
+        self.config.virtual_barrier_enabled = enabled;
     }
 
     /// Override the default HUD sprite emission with a compiled `.tlsprite` program.
@@ -338,6 +436,11 @@ impl BounceTankSceneController {
     ) -> BounceTankPatchMetrics {
         let mut updated = false;
         let mut retuned = 0usize;
+        let mut collider_materials_retuned = 0usize;
+        let mut refresh_ball_material = false;
+        let mut refresh_wall_material = false;
+        let mut refresh_solver_friction = false;
+        let mut refresh_solver_restitution = false;
 
         if let Some(target) = patch.target_ball_count {
             let clamped = target.clamp(1, 200_000);
@@ -350,6 +453,38 @@ impl BounceTankSceneController {
             let clamped = spawn.clamp(1, 8_192);
             if self.config.spawn_per_tick != clamped {
                 self.config.spawn_per_tick = clamped;
+                updated = true;
+            }
+        }
+        let mut rebuild_barriers = false;
+        if let Some(ext) = patch.container_half_extents {
+            let clamped = [
+                ext[0].clamp(0.5, 256.0),
+                ext[1].clamp(0.5, 256.0),
+                ext[2].clamp(0.5, 256.0),
+            ];
+            if self.config.container_half_extents != clamped {
+                self.config.container_half_extents = clamped;
+                rebuild_barriers = true;
+                updated = true;
+            }
+        }
+        if let Some(thickness) = patch.wall_thickness {
+            let clamped = thickness.clamp(0.01, 8.0);
+            if (self.config.wall_thickness - clamped).abs() > f32::EPSILON {
+                self.config.wall_thickness = clamped;
+                rebuild_barriers = true;
+                updated = true;
+            }
+        }
+        if let Some(scale) = patch.container_mesh_scale {
+            let clamped = [
+                scale[0].clamp(0.05, 64.0),
+                scale[1].clamp(0.05, 64.0),
+                scale[2].clamp(0.05, 64.0),
+            ];
+            if self.config.container_mesh_scale != clamped {
+                self.config.container_mesh_scale = clamped;
                 updated = true;
             }
         }
@@ -382,12 +517,148 @@ impl BounceTankSceneController {
             if (self.config.ball_restitution - clamped).abs() > f32::EPSILON {
                 self.config.ball_restitution = clamped;
                 updated = true;
+                refresh_ball_material = true;
+            }
+        }
+        if let Some(friction) = patch.ball_friction {
+            let clamped = friction.clamp(0.0, 2.0);
+            if (self.config.ball_friction - clamped).abs() > f32::EPSILON {
+                self.config.ball_friction = clamped;
+                updated = true;
+                refresh_ball_material = true;
             }
         }
         if let Some(restitution) = patch.wall_restitution {
             let clamped = restitution.clamp(0.0, 1.25);
             if (self.config.wall_restitution - clamped).abs() > f32::EPSILON {
                 self.config.wall_restitution = clamped;
+                updated = true;
+                refresh_wall_material = true;
+            }
+        }
+        if let Some(friction) = patch.wall_friction {
+            let clamped = friction.clamp(0.0, 2.0);
+            if (self.config.wall_friction - clamped).abs() > f32::EPSILON {
+                self.config.wall_friction = clamped;
+                updated = true;
+                refresh_wall_material = true;
+            }
+        }
+        if let Some(transition) = patch.friction_transition_speed {
+            let clamped = transition.clamp(0.0, 12.0);
+            if (self.config.friction_transition_speed - clamped).abs() > f32::EPSILON {
+                self.config.friction_transition_speed = clamped;
+                updated = true;
+                refresh_solver_friction = true;
+            }
+        }
+        if let Some(static_boost) = patch.friction_static_boost {
+            let clamped = static_boost.clamp(0.0, 4.0);
+            if (self.config.friction_static_boost - clamped).abs() > f32::EPSILON {
+                self.config.friction_static_boost = clamped;
+                updated = true;
+                refresh_solver_friction = true;
+            }
+        }
+        if let Some(kinetic_scale) = patch.friction_kinetic_scale {
+            let clamped = kinetic_scale.clamp(0.0, 4.0);
+            if (self.config.friction_kinetic_scale - clamped).abs() > f32::EPSILON {
+                self.config.friction_kinetic_scale = clamped;
+                updated = true;
+                refresh_solver_friction = true;
+            }
+        }
+        if let Some(threshold) = patch.restitution_velocity_threshold {
+            let clamped = threshold.clamp(0.0, 6.0);
+            if (self.config.restitution_velocity_threshold - clamped).abs() > f32::EPSILON {
+                self.config.restitution_velocity_threshold = clamped;
+                updated = true;
+                refresh_solver_restitution = true;
+            }
+        }
+        if let Some(height) = patch.levitation_height {
+            let hy = self.config.container_half_extents[1].max(0.5);
+            let clamped = height.clamp(-hy * 0.95, hy * 0.95);
+            if (self.config.levitation_height - clamped).abs() > f32::EPSILON {
+                self.config.levitation_height = clamped;
+                updated = true;
+            }
+        }
+        if let Some(strength) = patch.levitation_strength {
+            let clamped = strength.clamp(0.0, 200.0);
+            if (self.config.levitation_strength - clamped).abs() > f32::EPSILON {
+                self.config.levitation_strength = clamped;
+                updated = true;
+            }
+        }
+        if let Some(damping) = patch.levitation_damping {
+            let clamped = damping.clamp(0.0, 80.0);
+            if (self.config.levitation_damping - clamped).abs() > f32::EPSILON {
+                self.config.levitation_damping = clamped;
+                updated = true;
+            }
+        }
+        if let Some(max_speed) = patch.levitation_max_vertical_speed {
+            let clamped = max_speed.clamp(0.05, 80.0);
+            if (self.config.levitation_max_vertical_speed - clamped).abs() > f32::EPSILON {
+                self.config.levitation_max_vertical_speed = clamped;
+                updated = true;
+            }
+        }
+        if let Some(strength) = patch.levitation_reaction_strength {
+            let clamped = strength.clamp(0.0, 80.0);
+            if (self.config.levitation_reaction_strength - clamped).abs() > f32::EPSILON {
+                self.config.levitation_reaction_strength = clamped;
+                updated = true;
+            }
+        }
+        if let Some(radius) = patch.levitation_reaction_radius {
+            let clamped = radius.clamp(0.0, 8.0);
+            if (self.config.levitation_reaction_radius - clamped).abs() > f32::EPSILON {
+                self.config.levitation_reaction_radius = clamped;
+                updated = true;
+            }
+        }
+        if let Some(damping) = patch.levitation_reaction_damping {
+            let clamped = damping.clamp(0.0, 40.0);
+            if (self.config.levitation_reaction_damping - clamped).abs() > f32::EPSILON {
+                self.config.levitation_reaction_damping = clamped;
+                updated = true;
+            }
+        }
+        if let Some(strength) = patch.levitation_lateral_strength {
+            let clamped = strength.clamp(0.0, 120.0);
+            if (self.config.levitation_lateral_strength - clamped).abs() > f32::EPSILON {
+                self.config.levitation_lateral_strength = clamped;
+                updated = true;
+            }
+        }
+        if let Some(damping) = patch.levitation_lateral_damping {
+            let clamped = damping.clamp(0.0, 80.0);
+            if (self.config.levitation_lateral_damping - clamped).abs() > f32::EPSILON {
+                self.config.levitation_lateral_damping = clamped;
+                updated = true;
+            }
+        }
+        if let Some(max_speed) = patch.levitation_lateral_max_horizontal_speed {
+            let clamped = max_speed.clamp(0.05, 120.0);
+            if (self.config.levitation_lateral_max_horizontal_speed - clamped).abs() > f32::EPSILON
+            {
+                self.config.levitation_lateral_max_horizontal_speed = clamped;
+                updated = true;
+            }
+        }
+        if let Some(push) = patch.levitation_lateral_wall_push {
+            let clamped = push.clamp(0.0, 240.0);
+            if (self.config.levitation_lateral_wall_push - clamped).abs() > f32::EPSILON {
+                self.config.levitation_lateral_wall_push = clamped;
+                updated = true;
+            }
+        }
+        if let Some(freq) = patch.levitation_lateral_frequency {
+            let clamped = freq.clamp(0.0, 20.0);
+            if (self.config.levitation_lateral_frequency - clamped).abs() > f32::EPSILON {
+                self.config.levitation_lateral_frequency = clamped;
                 updated = true;
             }
         }
@@ -419,6 +690,52 @@ impl BounceTankSceneController {
                 updated = true;
             }
         }
+        if let Some(enabled) = patch.virtual_barrier_enabled {
+            if self.virtual_barrier_enabled() != enabled {
+                self.set_virtual_barrier_enabled(enabled);
+                updated = true;
+            }
+        }
+        if patch.speculative_sweep_enabled.is_some()
+            || patch.speculative_sweep_max_distance.is_some()
+        {
+            let current = &world.config().broadphase;
+            let enabled = patch
+                .speculative_sweep_enabled
+                .unwrap_or(current.speculative_sweep);
+            let max_distance = patch
+                .speculative_sweep_max_distance
+                .unwrap_or(current.speculative_max_distance)
+                .clamp(0.0, 8.0);
+            if world.set_broadphase_speculative_sweep(enabled, max_distance) {
+                updated = true;
+            }
+        }
+        if patch.speculative_contacts_enabled.is_some()
+            || patch.speculative_contact_distance.is_some()
+            || patch.speculative_max_prediction_distance.is_some()
+        {
+            let current = &world.config().narrowphase;
+            let enabled = patch
+                .speculative_contacts_enabled
+                .unwrap_or(current.speculative_contacts);
+            let contact_distance = patch
+                .speculative_contact_distance
+                .unwrap_or(current.speculative_contact_distance)
+                .clamp(0.0, 2.0);
+            let max_prediction_distance = patch
+                .speculative_max_prediction_distance
+                .unwrap_or(current.speculative_max_prediction_distance)
+                .clamp(0.0, 8.0)
+                .max(contact_distance);
+            if world.set_narrowphase_speculative_contacts(
+                enabled,
+                contact_distance,
+                max_prediction_distance,
+            ) {
+                updated = true;
+            }
+        }
         if self.config.initial_speed_max < self.config.initial_speed_min {
             self.config.initial_speed_max = self.config.initial_speed_min;
             updated = true;
@@ -435,20 +752,70 @@ impl BounceTankSceneController {
                 updated = true;
             }
         }
+        if rebuild_barriers {
+            for body in self.walls.drain(..) {
+                let _ = world.destroy_body(body);
+            }
+            for body in self.edge_barriers.drain(..) {
+                let _ = world.destroy_body(body);
+            }
+        }
+
+        if refresh_ball_material {
+            collider_materials_retuned = collider_materials_retuned.saturating_add(
+                world.set_collider_material_for_collision_group(
+                    COLLISION_GROUP_BALL,
+                    ColliderMaterial {
+                        restitution: self.config.ball_restitution.max(0.0),
+                        friction: self.config.ball_friction.max(0.0),
+                    },
+                ),
+            );
+        }
+        if refresh_wall_material {
+            collider_materials_retuned = collider_materials_retuned.saturating_add(
+                world.set_collider_material_for_collision_group(
+                    COLLISION_GROUP_WALL,
+                    ColliderMaterial {
+                        restitution: self.config.wall_restitution.max(0.0),
+                        friction: self.config.wall_friction.max(0.0),
+                    },
+                ),
+            );
+        }
+        if refresh_solver_friction || refresh_solver_restitution {
+            let mut solver = world.solver().config().clone();
+            if refresh_solver_friction {
+                solver.friction_transition_speed = self.config.friction_transition_speed.max(0.0);
+                solver.friction_static_boost = self.config.friction_static_boost.max(0.0);
+                solver.friction_kinetic_scale = self.config.friction_kinetic_scale.max(0.0);
+            }
+            if refresh_solver_restitution {
+                solver.restitution_velocity_threshold =
+                    self.config.restitution_velocity_threshold.max(0.0);
+            }
+            world.set_solver_config(solver);
+        }
 
         BounceTankPatchMetrics {
             config_updated: updated,
             dynamic_bodies_retuned: retuned,
+            collider_materials_retuned,
         }
     }
 
     /// Ensure static physics walls exist and then spawn a progressive ball batch.
     pub fn physics_tick(&mut self, world: &mut PhysicsWorld) -> BounceTankTickMetrics {
         self.ensure_container_walls(world);
+        self.ensure_container_edge_barriers(world);
         self.cull_missing(world);
-        let _ = self.recycle_escaped_balls(world);
+        if self.virtual_barrier_enabled() {
+            let _ = self.recycle_escaped_balls(world);
+        }
         let spawned = self.spawn_batch(world);
         let scattered = self.maybe_scatter_burst(world);
+        let _ = self.apply_levitation_field(world);
+        let _ = self.clamp_ball_velocity_for_collision_safety(world);
         BounceTankTickMetrics {
             spawned_this_tick: spawned,
             scattered_this_tick: scattered,
@@ -463,7 +830,22 @@ impl BounceTankSceneController {
     /// Call this right after `world.step(...)` to avoid one-frame visual pops where a high-energy
     /// body tunnels outside the prism before the next `physics_tick`.
     pub fn reconcile_after_step(&mut self, world: &mut PhysicsWorld) -> usize {
-        self.recycle_escaped_balls(world)
+        let recycled = if self.virtual_barrier_enabled() {
+            self.recycle_escaped_balls(world)
+        } else {
+            // Even with "virtual barrier off", keep a hard safety net for obvious tunnels so
+            // dynamic balls do not remain visibly outside the container.
+            self.recycle_hard_escaped_balls(world)
+        };
+        if recycled > 0 {
+            // Interpolation uses stored snapshots captured inside `world.step(...)`.
+            // If we corrected positions after the step, push one fresh snapshot so render doesn't
+            // show an old out-of-bounds pose for a frame.
+            // Push twice to replace both (previous, latest) interpolation endpoints.
+            world.push_interpolation_snapshot();
+            world.push_interpolation_snapshot();
+        }
+        recycled
     }
 
     /// Enforce an upper bound for live dynamic balls and destroy overflow bodies immediately.
@@ -507,8 +889,9 @@ impl BounceTankSceneController {
         ball_render_limit: Option<usize>,
     ) -> SceneFrameInstances {
         let mut frame = SceneFrameInstances::default();
-        // Default to edge-only prism rendering; full shell is opt-in via container mesh slot.
         if self.container_mesh_slot.is_some() {
+            self.append_container_wall_instances(&mut frame.transparent_3d);
+        } else {
             frame.transparent_3d.push(self.container_visual_instance());
         }
         self.append_container_edge_instances(&mut frame.opaque_3d);
@@ -612,6 +995,8 @@ impl BounceTankSceneController {
     fn cull_missing(&mut self, world: &PhysicsWorld) {
         self.balls.retain(|ball| world.body(ball.body).is_some());
         self.walls.retain(|wall| world.body(*wall).is_some());
+        self.edge_barriers
+            .retain(|barrier| world.body(*barrier).is_some());
     }
 
     fn ensure_container_walls(&mut self, world: &mut PhysicsWorld) {
@@ -676,6 +1061,70 @@ impl BounceTankSceneController {
                 user_tag: collision_filter_tag(COLLISION_GROUP_WALL, COLLISION_GROUP_BALL),
             });
             self.walls.push(body);
+        }
+    }
+
+    fn ensure_container_edge_barriers(&mut self, world: &mut PhysicsWorld) {
+        if self.edge_barriers.len() == 12
+            && self
+                .edge_barriers
+                .iter()
+                .all(|barrier| world.body(*barrier).is_some())
+        {
+            return;
+        }
+        self.edge_barriers.clear();
+
+        let hx = self.config.container_half_extents[0].max(0.5);
+        let hy = self.config.container_half_extents[1].max(0.5);
+        let hz = self.config.container_half_extents[2].max(0.5);
+        let edge = self.config.wall_thickness.max(0.03) * 0.30;
+        let edge_half = edge.max(0.01) * 0.5;
+
+        let x_edges = [
+            ([0.0, hy, hz], [hx * 0.5, edge_half, edge_half]),
+            ([0.0, hy, -hz], [hx * 0.5, edge_half, edge_half]),
+            ([0.0, -hy, hz], [hx * 0.5, edge_half, edge_half]),
+            ([0.0, -hy, -hz], [hx * 0.5, edge_half, edge_half]),
+        ];
+        let y_edges = [
+            ([hx, 0.0, hz], [edge_half, hy * 0.5, edge_half]),
+            ([hx, 0.0, -hz], [edge_half, hy * 0.5, edge_half]),
+            ([-hx, 0.0, hz], [edge_half, hy * 0.5, edge_half]),
+            ([-hx, 0.0, -hz], [edge_half, hy * 0.5, edge_half]),
+        ];
+        let z_edges = [
+            ([hx, hy, 0.0], [edge_half, edge_half, hz * 0.5]),
+            ([hx, -hy, 0.0], [edge_half, edge_half, hz * 0.5]),
+            ([-hx, hy, 0.0], [edge_half, edge_half, hz * 0.5]),
+            ([-hx, -hy, 0.0], [edge_half, edge_half, hz * 0.5]),
+        ];
+
+        let wall_material = ColliderMaterial {
+            restitution: self.config.wall_restitution.max(0.0),
+            friction: self.config.wall_friction.max(0.0),
+        };
+
+        for (center, half_extents) in x_edges
+            .into_iter()
+            .chain(y_edges.into_iter())
+            .chain(z_edges.into_iter())
+        {
+            let half_extents = Vector3::new(half_extents[0], half_extents[1], half_extents[2]);
+            let body = world.spawn_body(BodyDesc {
+                kind: BodyKind::Static,
+                position: Vector3::new(center[0], center[1], center[2]),
+                local_bounds: Aabb::from_center_half_extents(Vector3::zeros(), half_extents),
+                ..BodyDesc::default()
+            });
+            let _ = world.spawn_collider(ColliderDesc {
+                body: Some(body),
+                shape: ColliderShape::Aabb { half_extents },
+                material: wall_material,
+                is_sensor: false,
+                user_tag: collision_filter_tag(COLLISION_GROUP_WALL, COLLISION_GROUP_BALL),
+            });
+            self.edge_barriers.push(body);
         }
     }
 
@@ -840,6 +1289,22 @@ impl BounceTankSceneController {
         let burst_min = base_speed * (1.02 + 0.35 * strength);
         let burst_max = base_speed * (1.25 + 0.95 * strength);
 
+        // Cycle bursts across six axis-aligned face directions so contact pressure reaches all
+        // container sides over time instead of continuously biasing toward diagonal corner piles.
+        let face_dirs = [
+            [1.0_f32, 0.0, 0.0],
+            [-1.0_f32, 0.0, 0.0],
+            [0.0_f32, 0.0, 1.0],
+            [0.0_f32, 0.0, -1.0],
+            [0.0_f32, 1.0, 0.0],
+            [0.0_f32, -1.0, 0.0],
+        ];
+        let face = face_dirs[(self.scatter_face_cursor as usize) % face_dirs.len()];
+        self.scatter_face_cursor = self.scatter_face_cursor.wrapping_add(1);
+        let face_dir = Vector3::new(face[0], face[1], face[2]);
+        let lateral_jitter = 0.22 + strength * 0.35;
+        let up_bias = self.config.container_half_extents[1] * 0.55;
+
         let mut scattered = 0usize;
         for i in (start..live).step_by(stride) {
             if scattered >= target {
@@ -849,11 +1314,25 @@ impl BounceTankSceneController {
             let Some(body) = world.body(ball.body) else {
                 continue;
             };
-            let mut dir = body.position;
-            let jitter = 0.08 + strength * 0.18;
-            dir.x += self.rand_range(-jitter, jitter);
-            dir.y = dir.y.abs() + self.rand_range(0.10, 0.25 + 0.45 * strength);
-            dir.z += self.rand_range(-jitter, jitter);
+            let mut dir = face_dir;
+            if face_dir.x.abs() < 0.5 {
+                dir.x += self.rand_range(-lateral_jitter, lateral_jitter);
+            } else {
+                dir.x += self.rand_range(-0.12, 0.12);
+            }
+            if face_dir.z.abs() < 0.5 {
+                dir.z += self.rand_range(-lateral_jitter, lateral_jitter);
+            } else {
+                dir.z += self.rand_range(-0.12, 0.12);
+            }
+            if face_dir.y.abs() < 0.5 {
+                dir.y += self.rand_range(0.05, 0.28 + 0.25 * strength);
+            } else {
+                dir.y += self.rand_range(-0.10, 0.10);
+            }
+            if body.position.y < -up_bias {
+                dir.y += self.rand_range(0.18, 0.42);
+            }
             let len2 = dir.dot(&dir);
             if len2 <= 1e-8 {
                 continue;
@@ -869,6 +1348,209 @@ impl BounceTankSceneController {
             self.last_scatter_tick = tick;
         }
         scattered
+    }
+
+    /// Apply spring-damper hover control and optional X/Z momentum glide on dynamic balls.
+    ///
+    /// The vertical path keeps balls floating while preserving external momentum under stress.
+    /// The lateral path adds deterministic X/Z glide plus side-wall steering so balls also move
+    /// and rebound across horizontal axes during the showcase.
+    fn apply_levitation_field(&mut self, world: &mut PhysicsWorld) -> usize {
+        let vertical_enabled = self.config.levitation_strength > 1e-5;
+        let lateral_strength = self.config.levitation_lateral_strength.max(0.0);
+        let lateral_damping = self.config.levitation_lateral_damping.max(0.0);
+        let lateral_max_speed = self
+            .config
+            .levitation_lateral_max_horizontal_speed
+            .max(0.05);
+        let lateral_wall_push = self.config.levitation_lateral_wall_push.max(0.0);
+        let lateral_frequency = self.config.levitation_lateral_frequency.max(0.0);
+        let lateral_enabled = lateral_strength > 1e-5 || lateral_wall_push > 1e-5;
+        if !vertical_enabled && !lateral_enabled {
+            return 0;
+        }
+
+        let dt = world.config().fixed_dt.max(1e-4);
+        let hy = self.config.container_half_extents[1].max(0.5);
+        let hx = self.config.container_half_extents[0].max(0.5);
+        let hz = self.config.container_half_extents[2].max(0.5);
+        let target_y = self.config.levitation_height.clamp(-hy * 0.95, hy * 0.95);
+        let strength = self.config.levitation_strength.max(0.0);
+        let damping = self.config.levitation_damping.max(0.0);
+        let max_vy = self.config.levitation_max_vertical_speed.max(0.05);
+        let reaction_strength = self.config.levitation_reaction_strength.max(0.0);
+        let reaction_radius = self.config.levitation_reaction_radius.max(0.0);
+        let reaction_damping = self.config.levitation_reaction_damping.max(0.0);
+        let reaction_enabled =
+            vertical_enabled && reaction_strength > 1e-5 && reaction_radius > 0.05;
+        let reaction_r2 = reaction_radius * reaction_radius;
+        let inv_cell = if reaction_enabled {
+            1.0 / reaction_radius.max(0.05)
+        } else {
+            0.0
+        };
+        let side_wall_band_x = hx * 0.86;
+        let side_wall_band_z = hz * 0.86;
+
+        if lateral_enabled {
+            self.levitation_lateral_phase =
+                (self.levitation_lateral_phase + dt * lateral_frequency * TAU).rem_euclid(TAU);
+        }
+
+        self.levitation_body_handles.clear();
+        self.levitation_positions.clear();
+        self.levitation_velocities.clear();
+        self.levitation_body_handles.reserve(self.balls.len());
+        self.levitation_positions.reserve(self.balls.len());
+        self.levitation_velocities.reserve(self.balls.len());
+        for ball in &self.balls {
+            let Some(body) = world.body(ball.body) else {
+                continue;
+            };
+            self.levitation_body_handles.push(ball.body);
+            self.levitation_positions
+                .push([body.position.x, body.position.y, body.position.z]);
+            self.levitation_velocities.push([
+                body.linear_velocity.x,
+                body.linear_velocity.y,
+                body.linear_velocity.z,
+            ]);
+        }
+        if self.levitation_body_handles.is_empty() {
+            return 0;
+        }
+
+        self.levitation_reaction_cells.clear();
+        if reaction_enabled {
+            self.levitation_reaction_cells
+                .reserve(self.levitation_body_handles.len() / 2);
+            for (index, pos) in self.levitation_positions.iter().enumerate() {
+                let key = LevitationCellKey {
+                    x: (pos[0] * inv_cell).floor() as i32,
+                    y: (pos[1] * inv_cell).floor() as i32,
+                    z: (pos[2] * inv_cell).floor() as i32,
+                };
+                self.levitation_reaction_cells
+                    .entry(key)
+                    .or_default()
+                    .push(index);
+            }
+        }
+
+        let mut adjusted = 0usize;
+        for i in 0..self.levitation_body_handles.len() {
+            let pos = self.levitation_positions[i];
+            let mut velocity = self.levitation_velocities[i];
+
+            if vertical_enabled {
+                let current_vy = velocity[1];
+                let error = target_y - pos[1];
+                let mut accel_y = error * strength - current_vy * damping;
+
+                if reaction_enabled {
+                    let base = LevitationCellKey {
+                        x: (pos[0] * inv_cell).floor() as i32,
+                        y: (pos[1] * inv_cell).floor() as i32,
+                        z: (pos[2] * inv_cell).floor() as i32,
+                    };
+                    let mut reaction = 0.0f32;
+                    for nx in (base.x - 1)..=(base.x + 1) {
+                        for ny in (base.y - 1)..=(base.y + 1) {
+                            for nz in (base.z - 1)..=(base.z + 1) {
+                                let key = LevitationCellKey {
+                                    x: nx,
+                                    y: ny,
+                                    z: nz,
+                                };
+                                let Some(indices) = self.levitation_reaction_cells.get(&key) else {
+                                    continue;
+                                };
+                                for &j in indices {
+                                    if j == i {
+                                        continue;
+                                    }
+                                    let other = self.levitation_positions[j];
+                                    let dx = pos[0] - other[0];
+                                    let dy = pos[1] - other[1];
+                                    let dz = pos[2] - other[2];
+                                    let dist2 = dx * dx + dy * dy + dz * dz;
+                                    if dist2 >= reaction_r2 || dist2 <= 1e-8 {
+                                        continue;
+                                    }
+                                    let dist = dist2.sqrt();
+                                    let proximity = (1.0 - (dist / reaction_radius)).max(0.0);
+                                    reaction += (dy / dist.max(1e-4)) * proximity;
+                                }
+                            }
+                        }
+                    }
+                    accel_y += reaction * reaction_strength - current_vy * reaction_damping;
+                }
+
+                let mut next_vy = current_vy + accel_y * dt;
+                if next_vy.abs() > max_vy {
+                    if current_vy.abs() <= max_vy {
+                        // When inside the configured envelope we keep levitation bounded.
+                        next_vy = next_vy.clamp(-max_vy, max_vy);
+                    } else {
+                        // Preserve external momentum (gravity/scatter bursts) and avoid abrupt cuts.
+                        // We only block extra acceleration that would push further in the same direction.
+                        let same_sign = next_vy.signum() == current_vy.signum();
+                        let speeding_up = next_vy.abs() > current_vy.abs();
+                        if same_sign && speeding_up {
+                            next_vy = current_vy;
+                        }
+                    }
+                }
+                velocity[1] = next_vy;
+            }
+
+            if lateral_enabled {
+                let current_vx = velocity[0];
+                let current_vz = velocity[2];
+                let mut accel_x = 0.0f32;
+                let mut accel_z = 0.0f32;
+
+                if lateral_strength > 1e-5 {
+                    let body_raw = self.levitation_body_handles[i].raw();
+                    let phase_offset = (body_raw % 1024) as f32 * (TAU / 1024.0);
+                    let angle = self.levitation_lateral_phase + phase_offset;
+                    let target_vx = lateral_strength * angle.cos();
+                    let target_vz = lateral_strength * angle.sin();
+                    accel_x += (target_vx - current_vx) * lateral_damping;
+                    accel_z += (target_vz - current_vz) * lateral_damping;
+                }
+
+                if lateral_wall_push > 1e-5 {
+                    if pos[0].abs() > side_wall_band_x {
+                        accel_x += -pos[0].signum() * lateral_wall_push;
+                    }
+                    if pos[2].abs() > side_wall_band_z {
+                        accel_z += -pos[2].signum() * lateral_wall_push;
+                    }
+                }
+
+                let mut next_vx = current_vx + accel_x * dt;
+                let mut next_vz = current_vz + accel_z * dt;
+                let speed_sq = next_vx * next_vx + next_vz * next_vz;
+                let max_sq = lateral_max_speed * lateral_max_speed;
+                if speed_sq > max_sq {
+                    let scale = lateral_max_speed / speed_sq.sqrt().max(1e-5);
+                    next_vx *= scale;
+                    next_vz *= scale;
+                }
+                velocity[0] = next_vx;
+                velocity[2] = next_vz;
+            }
+
+            if world.set_velocity(
+                self.levitation_body_handles[i],
+                Vector3::new(velocity[0], velocity[1], velocity[2]),
+            ) {
+                adjusted = adjusted.saturating_add(1);
+            }
+        }
+        adjusted
     }
 
     /// Clamps rare escaped balls back inside the prism instead of deleting them.
@@ -890,61 +1572,290 @@ impl BounceTankSceneController {
                 continue;
             };
 
-            let mut clamped = false;
             let mut position = body.position;
             let mut velocity = body.linear_velocity;
             let limit_x = (hx - radius).max(radius * 0.5);
             let limit_y = (hy - radius).max(radius * 0.5);
             let limit_z = (hz - radius).max(radius * 0.5);
+            // Only recycle when the body clearly escaped beyond a tolerance band.
+            // If we clamp multiple axes in one shot, escaped bodies collapse into corners.
+            let recycle_margin = (self.config.wall_thickness.max(radius * 0.45)).max(0.06);
+            let contact_slop = (radius * 0.02).max(0.0025);
+            let over_x = (position.x.abs() - limit_x).max(0.0);
+            let over_y = (position.y.abs() - limit_y).max(0.0);
+            let over_z = (position.z.abs() - limit_z).max(0.0);
 
-            if position.x > limit_x {
-                position.x = limit_x;
-                velocity.x = -velocity.x.abs() * wall_bounce;
-                clamped = true;
-            } else if position.x < -limit_x {
-                position.x = -limit_x;
-                velocity.x = velocity.x.abs() * wall_bounce;
-                clamped = true;
+            let max_over = over_x.max(over_y.max(over_z));
+            if max_over <= recycle_margin {
+                i += 1;
+                continue;
             }
 
-            if position.y > limit_y {
-                position.y = limit_y;
-                velocity.y = -velocity.y.abs() * wall_bounce;
-                clamped = true;
-            } else if position.y < -limit_y {
-                position.y = -limit_y;
-                velocity.y = velocity.y.abs() * wall_bounce;
-                clamped = true;
+            let escaped_axes = u8::from(over_x > contact_slop)
+                + u8::from(over_y > contact_slop)
+                + u8::from(over_z > contact_slop);
+            let dominant_only = escaped_axes >= 2 && max_over > recycle_margin * 3.0;
+            let inset = (radius * 0.22).clamp(0.02, 0.10);
+            let mut corrected_axes = 0u8;
+            if dominant_only {
+                if over_x >= over_y && over_x >= over_z {
+                    if position.x > limit_x {
+                        position.x = (limit_x - inset).max(radius * 0.5);
+                        velocity.x = -velocity.x.abs() * wall_bounce;
+                    } else {
+                        position.x = -(limit_x - inset).max(radius * 0.5);
+                        velocity.x = velocity.x.abs() * wall_bounce;
+                    }
+                    velocity.y *= 0.985;
+                    velocity.z *= 0.985;
+                    corrected_axes = 1;
+                } else if over_y >= over_z {
+                    if position.y > limit_y {
+                        position.y = (limit_y - inset).max(radius * 0.5);
+                        velocity.y = -velocity.y.abs() * wall_bounce;
+                    } else {
+                        position.y = -(limit_y - inset).max(radius * 0.5);
+                        velocity.y = velocity.y.abs() * wall_bounce;
+                    }
+                    velocity.x *= 0.985;
+                    velocity.z *= 0.985;
+                    corrected_axes = 1;
+                } else {
+                    if position.z > limit_z {
+                        position.z = (limit_z - inset).max(radius * 0.5);
+                        velocity.z = -velocity.z.abs() * wall_bounce;
+                    } else {
+                        position.z = -(limit_z - inset).max(radius * 0.5);
+                        velocity.z = velocity.z.abs() * wall_bounce;
+                    }
+                    velocity.x *= 0.985;
+                    velocity.y *= 0.985;
+                    corrected_axes = 1;
+                }
+            } else {
+                if position.x > limit_x + contact_slop {
+                    position.x = (limit_x - inset).max(radius * 0.5);
+                    if velocity.x > 0.0 {
+                        velocity.x = -velocity.x * wall_bounce;
+                    }
+                    corrected_axes = corrected_axes.saturating_add(1);
+                } else if position.x < -(limit_x + contact_slop) {
+                    position.x = -(limit_x - inset).max(radius * 0.5);
+                    if velocity.x < 0.0 {
+                        velocity.x = -velocity.x * wall_bounce;
+                    }
+                    corrected_axes = corrected_axes.saturating_add(1);
+                }
+                if position.y > limit_y + contact_slop {
+                    position.y = (limit_y - inset).max(radius * 0.5);
+                    if velocity.y > 0.0 {
+                        velocity.y = -velocity.y * wall_bounce;
+                    }
+                    corrected_axes = corrected_axes.saturating_add(1);
+                } else if position.y < -(limit_y + contact_slop) {
+                    position.y = -(limit_y - inset).max(radius * 0.5);
+                    if velocity.y < 0.0 {
+                        velocity.y = -velocity.y * wall_bounce;
+                    }
+                    corrected_axes = corrected_axes.saturating_add(1);
+                }
+                if position.z > limit_z + contact_slop {
+                    position.z = (limit_z - inset).max(radius * 0.5);
+                    if velocity.z > 0.0 {
+                        velocity.z = -velocity.z * wall_bounce;
+                    }
+                    corrected_axes = corrected_axes.saturating_add(1);
+                } else if position.z < -(limit_z + contact_slop) {
+                    position.z = -(limit_z - inset).max(radius * 0.5);
+                    if velocity.z < 0.0 {
+                        velocity.z = -velocity.z * wall_bounce;
+                    }
+                    corrected_axes = corrected_axes.saturating_add(1);
+                }
+                if corrected_axes > 1 {
+                    velocity *= 0.992;
+                }
+            }
+            if corrected_axes == 0 {
+                i += 1;
+                continue;
             }
 
-            if position.z > limit_z {
-                position.z = limit_z;
-                velocity.z = -velocity.z.abs() * wall_bounce;
-                clamped = true;
-            } else if position.z < -limit_z {
-                position.z = -limit_z;
-                velocity.z = velocity.z.abs() * wall_bounce;
-                clamped = true;
+            let max_rebound_speed = self.config.initial_speed_max.max(1.0)
+                * (3.5 + self.config.scatter_strength.clamp(0.0, 1.0) * 8.0);
+            let speed_sq = velocity.norm_squared();
+            if speed_sq > max_rebound_speed * max_rebound_speed {
+                let inv = max_rebound_speed / speed_sq.sqrt();
+                velocity *= inv;
             }
-
-            if clamped {
-                let _ = world.set_position(handle, position);
-                let _ = world.set_velocity(handle, velocity);
-                recycled = recycled.saturating_add(1);
-            }
+            let _ = world.set_position(handle, position);
+            let _ = world.set_velocity(handle, velocity);
+            recycled = recycled.saturating_add(1);
             i += 1;
         }
 
         recycled
     }
 
+    /// Hard safety recycle path used when `virtual_barrier` is disabled.
+    ///
+    /// This path is intentionally conservative: it only corrects bodies that clearly tunneled
+    /// outside the container by a wide margin, so normal wall interaction remains purely physics
+    /// driven in the common case.
+    fn recycle_hard_escaped_balls(&mut self, world: &mut PhysicsWorld) -> usize {
+        let hx = self.config.container_half_extents[0].max(0.5);
+        let hy = self.config.container_half_extents[1].max(0.5);
+        let hz = self.config.container_half_extents[2].max(0.5);
+        let wall_bounce = self.config.wall_restitution.clamp(0.45, 0.98);
+        let mut recycled = 0usize;
+
+        let mut i = 0usize;
+        while i < self.balls.len() {
+            let handle = self.balls[i].body;
+            let radius = self.balls[i].radius.max(0.02);
+            let Some(body) = world.body(handle) else {
+                self.balls.swap_remove(i);
+                continue;
+            };
+
+            let mut position = body.position;
+            let mut velocity = body.linear_velocity;
+            let limit_x = (hx - radius).max(radius * 0.5);
+            let limit_y = (hy - radius).max(radius * 0.5);
+            let limit_z = (hz - radius).max(radius * 0.5);
+            let hard_margin = (self.config.wall_thickness.max(radius * 0.45)).max(0.06) * 3.5;
+            let over_x = (position.x.abs() - limit_x).max(0.0);
+            let over_y = (position.y.abs() - limit_y).max(0.0);
+            let over_z = (position.z.abs() - limit_z).max(0.0);
+            let max_over = over_x.max(over_y.max(over_z));
+            if max_over <= hard_margin {
+                i += 1;
+                continue;
+            }
+
+            let contact_slop = (radius * 0.03).max(0.005);
+            let inset = (radius * 0.22).clamp(0.02, 0.12);
+            let mut corrected = false;
+
+            if position.x > limit_x + contact_slop {
+                position.x = (limit_x - inset).max(radius * 0.5);
+                velocity.x = -velocity.x.abs() * wall_bounce;
+                corrected = true;
+            } else if position.x < -(limit_x + contact_slop) {
+                position.x = -(limit_x - inset).max(radius * 0.5);
+                velocity.x = velocity.x.abs() * wall_bounce;
+                corrected = true;
+            }
+            if position.y > limit_y + contact_slop {
+                position.y = (limit_y - inset).max(radius * 0.5);
+                velocity.y = -velocity.y.abs() * wall_bounce;
+                corrected = true;
+            } else if position.y < -(limit_y + contact_slop) {
+                position.y = -(limit_y - inset).max(radius * 0.5);
+                velocity.y = velocity.y.abs() * wall_bounce;
+                corrected = true;
+            }
+            if position.z > limit_z + contact_slop {
+                position.z = (limit_z - inset).max(radius * 0.5);
+                velocity.z = -velocity.z.abs() * wall_bounce;
+                corrected = true;
+            } else if position.z < -(limit_z + contact_slop) {
+                position.z = -(limit_z - inset).max(radius * 0.5);
+                velocity.z = velocity.z.abs() * wall_bounce;
+                corrected = true;
+            }
+            if !corrected {
+                i += 1;
+                continue;
+            }
+
+            // Keep post-recycle rebound finite so one escaped body doesn't re-tunnel repeatedly.
+            let speed_cap = self.collision_safety_speed_cap(world) * 0.90;
+            let speed_sq = velocity.norm_squared();
+            let speed_cap_sq = speed_cap * speed_cap;
+            if speed_sq > speed_cap_sq {
+                velocity *= speed_cap / speed_sq.sqrt().max(1e-5);
+            }
+            let _ = world.set_position(handle, position);
+            let _ = world.set_velocity(handle, velocity);
+            recycled = recycled.saturating_add(1);
+            i += 1;
+        }
+
+        recycled
+    }
+
+    /// Clamp rare outlier velocities so one-step motion cannot regularly leap through thin walls.
+    ///
+    /// This protects against energy spikes from high restitution + burst combinations without
+    /// flattening normal motion under typical showcase settings.
+    fn clamp_ball_velocity_for_collision_safety(&mut self, world: &mut PhysicsWorld) -> usize {
+        let cap = self.collision_safety_speed_cap(world);
+        let cap_sq = cap * cap;
+        let axis_cap = cap * 0.86;
+        let mut clamped = 0usize;
+
+        for ball in &self.balls {
+            let Some(body) = world.body(ball.body) else {
+                continue;
+            };
+            let mut velocity = body.linear_velocity;
+            let mut changed = false;
+
+            if velocity.x.abs() > axis_cap {
+                velocity.x = velocity.x.signum() * axis_cap;
+                changed = true;
+            }
+            if velocity.y.abs() > axis_cap {
+                velocity.y = velocity.y.signum() * axis_cap;
+                changed = true;
+            }
+            if velocity.z.abs() > axis_cap {
+                velocity.z = velocity.z.signum() * axis_cap;
+                changed = true;
+            }
+
+            let speed_sq = velocity.norm_squared();
+            if speed_sq > cap_sq {
+                velocity *= cap / speed_sq.sqrt().max(1e-5);
+                changed = true;
+            }
+
+            if changed && world.set_velocity(ball.body, velocity) {
+                clamped = clamped.saturating_add(1);
+            }
+        }
+
+        clamped
+    }
+
+    #[inline]
+    fn collision_safety_speed_cap(&self, world: &PhysicsWorld) -> f32 {
+        let dt = world.config().fixed_dt.max(1e-4);
+        let radius = self
+            .config
+            .ball_radius_max
+            .max(self.config.ball_radius_min)
+            .max(0.02);
+        let wall = self
+            .config
+            .wall_thickness
+            .max(self.config.ball_radius_max.max(0.02) * 1.35)
+            .max(0.02);
+        let tunnel_cap = ((wall + radius * 1.25) / dt) * 0.92;
+        let design_cap = self
+            .config
+            .initial_speed_max
+            .max(self.config.initial_speed_min)
+            .max(1.0)
+            * (8.0 + self.config.scatter_strength.clamp(0.0, 1.0) * 18.0);
+        tunnel_cap.max(design_cap).clamp(12.0, 220.0)
+    }
+
     fn container_visual_instance(&self) -> SceneInstance3d {
         SceneInstance3d {
             instance_id: u64::MAX - 1,
-            primitive: self
-                .container_mesh_slot
-                .map(|slot| ScenePrimitive3d::Mesh { slot })
-                .unwrap_or(ScenePrimitive3d::Box),
+            primitive: ScenePrimitive3d::Box,
             transform: SceneTransform3d {
                 translation: [0.0, 0.0, 0.0],
                 rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
@@ -966,12 +1877,81 @@ impl BounceTankSceneController {
         }
     }
 
+    /// Adds six wall panel mesh instances (three pairs) so custom FBX walls form a clean box.
+    fn append_container_wall_instances(&self, out: &mut Vec<SceneInstance3d>) {
+        let Some(slot) = self.container_mesh_slot else {
+            return;
+        };
+        let hx = self.config.container_half_extents[0].max(0.5);
+        let hy = self.config.container_half_extents[1].max(0.5);
+        let hz = self.config.container_half_extents[2].max(0.5);
+        let t = self
+            .config
+            .wall_thickness
+            .max(self.config.ball_radius_max.max(0.02) * 1.35)
+            .max(0.02);
+        let primitive = ScenePrimitive3d::Mesh { slot };
+        let mesh_scale = self.config.container_mesh_scale;
+        let faces = [
+            (
+                [hx + t * 0.5, 0.0, 0.0],
+                [t, (hy + t) * 2.0, (hz + t) * 2.0],
+            ),
+            (
+                [-hx - t * 0.5, 0.0, 0.0],
+                [t, (hy + t) * 2.0, (hz + t) * 2.0],
+            ),
+            (
+                [0.0, hy + t * 0.5, 0.0],
+                [(hx + t) * 2.0, t, (hz + t) * 2.0],
+            ),
+            (
+                [0.0, -hy - t * 0.5, 0.0],
+                [(hx + t) * 2.0, t, (hz + t) * 2.0],
+            ),
+            (
+                [0.0, 0.0, hz + t * 0.5],
+                [(hx + t) * 2.0, (hy + t) * 2.0, t],
+            ),
+            (
+                [0.0, 0.0, -hz - t * 0.5],
+                [(hx + t) * 2.0, (hy + t) * 2.0, t],
+            ),
+        ];
+        for (index, (translation, scale)) in faces.into_iter().enumerate() {
+            let shaped_scale = [
+                scale[0] * mesh_scale[0],
+                scale[1] * mesh_scale[1],
+                scale[2] * mesh_scale[2],
+            ];
+            out.push(SceneInstance3d {
+                instance_id: (u64::MAX - 200).saturating_sub(index as u64),
+                primitive,
+                transform: SceneTransform3d {
+                    translation,
+                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+                    scale: shaped_scale,
+                },
+                material: SceneMaterial {
+                    base_color_rgba: [0.80, 0.89, 1.0, 0.26],
+                    roughness: 0.06,
+                    metallic: 0.0,
+                    emissive_rgb: [0.05, 0.07, 0.10],
+                    shading: ShadingModel::LitPbr,
+                },
+                casts_shadow: false,
+                receives_shadow: true,
+            });
+        }
+    }
+
     /// Adds 12 thin edge prisms so the tank silhouette remains readable from every camera angle.
     fn append_container_edge_instances(&self, out: &mut Vec<SceneInstance3d>) {
         let hx = self.config.container_half_extents[0] * 2.0;
         let hy = self.config.container_half_extents[1] * 2.0;
         let hz = self.config.container_half_extents[2] * 2.0;
         let edge = self.config.wall_thickness.max(0.03) * 0.30;
+        let primitive = ScenePrimitive3d::Box;
 
         // X-axis edges (y/z corners).
         let x_edges = [
@@ -1087,14 +2067,14 @@ impl BounceTankSceneController {
         {
             out.push(SceneInstance3d {
                 instance_id: (u64::MAX - 20).saturating_sub(edge_index),
-                primitive: ScenePrimitive3d::Box,
+                primitive,
                 transform: SceneTransform3d {
                     translation,
                     rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
                     scale,
                 },
                 material: SceneMaterial {
-                    base_color_rgba: [0.90, 0.96, 1.0, 0.72],
+                    base_color_rgba: [0.90, 0.96, 1.0, 0.56],
                     roughness: 0.06,
                     metallic: 0.0,
                     emissive_rgb: [0.06, 0.09, 0.12],
@@ -1213,6 +2193,7 @@ mod tests {
         }
 
         assert_eq!(scene.wall_count(), 6);
+        assert_eq!(scene.edge_barrier_count(), 12);
         assert!(total_spawned > 0);
         assert!(scene.live_ball_count() <= 256);
 
@@ -1245,6 +2226,12 @@ mod tests {
                 contact_guard: Some(0.92),
                 initial_speed_min: Some(3.0),
                 initial_speed_max: Some(1.0),
+                ball_friction: Some(0.48),
+                wall_friction: Some(0.22),
+                friction_transition_speed: Some(1.65),
+                friction_static_boost: Some(1.28),
+                friction_kinetic_scale: Some(0.84),
+                restitution_velocity_threshold: Some(0.25),
                 ..BounceTankRuntimePatch::default()
             },
         );
@@ -1252,9 +2239,20 @@ mod tests {
         assert_eq!(cfg.spawn_per_tick, 1);
         assert!(cfg.linear_damping <= 0.95);
         assert!(cfg.initial_speed_max >= cfg.initial_speed_min);
+        assert!((cfg.ball_friction - 0.48).abs() < 1e-6);
+        assert!((cfg.wall_friction - 0.22).abs() < 1e-6);
+        assert!((cfg.friction_transition_speed - 1.65).abs() < 1e-6);
+        assert!((cfg.friction_static_boost - 1.28).abs() < 1e-6);
+        assert!((cfg.friction_kinetic_scale - 0.84).abs() < 1e-6);
+        assert!((cfg.restitution_velocity_threshold - 0.25).abs() < 1e-6);
         assert!(world.gravity().y < -9.9);
         assert!(world.solver().config().hard_position_projection_strength > 1.0);
+        assert!((world.solver().config().friction_transition_speed - 1.65).abs() < 1e-6);
+        assert!((world.solver().config().friction_static_boost - 1.28).abs() < 1e-6);
+        assert!((world.solver().config().friction_kinetic_scale - 0.84).abs() < 1e-6);
+        assert!((world.solver().config().restitution_velocity_threshold - 0.25).abs() < 1e-6);
         assert!(metrics.config_updated);
+        assert!(metrics.collider_materials_retuned > 0);
     }
 
     #[test]
@@ -1403,5 +2401,113 @@ mod tests {
 
         let _ = scene.physics_tick(&mut world);
         assert!(scene.live_ball_count() <= scene.config().target_ball_count);
+    }
+
+    #[test]
+    fn recycle_prefers_dominant_axis_and_avoids_corner_snap() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 16,
+            spawn_per_tick: 16,
+            container_half_extents: [8.0, 8.0, 8.0],
+            ..BounceTankSceneConfig::default()
+        });
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+        let escaped = scene.balls[0].body;
+
+        let mut snapshot = world.capture_snapshot();
+        if let Some(frame) = snapshot.bodies.iter_mut().find(|b| b.handle == escaped) {
+            // Escape in both X and Z, with X as dominant axis.
+            frame.position.x = 100.0;
+            frame.position.z = 20.0;
+        }
+        let _ = world.restore_snapshot(&snapshot);
+        let _ = scene.physics_tick(&mut world);
+
+        let body = world
+            .body(escaped)
+            .expect("escaped body should still exist");
+        let radius = scene.balls[0].radius.max(0.02);
+        let limit_x = (scene.config().container_half_extents[0] - radius).max(radius * 0.5);
+        let limit_z = (scene.config().container_half_extents[2] - radius).max(radius * 0.5);
+        // X is corrected back inside. Z must not be snapped to boundary in the same pass
+        // (avoids immediate corner attractor behavior).
+        assert!(body.position.x.abs() <= limit_x + 1e-3);
+        assert!((body.position.z.abs() - limit_z).abs() > 0.25);
+    }
+
+    #[test]
+    fn reconcile_after_step_refreshes_interpolation_for_recycled_bodies() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 24,
+            spawn_per_tick: 24,
+            container_half_extents: [8.0, 8.0, 8.0],
+            ..BounceTankSceneConfig::default()
+        });
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+        let escaped = scene.balls[0].body;
+
+        let mut snapshot = world.capture_snapshot();
+        if let Some(frame) = snapshot.bodies.iter_mut().find(|b| b.handle == escaped) {
+            frame.position.x = 512.0;
+            frame.position.z = 64.0;
+        }
+        let _ = world.restore_snapshot(&snapshot);
+        world.push_interpolation_snapshot();
+
+        let recycled = scene.reconcile_after_step(&mut world);
+        assert!(recycled > 0);
+
+        let frame = scene.build_frame_instances(&world, Some(0.5));
+        let inst = frame
+            .opaque_3d
+            .iter()
+            .find(|instance| instance.instance_id == escaped.raw() as u64)
+            .expect("escaped body instance should be present");
+        let radius = scene.balls[0].radius.max(0.02);
+        let limit_x = (scene.config().container_half_extents[0] - radius).max(radius * 0.5);
+        assert!(inst.transform.translation[0].abs() <= limit_x + 0.2);
+    }
+
+    #[test]
+    fn reconcile_after_step_hard_safety_recycles_with_virtual_barrier_disabled() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            target_ball_count: 24,
+            spawn_per_tick: 24,
+            container_half_extents: [8.0, 8.0, 8.0],
+            virtual_barrier_enabled: false,
+            ..BounceTankSceneConfig::default()
+        });
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+        let escaped = scene.balls[0].body;
+
+        let mut snapshot = world.capture_snapshot();
+        if let Some(frame) = snapshot.bodies.iter_mut().find(|b| b.handle == escaped) {
+            frame.position.z = -512.0;
+            frame.linear_velocity.z = -256.0;
+        }
+        let _ = world.restore_snapshot(&snapshot);
+        world.push_interpolation_snapshot();
+
+        let recycled = scene.reconcile_after_step(&mut world);
+        assert!(recycled > 0);
+        let body = world.body(escaped).expect("body should still exist");
+        let radius = scene.balls[0].radius.max(0.02);
+        let limit_z = (scene.config().container_half_extents[2] - radius).max(radius * 0.5);
+        assert!(body.position.z.abs() <= limit_z + 0.2);
     }
 }

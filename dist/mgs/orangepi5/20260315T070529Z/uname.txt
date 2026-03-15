@@ -1,0 +1,2 @@
+$ uname -a
+Linux msib850 6.18.13-arch1-1 #1 SMP PREEMPT_DYNAMIC Wed, 25 Feb 2026 23:12:35 +0000 x86_64 GNU/Linux

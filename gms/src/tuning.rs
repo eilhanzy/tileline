@@ -170,9 +170,7 @@ impl GmsRuntimeTuningProfile {
 }
 
 fn is_arm_mali_like(name_lower: &str) -> bool {
-    name_lower.contains("mali")
-        || name_lower.contains("immortalis")
-        || name_lower.contains("arm")
+    name_lower.contains("mali") || name_lower.contains("immortalis") || name_lower.contains("arm")
 }
 
 #[cfg(target_os = "linux")]
@@ -190,11 +188,9 @@ fn is_linux_panthor_adapter(adapter_info: &wgpu::AdapterInfo, name_lower: &str) 
         return false;
     }
 
-    let driver_text = format!("{} {}", adapter_info.driver, adapter_info.driver_info)
-        .to_ascii_lowercase();
-    driver_text.contains("panthor")
-        || driver_text.contains("panfrost")
-        || panthor_module_present()
+    let driver_text =
+        format!("{} {}", adapter_info.driver, adapter_info.driver_info).to_ascii_lowercase();
+    driver_text.contains("panthor") || driver_text.contains("panfrost") || panthor_module_present()
 }
 
 #[cfg(test)]

@@ -8,3 +8,7 @@ default_scene = main
 [scene.main]
 tljoint = main.tljoint
 tljoint_scene = main
+
+[scene.mobile_safe]
+tljoint = bounce_showcase_mobile_safe.tljoint
+tljoint_scene = main
