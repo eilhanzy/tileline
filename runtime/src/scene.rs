@@ -196,6 +196,7 @@ pub struct BounceTankSceneConfig {
     pub spawn_per_tick: usize,
     pub container_half_extents: [f32; 3],
     pub wall_thickness: f32,
+    pub container_mesh_scale: [f32; 3],
     pub ball_radius_min: f32,
     pub ball_radius_max: f32,
     pub ball_restitution: f32,
@@ -234,6 +235,7 @@ impl Default for BounceTankSceneConfig {
             spawn_per_tick: 120,
             container_half_extents: [24.0, 16.0, 24.0],
             wall_thickness: 0.40,
+            container_mesh_scale: [1.0, 1.0, 1.0],
             ball_radius_min: 0.10,
             ball_radius_max: 0.24,
             ball_restitution: 0.74,
@@ -284,6 +286,7 @@ pub struct BounceTankRuntimePatch {
     pub spawn_per_tick: Option<usize>,
     pub container_half_extents: Option<[f32; 3]>,
     pub wall_thickness: Option<f32>,
+    pub container_mesh_scale: Option<[f32; 3]>,
     pub linear_damping: Option<f32>,
     pub gravity: Option<[f32; 3]>,
     pub contact_guard: Option<f32>,
@@ -466,6 +469,17 @@ impl BounceTankSceneController {
             if (self.config.wall_thickness - clamped).abs() > f32::EPSILON {
                 self.config.wall_thickness = clamped;
                 rebuild_barriers = true;
+                updated = true;
+            }
+        }
+        if let Some(scale) = patch.container_mesh_scale {
+            let clamped = [
+                scale[0].clamp(0.05, 64.0),
+                scale[1].clamp(0.05, 64.0),
+                scale[2].clamp(0.05, 64.0),
+            ];
+            if self.config.container_mesh_scale != clamped {
+                self.config.container_mesh_scale = clamped;
                 updated = true;
             }
         }
@@ -1673,6 +1687,7 @@ impl BounceTankSceneController {
             .max(self.config.ball_radius_max.max(0.02) * 1.35)
             .max(0.02);
         let primitive = ScenePrimitive3d::Mesh { slot };
+        let mesh_scale = self.config.container_mesh_scale;
         let faces = [
             (
                 [hx + t * 0.5, 0.0, 0.0],
@@ -1700,13 +1715,18 @@ impl BounceTankSceneController {
             ),
         ];
         for (index, (translation, scale)) in faces.into_iter().enumerate() {
+            let shaped_scale = [
+                scale[0] * mesh_scale[0],
+                scale[1] * mesh_scale[1],
+                scale[2] * mesh_scale[2],
+            ];
             out.push(SceneInstance3d {
                 instance_id: (u64::MAX - 200).saturating_sub(index as u64),
                 primitive,
                 transform: SceneTransform3d {
                     translation,
                     rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                    scale,
+                    scale: shaped_scale,
                 },
                 material: SceneMaterial {
                     base_color_rgba: [0.80, 0.89, 1.0, 0.26],

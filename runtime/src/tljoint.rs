@@ -580,6 +580,9 @@ fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatc
     if patch.wall_thickness.is_some() {
         target.wall_thickness = patch.wall_thickness;
     }
+    if patch.container_mesh_scale.is_some() {
+        target.container_mesh_scale = patch.container_mesh_scale;
+    }
     if patch.linear_damping.is_some() {
         target.linear_damping = patch.linear_damping;
     }

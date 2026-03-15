@@ -20,13 +20,14 @@ use tl_core::{
 
 use crate::scene::BounceTankRuntimePatch;
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 57] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 58] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_container_size",
     "set_container_shape",
     "set_container_half_extents",
     "set_wall_thickness",
+    "set_container_mesh_scale",
     "set_linear_damping",
     "set_contact_guard",
     "set_bounce",
@@ -869,6 +870,13 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
             [v] => state.patch.wall_thickness = Some(v.to_f64() as f32),
             _ => state.warn("set_wall_thickness expects 1 arg"),
         },
+        "set_container_mesh_scale" => match args {
+            [x, y, z] => {
+                state.patch.container_mesh_scale =
+                    Some([x.to_f64() as f32, y.to_f64() as f32, z.to_f64() as f32]);
+            }
+            _ => state.warn("set_container_mesh_scale expects 3 args"),
+        },
         "set_linear_damping" => match args {
             [v] => state.patch.linear_damping = Some(v.to_f64() as f32),
             _ => state.warn("set_linear_damping expects 1 arg"),
@@ -1542,6 +1550,7 @@ mod tests {
             "@export\n",
             "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
             "    set_container_shape(48.0, 32.0, 48.0, 0.46)\n",
+            "    set_container_mesh_scale(1.0, 0.86, 1.0)\n",
         );
         let outcome = compile_tlscript_showcase(src, Default::default());
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -1554,6 +1563,7 @@ mod tests {
         });
         assert_eq!(out.patch.container_half_extents, Some([24.0, 16.0, 24.0]));
         assert!((out.patch.wall_thickness.unwrap_or(0.0) - 0.46).abs() < 1e-6);
+        assert_eq!(out.patch.container_mesh_scale, Some([1.0, 0.86, 1.0]));
     }
 
     #[test]

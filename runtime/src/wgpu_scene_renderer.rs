@@ -995,11 +995,12 @@ fn parse_first_mesh_from_fbx(bytes: &[u8]) -> Result<ParsedFbxMesh, String> {
             .and_then(fbx_property_as_i32_slice)
             .ok_or_else(|| "FBX mesh does not contain polygon vertex indices".to_string())?;
 
-        let vertices = fbx_vertices_to_gpu(vertices_f64)?;
+        let mut vertices = fbx_vertices_to_gpu(vertices_f64)?;
         let indices = fbx_polygon_indices_to_triangles(polygon_vertex_index, vertices.len())?;
         if indices.is_empty() {
             return Err("FBX mesh did not produce triangle indices".to_string());
         }
+        normalize_vertices_to_unit_box(vertices.as_mut_slice());
         return Ok(ParsedFbxMesh { vertices, indices });
     }
 
@@ -1021,6 +1022,59 @@ fn fbx_vertices_to_gpu(vertices_f64: &[f64]) -> Result<Vec<GpuVertex3d>, String>
         });
     }
     Ok(vertices)
+}
+
+/// Normalize imported FBX vertices into a centered unit box (`[-0.5, 0.5]` per axis).
+///
+/// This keeps mesh-slot scaling predictable so runtime X/Y/Z scale controls can shape panels
+/// consistently even when source FBX files use arbitrary pivots or authoring units.
+fn normalize_vertices_to_unit_box(vertices: &mut [GpuVertex3d]) {
+    if vertices.is_empty() {
+        return;
+    }
+
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for v in vertices.iter() {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(v.position[axis]);
+            max[axis] = max[axis].max(v.position[axis]);
+        }
+    }
+
+    let center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    let extent = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let inv_extent = [
+        if extent[0].abs() > 1e-6 {
+            1.0 / extent[0]
+        } else {
+            0.0
+        },
+        if extent[1].abs() > 1e-6 {
+            1.0 / extent[1]
+        } else {
+            0.0
+        },
+        if extent[2].abs() > 1e-6 {
+            1.0 / extent[2]
+        } else {
+            0.0
+        },
+    ];
+
+    for v in vertices.iter_mut() {
+        for axis in 0..3 {
+            if inv_extent[axis] > 0.0 {
+                v.position[axis] = (v.position[axis] - center[axis]) * inv_extent[axis];
+            } else {
+                v.position[axis] = 0.0;
+            }
+        }
+    }
 }
 
 fn fbx_polygon_indices_to_triangles(
