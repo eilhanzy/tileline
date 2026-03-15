@@ -18,9 +18,12 @@ use egui_winit::State as EguiWinitState;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::ActiveEventLoop;
+#[cfg(target_os = "android")]
+use winit::platform::android::activity::AndroidApp;
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use crate::app_runner;
 use crate::tlpfile::{
     compile_tlpfile_scene_from_path, load_tlpfile, parse_tlpfile, TlpfileDiagnostic,
     TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlpfileParseOutcome, TlpfileProject,
@@ -286,6 +289,13 @@ impl ScenePreviewState {
             }
         }
     }
+
+    fn apply_touch_pan(&mut self, delta_pixels: [f32; 2], viewport: [f32; 2]) {
+        let w = viewport[0].max(1.0);
+        let h = viewport[1].max(1.0);
+        self.tool_anchor[0] = (self.tool_anchor[0] + (delta_pixels[0] / w)).clamp(0.1, 0.9);
+        self.tool_anchor[1] = (self.tool_anchor[1] + (delta_pixels[1] / h)).clamp(0.1, 0.9);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +405,7 @@ struct UiModel {
     runtime_last_command: String,
     transform_tool: TransformToolState,
     transform_status: String,
+    android_editor_lite: bool,
 }
 
 impl UiModel {
@@ -413,7 +424,7 @@ impl UiModel {
             editor_dirty: false,
             editor_status: String::new(),
             preview: ScenePreviewState::new(),
-            scheduler_override: TlpfileGraphicsScheduler::Gms,
+            scheduler_override: TlpfileGraphicsScheduler::Auto,
             project_files: Vec::new(),
             selected_file: None,
             new_asset_name: String::from("new_scene"),
@@ -424,6 +435,7 @@ impl UiModel {
             runtime_last_command: String::new(),
             transform_tool: TransformToolState::default(),
             transform_status: String::new(),
+            android_editor_lite: cfg!(target_os = "android"),
         };
         model.reload_parse();
         model.compile_selected_scene();
@@ -483,24 +495,11 @@ impl UiModel {
             self.compile = None;
             return;
         }
-        let mut outcome = compile_tlpfile_scene_from_path(
+        let outcome = compile_tlpfile_scene_from_path(
             &self.project_path,
             Some(self.selected_scene.as_str()),
             TlscriptShowcaseConfig::default(),
         );
-        if let Some(bundle) = outcome.bundle.as_ref() {
-            if bundle.scheduler != TlpfileGraphicsScheduler::Gms {
-                outcome.diagnostics.push(TlpfileDiagnostic {
-                    level: TlpfileDiagnosticLevel::Error,
-                    line: 1,
-                    message: format!(
-                        "scene viewer runtime currently requires scheduler=gms, got '{}'",
-                        bundle.scheduler.as_str()
-                    ),
-                });
-                outcome.bundle = None;
-            }
-        }
         let errors = count_diagnostics(&outcome.diagnostics, |level| {
             level == TlpfileDiagnosticLevel::Error
         });
@@ -914,9 +913,40 @@ impl GuiRuntime {
             compatible_surface: Some(&surface),
         }))
         .map_err(|err| format!("request_adapter failed: {err}"))?;
+        let adapter_info = adapter.get_info();
+        let supported_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::default();
+        let mut any_clamped = false;
+        if required_limits.max_texture_dimension_1d > supported_limits.max_texture_dimension_1d {
+            required_limits.max_texture_dimension_1d = supported_limits.max_texture_dimension_1d;
+            any_clamped = true;
+        }
+        if required_limits.max_texture_dimension_2d > supported_limits.max_texture_dimension_2d {
+            required_limits.max_texture_dimension_2d = supported_limits.max_texture_dimension_2d;
+            any_clamped = true;
+        }
+        if required_limits.max_texture_dimension_3d > supported_limits.max_texture_dimension_3d {
+            required_limits.max_texture_dimension_3d = supported_limits.max_texture_dimension_3d;
+            any_clamped = true;
+        }
+        if required_limits.max_texture_array_layers > supported_limits.max_texture_array_layers {
+            required_limits.max_texture_array_layers = supported_limits.max_texture_array_layers;
+            any_clamped = true;
+        }
+        if any_clamped {
+            eprintln!(
+                "[tlproject-gui limits] adapter='{}' clamped required limits to supported values (1d={}, 2d={}, 3d={}, layers={})",
+                adapter_info.name,
+                required_limits.max_texture_dimension_1d,
+                required_limits.max_texture_dimension_2d,
+                required_limits.max_texture_dimension_3d,
+                required_limits.max_texture_array_layers
+            );
+        }
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("tlproject-gui-device"),
+                required_limits,
                 ..Default::default()
             }))?;
         let mut config = surface
@@ -1108,6 +1138,7 @@ impl GuiRuntime {
                 egui::ComboBox::from_label("Scheduler")
                     .selected_text(scheduler.as_str())
                     .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut scheduler, TlpfileGraphicsScheduler::Auto, "auto");
                         ui.selectable_value(&mut scheduler, TlpfileGraphicsScheduler::Gms, "gms");
                         ui.selectable_value(&mut scheduler, TlpfileGraphicsScheduler::Mgs, "mgs");
                     });
@@ -1167,10 +1198,11 @@ impl GuiRuntime {
             }
         });
 
-        egui::SidePanel::left("scene_panel")
-            .resizable(true)
-            .default_width(320.0)
-            .show(ctx, |ui| {
+        if !self.model.android_editor_lite {
+            egui::SidePanel::left("scene_panel")
+                .resizable(true)
+                .default_width(320.0)
+                .show(ctx, |ui| {
                 ui.heading("Scenes");
                 if let Some((_, _, _, scene_names)) = project_meta.as_ref() {
                     egui::ScrollArea::vertical()
@@ -1259,7 +1291,8 @@ impl GuiRuntime {
                     .small()
                     .color(Color32::from_rgb(176, 164, 220)),
                 );
-            });
+                });
+        }
 
         egui::SidePanel::right("diagnostics_panel")
             .resizable(true)
@@ -1289,11 +1322,11 @@ impl GuiRuntime {
             } else {
                 ui.label("Project parse failed.");
             }
-            let runtime_ready = self.model.scheduler_override == TlpfileGraphicsScheduler::Gms;
-            let runtime_text = if runtime_ready {
-                "Scene viewer runtime: ready (GMS path)"
+            let runtime_ready = true;
+            let runtime_text = if self.model.android_editor_lite {
+                "Scene viewer runtime: Android mini-editor mode (preview + diagnostics)"
             } else {
-                "Scene viewer runtime: blocked (switch scheduler to gms)"
+                "Scene viewer runtime: ready"
             };
             let runtime_color = if runtime_ready {
                 Color32::from_rgb(178, 232, 178)
@@ -1312,109 +1345,127 @@ impl GuiRuntime {
             };
             let (preview_rect, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width().max(120.0), preview_height),
-                egui::Sense::hover(),
+                egui::Sense::drag(),
             );
+            let preview_response = ui.interact(
+                preview_rect,
+                ui.id().with("scene_preview_touch"),
+                egui::Sense::drag(),
+            );
+            if preview_response.dragged() {
+                let delta = preview_response.drag_delta();
+                self.model.preview.apply_touch_pan(
+                    [delta.x, delta.y],
+                    [preview_rect.width(), preview_rect.height()],
+                );
+            }
             let painter = ui.painter_at(preview_rect);
             draw_scene_preview(&painter, preview_rect, &self.model.preview);
             ui.separator();
 
-            ui.label(RichText::new("Transform Tool").strong());
-            ui.label("Pre-Beta move/rotate lane with world/local coordinate-space mapping.");
-            egui::ComboBox::from_label("Coordinate Space")
-                .selected_text(self.model.transform_tool.coordinate_space.as_tlscript_str())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.model.transform_tool.coordinate_space,
-                        EditorCoordinateSpace::World,
-                        "world",
+            if !self.model.android_editor_lite {
+                ui.label(RichText::new("Transform Tool").strong());
+                ui.label("Pre-Beta move/rotate lane with world/local coordinate-space mapping.");
+                egui::ComboBox::from_label("Coordinate Space")
+                    .selected_text(self.model.transform_tool.coordinate_space.as_tlscript_str())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.model.transform_tool.coordinate_space,
+                            EditorCoordinateSpace::World,
+                            "world",
+                        );
+                        ui.selectable_value(
+                            &mut self.model.transform_tool.coordinate_space,
+                            EditorCoordinateSpace::Local,
+                            "local",
+                        );
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Move Δ");
+                    ui.add(
+                        egui::DragValue::new(&mut self.model.transform_tool.move_delta[0])
+                            .speed(0.05)
+                            .prefix("x:"),
                     );
-                    ui.selectable_value(
-                        &mut self.model.transform_tool.coordinate_space,
-                        EditorCoordinateSpace::Local,
-                        "local",
+                    ui.add(
+                        egui::DragValue::new(&mut self.model.transform_tool.move_delta[1])
+                            .speed(0.05)
+                            .prefix("y:"),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.model.transform_tool.move_delta[2])
+                            .speed(0.05)
+                            .prefix("z:"),
                     );
                 });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Move Δ");
-                ui.add(
-                    egui::DragValue::new(&mut self.model.transform_tool.move_delta[0])
-                        .speed(0.05)
-                        .prefix("x:"),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut self.model.transform_tool.move_delta[1])
-                        .speed(0.05)
-                        .prefix("y:"),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut self.model.transform_tool.move_delta[2])
-                        .speed(0.05)
-                        .prefix("z:"),
-                );
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Rotate Δ");
-                ui.add(
-                    egui::DragValue::new(&mut self.model.transform_tool.rotate_delta_deg[0])
-                        .speed(0.5)
-                        .prefix("yaw:"),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut self.model.transform_tool.rotate_delta_deg[1])
-                        .speed(0.5)
-                        .prefix("pitch:"),
-                );
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Nudge");
-                ui.add(
-                    egui::DragValue::new(&mut self.model.transform_tool.move_step)
-                        .speed(0.01)
-                        .range(0.01..=5.0)
-                        .prefix("move:"),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut self.model.transform_tool.rotate_step_deg)
-                        .speed(0.25)
-                        .range(0.1..=90.0)
-                        .prefix("rot:"),
-                );
-            });
-            ui.horizontal_wrapped(|ui| {
-                if icon_button(ui, "MX-", "-X").clicked() {
-                    self.model.transform_tool.move_delta[0] -= self.model.transform_tool.move_step;
-                }
-                if icon_button(ui, "MX+", "+X").clicked() {
-                    self.model.transform_tool.move_delta[0] += self.model.transform_tool.move_step;
-                }
-                if icon_button(ui, "MY-", "-Y").clicked() {
-                    self.model.transform_tool.move_delta[1] -= self.model.transform_tool.move_step;
-                }
-                if icon_button(ui, "MY+", "+Y").clicked() {
-                    self.model.transform_tool.move_delta[1] += self.model.transform_tool.move_step;
-                }
-                if icon_button(ui, "R-", "-Yaw").clicked() {
-                    self.model.transform_tool.rotate_delta_deg[0] -=
-                        self.model.transform_tool.rotate_step_deg;
-                }
-                if icon_button(ui, "R+", "+Yaw").clicked() {
-                    self.model.transform_tool.rotate_delta_deg[0] +=
-                        self.model.transform_tool.rotate_step_deg;
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                if icon_button(ui, "AP", "Apply Preview").clicked() {
-                    self.model.apply_transform_to_preview();
-                }
-                if icon_button(ui, "TS", "Append .tlscript").clicked() {
-                    self.model.append_transform_to_selected_script();
-                }
-                if icon_button(ui, "RST", "Reset Tool").clicked() {
-                    self.model.transform_tool = TransformToolState::default();
-                    self.model.transform_status = "transform tool reset".to_string();
-                }
-            });
-            ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Rotate Δ");
+                    ui.add(
+                        egui::DragValue::new(&mut self.model.transform_tool.rotate_delta_deg[0])
+                            .speed(0.5)
+                            .prefix("yaw:"),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.model.transform_tool.rotate_delta_deg[1])
+                            .speed(0.5)
+                            .prefix("pitch:"),
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Nudge");
+                    ui.add(
+                        egui::DragValue::new(&mut self.model.transform_tool.move_step)
+                            .speed(0.01)
+                            .range(0.01..=5.0)
+                            .prefix("move:"),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.model.transform_tool.rotate_step_deg)
+                            .speed(0.25)
+                            .range(0.1..=90.0)
+                            .prefix("rot:"),
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if icon_button(ui, "MX-", "-X").clicked() {
+                        self.model.transform_tool.move_delta[0] -=
+                            self.model.transform_tool.move_step;
+                    }
+                    if icon_button(ui, "MX+", "+X").clicked() {
+                        self.model.transform_tool.move_delta[0] +=
+                            self.model.transform_tool.move_step;
+                    }
+                    if icon_button(ui, "MY-", "-Y").clicked() {
+                        self.model.transform_tool.move_delta[1] -=
+                            self.model.transform_tool.move_step;
+                    }
+                    if icon_button(ui, "MY+", "+Y").clicked() {
+                        self.model.transform_tool.move_delta[1] +=
+                            self.model.transform_tool.move_step;
+                    }
+                    if icon_button(ui, "R-", "-Yaw").clicked() {
+                        self.model.transform_tool.rotate_delta_deg[0] -=
+                            self.model.transform_tool.rotate_step_deg;
+                    }
+                    if icon_button(ui, "R+", "+Yaw").clicked() {
+                        self.model.transform_tool.rotate_delta_deg[0] +=
+                            self.model.transform_tool.rotate_step_deg;
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if icon_button(ui, "AP", "Apply Preview").clicked() {
+                        self.model.apply_transform_to_preview();
+                    }
+                    if icon_button(ui, "TS", "Append .tlscript").clicked() {
+                        self.model.append_transform_to_selected_script();
+                    }
+                    if icon_button(ui, "RST", "Reset Tool").clicked() {
+                        self.model.transform_tool = TransformToolState::default();
+                        self.model.transform_status = "transform tool reset".to_string();
+                    }
+                });
+                ui.separator();
+            }
 
             if let Some(compile) = &self.model.compile {
                 if let Some(bundle) = &compile.bundle {
@@ -1463,48 +1514,50 @@ impl GuiRuntime {
             }
         });
 
-        egui::TopBottomPanel::bottom("editor_panel")
-            .resizable(true)
-            .default_height(230.0)
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Mini .tlpfile Editor").strong());
-                    ui.separator();
-                    if icon_button(ui, "L", "Load").clicked() {
-                        self.model.reload_source_from_disk();
-                        self.model.reparse_from_buffer();
-                    }
-                    if icon_button(ui, "S", "Save").clicked() {
-                        if let Err(err) = self.model.save_source_to_disk() {
-                            self.model.editor_status = err;
+        if !self.model.android_editor_lite {
+            egui::TopBottomPanel::bottom("editor_panel")
+                .resizable(true)
+                .default_height(230.0)
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Mini .tlpfile Editor").strong());
+                        ui.separator();
+                        if icon_button(ui, "L", "Load").clicked() {
+                            self.model.reload_source_from_disk();
+                            self.model.reparse_from_buffer();
                         }
-                    }
-                    if icon_button(ui, "P", "Parse").clicked() {
-                        self.model.reparse_from_buffer();
-                    }
-                    if icon_button(ui, "SC", "Save+Compile").clicked() {
-                        match self.model.save_source_to_disk() {
-                            Ok(()) => self.model.compile_selected_scene(),
-                            Err(err) => self.model.editor_status = err,
+                        if icon_button(ui, "S", "Save").clicked() {
+                            if let Err(err) = self.model.save_source_to_disk() {
+                                self.model.editor_status = err;
+                            }
                         }
-                    }
-                });
-
-                egui::ScrollArea::both()
-                    .id_salt("tlpfile_editor_scroll")
-                    .show(ui, |ui| {
-                        let response = ui.add(
-                            egui::TextEdit::multiline(&mut self.model.project_source)
-                                .code_editor()
-                                .desired_rows(14)
-                                .desired_width(f32::INFINITY),
-                        );
-                        if response.changed() {
-                            self.model.editor_dirty = true;
-                            self.model.editor_status = "buffer modified".to_string();
+                        if icon_button(ui, "P", "Parse").clicked() {
+                            self.model.reparse_from_buffer();
+                        }
+                        if icon_button(ui, "SC", "Save+Compile").clicked() {
+                            match self.model.save_source_to_disk() {
+                                Ok(()) => self.model.compile_selected_scene(),
+                                Err(err) => self.model.editor_status = err,
+                            }
                         }
                     });
-            });
+
+                    egui::ScrollArea::both()
+                        .id_salt("tlpfile_editor_scroll")
+                        .show(ui, |ui| {
+                            let response = ui.add(
+                                egui::TextEdit::multiline(&mut self.model.project_source)
+                                    .code_editor()
+                                    .desired_rows(14)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if response.changed() {
+                                self.model.editor_dirty = true;
+                                self.model.editor_status = "buffer modified".to_string();
+                            }
+                        });
+                });
+        }
     }
 }
 
@@ -1584,10 +1637,16 @@ impl ApplicationHandler for GuiApp {
 /// Run the general-purpose project GUI based on `.tlpfile`.
 pub fn run_from_env() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse_from_env()?;
-    let event_loop = EventLoop::new()?;
-    let mut app = GuiApp::new(cli);
-    event_loop.run_app(&mut app)?;
-    Ok(())
+    let app = GuiApp::new(cli);
+    app_runner::run_app_desktop(app)
+}
+
+/// Run project GUI from Android lifecycle entrypoint.
+#[cfg(target_os = "android")]
+pub fn run_with_android_app(android_app: AndroidApp) -> Result<(), Box<dyn Error>> {
+    let cli = Cli::default();
+    let app = GuiApp::new(cli);
+    app_runner::run_app_android(android_app, app)
 }
 
 fn upsert_project_scheduler(source: &str, scheduler: TlpfileGraphicsScheduler) -> String {

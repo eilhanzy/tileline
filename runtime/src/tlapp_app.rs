@@ -7,24 +7,30 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use crate::{
-    compile_tljoint_scene_from_path, compile_tlpfile_scene_from_path, compile_tlscript_showcase,
-    BounceTankRuntimePatch, BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler,
-    RenderSyncMode, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
+    app_runner, choose_scheduler_path_for_platform, compile_tljoint_scene_from_path,
+    compile_tlpfile_scene_from_path, compile_tlscript_showcase, BounceTankRuntimePatch,
+    BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler, GraphicsSchedulerPath,
+    RenderSyncMode, RuntimePlatform, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
     TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
     TlscriptCoordinateSpace, TlscriptShowcaseConfig, TlscriptShowcaseControlInput,
     TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
     TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader,
     WgpuSceneRenderer,
 };
+use gms::safe_default_required_limits_for_adapter;
 use nalgebra::Vector3;
 use paradoxpe::{
     BroadphaseConfig, ContactSolverConfig, NarrowphaseConfig, PhysicsWorld, PhysicsWorldConfig,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event::{
+    DeviceEvent, ElementState, KeyEvent, MouseButton, Touch, TouchPhase, WindowEvent,
+};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+#[cfg(target_os = "android")]
+use winit::platform::android::activity::AndroidApp;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
 #[cfg(feature = "gamepad")]
@@ -50,10 +56,17 @@ pub fn run_from_env() -> Result<(), Box<dyn Error>> {
         );
     }
     let options = CliOptions::parse_from_env()?;
-    let event_loop = EventLoop::new()?;
-    let mut app = TlApp::new(options);
-    event_loop.run_app(&mut app)?;
-    Ok(())
+    let app = TlApp::new(options, RuntimePlatform::current());
+    app_runner::run_app_desktop(app)
+}
+
+/// Run TLApp from Android lifecycle entrypoint.
+#[cfg(target_os = "android")]
+pub fn run_with_android_app(android_app: AndroidApp) -> Result<(), Box<dyn Error>> {
+    configure_parallel_runtime();
+    let options = CliOptions::default();
+    let app = TlApp::new(options, RuntimePlatform::Android);
+    app_runner::run_app_android(android_app, app)
 }
 
 fn configure_parallel_runtime() {
@@ -191,6 +204,139 @@ enum TickProfile {
     Max,
 }
 
+#[derive(Debug, Clone)]
+struct SchedulerResolution {
+    selected: GraphicsSchedulerPath,
+    fallback_applied: bool,
+    reason: String,
+}
+
+fn gms_supported_on_platform(platform: RuntimePlatform, adapter_info: &wgpu::AdapterInfo) -> bool {
+    match platform {
+        RuntimePlatform::Android => {
+            matches!(adapter_info.backend, wgpu::Backend::Vulkan)
+                && !matches!(adapter_info.device_type, wgpu::DeviceType::Cpu)
+        }
+        RuntimePlatform::Desktop => true,
+    }
+}
+
+fn resolve_project_scheduler(
+    manifest: TlpfileGraphicsScheduler,
+    platform: RuntimePlatform,
+    adapter_info: &wgpu::AdapterInfo,
+) -> Result<SchedulerResolution, String> {
+    match manifest {
+        TlpfileGraphicsScheduler::Mgs => Ok(SchedulerResolution {
+            selected: GraphicsSchedulerPath::Mgs,
+            fallback_applied: false,
+            reason: "manifest scheduler=mgs".to_string(),
+        }),
+        TlpfileGraphicsScheduler::Gms => {
+            if gms_supported_on_platform(platform, adapter_info) {
+                Ok(SchedulerResolution {
+                    selected: GraphicsSchedulerPath::Gms,
+                    fallback_applied: false,
+                    reason: "manifest scheduler=gms".to_string(),
+                })
+            } else {
+                Err(format!(
+                    "manifest scheduler=gms is unsupported on {:?} (backend={:?}, type={:?}); explicit scheduler rejected for fail-soft policy",
+                    platform, adapter_info.backend, adapter_info.device_type
+                ))
+            }
+        }
+        TlpfileGraphicsScheduler::Auto => {
+            let decision = choose_scheduler_path_for_platform(adapter_info, platform);
+            Ok(SchedulerResolution {
+                selected: decision.path,
+                fallback_applied: false,
+                reason: format!("manifest scheduler=auto -> {}", decision.reason),
+            })
+        }
+    }
+}
+
+struct AdapterBootstrap {
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    adapter: wgpu::Adapter,
+    bootstrap_note: String,
+}
+
+fn request_adapter_with_platform_policy(
+    window: &Arc<Window>,
+    platform: RuntimePlatform,
+) -> Result<AdapterBootstrap, Box<dyn Error>> {
+    let request_adapter = |instance: &wgpu::Instance,
+                           surface: &wgpu::Surface<'static>|
+     -> Result<wgpu::Adapter, String> {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(surface),
+        }))
+        .map_err(|err| format!("request_adapter failed: {err}"))
+    };
+
+    if matches!(platform, RuntimePlatform::Android) {
+        let vk_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
+        let vk_surface = vk_instance.create_surface(Arc::clone(window))?;
+        match request_adapter(&vk_instance, &vk_surface) {
+            Ok(vk_adapter) => {
+                return Ok(AdapterBootstrap {
+                    instance: vk_instance,
+                    surface: vk_surface,
+                    adapter: vk_adapter,
+                    bootstrap_note: "vulkan-first path active".to_string(),
+                });
+            }
+            Err(vk_err) => {
+                let fallback_instance = wgpu::Instance::default();
+                let fallback_surface = fallback_instance.create_surface(Arc::clone(window))?;
+                if let Ok(fallback_adapter) = request_adapter(&fallback_instance, &fallback_surface)
+                {
+                    let info = fallback_adapter.get_info();
+                    return Err(build_vulkan_unavailable_message(
+                        &vk_err,
+                        Some((&info.name, info.backend)),
+                    )
+                    .into());
+                }
+                return Err(build_vulkan_unavailable_message(&vk_err, None).into());
+            }
+        }
+    }
+
+    let instance = wgpu::Instance::default();
+    let surface = instance.create_surface(Arc::clone(window))?;
+    let adapter = request_adapter(&instance, &surface)?;
+    Ok(AdapterBootstrap {
+        instance,
+        surface,
+        adapter,
+        bootstrap_note: "desktop default adapter path".to_string(),
+    })
+}
+
+fn build_vulkan_unavailable_message(
+    vk_err: &str,
+    fallback: Option<(&str, wgpu::Backend)>,
+) -> String {
+    if let Some((name, backend)) = fallback {
+        format!(
+            "Vulkan unavailable on Android (probe error: {vk_err}); fallback adapter '{name}' backend={backend:?} was detected, entering fail-soft policy"
+        )
+    } else {
+        format!(
+            "Vulkan unavailable on Android (probe error: {vk_err}); no compatible fallback adapter detected"
+        )
+    }
+}
+
 impl TickProfile {
     fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
         match value.to_ascii_lowercase().as_str() {
@@ -296,16 +442,39 @@ fn print_usage() {
 
 struct TlApp {
     options: CliOptions,
-    runtime: Option<TlAppRuntime>,
+    runtime: Option<TlAppRuntimeState>,
+    platform: RuntimePlatform,
     exit_requested: bool,
 }
 
 impl TlApp {
-    fn new(options: CliOptions) -> Self {
+    fn new(options: CliOptions, platform: RuntimePlatform) -> Self {
         Self {
             options,
             runtime: None,
+            platform,
             exit_requested: false,
+        }
+    }
+}
+
+enum TlAppRuntimeState {
+    Ready(TlAppRuntime),
+    FailSoft(FailSoftRuntime),
+}
+
+impl TlAppRuntimeState {
+    fn window_id(&self) -> WindowId {
+        match self {
+            Self::Ready(runtime) => runtime.window.id(),
+            Self::FailSoft(runtime) => runtime.window.id(),
+        }
+    }
+
+    fn schedule_next_redraw(&mut self, event_loop: &ActiveEventLoop) {
+        match self {
+            Self::Ready(runtime) => runtime.schedule_next_redraw(event_loop),
+            Self::FailSoft(runtime) => runtime.schedule_next_redraw(event_loop),
         }
     }
 }
@@ -316,14 +485,24 @@ impl ApplicationHandler for TlApp {
             return;
         }
 
-        match TlAppRuntime::new(event_loop, self.options.clone()) {
+        match TlAppRuntime::new(event_loop, self.options.clone(), self.platform) {
             Ok(runtime) => {
-                self.runtime = Some(runtime);
+                self.runtime = Some(TlAppRuntimeState::Ready(runtime));
             }
             Err(err) => {
-                eprintln!("Failed to start TLApp runtime: {err}");
-                self.exit_requested = true;
-                event_loop.exit();
+                eprintln!("Failed to start TLApp runtime core, switching to fail-soft mode: {err}");
+                let fail_soft =
+                    FailSoftRuntime::new(event_loop, self.options.resolution, format!("{err}"));
+                match fail_soft {
+                    Ok(runtime) => {
+                        self.runtime = Some(TlAppRuntimeState::FailSoft(runtime));
+                    }
+                    Err(inner) => {
+                        eprintln!("Failed to initialize TLApp fail-soft runtime: {inner}");
+                        self.exit_requested = true;
+                        event_loop.exit();
+                    }
+                }
             }
         }
     }
@@ -334,10 +513,10 @@ impl ApplicationHandler for TlApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(runtime) = self.runtime.as_mut() else {
+        let Some(runtime_state) = self.runtime.as_mut() else {
             return;
         };
-        if runtime.window.id() != window_id {
+        if runtime_state.window_id() != window_id {
             return;
         }
 
@@ -347,10 +526,21 @@ impl ApplicationHandler for TlApp {
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if matches!(runtime.on_keyboard_input(&event), RuntimeCommand::Exit) {
-                    self.exit_requested = true;
-                    event_loop.exit();
-                    return;
+                match runtime_state {
+                    TlAppRuntimeState::Ready(runtime) => {
+                        if matches!(runtime.on_keyboard_input(&event), RuntimeCommand::Exit) {
+                            self.exit_requested = true;
+                            event_loop.exit();
+                            return;
+                        }
+                    }
+                    TlAppRuntimeState::FailSoft(runtime) => {
+                        if runtime.on_keyboard_input(&event) {
+                            self.exit_requested = true;
+                            event_loop.exit();
+                            return;
+                        }
+                    }
                 }
                 if matches!(event.logical_key, Key::Named(NamedKey::Escape))
                     && event.state == ElementState::Pressed
@@ -360,19 +550,36 @@ impl ApplicationHandler for TlApp {
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
-                runtime.on_modifiers_changed(modifiers.state());
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                runtime.on_mouse_button(state, button);
-            }
-            WindowEvent::Resized(size) => runtime.resize(size),
-            WindowEvent::RedrawRequested => {
-                if let Err(err) = runtime.render_frame() {
-                    eprintln!("Render error: {err}");
-                    self.exit_requested = true;
-                    event_loop.exit();
+                if let TlAppRuntimeState::Ready(runtime) = runtime_state {
+                    runtime.on_modifiers_changed(modifiers.state());
                 }
             }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let TlAppRuntimeState::Ready(runtime) = runtime_state {
+                    runtime.on_mouse_button(state, button);
+                }
+            }
+            WindowEvent::Touch(touch) => {
+                if let TlAppRuntimeState::Ready(runtime) = runtime_state {
+                    runtime.on_touch(touch);
+                }
+            }
+            WindowEvent::Resized(size) => match runtime_state {
+                TlAppRuntimeState::Ready(runtime) => runtime.resize(size),
+                TlAppRuntimeState::FailSoft(runtime) => runtime.resize(size),
+            },
+            WindowEvent::RedrawRequested => match runtime_state {
+                TlAppRuntimeState::Ready(runtime) => {
+                    if let Err(err) = runtime.render_frame() {
+                        eprintln!("Render error: {err}");
+                        self.exit_requested = true;
+                        event_loop.exit();
+                    }
+                }
+                TlAppRuntimeState::FailSoft(runtime) => {
+                    runtime.render_frame();
+                }
+            },
             _ => {}
         }
     }
@@ -383,7 +590,7 @@ impl ApplicationHandler for TlApp {
         _device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
-        if let Some(runtime) = self.runtime.as_mut() {
+        if let Some(TlAppRuntimeState::Ready(runtime)) = self.runtime.as_mut() {
             runtime.on_device_event(event);
         }
     }
@@ -428,6 +635,8 @@ struct TlAppRuntime {
     camera_reset_requested: bool,
     keyboard_modifiers: ModifiersState,
     gamepad: GamepadManager,
+    touch_look_id: Option<u64>,
+    touch_last_position: Option<(f32, f32)>,
     tick_policy: TickRatePolicy,
     tick_profile: TickProfile,
     tick_hz: f32,
@@ -444,6 +653,79 @@ struct TlAppRuntime {
     frame_cap_interval: Option<Duration>,
     next_redraw_at: Instant,
     fps_tracker: FpsTracker,
+    scheduler_path: GraphicsSchedulerPath,
+    scheduler_reason: String,
+    scheduler_fallback_applied: bool,
+    adapter_backend: wgpu::Backend,
+    adapter_name: String,
+    present_mode: wgpu::PresentMode,
+    platform: RuntimePlatform,
+}
+
+struct FailSoftRuntime {
+    window: Arc<Window>,
+    reason: String,
+    size: PhysicalSize<u32>,
+    last_present_note: Instant,
+}
+
+impl FailSoftRuntime {
+    fn new(
+        event_loop: &ActiveEventLoop,
+        resolution: PhysicalSize<u32>,
+        reason: String,
+    ) -> Result<Self, Box<dyn Error>> {
+        let window = Arc::new(
+            event_loop.create_window(
+                WindowAttributes::default()
+                    .with_title("Tileline TLApp | Fail-Soft")
+                    .with_inner_size(LogicalSize::new(
+                        resolution.width as f64,
+                        resolution.height as f64,
+                    )),
+            )?,
+        );
+        Ok(Self {
+            window,
+            reason,
+            size: resolution,
+            last_present_note: Instant::now(),
+        })
+    }
+
+    fn resize(&mut self, new_size: PhysicalSize<u32>) {
+        if new_size.width == 0 || new_size.height == 0 {
+            return;
+        }
+        self.size = new_size;
+    }
+
+    fn on_keyboard_input(&self, event: &KeyEvent) -> bool {
+        let pressed = event.state == ElementState::Pressed && !event.repeat;
+        if !pressed {
+            return false;
+        }
+        matches!(event.logical_key, Key::Named(NamedKey::Escape))
+            || matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyQ))
+    }
+
+    fn schedule_next_redraw(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(100),
+        ));
+        self.window.request_redraw();
+    }
+
+    fn render_frame(&mut self) {
+        if self.last_present_note.elapsed() >= Duration::from_millis(450) {
+            let title = format!(
+                "Tileline TLApp | Fail-Soft | Unsupported runtime path | {}",
+                self.reason
+            );
+            self.window.set_title(&title);
+            self.last_present_note = Instant::now();
+        }
+    }
 }
 
 enum ScriptRuntime<'src> {
@@ -600,7 +882,11 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
 }
 
 impl TlAppRuntime {
-    fn new(event_loop: &ActiveEventLoop, options: CliOptions) -> Result<Self, Box<dyn Error>> {
+    fn new(
+        event_loop: &ActiveEventLoop,
+        options: CliOptions,
+        platform: RuntimePlatform,
+    ) -> Result<Self, Box<dyn Error>> {
         let window = Arc::new(
             event_loop.create_window(
                 WindowAttributes::default()
@@ -613,18 +899,32 @@ impl TlAppRuntime {
         );
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(Arc::clone(&window))?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: Some(&surface),
-        }))
-        .map_err(|err| format!("request_adapter failed: {err}"))?;
+        let adapter_bootstrap = request_adapter_with_platform_policy(&window, platform)?;
+        let instance = adapter_bootstrap.instance;
+        let surface = adapter_bootstrap.surface;
+        let adapter = adapter_bootstrap.adapter;
+        let adapter_info = adapter.get_info();
+        eprintln!(
+            "[runtime bootstrap] platform={:?} adapter='{}' backend={:?} note={}",
+            platform, adapter_info.name, adapter_info.backend, adapter_bootstrap.bootstrap_note
+        );
 
+        let (required_limits, limit_clamp_report) =
+            safe_default_required_limits_for_adapter(&adapter);
+        if limit_clamp_report.any_clamped() {
+            eprintln!(
+                "[runtime limits] adapter='{}' clamped required limits to supported values (1d={}, 2d={}, 3d={}, layers={})",
+                adapter_info.name,
+                required_limits.max_texture_dimension_1d,
+                required_limits.max_texture_dimension_2d,
+                required_limits.max_texture_dimension_3d,
+                required_limits.max_texture_array_layers
+            );
+        }
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("tlapp-device"),
+                required_limits,
                 ..Default::default()
             }))?;
 
@@ -636,11 +936,13 @@ impl TlAppRuntime {
             VsyncMode::On => wgpu::PresentMode::Fifo,
             VsyncMode::Off => wgpu::PresentMode::AutoNoVsync,
         };
+        let selected_present_mode = config.present_mode;
         surface.configure(&device, &config);
 
         let mut script_runtime = None;
         let mut joint_merged_sprite_program: Option<TlspriteProgram> = None;
         let mut bundle_sprite_root: Option<PathBuf> = None;
+        let mut project_scheduler_manifest: Option<TlpfileGraphicsScheduler> = None;
         if let Some(project_path) = &options.project_path {
             let project_compile = compile_tlpfile_scene_from_path(
                 project_path,
@@ -674,15 +976,7 @@ impl TlAppRuntime {
                 )
             })?;
 
-            if bundle.scheduler != TlpfileGraphicsScheduler::Gms {
-                return Err(format!(
-                    "TLApp runtime requires scheduler=gms, but project '{}' scene '{}' resolved to '{}'",
-                    project_path.display(),
-                    bundle.scene_name,
-                    bundle.scheduler.as_str()
-                )
-                .into());
-            }
+            project_scheduler_manifest = Some(bundle.scheduler);
 
             if bundle.scene_name == "main" {
                 let main_joint_ok = bundle
@@ -791,6 +1085,31 @@ impl TlAppRuntime {
                 .expect("showcase script should compile without errors");
             script_runtime = Some(ScriptRuntime::Single(script_program));
         }
+
+        let scheduler_resolution = if let Some(manifest_scheduler) = project_scheduler_manifest {
+            resolve_project_scheduler(manifest_scheduler, platform, &adapter_info).map_err(
+                |reason| {
+                    format!(
+                        "project scheduler rejected on '{}': {}",
+                        adapter_info.name, reason
+                    )
+                },
+            )?
+        } else {
+            let decision = choose_scheduler_path_for_platform(&adapter_info, platform);
+            SchedulerResolution {
+                selected: decision.path,
+                fallback_applied: false,
+                reason: decision.reason,
+            }
+        };
+        eprintln!(
+            "[scheduler] platform={:?} path={:?} fallback={} reason={}",
+            platform,
+            scheduler_resolution.selected,
+            scheduler_resolution.fallback_applied,
+            scheduler_resolution.reason
+        );
 
         let logical_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -963,6 +1282,8 @@ impl TlAppRuntime {
             camera_reset_requested: false,
             keyboard_modifiers: ModifiersState::empty(),
             gamepad,
+            touch_look_id: None,
+            touch_last_position: None,
             tick_policy,
             tick_profile: options.tick_profile,
             tick_hz: 1.0 / fixed_dt.max(1e-6),
@@ -979,6 +1300,13 @@ impl TlAppRuntime {
             frame_cap_interval,
             next_redraw_at: now,
             fps_tracker: FpsTracker::new(fps_report_interval),
+            scheduler_path: scheduler_resolution.selected,
+            scheduler_reason: scheduler_resolution.reason,
+            scheduler_fallback_applied: scheduler_resolution.fallback_applied,
+            adapter_backend: adapter_info.backend,
+            adapter_name: adapter_info.name,
+            present_mode: selected_present_mode,
+            platform,
         })
     }
 
@@ -1071,6 +1399,34 @@ impl TlAppRuntime {
         }
     }
 
+    fn on_touch(&mut self, touch: Touch) {
+        let id = touch.id;
+        let current = (touch.location.x as f32, touch.location.y as f32);
+        match touch.phase {
+            TouchPhase::Started => {
+                self.touch_look_id = Some(id);
+                self.touch_last_position = Some(current);
+                self.mouse_look_held = true;
+            }
+            TouchPhase::Moved => {
+                if self.touch_look_id == Some(id) {
+                    if let Some(previous) = self.touch_last_position {
+                        self.mouse_look_delta.0 += current.0 - previous.0;
+                        self.mouse_look_delta.1 += current.1 - previous.1;
+                    }
+                    self.touch_last_position = Some(current);
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if self.touch_look_id == Some(id) {
+                    self.touch_look_id = None;
+                    self.touch_last_position = None;
+                    self.mouse_look_held = false;
+                }
+            }
+        }
+    }
+
     fn on_device_event(&mut self, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             self.mouse_look_delta.0 += delta.0 as f32;
@@ -1115,16 +1471,18 @@ impl TlAppRuntime {
         let sensitivity = self.camera.mouse_sensitivity().max(0.0001);
         let pad_look_to_mouse = (GAMEPAD_LOOK_SPEED_RAD * view_dt.max(0.0)) / sensitivity;
 
-        let move_x = (axis_from_bools(self.keyboard_camera.right, self.keyboard_camera.left)
-            + gamepad.move_x)
-            .clamp(-1.0, 1.0);
-        let move_y = (axis_from_bools(self.keyboard_camera.forward, self.keyboard_camera.backward)
-            + gamepad.move_y)
-            .clamp(-1.0, 1.0);
-        let move_z = (axis_from_bools(self.keyboard_camera.up, self.keyboard_camera.down)
-            + gamepad.rise
-            - gamepad.descend)
-            .clamp(-1.0, 1.0);
+        let move_x = merge_axis_inputs(
+            axis_from_bools(self.keyboard_camera.right, self.keyboard_camera.left),
+            gamepad.move_x,
+        );
+        let move_y = merge_axis_inputs(
+            axis_from_bools(self.keyboard_camera.forward, self.keyboard_camera.backward),
+            gamepad.move_y,
+        );
+        let move_z = merge_axis_inputs(
+            axis_from_bools(self.keyboard_camera.up, self.keyboard_camera.down),
+            gamepad.rise - gamepad.descend,
+        );
         let look_dx = self.mouse_look_delta.0 + gamepad.look_x * pad_look_to_mouse;
         let look_dy = self.mouse_look_delta.1 + gamepad.look_y * pad_look_to_mouse;
         self.mouse_look_delta = (0.0, 0.0);
@@ -1438,15 +1796,23 @@ impl TlAppRuntime {
                     String::new()
                 }
             });
+        let scheduler_label = scheduler_path_label(self.scheduler_path);
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Substeps {}{}{}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Substeps {} | {:?} {} {:?}{}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
             self.tick_hz,
             tick.live_balls,
             visible_ball_count,
             substeps,
-            pacing_suffix,
+            self.adapter_backend,
+            scheduler_label,
+            self.present_mode,
+            if self.scheduler_fallback_applied {
+                " | fallback"
+            } else {
+                ""
+            },
             if self.adaptive_low_poly_override {
                 " | lowpoly"
             } else {
@@ -1456,7 +1822,8 @@ impl TlAppRuntime {
                 format!(" | scatter {}", tick.scattered_this_tick)
             } else {
                 String::new()
-            }
+            },
+            pacing_suffix,
         );
         self.window.set_title(&title);
 
@@ -1464,7 +1831,7 @@ impl TlAppRuntime {
             let broadphase = self.world.broadphase().stats();
             let narrowphase = self.world.narrowphase().stats();
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | substeps: {} | scattered: {:>4} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | substeps: {} | scattered: {:>4} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
@@ -1476,7 +1843,14 @@ impl TlAppRuntime {
                 self.mps_logical_threads,
                 broadphase.shard_count,
                 broadphase.candidate_pairs,
-                narrowphase.manifolds
+                narrowphase.manifolds,
+                self.platform,
+                self.adapter_backend,
+                scheduler_label,
+                self.present_mode,
+                self.scheduler_fallback_applied,
+                self.adapter_name,
+                self.scheduler_reason
             );
         }
 
@@ -1531,6 +1905,19 @@ fn resolve_asset_path(base_file: &Path, raw_path: &str) -> PathBuf {
 #[inline]
 fn axis_from_bools(positive: bool, negative: bool) -> f32 {
     (positive as i8 - negative as i8) as f32
+}
+
+#[inline]
+fn merge_axis_inputs(primary: f32, secondary: f32) -> f32 {
+    (primary + secondary).clamp(-1.0, 1.0)
+}
+
+#[inline]
+fn scheduler_path_label(path: GraphicsSchedulerPath) -> &'static str {
+    match path {
+        GraphicsSchedulerPath::Gms => "gms",
+        GraphicsSchedulerPath::Mgs => "mgs",
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2225,5 +2612,96 @@ fn print_tlsprite_event(prefix: &str, event: TlspriteHotReloadEvent) {
         TlspriteHotReloadEvent::SourceError { message } => {
             eprintln!("{prefix} source_error: {message}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_adapter_info(
+        name: &str,
+        backend: wgpu::Backend,
+        device_type: wgpu::DeviceType,
+    ) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.to_string(),
+            vendor: 0,
+            device: 0,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend,
+            subgroup_min_size: 1,
+            subgroup_max_size: 1,
+            transient_saves_memory: false,
+        }
+    }
+
+    #[test]
+    fn android_auto_scheduler_prefers_mgs() {
+        let info = make_adapter_info(
+            "NVIDIA GeForce RTX 5060 Ti",
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::DiscreteGpu,
+        );
+        let resolved = resolve_project_scheduler(
+            TlpfileGraphicsScheduler::Auto,
+            RuntimePlatform::Android,
+            &info,
+        )
+        .expect("auto scheduler should resolve");
+        assert_eq!(resolved.selected, GraphicsSchedulerPath::Mgs);
+    }
+
+    #[test]
+    fn android_explicit_gms_requires_supported_backend() {
+        let info = make_adapter_info(
+            "Mali-G610",
+            wgpu::Backend::Gl,
+            wgpu::DeviceType::IntegratedGpu,
+        );
+        let err = resolve_project_scheduler(
+            TlpfileGraphicsScheduler::Gms,
+            RuntimePlatform::Android,
+            &info,
+        )
+        .expect_err("explicit gms should be rejected on unsupported backend");
+        assert!(err.contains("unsupported"));
+    }
+
+    #[test]
+    fn android_explicit_mgs_is_accepted() {
+        let info = make_adapter_info(
+            "Adreno 740",
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::IntegratedGpu,
+        );
+        let resolved = resolve_project_scheduler(
+            TlpfileGraphicsScheduler::Mgs,
+            RuntimePlatform::Android,
+            &info,
+        )
+        .expect("mgs scheduler should resolve");
+        assert_eq!(resolved.selected, GraphicsSchedulerPath::Mgs);
+    }
+
+    #[test]
+    fn merged_axis_inputs_are_clamped() {
+        assert_eq!(merge_axis_inputs(0.9, 0.8), 1.0);
+        assert_eq!(merge_axis_inputs(-0.9, -0.8), -1.0);
+        assert_eq!(merge_axis_inputs(0.2, -0.1), 0.1);
+    }
+
+    #[test]
+    fn vulkan_fail_soft_message_contains_backend_diagnostics() {
+        let message = build_vulkan_unavailable_message(
+            "vk init failed",
+            Some(("FallbackGPU", wgpu::Backend::Gl)),
+        );
+        assert!(message.contains("Vulkan unavailable on Android"));
+        assert!(message.contains("FallbackGPU"));
+        assert!(message.contains("backend=Gl"));
     }
 }

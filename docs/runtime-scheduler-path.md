@@ -14,6 +14,18 @@ This note documents the automatic graphics scheduler selection used by runtime c
 - `Mgs` for mobile/TBDR-style integrated targets (Mali/Adreno/PowerVR/Apple mobile profile)
 - `Gms` for non-mobile throughput-oriented targets (typically discrete desktop GPUs)
 
+`runtime::choose_scheduler_path_for_platform(...)` adds explicit platform overrides:
+
+- Android `auto` policy is deterministic: `auto => Mgs`
+- Desktop policy keeps adapter-profile based choice (`Gms` vs `Mgs`)
+
+For `.tlpfile` projects, runtime applies precedence:
+
+1. manifest explicit `scheduler = gms|mgs` is attempted first
+2. if explicit value is unsupported on Android (for example `gms` on non-Vulkan), runtime enters
+   fail-soft mode with diagnostics
+3. `scheduler = auto` delegates to platform policy (Android -> `Mgs`)
+
 The decision includes:
 
 - selected path (`GraphicsSchedulerPath`)

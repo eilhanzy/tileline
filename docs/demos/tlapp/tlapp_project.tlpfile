@@ -2,7 +2,7 @@ tlpfile_v1
 
 [project]
 name = TLApp Showcase Project
-scheduler = gms
+scheduler = auto
 default_scene = main
 
 [scene.main]

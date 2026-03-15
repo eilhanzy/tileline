@@ -69,6 +69,41 @@ the active phase before broad beta feature expansion.
   - guide: `docs/mgs-orangepi5-validation.md`
 - prioritize integration bugs over new subsystem scope
 
+## Android Beta Track (Decision-Locked)
+
+Android is the official second platform in beta planning. This track runs in parallel with core
+desktop hardening.
+
+### Locked Defaults
+
+- ABI: `arm64-v8a` (`aarch64-linux-android`)
+- API level: `29+`
+- backend policy: Vulkan-first with fail-soft fallback UX (no hard crash)
+- scheduler policy: Android `auto => MGS`
+- mini editor scope: scene view + start/pause/stop + compile diagnostics
+- input scope: touch + gamepad
+- build path: `cargo-apk`
+
+### Phase Locks
+
+1. Stage 1: APK bring-up + scheduler + fail-soft
+   - shared app-runner layer used by desktop and Android entrypoints
+   - deterministic scheduler precedence for `.tlpfile`
+   - unsupported Vulkan must enter fail-soft mode with clear diagnostics
+2. Stage 2: Mini Editor V1
+   - Android editor-lite shell (scene preview + playback controls + diagnostics)
+   - touch-first preview control while keeping gamepad active
+   - advanced file/text editing remains desktop-focused in this stage
+3. Stage 3: Device + performance gates
+   - minimum two-device gate: one Adreno + one Mali/Panthor
+   - average FPS target >= 30
+   - P95 frame-time target near 33.3 ms band (short spikes diagnosable)
+
+### Release Mapping
+
+- `v0.2.x`: pre-beta Android enablement and policy stabilization
+- `v0.3.0-beta`: Android enters official beta scope
+
 ## Phase 0: Foundation Hardening
 
 This phase is partially complete. The remaining work is mostly stabilization.

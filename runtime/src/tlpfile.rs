@@ -8,7 +8,7 @@
 //! tlpfile_v1
 //! [project]
 //! name = TLApp Demo
-//! scheduler = gms
+//! scheduler = auto
 //! default_scene = main
 //!
 //! [scene.main]
@@ -30,18 +30,26 @@ use crate::tlsprite::{
 };
 
 /// Project-level graphics scheduler selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlpfileGraphicsScheduler {
+    /// Platform policy decides the runtime path.
+    Auto,
     /// Graphics Multi Scaler path (desktop/high-throughput).
-    #[default]
     Gms,
     /// Mobile Graphics Scaler path (mobile fallback).
     Mgs,
 }
 
+impl Default for TlpfileGraphicsScheduler {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 impl TlpfileGraphicsScheduler {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
             "gms" => Some(Self::Gms),
             "mgs" => Some(Self::Mgs),
             _ => None,
@@ -50,6 +58,7 @@ impl TlpfileGraphicsScheduler {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Gms => "gms",
             Self::Mgs => "mgs",
         }
@@ -256,7 +265,7 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
                         diagnostics.push(TlpfileDiagnostic {
                             level: TlpfileDiagnosticLevel::Warning,
                             line: line_no,
-                            message: "empty scheduler ignored (expected gms|mgs)".to_string(),
+                            message: "empty scheduler ignored (expected auto|gms|mgs)".to_string(),
                         });
                     } else if let Some(parsed) = TlpfileGraphicsScheduler::parse(value) {
                         project_scheduler = Some(parsed);
@@ -264,7 +273,7 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
                         diagnostics.push(TlpfileDiagnostic {
                             level: TlpfileDiagnosticLevel::Error,
                             line: line_no,
-                            message: format!("invalid scheduler '{value}' (expected gms|mgs)"),
+                            message: format!("invalid scheduler '{value}' (expected auto|gms|mgs)"),
                         });
                     }
                 }
@@ -829,6 +838,23 @@ mod tests {
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
         let project = out.project.expect("project");
         assert_eq!(project.scheduler, TlpfileGraphicsScheduler::Mgs);
+    }
+
+    #[test]
+    fn parses_project_scheduler_auto() {
+        let source = concat!(
+            "tlpfile_v1\n",
+            "[project]\n",
+            "name = Scheduler Auto Demo\n",
+            "scheduler = auto\n",
+            "default_scene = demo\n",
+            "[scene.demo]\n",
+            "tlscript = demo.tlscript\n",
+        );
+        let out = parse_tlpfile(source);
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        let project = out.project.expect("project");
+        assert_eq!(project.scheduler, TlpfileGraphicsScheduler::Auto);
     }
 
     #[test]

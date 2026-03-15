@@ -139,10 +139,7 @@ impl MgsPlanner {
     ///
     /// Bu yaklaşım, aynı total workload'u korurken tile başına geçici bellek baskısını düşürür.
     /// Amaç fallback zincirine daha geç düşmek ve stabilize edilmiş throughput sağlamaktır.
-    fn select_adaptive_tiling(
-        &self,
-        request: TileWorkloadRequest,
-    ) -> (u32, u32, u32, u32, u32) {
+    fn select_adaptive_tiling(&self, request: TileWorkloadRequest) -> (u32, u32, u32, u32, u32) {
         let mut tile_px = self.effective_tile_px().max(8);
         let min_tile_px = 8;
 

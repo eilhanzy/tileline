@@ -17,7 +17,7 @@ Minimal example:
 tlpfile_v1
 [project]
 name = TLApp Showcase Project
-scheduler = gms
+scheduler = auto
 default_scene = main
 
 [scene.main]
@@ -59,12 +59,22 @@ Optional:
 ## Scene View (Light Mode)
 
 - A lightweight animated scene preview is rendered directly in the GUI.
-- Preview compile path enforces `scheduler = gms` (MGS scenes are shown as compile-blocked in this viewer).
+- Preview compile path follows project scheduler policy (`auto|gms|mgs`).
 - `Light Mode` toggle keeps preview simulation cheap for editor responsiveness.
 - Playback controls:
   - `Start` runs preview simulation
   - `Pause` freezes simulation state
   - `Stop` resets and re-seeds preview bodies
+
+## Android Mini Editor V1
+
+Android builds run a reduced "editor-lite" layout to keep touch UX simple and avoid heavy panel
+traffic:
+
+- Included: scene preview, `Start/Pause/Stop`, compile diagnostics.
+- Hidden in V1: full file explorer, `.tlpfile` text editor, transform authoring panel.
+- Touch drag in preview pans the lightweight scene marker.
+- Gamepad support remains enabled and can be used together with touch input.
 
 ## Transform Tool (Pre-Beta)
 

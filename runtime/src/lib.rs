@@ -26,6 +26,7 @@
 //! - `wgpu_scene_renderer`: backend implementation for draw-path + HUD sprite rendering
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
+mod app_runner;
 mod draw_path;
 mod frame_loop;
 mod mas;
@@ -92,11 +93,16 @@ pub use scene_dispatch::{
 pub use scene_workload::{
     build_scene_workload_snapshot, estimate_scene_workload_requests, SceneWorkloadBridgeConfig,
 };
-pub use scheduler_path::{choose_scheduler_path, GraphicsSchedulerDecision, GraphicsSchedulerPath};
+pub use scheduler_path::{
+    choose_scheduler_path, choose_scheduler_path_for_platform, GraphicsSchedulerDecision,
+    GraphicsSchedulerPath, RuntimePlatform,
+};
 pub use telemetry_hud::{
     TelemetryHudComposer, TelemetryHudConfig, TelemetryHudMetrics, TelemetryHudSample,
 };
 pub use tlapp_app::run_from_env as run_tlapp_from_env;
+#[cfg(target_os = "android")]
+pub use tlapp_app::run_with_android_app as run_tlapp_with_android_app;
 pub use tljoint::{
     compile_tljoint_scene_from_path, load_tljoint, parse_tljoint, TljointDiagnostic,
     TljointDiagnosticLevel, TljointManifest, TljointParseOutcome, TljointSceneBinding,
@@ -108,6 +114,8 @@ pub use tlpfile::{
     TlpfileSceneBinding, TlpfileSceneBundle, TlpfileSceneCompileOutcome,
 };
 pub use tlpfile_gui::run_from_env as run_tlproject_gui_from_env;
+#[cfg(target_os = "android")]
+pub use tlpfile_gui::run_with_android_app as run_tlproject_gui_with_android_app;
 pub use tlscript_parallel::{
     TlscriptDispatchSubmission, TlscriptMpsDispatchConfig, TlscriptParallelRuntimeCoordinator,
     TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,

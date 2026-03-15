@@ -669,10 +669,23 @@ impl Renderer {
         let vsync_mode = runtime_vsync_from_override(options.vsync_override);
         let tuning = crate::MgsTuningProfile::from_profile(&profile);
         let bridge = MgsBridge::with_tuning(profile.clone(), tuning);
+        let supported_limits = adapter.limits();
+        let (required_limits, limit_clamp_report) =
+            clamp_required_limits_to_supported(wgpu::Limits::default(), &supported_limits);
+        if limit_clamp_report.any_clamped() {
+            eprintln!(
+                "MGS note: device limits clamped for adapter '{}' (1d={}, 2d={}, 3d={}, layers={})",
+                adapter_info.name,
+                required_limits.max_texture_dimension_1d,
+                required_limits.max_texture_dimension_2d,
+                required_limits.max_texture_dimension_3d,
+                required_limits.max_texture_array_layers
+            );
+        }
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("mgs-render-benchmark-device"),
-                required_limits: adapter.limits(),
+                required_limits,
                 ..Default::default()
             }))?;
 
@@ -1567,3 +1580,73 @@ impl fmt::Display for SimpleError {
 }
 
 impl Error for SimpleError {}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DeviceLimitClampReport {
+    max_texture_dimension_1d: bool,
+    max_texture_dimension_2d: bool,
+    max_texture_dimension_3d: bool,
+    max_texture_array_layers: bool,
+}
+
+impl DeviceLimitClampReport {
+    #[inline]
+    fn any_clamped(self) -> bool {
+        self.max_texture_dimension_1d
+            || self.max_texture_dimension_2d
+            || self.max_texture_dimension_3d
+            || self.max_texture_array_layers
+    }
+}
+
+fn clamp_required_limits_to_supported(
+    mut requested: wgpu::Limits,
+    supported: &wgpu::Limits,
+) -> (wgpu::Limits, DeviceLimitClampReport) {
+    let mut report = DeviceLimitClampReport::default();
+
+    if requested.max_texture_dimension_1d > supported.max_texture_dimension_1d {
+        requested.max_texture_dimension_1d = supported.max_texture_dimension_1d;
+        report.max_texture_dimension_1d = true;
+    }
+    if requested.max_texture_dimension_2d > supported.max_texture_dimension_2d {
+        requested.max_texture_dimension_2d = supported.max_texture_dimension_2d;
+        report.max_texture_dimension_2d = true;
+    }
+    if requested.max_texture_dimension_3d > supported.max_texture_dimension_3d {
+        requested.max_texture_dimension_3d = supported.max_texture_dimension_3d;
+        report.max_texture_dimension_3d = true;
+    }
+    if requested.max_texture_array_layers > supported.max_texture_array_layers {
+        requested.max_texture_array_layers = supported.max_texture_array_layers;
+        report.max_texture_array_layers = true;
+    }
+
+    (requested, report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamps_3d_dimension_to_supported_limit() {
+        let requested = wgpu::Limits::default();
+        let mut supported = wgpu::Limits::default();
+        supported.max_texture_dimension_3d = 512;
+
+        let (clamped, report) = clamp_required_limits_to_supported(requested, &supported);
+        assert!(report.max_texture_dimension_3d);
+        assert_eq!(clamped.max_texture_dimension_3d, 512);
+    }
+
+    #[test]
+    fn no_clamp_when_supported_limits_are_sufficient() {
+        let requested = wgpu::Limits::default();
+        let mut supported = requested.clone();
+        supported.max_texture_dimension_3d = requested.max_texture_dimension_3d.saturating_add(1);
+
+        let (_clamped, report) = clamp_required_limits_to_supported(requested, &supported);
+        assert!(!report.any_clamped());
+    }
+}

@@ -22,6 +22,7 @@ in `src/` crates (not benchmark-only code).
 - `runtime-scene-showcase.md`: runtime-side 3D scene/sprite payload model and bounce-tank showcase controller
 - `runtime-scene-workload.md`: runtime scene density to GMS dispatch workload mapping
 - `runtime-scheduler-path.md`: runtime automatic scheduler path selection (`GMS` vs `MGS`)
+- `runtime-android.md`: Android beta-track runtime policy, scheduler precedence, and fail-soft behavior
 - `runtime-draw-hud.md`: `SceneFrameInstances` -> draw-batch compile path and telemetry HUD overlay flow
 - `runtime-pak.md`: `.pak` archive format and pack/list/unpack runtime toolchain
 - `runtime-tlpfile-gui.md`: `.tlpfile` project manifest + general-purpose runtime GUI shell

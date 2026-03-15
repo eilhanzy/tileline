@@ -3,6 +3,12 @@ name = "runtime"
 version = "0.2.0"
 edition = "2021"
 
+[package.metadata.android]
+package = "dev.tileline.runtime"
+build_targets = ["aarch64-linux-android"]
+min_sdk_version = 29
+target_sdk_version = 34
+
 [features]
 default = ["gamepad"]
 gamepad = ["dep:gilrs"]
