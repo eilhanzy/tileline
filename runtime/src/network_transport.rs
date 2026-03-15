@@ -18,10 +18,10 @@ use std::sync::Arc;
 
 use mps::MpsScheduler;
 use nps::{
-    packet_semantics, BootstrapHello, BootstrapWelcome, DecodedPacketEvent, DecodedPayload,
-    EncodedDatagram, NetworkPacketConfig, NetworkPacketManager, NetworkPacketMetrics,
-    PacketDecodeFailure, PacketEncodeFailure, PacketLane, PeerId, PeerLinkMetrics,
-    NPS_HEADER_BYTES,
+    packet_semantics, select_mesh_snapshot_targets, BootstrapHello, BootstrapWelcome,
+    DecodedPacketEvent, DecodedPayload, EncodedDatagram, MeshFanoutConfig, NetworkPacketConfig,
+    NetworkPacketManager, NetworkPacketMetrics, NetworkTopology, PacketDecodeFailure,
+    PacketEncodeFailure, PacketLane, PeerId, PeerLinkMetrics, NPS_HEADER_BYTES,
 };
 use paradoxpe::PhysicsWorld;
 use tokio::net::{ToSocketAddrs, UdpSocket};
@@ -151,6 +151,10 @@ pub struct NetworkTransportConfig {
     pub snapshot_cadence: SnapshotCadenceConfig,
     /// Optional startup handshake policy.
     pub bootstrap: NetworkBootstrapConfig,
+    /// Snapshot replication topology policy.
+    pub snapshot_topology: NetworkTopology,
+    /// Fanout limits for decentralized mesh snapshot replication.
+    pub mesh_fanout: MeshFanoutConfig,
 }
 
 impl Default for NetworkTransportConfig {
@@ -164,6 +168,8 @@ impl Default for NetworkTransportConfig {
             recv_buffer_bytes: 2048,
             snapshot_cadence: SnapshotCadenceConfig::default(),
             bootstrap: NetworkBootstrapConfig::default(),
+            snapshot_topology: NetworkTopology::ClientServer,
+            mesh_fanout: MeshFanoutConfig::default(),
         }
     }
 }
@@ -251,7 +257,10 @@ pub struct NetworkTransportMetrics {
     pub snapshot_skipped_cadence: u64,
     pub snapshot_skipped_duplicate_tick: u64,
     pub snapshot_skipped_not_ready: u64,
+    pub snapshot_skipped_topology: u64,
     pub last_snapshot_tick: Option<u64>,
+    pub last_snapshot_ready_peers: usize,
+    pub last_snapshot_target_peers: usize,
     pub known_peers: usize,
     pub ready_peers: usize,
     pub pending_send_queue_len: usize,
@@ -289,7 +298,10 @@ pub struct NetworkTransportRuntime {
     snapshot_skipped_cadence: u64,
     snapshot_skipped_duplicate_tick: u64,
     snapshot_skipped_not_ready: u64,
+    snapshot_skipped_topology: u64,
     last_snapshot_tick: Option<u64>,
+    last_snapshot_ready_peers: usize,
+    last_snapshot_target_peers: usize,
     bootstrap_hello_queued: u64,
     bootstrap_hello_received: u64,
     bootstrap_welcome_queued: u64,
@@ -334,7 +346,10 @@ impl NetworkTransportRuntime {
             snapshot_skipped_cadence: 0,
             snapshot_skipped_duplicate_tick: 0,
             snapshot_skipped_not_ready: 0,
+            snapshot_skipped_topology: 0,
             last_snapshot_tick: None,
+            last_snapshot_ready_peers: 0,
+            last_snapshot_target_peers: 0,
             bootstrap_hello_queued: 0,
             bootstrap_hello_received: 0,
             bootstrap_welcome_queued: 0,
@@ -395,6 +410,16 @@ impl NetworkTransportRuntime {
             self.peer_sessions.get(&peer).map(|s| s.phase),
             Some(NetworkSessionPhase::Ready)
         )
+    }
+
+    /// Snapshot topology currently used by this runtime.
+    pub fn snapshot_topology(&self) -> NetworkTopology {
+        self.config.snapshot_topology
+    }
+
+    /// Update snapshot topology policy at runtime.
+    pub fn set_snapshot_topology(&mut self, topology: NetworkTopology) {
+        self.config.snapshot_topology = topology;
     }
 
     /// Queue a bootstrap hello packet for one peer and move it into negotiating state.
@@ -467,7 +492,7 @@ impl NetworkTransportRuntime {
         }
 
         let snapshot = world.capture_snapshot();
-        let mut queued = 0usize;
+        let mut ready_peers = Vec::with_capacity(self.peer_addrs.len());
         for &peer in self.peer_addrs.keys() {
             if self.bootstrap_active()
                 && !matches!(
@@ -478,6 +503,26 @@ impl NetworkTransportRuntime {
                 self.snapshot_skipped_not_ready = self.snapshot_skipped_not_ready.saturating_add(1);
                 continue;
             }
+            ready_peers.push(peer);
+        }
+        ready_peers.sort_unstable();
+        self.last_snapshot_ready_peers = ready_peers.len();
+
+        let target_peers = match self.config.snapshot_topology {
+            NetworkTopology::ClientServer | NetworkTopology::ListenHost => ready_peers,
+            NetworkTopology::PeerMesh => {
+                select_mesh_snapshot_targets(ready_peers.as_slice(), tick, self.config.mesh_fanout)
+            }
+        };
+        self.last_snapshot_target_peers = target_peers.len();
+        if self.last_snapshot_target_peers < self.last_snapshot_ready_peers {
+            self.snapshot_skipped_topology = self.snapshot_skipped_topology.saturating_add(
+                (self.last_snapshot_ready_peers - self.last_snapshot_target_peers) as u64,
+            );
+        }
+
+        let mut queued = 0usize;
+        for peer in target_peers {
             self.manager
                 .queue_physics_snapshot(peer, tick as u32, &snapshot);
             queued += 1;
@@ -590,7 +635,10 @@ impl NetworkTransportRuntime {
             snapshot_skipped_cadence: self.snapshot_skipped_cadence,
             snapshot_skipped_duplicate_tick: self.snapshot_skipped_duplicate_tick,
             snapshot_skipped_not_ready: self.snapshot_skipped_not_ready,
+            snapshot_skipped_topology: self.snapshot_skipped_topology,
             last_snapshot_tick: self.last_snapshot_tick,
+            last_snapshot_ready_peers: self.last_snapshot_ready_peers,
+            last_snapshot_target_peers: self.last_snapshot_target_peers,
             known_peers: self.peer_addrs.len(),
             ready_peers: self
                 .peer_sessions

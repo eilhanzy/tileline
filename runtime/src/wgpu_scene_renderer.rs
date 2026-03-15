@@ -13,6 +13,7 @@ use wgpu::util::DeviceExt;
 
 use crate::draw_path::{DrawLane, RuntimeDrawFrame};
 use crate::scene::{RayTracingMode, SceneLight, SceneLightKind, SpriteKind, MAX_SCENE_LIGHTS};
+use crate::upscaler::{resolve_fsr_status, FsrConfig, FsrStatus};
 
 const SPRITE_ATLAS_GRID_DIM: u32 = 4;
 const SPRITE_ATLAS_TILE_SIZE: u32 = 64;
@@ -114,7 +115,7 @@ struct UploadPlan {
 }
 
 /// Upload summary for one frame.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WgpuSceneRendererUploadStats {
     pub opaque_draw_calls: usize,
     pub transparent_draw_calls: usize,
@@ -125,6 +126,8 @@ pub struct WgpuSceneRendererUploadStats {
     pub light_count: usize,
     pub rt_active: bool,
     pub rt_dynamic_count: u32,
+    pub fsr_active: bool,
+    pub fsr_scale: f32,
 }
 
 /// Runtime RT status snapshot from scene renderer.
@@ -154,6 +157,7 @@ enum SphereLodMode {
 
 /// Runtime `wgpu` renderer for `RuntimeDrawFrame`.
 pub struct WgpuSceneRenderer {
+    adapter_backend: wgpu::Backend,
     camera_buffer: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
     light_buffer: wgpu::Buffer,
@@ -182,6 +186,8 @@ pub struct WgpuSceneRenderer {
     camera_target: [f32; 3],
     custom_mesh_slots: BTreeMap<u8, GpuMesh>,
     ray_tracing_status: SceneRayTracingStatus,
+    fsr_config: FsrConfig,
+    fsr_status: FsrStatus,
 }
 
 impl WgpuSceneRenderer {
@@ -356,6 +362,7 @@ impl WgpuSceneRenderer {
         });
 
         let renderer = Self {
+            adapter_backend,
             camera_buffer,
             scene_bind_group,
             light_buffer,
@@ -387,6 +394,8 @@ impl WgpuSceneRenderer {
                 RayTracingMode::Auto,
                 supports_ray_query(device, adapter_backend),
             ),
+            fsr_config: FsrConfig::default(),
+            fsr_status: resolve_fsr_status(FsrConfig::default(), adapter_backend),
         };
         renderer.write_camera_uniform(queue, surface_width.max(1), surface_height.max(1));
         renderer.write_lighting_uniform(queue, 0);
@@ -543,6 +552,8 @@ impl WgpuSceneRenderer {
             light_count: self.light_count as usize,
             rt_active: self.ray_tracing_status.active,
             rt_dynamic_count: self.ray_tracing_status.rt_dynamic_count,
+            fsr_active: self.fsr_status.active,
+            fsr_scale: self.fsr_status.render_scale,
         }
     }
 
@@ -558,13 +569,25 @@ impl WgpuSceneRenderer {
 
     /// Configure RT mode (Off/Auto/On) with fail-soft fallback when unsupported.
     pub fn set_ray_tracing_mode(&mut self, queue: &wgpu::Queue, mode: RayTracingMode) {
-        self.ray_tracing_status = resolve_rt_status(mode, self.ray_tracing_status.supports_ray_query);
+        self.ray_tracing_status =
+            resolve_rt_status(mode, self.ray_tracing_status.supports_ray_query);
         self.write_lighting_uniform(queue, self.light_count);
     }
 
     /// Current renderer RT status snapshot.
     pub fn ray_tracing_status(&self) -> SceneRayTracingStatus {
         self.ray_tracing_status.clone()
+    }
+
+    /// Configure FSR policy (mode/quality/sharpness) with fail-soft backend fallback.
+    pub fn set_fsr_config(&mut self, config: FsrConfig) {
+        self.fsr_config = config;
+        self.fsr_status = resolve_fsr_status(config, self.adapter_backend);
+    }
+
+    /// Current effective FSR status snapshot.
+    pub fn fsr_status(&self) -> FsrStatus {
+        self.fsr_status.clone()
     }
 
     pub fn encode(
@@ -660,13 +683,23 @@ impl WgpuSceneRenderer {
         let view_proj: Matrix4<f32> = proj.to_homogeneous() * view.to_homogeneous();
         let mut uniform = GpuCameraUniform {
             view_proj: [0.0; 16],
-            camera_eye: [self.camera_eye[0], self.camera_eye[1], self.camera_eye[2], 1.0],
+            camera_eye: [
+                self.camera_eye[0],
+                self.camera_eye[1],
+                self.camera_eye[2],
+                1.0,
+            ],
         };
         uniform.view_proj.copy_from_slice(view_proj.as_slice());
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
-    fn upload_lights(&mut self, queue: &wgpu::Queue, lights: &[SceneLight], dynamic_instances: usize) {
+    fn upload_lights(
+        &mut self,
+        queue: &wgpu::Queue,
+        lights: &[SceneLight],
+        dynamic_instances: usize,
+    ) {
         let selected = lights.len().min(MAX_SCENE_LIGHTS);
         let mut gpu_lights = vec![GpuLight::default(); selected.max(1)];
         for (index, light) in lights.iter().take(selected).enumerate() {
@@ -865,7 +898,12 @@ fn gpu_light_from_scene(light: &SceneLight) -> GpuLight {
         .to_radians()
         .cos();
     GpuLight {
-        position_kind: [light.position[0], light.position[1], light.position[2], kind],
+        position_kind: [
+            light.position[0],
+            light.position[1],
+            light.position[2],
+            kind,
+        ],
         direction_inner: [direction[0], direction[1], direction[2], inner],
         color_intensity: [color[0], color[1], color[2], light.intensity.max(0.0)],
         params: [
@@ -910,7 +948,8 @@ fn resolve_rt_status(mode: RayTracingMode, supports_ray_query: bool) -> SceneRay
             fallback_reason: if supports_ray_query {
                 String::new()
             } else {
-                "ray query unsupported on current adapter; auto fallback to forward path".to_string()
+                "ray query unsupported on current adapter; auto fallback to forward path"
+                    .to_string()
             },
             rt_dynamic_count: 0,
             rt_dynamic_cap: RT_DYNAMIC_CAP,

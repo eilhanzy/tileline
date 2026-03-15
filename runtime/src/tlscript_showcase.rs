@@ -767,10 +767,12 @@ impl EvalState {
     }
 
     fn light_override_mut(&mut self, id: u64) -> &mut SceneLightOverride {
-        self.light_overrides.entry(id).or_insert_with(|| SceneLightOverride {
-            id,
-            ..SceneLightOverride::default()
-        })
+        self.light_overrides
+            .entry(id)
+            .or_insert_with(|| SceneLightOverride {
+                id,
+                ..SceneLightOverride::default()
+            })
     }
 
     fn light_overrides_values(&self) -> Vec<SceneLightOverride> {

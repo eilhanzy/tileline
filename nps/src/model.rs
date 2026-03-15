@@ -7,6 +7,7 @@
 //! `manager.rs`, `reliability.rs`, and gameplay glue.
 
 use crate::packet::{PacketChannel, PayloadKind};
+use crate::reliability::PeerId;
 
 /// Logical traffic lane used for runtime budgeting and diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +170,84 @@ pub const fn packet_semantics(channel: PacketChannel, kind: PayloadKind) -> Pack
     }
 }
 
+/// Network replication topology used by runtime transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkTopology {
+    /// Canonical authoritative server or dedicated-host model.
+    ClientServer,
+    /// Listen-host variant where one player is authoritative host.
+    ListenHost,
+    /// Decentralized mesh model with deterministic fanout limits.
+    PeerMesh,
+}
+
+/// Deterministic fanout policy for decentralized mesh snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshFanoutConfig {
+    /// Maximum number of direct peers selected per snapshot tick.
+    pub max_direct_peers: usize,
+    /// Prime-like stride that rotates target windows across ticks.
+    pub rotation_stride: usize,
+}
+
+impl Default for MeshFanoutConfig {
+    fn default() -> Self {
+        Self {
+            max_direct_peers: 4,
+            rotation_stride: 3,
+        }
+    }
+}
+
+/// Deterministically select mesh snapshot targets for one tick.
+///
+/// This keeps decentralized packet fanout bounded while rotating recipients over time.
+/// Returned peers are sorted and unique for stable telemetry/reporting.
+pub fn select_mesh_snapshot_targets(
+    peers: &[PeerId],
+    tick: u64,
+    config: MeshFanoutConfig,
+) -> Vec<PeerId> {
+    if peers.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = peers.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let limit = config.max_direct_peers.max(1).min(sorted.len());
+    if limit >= sorted.len() {
+        return sorted;
+    }
+
+    let len = sorted.len();
+    let stride = config.rotation_stride.max(1) % len.max(1);
+    let mut step = if stride == 0 { 1 } else { stride };
+    while gcd(step, len) != 1 {
+        step = (step + 1).max(1) % len.max(1);
+        if step == 0 {
+            step = 1;
+        }
+    }
+    let start = ((tick as usize).wrapping_mul(step)) % len;
+    let mut out = Vec::with_capacity(limit);
+    for offset in 0..limit {
+        out.push(sorted[(start + offset * step) % len]);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+#[inline]
+const fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +295,32 @@ mod tests {
         assert_eq!(semantics.snapshot_mode, SnapshotMode::None);
         assert!(semantics.reliable);
         assert!(!semantics.sequenced);
+    }
+
+    #[test]
+    fn mesh_target_selection_is_bounded_and_deterministic() {
+        let peers = vec![9, 2, 7, 4, 3, 2];
+        let cfg = MeshFanoutConfig {
+            max_direct_peers: 3,
+            rotation_stride: 5,
+        };
+        let tick_1 = select_mesh_snapshot_targets(&peers, 1, cfg);
+        let tick_2 = select_mesh_snapshot_targets(&peers, 2, cfg);
+        assert_eq!(tick_1.len(), 3);
+        assert_eq!(tick_2.len(), 3);
+        assert_ne!(tick_1, tick_2);
+        let tick_1_repeat = select_mesh_snapshot_targets(&peers, 1, cfg);
+        assert_eq!(tick_1, tick_1_repeat);
+    }
+
+    #[test]
+    fn mesh_target_selection_returns_all_when_under_limit() {
+        let peers = vec![11, 1, 9];
+        let cfg = MeshFanoutConfig {
+            max_direct_peers: 8,
+            rotation_stride: 3,
+        };
+        let targets = select_mesh_snapshot_targets(&peers, 77, cfg);
+        assert_eq!(targets, vec![1, 9, 11]);
     }
 }

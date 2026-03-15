@@ -21,7 +21,10 @@ pub use manager::{
     NetworkPacketManager, NetworkPacketMetrics, OutboundPacketJob, OutboundPayload,
     PacketDecodeFailure, PacketEncodeFailure,
 };
-pub use model::{packet_semantics, PacketLane, PacketSemantics, SnapshotMode, TickScope};
+pub use model::{
+    packet_semantics, select_mesh_snapshot_targets, MeshFanoutConfig, NetworkTopology, PacketLane,
+    PacketSemantics, SnapshotMode, TickScope,
+};
 pub use packet::{
     decode_authority_transfer, decode_bootstrap_hello, decode_bootstrap_welcome,
     decode_input_frame, decode_lifecycle_event, decode_payload_owned, decode_transform_batch,

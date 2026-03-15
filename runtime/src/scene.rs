@@ -316,9 +316,7 @@ pub fn clamp_scene_lights_for_camera(
 
         let ld = sq_distance(left.position, camera_eye);
         let rd = sq_distance(right.position, camera_eye);
-        let distance_cmp = ld
-            .partial_cmp(&rd)
-            .unwrap_or(std::cmp::Ordering::Equal);
+        let distance_cmp = ld.partial_cmp(&rd).unwrap_or(std::cmp::Ordering::Equal);
         if !distance_cmp.is_eq() {
             return distance_cmp;
         }

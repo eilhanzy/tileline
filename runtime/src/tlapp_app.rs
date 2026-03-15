@@ -10,14 +10,14 @@ use crate::{
     app_runner, apply_scene_light_overrides, choose_scheduler_path_for_platform,
     clamp_scene_lights_for_camera, compile_tljoint_scene_from_path,
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, BounceTankRuntimePatch,
-    BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler, GraphicsSchedulerPath,
-    RayTracingMode, RenderSyncMode, RuntimePlatform, SceneFrameInstances, ScenePrimitive3d,
-    TelemetryHudComposer, TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel,
-    TljointSceneBundle, MAX_SCENE_LIGHTS,
-    TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlscriptCoordinateSpace,
-    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
-    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram,
-    TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer,
+    BounceTankSceneConfig, BounceTankSceneController, DrawPathCompiler, FsrConfig, FsrMode,
+    FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode, RuntimePlatform,
+    SceneFrameInstances, ScenePrimitive3d, TelemetryHudComposer, TelemetryHudSample,
+    TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel,
+    TlpfileGraphicsScheduler, TlscriptCoordinateSpace, TlscriptShowcaseConfig,
+    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
+    TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache,
+    TlspriteWatchReloader, WgpuSceneRenderer, MAX_SCENE_LIGHTS,
 };
 use gms::safe_default_required_limits_for_adapter;
 use nalgebra::Vector3;
@@ -98,6 +98,10 @@ struct CliOptions {
     render_distance: Option<f32>,
     adaptive_distance: ToggleAuto,
     distance_blur: ToggleAuto,
+    fsr_mode: FsrMode,
+    fsr_quality: FsrQualityPreset,
+    fsr_sharpness: f32,
+    fsr_scale_override: Option<f32>,
     fps_report_interval: Duration,
     project_path: Option<PathBuf>,
     joint_path: Option<PathBuf>,
@@ -116,6 +120,10 @@ impl Default for CliOptions {
             render_distance: None,
             adaptive_distance: ToggleAuto::Auto,
             distance_blur: ToggleAuto::Auto,
+            fsr_mode: FsrMode::Auto,
+            fsr_quality: FsrQualityPreset::Quality,
+            fsr_sharpness: 0.35,
+            fsr_scale_override: None,
             fps_report_interval: Duration::from_secs_f32(1.0),
             project_path: None,
             joint_path: None,
@@ -165,6 +173,30 @@ impl CliOptions {
                     let value = next_arg(&mut args, "--distance-blur")?;
                     options.distance_blur = ToggleAuto::parse(&value, "--distance-blur")?;
                 }
+                "--fsr" => {
+                    let value = next_arg(&mut args, "--fsr")?;
+                    options.fsr_mode =
+                        FsrMode::parse(&value).ok_or_else(|| -> Box<dyn Error> {
+                            "invalid --fsr value (expected off|auto|on|fsr1)".into()
+                        })?;
+                }
+                "--fsr-quality" => {
+                    let value = next_arg(&mut args, "--fsr-quality")?;
+                    options.fsr_quality = FsrQualityPreset::parse(&value).ok_or_else(
+                        || -> Box<dyn Error> {
+                            "invalid --fsr-quality value (expected native|ultra|quality|balanced|performance)"
+                                .into()
+                        },
+                    )?;
+                }
+                "--fsr-sharpness" => {
+                    let value = next_arg(&mut args, "--fsr-sharpness")?;
+                    options.fsr_sharpness = parse_fsr_sharpness(&value)?;
+                }
+                "--fsr-scale" => {
+                    let value = next_arg(&mut args, "--fsr-scale")?;
+                    options.fsr_scale_override = parse_fsr_scale(&value)?;
+                }
                 "--fps-report" => {
                     let value = next_arg(&mut args, "--fps-report")?;
                     options.fps_report_interval = parse_seconds_arg(&value, "--fps-report")?;
@@ -205,6 +237,9 @@ impl CliOptions {
         }
         if options.joint_scene.is_empty() {
             return Err("--scene cannot be empty".into());
+        }
+        if !(0.0..=1.0).contains(&options.fsr_sharpness) {
+            return Err("--fsr-sharpness must be in 0.0..=1.0".into());
         }
 
         Ok(options)
@@ -464,6 +499,29 @@ fn parse_render_distance(value: &str) -> Result<Option<f32>, Box<dyn Error>> {
     Ok(Some(distance))
 }
 
+fn parse_fsr_sharpness(value: &str) -> Result<f32, Box<dyn Error>> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| format!("invalid --fsr-sharpness value: {value}"))?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err("--fsr-sharpness must be in 0.0..=1.0".into());
+    }
+    Ok(parsed)
+}
+
+fn parse_fsr_scale(value: &str) -> Result<Option<f32>, Box<dyn Error>> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| format!("invalid --fsr-scale value: {value} (expected number or auto)"))?;
+    if !parsed.is_finite() || !(0.50..=1.0).contains(&parsed) {
+        return Err("--fsr-scale must be in 0.50..=1.0 or auto".into());
+    }
+    Ok(Some(parsed))
+}
+
 fn bootstrap_uncapped_fps_hint(logical_threads: usize) -> f32 {
     // Start from a conservative-but-fast target and let runtime sampling retune to hardware limit.
     (170.0 + logical_threads as f32 * 7.5).clamp(170.0, 420.0)
@@ -480,6 +538,10 @@ fn print_usage() {
     println!("  --render-distance <N|off> Distance cull radius for 3D balls (default: auto)");
     println!("  --adaptive-distance <mode> Adaptive distance tuning: auto|on|off (default: auto)");
     println!("  --distance-blur <mode>    Distance haze blur: auto|on|off (default: auto)");
+    println!("  --fsr off|auto|on         FSR policy mode (default: auto)");
+    println!("  --fsr-quality <preset>    FSR quality: native|ultra|quality|balanced|performance");
+    println!("  --fsr-sharpness <0..1>    FSR sharpen amount (default: 0.35)");
+    println!("  --fsr-scale <0.5..1|auto> Render scale override for FSR mode");
     println!("  --fps-report <sec>        CLI FPS report cadence (default: 1.0)");
     println!("  --project <path>          .tlpfile manifest (GMS required for TLApp runtime)");
     println!("  --joint <path>            .tljoint manifest path (overrides --script/--sprite)");
@@ -925,7 +987,10 @@ fn merge_showcase_output(
     }
 }
 
-fn merge_light_overrides(target: &mut Vec<crate::scene::SceneLightOverride>, incoming: &[crate::scene::SceneLightOverride]) {
+fn merge_light_overrides(
+    target: &mut Vec<crate::scene::SceneLightOverride>,
+    incoming: &[crate::scene::SceneLightOverride],
+) {
     for entry in incoming {
         if let Some(existing) = target.iter_mut().find(|cur| cur.id == entry.id) {
             if entry.enabled.is_some() {
@@ -1486,6 +1551,12 @@ impl TlAppRuntime {
             adapter_info.backend,
         );
         renderer.set_ray_tracing_mode(&queue, RayTracingMode::Auto);
+        renderer.set_fsr_config(FsrConfig {
+            mode: options.fsr_mode,
+            quality: options.fsr_quality,
+            sharpness: options.fsr_sharpness,
+            render_scale_override: options.fsr_scale_override,
+        });
         // Always keep a deterministic high-quality FBX-equivalent mesh in slot 2 so script
         // `set_ball_mesh_slot(2)` stays stable even when tlsprite binding fails.
         renderer.bind_builtin_sphere_mesh_slot(&device, DEFAULT_FBX_BALL_SLOT, true);
@@ -1509,8 +1580,9 @@ impl TlAppRuntime {
                 .clamp(guarded_distance, 260.0);
         }
         renderer.set_camera_view(&queue, size.width.max(1), size.height.max(1), eye, target);
+        let fsr_status = renderer.fsr_status();
         eprintln!(
-            "[mps] cpu profile logical={} physical={} mobile_tuning={} little_core_class={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={} render_distance={:?} adaptive_distance={} distance_blur={:?} ({}) adaptive_pacer={} ({:.0} fps)",
+            "[mps] cpu profile logical={} physical={} mobile_tuning={} little_core_class={} thread_scale={:.2} broadphase_chunk={} max_pairs={} solver_iters={} max_substeps={} render_distance={:?} adaptive_distance={} distance_blur={:?} ({}) adaptive_pacer={} ({:.0} fps) fsr={:?} active={} scale={:.2} sharpness={:.2} reason={}",
             logical_threads,
             physical_threads,
             mobile_class_tuning,
@@ -1525,7 +1597,16 @@ impl TlAppRuntime {
             distance_blur_mode,
             distance_blur_enabled,
             adaptive_pacer_enabled,
-            adaptive_pacer_fps
+            adaptive_pacer_fps,
+            options.fsr_mode,
+            fsr_status.active,
+            fsr_status.render_scale,
+            fsr_status.sharpness,
+            if fsr_status.reason.is_empty() {
+                "none"
+            } else {
+                fsr_status.reason.as_str()
+            }
         );
 
         let draw_compiler = DrawPathCompiler::new();
@@ -2363,7 +2444,11 @@ impl TlAppRuntime {
                 rt_mode: self.rt_mode,
                 rt_active: self.renderer.ray_tracing_status().active,
                 rt_dynamic_count: self.renderer.ray_tracing_status().rt_dynamic_count,
-                rt_fallback: !self.renderer.ray_tracing_status().fallback_reason.is_empty(),
+                rt_fallback: !self
+                    .renderer
+                    .ray_tracing_status()
+                    .fallback_reason
+                    .is_empty(),
             },
             &mut frame.sprites,
         );
@@ -2372,6 +2457,7 @@ impl TlAppRuntime {
             .renderer
             .upload_draw_frame(&self.device, &self.queue, &draw);
         let rt_status = self.renderer.ray_tracing_status();
+        let fsr_status = self.renderer.fsr_status();
 
         let output = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -2442,7 +2528,7 @@ impl TlAppRuntime {
             None => String::new(),
         };
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | Substeps {} | {:?} {} {:?}{}{}{}{}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | {:?} {} {:?}{}{}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
             self.tick_hz,
@@ -2452,6 +2538,9 @@ impl TlAppRuntime {
             self.rt_mode,
             if rt_status.active { "on" } else { "off" },
             rt_status.rt_dynamic_count,
+            fsr_status.requested_mode,
+            if fsr_status.active { "on" } else { "off" },
+            fsr_status.render_scale,
             substeps,
             self.adapter_backend,
             scheduler_label,
@@ -2480,7 +2569,7 @@ impl TlAppRuntime {
             let broadphase = self.world.broadphase().stats();
             let narrowphase = self.world.narrowphase().stats();
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | lights: {:>2} | substeps: {} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | lights: {:>2} | substeps: {} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
@@ -2501,6 +2590,15 @@ impl TlAppRuntime {
                     "none"
                 } else {
                     rt_status.fallback_reason.as_str()
+                },
+                fsr_status.requested_mode,
+                fsr_status.active,
+                fsr_status.render_scale,
+                fsr_status.sharpness,
+                if fsr_status.reason.is_empty() {
+                    "none"
+                } else {
+                    fsr_status.reason.as_str()
                 },
                 self.mps_logical_threads,
                 broadphase.shard_count,

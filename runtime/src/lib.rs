@@ -18,6 +18,7 @@
 //! - `tlapp_app`: canonical TLApp runtime entry moved from examples into core runtime
 //! - `tlpfile`: project manifest that unifies `.tlscript` / `.tlsprite` / `.tljoint`
 //! - `tlpfile_gui`: general-purpose GUI shell driven by `.tlpfile`
+//! - `upscaler`: runtime FSR policy and fail-soft render-scale resolution
 //! - `tljoint`: scene-based multi `.tlscript` + multi `.tlsprite` binding manifest
 //! - `tlsprite`: `.tlsprite` sprite program parser and frame emitter
 //! - `tlsprite_editor_cli`: runtime-owned CLI entry for list-mode `.tlsprite` editing
@@ -48,6 +49,7 @@ mod tlscript_showcase;
 mod tlsprite;
 mod tlsprite_editor;
 mod tlsprite_editor_cli;
+mod upscaler;
 mod wgpu_render_loop;
 mod wgpu_scene_renderer;
 
@@ -72,6 +74,7 @@ pub use network_transport::{
     NetworkTransportConfig, NetworkTransportMetrics, NetworkTransportRuntime,
     SnapshotCadenceConfig,
 };
+pub use nps::{MeshFanoutConfig, NetworkTopology};
 pub use pak::{
     create_pak_from_dir, list_pak, read_file_from_pak, unpack_pak, PakBuildReport, PakEntry,
     PakIndex, PakUnpackReport,
@@ -82,10 +85,10 @@ pub use pre_alpha_loop::{
 };
 pub use scene::{
     apply_scene_light_overrides, clamp_scene_lights_for_camera, BounceTankPatchMetrics,
-    BounceTankRuntimePatch, BounceTankSceneConfig, BounceTankSceneController, BounceTankTickMetrics,
-    RayTracingMode, RenderSyncMode, SceneFrameInstances, SceneInstance3d, SceneLight,
-    SceneLightKind, SceneLightOverride, SceneMaterial, ScenePrimitive3d, SceneTransform3d,
-    ShadingModel, SpriteInstance, SpriteKind, TickRatePolicy, MAX_SCENE_LIGHTS,
+    BounceTankRuntimePatch, BounceTankSceneConfig, BounceTankSceneController,
+    BounceTankTickMetrics, RayTracingMode, RenderSyncMode, SceneFrameInstances, SceneInstance3d,
+    SceneLight, SceneLightKind, SceneLightOverride, SceneMaterial, ScenePrimitive3d,
+    SceneTransform3d, ShadingModel, SpriteInstance, SpriteKind, TickRatePolicy, MAX_SCENE_LIGHTS,
 };
 pub use scene_dispatch::{
     submit_scene_estimate_to_bridge, SceneDispatchBridgeConfig, SceneDispatchLaneSummary,
@@ -130,14 +133,15 @@ pub use tlsprite::{
     compile_tlsprite, compile_tlsprite_pack, compile_tlsprite_with_extra_roots, load_tlsprite_pack,
     TlspriteCacheLoadOutcome, TlspriteCacheLoadSource, TlspriteCompileOutcome, TlspriteDiagnostic,
     TlspriteDiagnosticLevel, TlspriteFrameContext, TlspriteHotReloadConfig, TlspriteHotReloadEvent,
-    TlspriteHotReloader, TlspritePack, TlspriteProgram, TlspriteProgramCache,
-    TlspriteProgramCacheStats, TlspriteLightDef, TlspriteScaleAxis, TlspriteScaleSource,
-    TlspriteSpriteDef, TlspriteWatchBackend, TlspriteWatchConfig, TlspriteWatchReloader,
+    TlspriteHotReloader, TlspriteLightDef, TlspritePack, TlspriteProgram, TlspriteProgramCache,
+    TlspriteProgramCacheStats, TlspriteScaleAxis, TlspriteScaleSource, TlspriteSpriteDef,
+    TlspriteWatchBackend, TlspriteWatchConfig, TlspriteWatchReloader,
 };
 pub use tlsprite_editor::{
     TlspriteEditorPalette, TlspriteEditorTheme, TlspriteListDocument, TlspriteListRow,
 };
 pub use tlsprite_editor_cli::run_from_env as run_tlsprite_editor_from_env;
+pub use upscaler::{resolve_fsr_status, FsrConfig, FsrMode, FsrQualityPreset, FsrStatus};
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,
     SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,

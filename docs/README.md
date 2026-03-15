@@ -13,6 +13,7 @@ in `src/` crates (not benchmark-only code).
 - `tileline-alpha-plan.md`: Alpha A1 scope for `.tlsprite` list editor, MAS scaffold, and theme baseline
 - `tileline-pre-beta-fsr-plan.md`: pre-beta milestones with FSR 1.0, adaptive quality, and full input accessibility
 - `tileline-beta-roadmap.md`: phased beta roadmap, integration milestones, and deferred scope
+- `tileline-v0.3.0-foundation.md`: v0.3.0 foundation scope for runtime FSR policy and decentralized NPS topology
 - `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
 - `nps-runtime-plan.md`: canonical NPS channel, tick, snapshot, and transport runtime plan
 - `paradoxpe-foundation.md`: ParadoxPE handles, SoA storage, broadphase/solver pipeline, snapshot base, and script ABI
@@ -24,6 +25,7 @@ in `src/` crates (not benchmark-only code).
 - `runtime-scheduler-path.md`: runtime automatic scheduler path selection (`GMS` vs `MGS`)
 - `runtime-android.md`: Android beta-track runtime policy, scheduler precedence, and fail-soft behavior
 - `runtime-draw-hud.md`: `SceneFrameInstances` -> draw-batch compile path and telemetry HUD overlay flow
+- `runtime-upscaler.md`: runtime FSR policy surface and TLApp integration points
 - `runtime-pak.md`: `.pak` archive format and pack/list/unpack runtime toolchain
 - `runtime-tlpfile-gui.md`: `.tlpfile` project manifest + general-purpose runtime GUI shell
 - `runtime-tlsprite.md`: `.tlsprite` parser, runtime sprite program flow, and HUD scaling signals

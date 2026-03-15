@@ -20,6 +20,20 @@ It does not yet define encryption or matchmaking. A lightweight bootstrap sessio
 (`BootstrapHello` / `BootstrapWelcome`) and feeds runtime peer states
 (`Connecting -> Negotiating -> Ready`).
 
+## v0.3.0 Foundation Update
+
+Runtime/NPS now includes a topology foundation layer:
+
+- `NetworkTopology`: `ClientServer | ListenHost | PeerMesh`
+- `MeshFanoutConfig` + deterministic `select_mesh_snapshot_targets(...)`
+- transport metrics for topology fanout decisions:
+  - `snapshot_skipped_topology`
+  - `last_snapshot_ready_peers`
+  - `last_snapshot_target_peers`
+
+`PeerMesh` currently bounds direct snapshot fanout deterministically; peer scoring/relay preference
+is the next step.
+
 ## Canonical Channel Model
 
 NPS should use a small fixed set of traffic lanes.

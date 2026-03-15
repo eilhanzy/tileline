@@ -1300,9 +1300,7 @@ impl PendingEntry {
                 other => diagnostics.push(TlspriteDiagnostic {
                     level: TlspriteDiagnosticLevel::Error,
                     line,
-                    message: format!(
-                        "invalid entry_kind '{other}' (expected sprite|light)"
-                    ),
+                    message: format!("invalid entry_kind '{other}' (expected sprite|light)"),
                 }),
             },
             "sprite_id" => {
@@ -1516,17 +1514,17 @@ impl PendingEntry {
             diagnostics.push(TlspriteDiagnostic {
                 level: TlspriteDiagnosticLevel::Error,
                 line: self.line_started,
-                message: format!(
-                    "section '{}' is missing required key 'light_id'",
-                    self.name
-                ),
+                message: format!("section '{}' is missing required key 'light_id'", self.name),
             });
             return None;
         };
         let kind = self.light_type.unwrap_or(SceneLightKind::Point);
         let position = self.position.unwrap_or([0.0, 4.0, 0.0]);
         let mut direction = self.direction.unwrap_or([0.0, -1.0, 0.0]);
-        let mut color = self.color.map(|rgba| [rgba[0], rgba[1], rgba[2]]).unwrap_or([1.0; 3]);
+        let mut color = self
+            .color
+            .map(|rgba| [rgba[0], rgba[1], rgba[2]])
+            .unwrap_or([1.0; 3]);
         for c in &mut color {
             *c = c.clamp(0.0, 16.0);
         }
