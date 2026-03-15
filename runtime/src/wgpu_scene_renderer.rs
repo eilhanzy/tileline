@@ -85,6 +85,26 @@ impl Default for GpuLightingUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+struct GpuUpscaleUniform {
+    inv_source_size: [f32; 2],
+    source_uv_scale: [f32; 2],
+    sharpness: f32,
+    _pad: [f32; 3],
+}
+
+impl Default for GpuUpscaleUniform {
+    fn default() -> Self {
+        Self {
+            inv_source_size: [1.0, 1.0],
+            source_uv_scale: [1.0, 1.0],
+            sharpness: 0.0,
+            _pad: [0.0; 3],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 struct GpuSpriteVertex {
     local_pos: [f32; 2],
 }
@@ -158,6 +178,7 @@ enum SphereLodMode {
 /// Runtime `wgpu` renderer for `RuntimeDrawFrame`.
 pub struct WgpuSceneRenderer {
     adapter_backend: wgpu::Backend,
+    surface_color_format: wgpu::TextureFormat,
     camera_buffer: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
     light_buffer: wgpu::Buffer,
@@ -165,8 +186,15 @@ pub struct WgpuSceneRenderer {
     pipeline_opaque: wgpu::RenderPipeline,
     pipeline_transparent: wgpu::RenderPipeline,
     pipeline_sprite: wgpu::RenderPipeline,
+    pipeline_upscale: wgpu::RenderPipeline,
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    _fsr_scene_texture: wgpu::Texture,
+    fsr_scene_view: wgpu::TextureView,
+    fsr_bind_group_layout: wgpu::BindGroupLayout,
+    fsr_sampler: wgpu::Sampler,
+    fsr_bind_group: wgpu::BindGroup,
+    fsr_uniform_buffer: wgpu::Buffer,
     _sprite_atlas_texture: wgpu::Texture,
     sprite_atlas_bind_group: wgpu::BindGroup,
     box_mesh: GpuMesh,
@@ -188,6 +216,8 @@ pub struct WgpuSceneRenderer {
     ray_tracing_status: SceneRayTracingStatus,
     fsr_config: FsrConfig,
     fsr_status: FsrStatus,
+    surface_width: u32,
+    surface_height: u32,
 }
 
 impl WgpuSceneRenderer {
@@ -279,6 +309,10 @@ impl WgpuSceneRenderer {
             label: Some("runtime-scene-sprite-shader"),
             source: wgpu::ShaderSource::Wgsl(SCENE_SPRITE_WGSL.into()),
         });
+        let shader_upscale = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("runtime-scene-upscale-shader"),
+            source: wgpu::ShaderSource::Wgsl(SCENE_UPSCALE_WGSL.into()),
+        });
 
         let sprite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("runtime-scene-sprite-bgl"),
@@ -301,6 +335,37 @@ impl WgpuSceneRenderer {
                 },
             ],
         });
+        let fsr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("runtime-scene-fsr-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
 
         let layout_3d = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("runtime-scene-3d-layout"),
@@ -310,6 +375,11 @@ impl WgpuSceneRenderer {
         let layout_sprite = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("runtime-scene-sprite-layout"),
             bind_group_layouts: &[&sprite_bgl, &camera_bgl],
+            immediate_size: 0,
+        });
+        let layout_upscale = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("runtime-scene-upscale-layout"),
+            bind_group_layouts: &[&fsr_bgl],
             immediate_size: 0,
         });
 
@@ -335,12 +405,55 @@ impl WgpuSceneRenderer {
         );
         let pipeline_sprite =
             create_sprite_pipeline(device, &layout_sprite, &shader_sprite, color_format);
+        let pipeline_upscale =
+            create_upscale_pipeline(device, &layout_upscale, &shader_upscale, color_format);
         let (depth_texture, depth_view) = create_depth_resources(
             device,
             surface_width.max(1),
             surface_height.max(1),
             "runtime-scene-depth",
         );
+        let (fsr_scene_texture, fsr_scene_view) = create_fsr_scene_resources(
+            device,
+            color_format,
+            surface_width.max(1),
+            surface_height.max(1),
+            "runtime-scene-fsr-source",
+        );
+        let fsr_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("runtime-scene-fsr-uniform-buffer"),
+            size: std::mem::size_of::<GpuUpscaleUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fsr_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("runtime-scene-fsr-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let fsr_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("runtime-scene-fsr-bg"),
+            layout: &fsr_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&fsr_scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&fsr_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fsr_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
         let (sprite_atlas_texture, sprite_atlas_bind_group) =
             create_default_sprite_atlas_resources(device, queue, &sprite_bgl);
 
@@ -363,6 +476,7 @@ impl WgpuSceneRenderer {
 
         let renderer = Self {
             adapter_backend,
+            surface_color_format: color_format,
             camera_buffer,
             scene_bind_group,
             light_buffer,
@@ -370,8 +484,15 @@ impl WgpuSceneRenderer {
             pipeline_opaque,
             pipeline_transparent,
             pipeline_sprite,
+            pipeline_upscale,
             _depth_texture: depth_texture,
             depth_view,
+            _fsr_scene_texture: fsr_scene_texture,
+            fsr_scene_view,
+            fsr_bind_group_layout: fsr_bgl,
+            fsr_sampler,
+            fsr_bind_group,
+            fsr_uniform_buffer,
             _sprite_atlas_texture: sprite_atlas_texture,
             sprite_atlas_bind_group,
             box_mesh,
@@ -396,18 +517,55 @@ impl WgpuSceneRenderer {
             ),
             fsr_config: FsrConfig::default(),
             fsr_status: resolve_fsr_status(FsrConfig::default(), adapter_backend),
+            surface_width: surface_width.max(1),
+            surface_height: surface_height.max(1),
         };
         renderer.write_camera_uniform(queue, surface_width.max(1), surface_height.max(1));
         renderer.write_lighting_uniform(queue, 0);
+        renderer.write_fsr_uniform(queue);
         renderer
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
-        self.write_camera_uniform(queue, width.max(1), height.max(1));
-        let (depth_texture, depth_view) =
-            create_depth_resources(device, width.max(1), height.max(1), "runtime-scene-depth");
+        self.surface_width = width.max(1);
+        self.surface_height = height.max(1);
+        self.write_camera_uniform(queue, self.surface_width, self.surface_height);
+        let (depth_texture, depth_view) = create_depth_resources(
+            device,
+            self.surface_width,
+            self.surface_height,
+            "runtime-scene-depth",
+        );
         self._depth_texture = depth_texture;
         self.depth_view = depth_view;
+        let (fsr_scene_texture, fsr_scene_view) = create_fsr_scene_resources(
+            device,
+            self.surface_color_format,
+            self.surface_width,
+            self.surface_height,
+            "runtime-scene-fsr-source",
+        );
+        self._fsr_scene_texture = fsr_scene_texture;
+        self.fsr_scene_view = fsr_scene_view;
+        self.fsr_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("runtime-scene-fsr-bg"),
+            layout: &self.fsr_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.fsr_scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.fsr_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.fsr_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        self.write_fsr_uniform(queue);
     }
 
     /// Overrides the active camera transform used by scene rendering.
@@ -580,9 +738,10 @@ impl WgpuSceneRenderer {
     }
 
     /// Configure FSR policy (mode/quality/sharpness) with fail-soft backend fallback.
-    pub fn set_fsr_config(&mut self, config: FsrConfig) {
+    pub fn set_fsr_config(&mut self, queue: &wgpu::Queue, config: FsrConfig) {
         self.fsr_config = config;
         self.fsr_status = resolve_fsr_status(config, self.adapter_backend);
+        self.write_fsr_uniform(queue);
     }
 
     /// Current effective FSR status snapshot.
@@ -596,10 +755,16 @@ impl WgpuSceneRenderer {
         target: &wgpu::TextureView,
         clear: wgpu::Color,
     ) {
+        let (source_width, source_height, _, _, fsr_scene_active) = self.compute_fsr_source_dims();
+        let scene_target = if fsr_scene_active {
+            &self.fsr_scene_view
+        } else {
+            target
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("runtime-scene-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
+                view: scene_target,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -619,6 +784,17 @@ impl WgpuSceneRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if fsr_scene_active {
+            pass.set_viewport(
+                0.0,
+                0.0,
+                source_width as f32,
+                source_height as f32,
+                0.0,
+                1.0,
+            );
+            pass.set_scissor_rect(0, 0, source_width, source_height);
+        }
 
         if !self.ranges.is_empty() {
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
@@ -665,6 +841,29 @@ impl WgpuSceneRenderer {
                 (self.sprite_count as usize * std::mem::size_of::<GpuSpriteInstance>()) as u64;
             pass.set_vertex_buffer(1, self.sprite_instance_buffer.slice(0..sprite_bytes));
             pass.draw(0..6, 0..self.sprite_count);
+        }
+        drop(pass);
+
+        if fsr_scene_active {
+            let mut upscale = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("runtime-scene-upscale-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            upscale.set_pipeline(&self.pipeline_upscale);
+            upscale.set_bind_group(0, &self.fsr_bind_group, &[]);
+            upscale.draw(0..3, 0..1);
         }
     }
 
@@ -731,6 +930,44 @@ impl WgpuSceneRenderer {
             _pad: [0; 3],
         };
         queue.write_buffer(&self.lighting_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn write_fsr_uniform(&self, queue: &wgpu::Queue) {
+        let (source_width, source_height, source_uv_x, source_uv_y, active) =
+            self.compute_fsr_source_dims();
+        let uniform = GpuUpscaleUniform {
+            inv_source_size: [1.0 / source_width as f32, 1.0 / source_height as f32],
+            source_uv_scale: [source_uv_x, source_uv_y],
+            sharpness: if active {
+                self.fsr_status.sharpness
+            } else {
+                0.0
+            },
+            _pad: [0.0; 3],
+        };
+        queue.write_buffer(&self.fsr_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn compute_fsr_source_dims(&self) -> (u32, u32, f32, f32, bool) {
+        let active = self.fsr_status.active && self.fsr_status.render_scale < 0.999;
+        if !active {
+            return (
+                self.surface_width.max(1),
+                self.surface_height.max(1),
+                1.0,
+                1.0,
+                false,
+            );
+        }
+        let scaled_w = ((self.surface_width as f32 * self.fsr_status.render_scale)
+            .round()
+            .max(1.0)) as u32;
+        let scaled_h = ((self.surface_height as f32 * self.fsr_status.render_scale)
+            .round()
+            .max(1.0)) as u32;
+        let uv_x = scaled_w as f32 / self.surface_width.max(1) as f32;
+        let uv_y = scaled_h as f32 / self.surface_height.max(1) as f32;
+        (scaled_w, scaled_h, uv_x, uv_y, true)
     }
 }
 
@@ -1099,6 +1336,42 @@ fn create_sprite_pipeline(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_upscale_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("runtime-scene-upscale-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -1571,6 +1844,31 @@ fn create_depth_resources(
     (texture, view)
 }
 
+fn create_fsr_scene_resources(
+    device: &wgpu::Device,
+    color_format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: color_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
 fn create_default_sprite_atlas_resources(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1935,6 +2233,56 @@ fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
     }
 
     return vec4<f32>(color, alpha);
+}
+"#;
+
+const SCENE_UPSCALE_WGSL: &str = r#"
+struct UpscaleUniform {
+    inv_source_size: vec2<f32>,
+    source_uv_scale: vec2<f32>,
+    sharpness: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_smp: sampler;
+@group(0) @binding(2) var<uniform> u_upscale: UpscaleUniform;
+
+struct VSOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VSOut {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(-1.0,  1.0),
+        vec2<f32>( 3.0,  1.0)
+    );
+    let pos = positions[vid];
+    var out: VSOut;
+    out.position = vec4<f32>(pos, 0.0, 1.0);
+    out.uv = pos * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
+    let uv = clamp(input.uv * u_upscale.source_uv_scale, vec2<f32>(0.0), vec2<f32>(1.0));
+    let center = textureSample(src_tex, src_smp, uv);
+
+    // RCAS-like lightweight unsharp mask to preserve contrast after spatial upscale.
+    let texel = u_upscale.inv_source_size;
+    let s0 = textureSample(src_tex, src_smp, uv + vec2<f32>( texel.x, 0.0));
+    let s1 = textureSample(src_tex, src_smp, uv + vec2<f32>(-texel.x, 0.0));
+    let s2 = textureSample(src_tex, src_smp, uv + vec2<f32>(0.0,  texel.y));
+    let s3 = textureSample(src_tex, src_smp, uv + vec2<f32>(0.0, -texel.y));
+    let neighborhood = (s0 + s1 + s2 + s3) * 0.25;
+    let sharpened = center.rgb + (center.rgb - neighborhood.rgb) * (u_upscale.sharpness * 1.65);
+    return vec4<f32>(max(sharpened, vec3<f32>(0.0)), center.a);
 }
 "#;
 

@@ -9,12 +9,14 @@ This track moves scope from `v0.2.x` polish into `v0.3.0` feature foundations:
 
 ## 1) Runtime FSR Foundation
 
-Implemented in `runtime/src/upscaler.rs` and integrated into TLApp runtime:
+Implemented in `runtime/src/upscaler.rs`, `runtime/src/wgpu_scene_renderer.rs`, and integrated
+into TLApp runtime:
 
 - `FsrMode`: `Off | Auto | On`
 - `FsrQualityPreset`: `Native | UltraQuality | Quality | Balanced | Performance`
 - `FsrConfig` and resolved `FsrStatus` (active/fallback reason/render scale/sharpness)
 - backend fail-soft resolution for unsupported backends
+- renderer two-stage path (internal scaled source + fullscreen upscale/sharpen pass)
 
 TLApp CLI additions:
 
@@ -42,8 +44,7 @@ Additional transport metrics:
 
 ## 3) Next v0.3.0 Steps
 
-1. Connect true FSR render pass path (EASU/RCAS fullscreen pipeline) to renderer targets.
+1. Tighten FSR 1.0 parity (`EASU/RCAS`) and tune quality/perf presets per hardware class.
 2. Add NPS peer scoring (RTT/loss-aware relay preference) on top of deterministic fanout.
 3. Bind topology and FSR profiles into `.tlpfile` scene/project policy.
 4. Add Android + Mali/Panthor + Adreno acceptance gates for v0.3.0.
-

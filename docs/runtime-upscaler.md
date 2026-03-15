@@ -8,6 +8,9 @@ This document describes the v0.3.0 foundation added in `runtime/src/upscaler.rs`
 - `FsrQualityPreset`: `Native | UltraQuality | Quality | Balanced | Performance`
 - `FsrConfig` and resolved `FsrStatus`
 - fail-soft backend gating (`Vulkan/Metal/DX12` accepted by policy, others fallback to native)
+- two-stage render path in `WgpuSceneRenderer`:
+  - scene pass into internal source target (scaled viewport when FSR active)
+  - fullscreen upscale pass with RCAS-like sharpen kernel
 
 Runtime integration points:
 
@@ -24,6 +27,6 @@ Runtime integration points:
 
 ## Notes
 
-This is the policy/config foundation pass. Full FSR 1.0 shader pass integration
-(`EASU + RCAS`) is the next v0.3.0 renderer milestone.
-
+Current pass is an engine-owned spatial upscaler + sharpen implementation for v0.3.0 foundation.
+Planned next step is stricter AMD FSR 1.0 parity tuning (`EASU + RCAS` parameterization and
+quality validation matrix).

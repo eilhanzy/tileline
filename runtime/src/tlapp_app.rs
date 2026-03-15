@@ -1551,12 +1551,15 @@ impl TlAppRuntime {
             adapter_info.backend,
         );
         renderer.set_ray_tracing_mode(&queue, RayTracingMode::Auto);
-        renderer.set_fsr_config(FsrConfig {
-            mode: options.fsr_mode,
-            quality: options.fsr_quality,
-            sharpness: options.fsr_sharpness,
-            render_scale_override: options.fsr_scale_override,
-        });
+        renderer.set_fsr_config(
+            &queue,
+            FsrConfig {
+                mode: options.fsr_mode,
+                quality: options.fsr_quality,
+                sharpness: options.fsr_sharpness,
+                render_scale_override: options.fsr_scale_override,
+            },
+        );
         // Always keep a deterministic high-quality FBX-equivalent mesh in slot 2 so script
         // `set_ball_mesh_slot(2)` stays stable even when tlsprite binding fails.
         renderer.bind_builtin_sphere_mesh_slot(&device, DEFAULT_FBX_BALL_SLOT, true);
