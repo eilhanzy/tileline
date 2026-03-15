@@ -51,6 +51,8 @@ const CONSOLE_HELP_COMMANDS: &[&str] = &[
     "help",
     "status | gfx.status",
     "sim.status | sim.pause | sim.resume | sim.step <n> | sim.reset",
+    "scene.reload | sprite.reload | script.reload",
+    "perf.snapshot",
     "phys.gravity <x y z>",
     "phys.substeps <auto|n>",
     "cam.speed <v>",
@@ -67,6 +69,7 @@ const CONSOLE_HELP_COMMANDS: &[&str] = &[
     "gfx.fsr_quality <native|ultra|quality|balanced|performance>",
     "gfx.fsr_sharpness <0..1>",
     "gfx.fsr_scale <auto|0.5..1>",
+    "gfx.profile <low|med|high|ultra>",
     "gfx.render_distance <off|N>",
     "gfx.adaptive_distance <auto|on|off>",
     "gfx.distance_blur <auto|on|off>",
@@ -832,6 +835,7 @@ impl ApplicationHandler for TlApp {
 }
 
 struct TlAppRuntime {
+    cli_options: CliOptions,
     window: Arc<Window>,
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
@@ -1924,6 +1928,7 @@ impl TlAppRuntime {
         let fps_report_interval = options.fps_report_interval;
 
         let mut runtime = Self {
+            cli_options: options.clone(),
             window,
             _instance: instance,
             surface,
@@ -2306,6 +2311,262 @@ impl TlAppRuntime {
         self.distance_retune_timer = 0.0;
     }
 
+    fn apply_bundle_sprite_program(
+        &mut self,
+        program: Option<TlspriteProgram>,
+        root_hint: Option<&Path>,
+    ) {
+        if let Some(program) = program {
+            self.force_full_fbx_from_sprite = program.requires_full_fbx_render();
+            self.scene.set_sprite_program(program.clone());
+            if let Some(root) = root_hint {
+                bind_renderer_meshes_from_tlsprite(
+                    &mut self.renderer,
+                    &self.device,
+                    root,
+                    &program,
+                );
+            }
+        } else {
+            self.force_full_fbx_from_sprite = false;
+            self.scene.clear_sprite_program();
+        }
+        self.renderer
+            .set_force_full_fbx_sphere(self.force_full_fbx_from_sprite);
+    }
+
+    fn reload_sprite_from_watcher(&mut self) -> Result<String, String> {
+        let (Some(sprite_loader), Some(sprite_cache)) =
+            (self.sprite_loader.as_mut(), self.sprite_cache.as_mut())
+        else {
+            return Err("sprite watcher is not active in this runtime mode".to_string());
+        };
+        let event = sprite_loader.reload_into_cache(sprite_cache);
+        let event_note = format!("{event:?}");
+        print_tlsprite_event("[tlsprite manual reload]", event);
+        if let Some(program) = sprite_cache.program_for_path(sprite_loader.path()).cloned() {
+            self.force_full_fbx_from_sprite = program.requires_full_fbx_render();
+            self.scene.set_sprite_program(program.clone());
+            bind_renderer_meshes_from_tlsprite(
+                &mut self.renderer,
+                &self.device,
+                sprite_loader.path(),
+                &program,
+            );
+            self.renderer
+                .set_force_full_fbx_sphere(self.force_full_fbx_from_sprite);
+            Ok(format!(
+                "sprite reloaded from '{}' ({event_note})",
+                sprite_loader.path().display()
+            ))
+        } else {
+            Err(format!(
+                "sprite reload did not produce a compiled program ({event_note})"
+            ))
+        }
+    }
+
+    fn reload_script_runtime_from_sources(
+        &mut self,
+        include_bundle_sprite: bool,
+    ) -> Result<String, String> {
+        if let Some(project_path) = &self.cli_options.project_path {
+            let compile = compile_tlpfile_scene_from_path(
+                project_path,
+                Some(&self.cli_options.joint_scene),
+                TlscriptShowcaseConfig::default(),
+            );
+            let warning_count = compile
+                .diagnostics
+                .iter()
+                .filter(|it| matches!(it.level, TlpfileDiagnosticLevel::Warning))
+                .count();
+            if compile.has_errors() {
+                let first_error = compile
+                    .diagnostics
+                    .iter()
+                    .find(|it| matches!(it.level, TlpfileDiagnosticLevel::Error))
+                    .map(|it| it.message.as_str())
+                    .unwrap_or("unknown project compile error");
+                return Err(format!(
+                    "project reload failed for '{}': {}",
+                    project_path.display(),
+                    first_error
+                ));
+            }
+            let bundle = compile.bundle.ok_or_else(|| {
+                format!(
+                    "project reload produced no bundle for '{}'",
+                    project_path.display()
+                )
+            })?;
+            let scene_name = bundle.scene_name.clone();
+            let script_count = bundle.scripts.len();
+            let sprite_count = bundle.sprite_count();
+            let merged_sprite_program = bundle.merged_sprite_program.clone();
+            let sprite_root = bundle
+                .selected_joint_path
+                .clone()
+                .or_else(|| Some(bundle.project_path.clone()));
+            self.script_runtime = ScriptRuntime::MultiScripts(bundle.scripts);
+            if include_bundle_sprite {
+                self.apply_bundle_sprite_program(merged_sprite_program, sprite_root.as_deref());
+            }
+            return Ok(format!(
+                "project reloaded scene='{}' scripts={} sprites={} warnings={}",
+                scene_name, script_count, sprite_count, warning_count
+            ));
+        }
+
+        if let Some(joint_path) = &self.cli_options.joint_path {
+            let compile = compile_tljoint_scene_from_path(
+                joint_path,
+                &self.cli_options.joint_scene,
+                TlscriptShowcaseConfig::default(),
+            );
+            let warning_count = compile
+                .diagnostics
+                .iter()
+                .filter(|it| matches!(it.level, TljointDiagnosticLevel::Warning))
+                .count();
+            if compile.has_errors() {
+                let first_error = compile
+                    .diagnostics
+                    .iter()
+                    .find(|it| matches!(it.level, TljointDiagnosticLevel::Error))
+                    .map(|it| it.message.as_str())
+                    .unwrap_or("unknown joint compile error");
+                return Err(format!(
+                    "joint reload failed for '{}': {}",
+                    joint_path.display(),
+                    first_error
+                ));
+            }
+            let bundle = compile.bundle.ok_or_else(|| {
+                format!(
+                    "joint reload produced no bundle for '{}'",
+                    joint_path.display()
+                )
+            })?;
+            let scene_name = bundle.scene_name.clone();
+            let script_count = bundle.scripts.len();
+            let sprite_count = bundle.sprite_paths.len();
+            let merged_sprite_program = bundle.merged_sprite_program.clone();
+            let sprite_root = Some(bundle.manifest_path.clone());
+            self.script_runtime = ScriptRuntime::Joint(bundle);
+            if include_bundle_sprite {
+                self.apply_bundle_sprite_program(merged_sprite_program, sprite_root.as_deref());
+            }
+            return Ok(format!(
+                "joint reloaded scene='{}' scripts={} sprites={} warnings={}",
+                scene_name, script_count, sprite_count, warning_count
+            ));
+        }
+
+        let script_source_owned =
+            fs::read_to_string(&self.cli_options.script_path).map_err(|err| {
+                format!(
+                    "failed to read script '{}': {err}",
+                    self.cli_options.script_path.display()
+                )
+            })?;
+        let script_source: &'static str = Box::leak(script_source_owned.into_boxed_str());
+        let compile = compile_tlscript_showcase(script_source, TlscriptShowcaseConfig::default());
+        if !compile.errors.is_empty() {
+            return Err(format!(
+                "script reload failed for '{}': {}",
+                self.cli_options.script_path.display(),
+                compile.errors.join(" | ")
+            ));
+        }
+        let warnings = compile.warnings.len();
+        let program = compile
+            .program
+            .ok_or_else(|| "script reload produced no runnable program".to_string())?;
+        self.script_runtime = ScriptRuntime::Single(program);
+        Ok(format!(
+            "script reloaded '{}' warnings={}",
+            self.cli_options.script_path.display(),
+            warnings
+        ))
+    }
+
+    fn apply_gfx_profile(&mut self, profile: &str) -> Result<String, String> {
+        let mobile_path = matches!(self.platform, RuntimePlatform::Android)
+            || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
+        match profile {
+            "low" => {
+                self.fsr_config.mode = FsrMode::On;
+                self.fsr_config.quality = FsrQualityPreset::Performance;
+                self.fsr_config.sharpness = 0.42;
+                self.fsr_config.render_scale_override = None;
+                self.render_distance = Some(if mobile_path { 36.0 } else { 48.0 });
+                self.adaptive_distance_enabled = true;
+                self.distance_blur_mode = ToggleAuto::On;
+                self.tick_profile = TickProfile::Balanced;
+            }
+            "med" | "medium" => {
+                self.fsr_config.mode = FsrMode::Auto;
+                self.fsr_config.quality = FsrQualityPreset::Balanced;
+                self.fsr_config.sharpness = 0.36;
+                self.fsr_config.render_scale_override = None;
+                self.render_distance = Some(if mobile_path { 56.0 } else { 76.0 });
+                self.adaptive_distance_enabled = true;
+                self.distance_blur_mode = ToggleAuto::Auto;
+                self.tick_profile = TickProfile::Balanced;
+            }
+            "high" => {
+                self.fsr_config.mode = FsrMode::Auto;
+                self.fsr_config.quality = FsrQualityPreset::Quality;
+                self.fsr_config.sharpness = 0.33;
+                self.fsr_config.render_scale_override = None;
+                self.render_distance = Some(if mobile_path { 72.0 } else { 104.0 });
+                self.adaptive_distance_enabled = true;
+                self.distance_blur_mode = ToggleAuto::Off;
+                self.tick_profile = TickProfile::Max;
+            }
+            "ultra" => {
+                self.fsr_config.mode = FsrMode::Off;
+                self.fsr_config.quality = FsrQualityPreset::Native;
+                self.fsr_config.sharpness = 0.28;
+                self.fsr_config.render_scale_override = Some(1.0);
+                self.render_distance = None;
+                self.adaptive_distance_enabled = false;
+                self.distance_blur_mode = ToggleAuto::Off;
+                self.tick_profile = TickProfile::Max;
+            }
+            _ => {
+                return Err("usage: gfx.profile <low|med|high|ultra>".to_string());
+            }
+        }
+
+        if let Some(distance) = self.render_distance {
+            self.render_distance_min = (distance * 0.72).clamp(28.0, distance);
+            self.render_distance_max = (distance * 1.55).clamp(distance, 260.0);
+        } else {
+            self.render_distance_min = 0.0;
+            self.render_distance_max = 0.0;
+        }
+        self.distance_blur_enabled = self.distance_blur_mode.resolve(mobile_path);
+        self.renderer.set_fsr_config(&self.queue, self.fsr_config);
+        self.sync_console_quick_fields_from_runtime();
+
+        let distance_label = self
+            .render_distance
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "off".to_string());
+        Ok(format!(
+            "gfx profile '{}' applied: fsr={:?}/{:?} sharpness={:.2} distance={} blur={:?} tick_profile={:?}",
+            profile,
+            self.fsr_config.mode,
+            self.fsr_config.quality,
+            self.fsr_config.sharpness,
+            distance_label,
+            self.distance_blur_mode,
+            self.tick_profile
+        ))
+    }
+
     fn apply_present_mode(&mut self, mode: wgpu::PresentMode) {
         if self.present_mode == mode {
             return;
@@ -2579,6 +2840,85 @@ impl TlAppRuntime {
                 self.reset_simulation_state();
                 self.console_feedback("simulation reset (world + scene)");
             }
+            "scene.reload" => {
+                let mut notes = Vec::new();
+                match self.reload_script_runtime_from_sources(true) {
+                    Ok(note) => notes.push(note),
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                }
+                if self.sprite_loader.is_some() {
+                    match self.reload_sprite_from_watcher() {
+                        Ok(note) => notes.push(note),
+                        Err(err) => self.console_feedback(format!("sprite reload warning: {err}")),
+                    }
+                }
+                self.reset_simulation_state();
+                self.camera.reset_pose();
+                self.console_feedback("scene state reset");
+                for note in notes {
+                    self.console_feedback(note);
+                }
+            }
+            "script.reload" => match self.reload_script_runtime_from_sources(false) {
+                Ok(note) => self.console_feedback(note),
+                Err(err) => self.console_feedback(err),
+            },
+            "sprite.reload" => {
+                if self.sprite_loader.is_some() {
+                    match self.reload_sprite_from_watcher() {
+                        Ok(note) => self.console_feedback(note),
+                        Err(err) => self.console_feedback(err),
+                    }
+                } else if self.cli_options.project_path.is_some()
+                    || self.cli_options.joint_path.is_some()
+                {
+                    match self.reload_script_runtime_from_sources(true) {
+                        Ok(note) => self.console_feedback(format!(
+                            "sprite refreshed via bundle reload: {note}"
+                        )),
+                        Err(err) => self.console_feedback(err),
+                    }
+                } else {
+                    self.console_feedback(
+                        "sprite.reload is unavailable (no sprite watcher / bundle context)",
+                    );
+                }
+            }
+            "perf.snapshot" => {
+                let fps = self.fps_tracker.snapshot();
+                let fsr = self.renderer.fsr_status();
+                let rt = self.renderer.ray_tracing_status();
+                let gravity = self.world.gravity();
+                self.console_feedback(format!(
+                    "perf snapshot | fps inst={:.1} ema={:.1} avg={:.1} stddev={:.2}ms | frame_ema={:.2}ms jitter_ema={:.2}ms | fill={:.2}/{:.2} | balls={} draw_limit={:?} | substeps={}/{} manual={:?} | grav=[{:.2},{:.2},{:.2}] | rt={:?}/{} dyn={} | fsr={:?}/{:?} scale={:.2} sharp={:.2}",
+                    fps.instant_fps,
+                    fps.ema_fps,
+                    fps.avg_fps,
+                    fps.frame_time_stddev_ms,
+                    self.frame_time_ema_ms,
+                    self.frame_time_jitter_ema_ms,
+                    self.last_framebuffer_fill_ratio,
+                    self.framebuffer_fill_ema,
+                    self.scene.live_ball_count(),
+                    self.adaptive_ball_render_limit,
+                    self.last_substeps,
+                    self.max_substeps,
+                    self.manual_max_substeps,
+                    gravity.x,
+                    gravity.y,
+                    gravity.z,
+                    self.rt_mode,
+                    if rt.active { "on" } else { "off" },
+                    rt.rt_dynamic_count,
+                    fsr.requested_mode,
+                    if fsr.active { "on" } else { "off" },
+                    fsr.render_scale,
+                    fsr.sharpness
+                ));
+            }
             "phys.gravity" => {
                 let Some(x_raw) = parts.next() else {
                     self.console_feedback("usage: phys.gravity <x> <y> <z>");
@@ -2846,6 +3186,17 @@ impl TlAppRuntime {
                         }
                     }
                     Err(err) => self.console_feedback(err.to_string()),
+                }
+            }
+            "gfx.profile" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.profile <low|med|high|ultra>");
+                    return RuntimeCommand::Consumed;
+                };
+                let profile = value.to_ascii_lowercase();
+                match self.apply_gfx_profile(profile.as_str()) {
+                    Ok(note) => self.console_feedback(note),
+                    Err(err) => self.console_feedback(err),
                 }
             }
             "gfx.render_distance" => {
@@ -5110,6 +5461,35 @@ impl FpsTracker {
         let fast_lane_fps = self.fast_percentile_fps(0.20);
         let blended = fast_lane_fps * 0.78 + self.ema_fps * 0.22;
         blended.clamp(45.0, 1_200.0)
+    }
+
+    fn snapshot(&self) -> FpsReport {
+        let count = self.count.max(1).min(self.frame_times.len());
+        let latest_index = if self.cursor == 0 {
+            count.saturating_sub(1)
+        } else {
+            self.cursor.saturating_sub(1).min(count.saturating_sub(1))
+        };
+        let instant_frame = self.frame_times[latest_index].max(1e-6);
+        let instant_fps = 1.0 / instant_frame;
+        let n = count as f32;
+        let avg_frame = self.frame_times.iter().take(count).copied().sum::<f32>() / n;
+        let variance = self
+            .frame_times
+            .iter()
+            .take(count)
+            .map(|t| {
+                let d = *t - avg_frame;
+                d * d
+            })
+            .sum::<f32>()
+            / n;
+        FpsReport {
+            instant_fps,
+            ema_fps: self.ema_fps,
+            avg_fps: 1.0 / avg_frame.max(1e-6),
+            frame_time_stddev_ms: variance.sqrt() * 1_000.0,
+        }
     }
 
     fn fast_percentile_fps(&self, quantile: f32) -> f32 {
