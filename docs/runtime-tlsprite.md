@@ -76,6 +76,7 @@ Examples wired:
 - `runtime/examples/auto_scene_scheduler.rs`
 - `runtime/examples/tlapp.rs`
 - `runtime/examples/tlsprite_list_editor.rs` (Alpha list inspector/editor scaffold)
+- `runtime/src/bin/tlsprite_editor.rs` (runtime-owned CLI entrypoint)
 
 ## 3-Phase Plan
 
@@ -107,6 +108,22 @@ Runtime now exposes precompiled pack + cache primitives:
 - Base sprite kinds (`generic`, `hud`, `camera`, `terrain`) with runtime defaults.
 - No disk I/O required in runtime core.
 - Renderer-agnostic output (`Vec<SpriteInstance>`).
+
+## Editor CLI (List Mode)
+
+Run the editor directly as a runtime binary:
+
+```bash
+cargo run -p runtime --bin tlsprite_editor -- --file docs/demos/tlapp/bounce_hud.tlsprite
+```
+
+Useful options:
+
+- `--watch-ms 250 --clear`: hot-reload mode with clean redraw
+- `--markdown`: print markdown table output
+- `--write-markdown docs/demos/tlapp/bounce_hud.table.md`: export table file
+- `--strict` / `--strict-warnings`: CI-friendly non-zero exit behavior
+- `--init-if-missing`: create a starter `.tlsprite` file if missing
 
 ## Renderer Mapping Notes
 

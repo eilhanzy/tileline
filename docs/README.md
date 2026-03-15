@@ -22,8 +22,10 @@ in `src/` crates (not benchmark-only code).
 - `runtime-scene-showcase.md`: runtime-side 3D scene/sprite payload model and bounce-tank showcase controller
 - `runtime-scene-workload.md`: runtime scene density to GMS dispatch workload mapping
 - `runtime-scheduler-path.md`: runtime automatic scheduler path selection (`GMS` vs `MGS`)
+- `runtime-android.md`: Android beta-track runtime policy, scheduler precedence, and fail-soft behavior
 - `runtime-draw-hud.md`: `SceneFrameInstances` -> draw-batch compile path and telemetry HUD overlay flow
 - `runtime-pak.md`: `.pak` archive format and pack/list/unpack runtime toolchain
+- `runtime-tlpfile-gui.md`: `.tlpfile` project manifest + general-purpose runtime GUI shell
 - `runtime-tlsprite.md`: `.tlsprite` parser, runtime sprite program flow, and HUD scaling signals
 - `runtime-tljoint.md`: scene-based multi `.tlscript` + multi `.tlsprite` composition manifest
 - `runtime-mas.md`: MAS audio scheduler flow and MPS integration contract
@@ -31,7 +33,7 @@ in `src/` crates (not benchmark-only code).
 - `examples/tlsprite/runtime_basic_types.tlsprite`: starter `.tlsprite` asset with `hud`, `camera`, and `terrain` kinds
 - `runtime-tlscript-showcase.md`: `.tlscript` showcase compile/evaluate bootstrap for scene control
 - `mgs-scene-workload.md`: runtime/mobile scene density to MGS bridge hint and tile planning mapping
-- `releases/v0.2.0-github.md`: copy-paste GitHub release body for `v0.2.0`
+- `mgs-orangepi5-validation.md`: repeatable Orange Pi 5 validation runner and pass gates for MGS
 - `releases/v0.2.0.md`: current release notes with pre-beta `.pak` packaging additions
 - `releases/v0.1.0.md`: first pre-alpha release notes and binary packaging flow
 - `demos/tlapp/*`: TLApp show-scene assets (`bounce_showcase.tlscript`, `bounce_hud.tlsprite`)

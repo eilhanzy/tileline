@@ -3,6 +3,12 @@ name = "runtime"
 version = "0.2.0"
 edition = "2021"
 
+[package.metadata.android]
+package = "dev.tileline.runtime"
+build_targets = ["aarch64-linux-android"]
+min_sdk_version = 29
+target_sdk_version = 34
+
 [features]
 default = ["gamepad"]
 gamepad = ["dep:gilrs"]
@@ -23,6 +29,9 @@ crossbeam.workspace = true
 notify = "6.1.1"
 bytemuck = { version = "1.17.1", features = ["derive"] }
 winit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
 fbx = "0.2.0"
 pollster = "0.4.0"
 gilrs = { version = "0.11.0", optional = true }

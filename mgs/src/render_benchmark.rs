@@ -6,10 +6,13 @@ use std::time::{Duration, Instant};
 
 use crate::bridge::MpsWorkloadHint;
 use crate::fallback::FallbackLevel;
-use crate::runtime::{RuntimeMode, RuntimePacingMode, ThroughputMemoryPolicy, VsyncMode};
+use crate::runtime::{
+    RuntimeMode, RuntimePacingMode, ThroughputFramePacer, ThroughputMemoryPolicy, VsyncMode,
+};
 use crate::{
-    is_unified_memory_profile, select_present_mode, select_throughput_burst, startup_ramp,
-    AdaptiveBurstController, AggressiveNoVsyncPolicy, MgsBridge, MobileGpuProfile,
+    is_unified_memory_profile, safe_default_required_limits_for_adapter, select_present_mode,
+    select_throughput_burst, startup_ramp, AdaptiveBurstController, AggressiveNoVsyncPolicy,
+    MgsBridge, MobileGpuProfile, MpsZramSpillPool, MpsZramStats,
 };
 use wgpu::{Color, CompositeAlphaMode, PresentMode, SurfaceError, TextureFormat};
 use winit::application::ApplicationHandler;
@@ -327,17 +330,19 @@ impl ApplicationHandler for RenderBenchmarkApp {
                     runtime.window.request_redraw();
                 }
             } else {
-                if let Err(render_outcome) = runtime.render_frame() {
-                    match render_outcome {
-                        RenderOutcome::SurfaceLost | RenderOutcome::Outdated => {
-                            runtime.reconfigure_surface();
+                if runtime.ready_for_next_frame(Instant::now()) {
+                    if let Err(render_outcome) = runtime.render_frame() {
+                        match render_outcome {
+                            RenderOutcome::SurfaceLost | RenderOutcome::Outdated => {
+                                runtime.reconfigure_surface();
+                            }
+                            RenderOutcome::OutOfMemory => {
+                                eprintln!("wgpu surface out of memory, exiting benchmark");
+                                self.exit_requested = true;
+                                event_loop.exit();
+                            }
+                            RenderOutcome::Timeout | RenderOutcome::Other => {}
                         }
-                        RenderOutcome::OutOfMemory => {
-                            eprintln!("wgpu surface out of memory, exiting benchmark");
-                            self.exit_requested = true;
-                            event_loop.exit();
-                        }
-                        RenderOutcome::Timeout | RenderOutcome::Other => {}
                     }
                 }
             }
@@ -374,7 +379,7 @@ struct BenchmarkRuntime {
     renderer: Renderer,
     stats: FrameStats,
     pacing_mode: BenchmarkPacingMode,
-    min_frame_interval: Duration,
+    frame_pacer: ThroughputFramePacer,
     options: CliOptions,
     session_start: Instant,
     sample_started_at: Option<Instant>,
@@ -407,6 +412,22 @@ impl BenchmarkRuntime {
         );
         let stats = FrameStats::new(renderer.size, Duration::from_millis(500));
         let session_start = Instant::now();
+        let renderer_is_uma = renderer.memory_policy.is_uma();
+        let cpu_relief_interval = if matches!(pacing_mode, BenchmarkPacingMode::MaxThroughput) {
+            if renderer_is_uma {
+                Duration::from_micros(2_400)
+            } else {
+                Duration::from_micros(1_200)
+            }
+        } else {
+            Duration::ZERO
+        };
+        let frame_pacer = ThroughputFramePacer::new(
+            pacing_mode,
+            min_frame_interval,
+            cpu_relief_interval,
+            session_start,
+        );
         let sample_started_at = if options.warmup_duration.is_zero() {
             Some(session_start)
         } else {
@@ -417,13 +438,13 @@ impl BenchmarkRuntime {
             renderer,
             stats,
             pacing_mode,
-            min_frame_interval,
+            frame_pacer,
             options,
             session_start,
             sample_started_at,
             sample_finished: false,
         };
-        runtime.update_title(0.0, 0.0, 0.0, 0.0);
+        runtime.update_title(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         Ok(runtime)
     }
 
@@ -440,9 +461,14 @@ impl BenchmarkRuntime {
         self.update_phase_before_frame(Instant::now());
 
         let frame_start = Instant::now();
-        let work_units = self.renderer.render(&self.window)?;
+        let frame_stats = self.renderer.render(&self.window)?;
         let frame_end = Instant::now();
-        let timing = self.stats.record_frame(frame_start, frame_end, work_units);
+        let timing = self.stats.record_frame(
+            frame_start,
+            frame_end,
+            frame_stats.work_units,
+            frame_stats.presented,
+        );
         self.update_phase_after_frame(frame_end);
 
         if timing.should_update_title {
@@ -451,13 +477,23 @@ impl BenchmarkRuntime {
                 timing.avg_fps,
                 timing.instant_wfps,
                 timing.avg_wfps,
+                timing.instant_present_fps,
+                timing.avg_present_fps,
             );
         }
         self.apply_max_throughput_pacing(frame_start, frame_end);
         Ok(())
     }
 
-    fn update_title(&mut self, instant_fps: f64, avg_fps: f64, instant_wfps: f64, avg_wfps: f64) {
+    fn update_title(
+        &mut self,
+        instant_fps: f64,
+        avg_fps: f64,
+        instant_wfps: f64,
+        avg_wfps: f64,
+        instant_present_fps: f64,
+        avg_present_fps: f64,
+    ) {
         let phase = self.phase_label();
         let show_throughput = self.renderer.throughput_target_burst > 1
             || matches!(self.pacing_mode, BenchmarkPacingMode::MaxThroughput);
@@ -476,11 +512,12 @@ impl BenchmarkRuntime {
         };
         let title = if show_throughput {
             format!(
-                "MGS Render Benchmark [{}] | WFPS {:.1} | WAvg {:.1} | FPS {:.1} | Frames {}{}{} | {} {} {} | Close/Esc to finish",
+                "MGS Render Benchmark [{}] | WFPS {:.1} | WAvg {:.1} | RFPS {:.1} | PFPS {:.1} | Frames {}{}{} | {} {} {} | Close/Esc to finish",
                 phase,
                 instant_wfps,
                 avg_wfps,
                 instant_fps,
+                instant_present_fps,
                 self.stats.total_frames,
                 burst_suffix,
                 vsync_suffix,
@@ -490,10 +527,12 @@ impl BenchmarkRuntime {
             )
         } else {
             format!(
-                "MGS Render Benchmark [{}] | FPS {:.1} | Avg {:.1} | Frames {} | {} {} {} | Close/Esc to finish",
+                "MGS Render Benchmark [{}] | RFPS {:.1} | RAvg {:.1} | PFPS {:.1} | PAvg {:.1} | Frames {} | {} {} {} | Close/Esc to finish",
                 phase,
                 instant_fps,
                 avg_fps,
+                instant_present_fps,
+                avg_present_fps,
                 self.stats.total_frames,
                 self.renderer.profile.family.short_label(),
                 self.renderer.profile.gfx_backend.label(),
@@ -507,6 +546,7 @@ impl BenchmarkRuntime {
         let computed = self.stats.compute_summary();
         let score = compute_render_score(&computed, &self.renderer.profile);
         let adaptive_burst_cap = self.renderer.adaptive_burst_cap();
+        let zram_stats = self.renderer.zram_stats();
 
         BenchmarkSummary {
             adapter_name: self.renderer.adapter_info.name.clone(),
@@ -516,12 +556,15 @@ impl BenchmarkRuntime {
             present_mode: self.renderer.present_mode,
             resolution: self.renderer.size,
             total_frames: computed.total_frames,
+            presented_frames: computed.presented_frames,
             total_work_units: computed.total_work_units,
             elapsed: computed.elapsed,
             avg_fps: computed.avg_fps,
             peak_fps: computed.peak_fps,
             avg_work_fps: computed.avg_work_fps,
             peak_work_fps: computed.peak_work_fps,
+            avg_present_fps: computed.avg_present_fps,
+            peak_present_fps: computed.peak_present_fps,
             avg_frame_ms: computed.avg_frame_ms,
             p95_frame_ms: computed.p95_frame_ms,
             p99_frame_ms: computed.p99_frame_ms,
@@ -534,6 +577,7 @@ impl BenchmarkRuntime {
             fallback_counts: self.renderer.fallback_counts,
             last_tile_count: self.renderer.last_tile_count,
             last_memory_pressure: self.renderer.last_memory_pressure,
+            zram_stats,
             mode_override: self.options.mode_override,
             vsync_override: self.options.vsync_override,
             warmup_duration: self.options.warmup_duration,
@@ -548,7 +592,11 @@ impl BenchmarkRuntime {
     fn preferred_control_flow(&self) -> ControlFlow {
         match self.pacing_mode {
             BenchmarkPacingMode::Stable => ControlFlow::Wait,
-            BenchmarkPacingMode::MaxThroughput => ControlFlow::Poll,
+            BenchmarkPacingMode::MaxThroughput => self
+                .frame_pacer
+                .preferred_wait_until(Instant::now())
+                .map(ControlFlow::WaitUntil)
+                .unwrap_or(ControlFlow::Wait),
         }
     }
 
@@ -558,6 +606,10 @@ impl BenchmarkRuntime {
 
     fn should_auto_exit(&self) -> bool {
         self.sample_finished
+    }
+
+    fn ready_for_next_frame(&self, now: Instant) -> bool {
+        self.frame_pacer.ready_for_next_frame(now)
     }
 
     fn update_phase_before_frame(&mut self, now: Instant) {
@@ -591,24 +643,8 @@ impl BenchmarkRuntime {
         }
     }
 
-    fn apply_max_throughput_pacing(&self, frame_start: Instant, frame_end: Instant) {
-        if !matches!(self.pacing_mode, BenchmarkPacingMode::MaxThroughput) {
-            return;
-        }
-        if self.min_frame_interval.is_zero() {
-            return;
-        }
-
-        let elapsed = frame_end.saturating_duration_since(frame_start);
-        if elapsed >= self.min_frame_interval {
-            return;
-        }
-
-        let wait_until = frame_start + self.min_frame_interval;
-        std::thread::yield_now();
-        while Instant::now() < wait_until {
-            std::hint::spin_loop();
-        }
+    fn apply_max_throughput_pacing(&mut self, frame_start: Instant, frame_end: Instant) {
+        self.frame_pacer.on_frame_complete(frame_start, frame_end);
     }
 }
 
@@ -627,6 +663,7 @@ struct Renderer {
     throughput_target_burst: u32,
     adaptive_burst: AdaptiveBurstController,
     memory_policy: ThroughputMemoryPolicy,
+    zram_pool: MpsZramSpillPool,
     throughput_targets: Vec<wgpu::Texture>,
     throughput_target_views: Vec<wgpu::TextureView>,
     throughput_target_signature: Option<ThroughputTargetSignature>,
@@ -650,6 +687,12 @@ struct ThroughputTargetSignature {
     format: TextureFormat,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RenderFrameStats {
+    work_units: u32,
+    presented: bool,
+}
+
 impl Renderer {
     fn new(window: Arc<Window>, options: CliOptions) -> Result<Self, Box<dyn Error>> {
         let size = window.inner_size();
@@ -665,14 +708,40 @@ impl Renderer {
         let profile = MobileGpuProfile::detect(&adapter_info.name);
         let uma_shared_memory = is_unified_memory_profile(&profile, &adapter_info);
         let memory_policy = ThroughputMemoryPolicy::new(uma_shared_memory);
+        let logical_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        let zram_config = memory_policy.recommended_zram_config(&profile, logical_threads);
+        if zram_config.enabled {
+            eprintln!(
+                "MGS note: MPS-zram enabled (target={} MB hard={} MB shards={} chunk={} KB)",
+                zram_config.target_compressed_bytes / (1024 * 1024),
+                zram_config.hard_compressed_bytes / (1024 * 1024),
+                zram_config.compression_shards,
+                zram_config.chunk_bytes / 1024
+            );
+        }
         let runtime_mode = runtime_mode_from_override(options.mode_override);
         let vsync_mode = runtime_vsync_from_override(options.vsync_override);
         let tuning = crate::MgsTuningProfile::from_profile(&profile);
         let bridge = MgsBridge::with_tuning(profile.clone(), tuning);
+        let (required_limits, limit_clamp_report) =
+            safe_default_required_limits_for_adapter(&adapter);
+        if limit_clamp_report.any_clamped() {
+            eprintln!(
+                "MGS note: device limits clamped for adapter '{}' (1d={}, 2d={}, 3d={}, layers={})",
+                adapter_info.name,
+                required_limits.max_texture_dimension_1d,
+                required_limits.max_texture_dimension_2d,
+                required_limits.max_texture_dimension_3d,
+                required_limits.max_texture_array_layers
+            );
+        }
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("mgs-render-benchmark-device"),
-                required_limits: adapter.limits(),
+                required_limits,
                 ..Default::default()
             }))?;
 
@@ -701,11 +770,18 @@ impl Renderer {
             prefer_stable_present,
             vsync_mode,
         );
-        let no_vsync_policy = AggressiveNoVsyncPolicy::from_selection(
+        let mut no_vsync_policy = AggressiveNoVsyncPolicy::from_selection(
             vsync_mode,
             config.present_mode,
             uma_shared_memory,
         );
+        if no_vsync_policy.enabled && uma_shared_memory && profile.is_mobile_tbdr() {
+            no_vsync_policy.enabled = false;
+            no_vsync_policy.forced_present_interval = 1;
+            eprintln!(
+                "MGS note: aggressive no-vsync fallback disabled on mobile UMA/TBDR to reduce system-wide chopping."
+            );
+        }
         if matches!(options.vsync_override, VsyncOverride::Off)
             && !crate::present_mode_allows_uncapped(config.present_mode)
         {
@@ -753,6 +829,7 @@ impl Renderer {
             throughput_target_burst,
             adaptive_burst,
             memory_policy,
+            zram_pool: MpsZramSpillPool::new(zram_config),
             throughput_targets: Vec::new(),
             throughput_target_views: Vec::new(),
             throughput_target_signature: None,
@@ -817,9 +894,12 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn render(&mut self, window: &Window) -> Result<u32, RenderOutcome> {
+    fn render(&mut self, window: &Window) -> Result<RenderFrameStats, RenderOutcome> {
         if self.size.width == 0 || self.size.height == 0 {
-            return Ok(1);
+            return Ok(RenderFrameStats {
+                work_units: 1,
+                presented: false,
+            });
         }
         let frame_begin = Instant::now();
 
@@ -865,6 +945,9 @@ impl Renderer {
             if plan.memory_pressure {
                 self.trim_throughput_targets(keep_len);
             }
+        }
+        if plan.memory_pressure && self.total_frames_submitted % 8 == 0 {
+            self.spill_plan_snapshot_to_zram(&plan);
         }
 
         let mut planned_units = self.derive_work_units_from_plan(&plan);
@@ -938,7 +1021,10 @@ impl Renderer {
         self.adaptive_burst
             .observe(frame_ms, work_units, planned_units, plan.memory_pressure);
 
-        Ok(work_units.max(1))
+        Ok(RenderFrameStats {
+            work_units: work_units.max(1),
+            presented: should_present,
+        })
     }
 
     fn ensure_throughput_targets(&mut self, required_work_units: usize) {
@@ -1043,7 +1129,8 @@ impl Renderer {
             units = units.saturating_mul(tile_factor);
         }
         if plan.memory_pressure {
-            units = (units / 2).max(1);
+            // Relax pressure decrease so short spikes do not collapse throughput.
+            units = units.saturating_mul(3).div_ceil(4).max(1);
         }
         units.clamp(1, 24)
     }
@@ -1072,6 +1159,53 @@ impl Renderer {
             self.throughput_target_cursor = 0;
         }
     }
+
+    fn spill_plan_snapshot_to_zram(&mut self, plan: &crate::bridge::MgsBridgePlan) {
+        if !self.zram_pool.is_enabled() {
+            return;
+        }
+
+        let snapshot = encode_plan_snapshot(
+            self.size,
+            plan.tile_plan.tile_px,
+            plan.tile_plan.tile_count,
+            plan.memory_pressure,
+            &plan.tile_plan.assignments,
+        );
+        let _ = self
+            .zram_pool
+            .spill(self.total_frames_submitted.max(1), &snapshot);
+    }
+
+    fn zram_stats(&self) -> MpsZramStats {
+        self.zram_pool.stats()
+    }
+}
+
+fn encode_plan_snapshot(
+    size: PhysicalSize<u32>,
+    tile_px: u32,
+    tile_count: u32,
+    memory_pressure: bool,
+    assignments: &[crate::tile_planner::TileAssignment],
+) -> Vec<u8> {
+    let max_assignments = assignments.len().min(768);
+    let mut out = Vec::with_capacity(32 + max_assignments * 24);
+    out.extend_from_slice(&size.width.to_le_bytes());
+    out.extend_from_slice(&size.height.to_le_bytes());
+    out.extend_from_slice(&tile_px.to_le_bytes());
+    out.extend_from_slice(&tile_count.to_le_bytes());
+    out.push(u8::from(memory_pressure));
+    out.extend_from_slice(&(max_assignments as u32).to_le_bytes());
+    for assignment in assignments.iter().take(max_assignments) {
+        out.extend_from_slice(&assignment.origin_x.to_le_bytes());
+        out.extend_from_slice(&assignment.origin_y.to_le_bytes());
+        out.extend_from_slice(&assignment.tile_w.to_le_bytes());
+        out.extend_from_slice(&assignment.tile_h.to_le_bytes());
+        out.extend_from_slice(&assignment.draw_calls.to_le_bytes());
+        out.extend_from_slice(&assignment.estimated_tile_memory_kb.to_le_bytes());
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1080,24 +1214,32 @@ struct FrameTiming {
     avg_fps: f64,
     instant_wfps: f64,
     avg_wfps: f64,
+    instant_present_fps: f64,
+    avg_present_fps: f64,
     should_update_title: bool,
 }
 
 struct FrameStats {
     resolution: PhysicalSize<u32>,
     total_frames: u64,
+    presented_frames: u64,
     total_work_units: u64,
     sample_start: Instant,
     frame_times_ms: Vec<f64>,
     work_times_ms: Vec<f64>,
     work_fps_samples: Vec<f64>,
+    present_fps_samples: Vec<f64>,
     last_frame_end: Option<Instant>,
+    last_present_end: Option<Instant>,
     fps_window: [f64; 32],
     fps_window_len: usize,
     fps_window_cursor: usize,
     wfps_window: [f64; 32],
     wfps_window_len: usize,
     wfps_window_cursor: usize,
+    present_fps_window: [f64; 32],
+    present_fps_window_len: usize,
+    present_fps_window_cursor: usize,
     last_title_update: Instant,
     title_update_interval: Duration,
 }
@@ -1108,18 +1250,24 @@ impl FrameStats {
         Self {
             resolution,
             total_frames: 0,
+            presented_frames: 0,
             total_work_units: 0,
             sample_start: now,
             frame_times_ms: Vec::with_capacity(64 * 1024),
             work_times_ms: Vec::with_capacity(64 * 1024),
             work_fps_samples: Vec::with_capacity(64 * 1024),
+            present_fps_samples: Vec::with_capacity(64 * 1024),
             last_frame_end: None,
+            last_present_end: None,
             fps_window: [0.0; 32],
             fps_window_len: 0,
             fps_window_cursor: 0,
             wfps_window: [0.0; 32],
             wfps_window_len: 0,
             wfps_window_cursor: 0,
+            present_fps_window: [0.0; 32],
+            present_fps_window_len: 0,
+            present_fps_window_cursor: 0,
             last_title_update: now,
             title_update_interval,
         }
@@ -1134,15 +1282,21 @@ impl FrameStats {
         self.frame_times_ms.clear();
         self.work_times_ms.clear();
         self.work_fps_samples.clear();
+        self.present_fps_samples.clear();
         self.total_frames = 0;
+        self.presented_frames = 0;
         self.total_work_units = 0;
         self.last_frame_end = None;
+        self.last_present_end = None;
         self.fps_window = [0.0; 32];
         self.fps_window_len = 0;
         self.fps_window_cursor = 0;
         self.wfps_window = [0.0; 32];
         self.wfps_window_len = 0;
         self.wfps_window_cursor = 0;
+        self.present_fps_window = [0.0; 32];
+        self.present_fps_window_len = 0;
+        self.present_fps_window_cursor = 0;
         self.last_title_update = now;
     }
 
@@ -1151,6 +1305,7 @@ impl FrameStats {
         frame_start: Instant,
         frame_end: Instant,
         work_units: u32,
+        presented: bool,
     ) -> FrameTiming {
         self.total_frames = self.total_frames.saturating_add(1);
         let work_units = work_units.max(1);
@@ -1172,6 +1327,27 @@ impl FrameStats {
         let instant_wfps = instant_fps * f64::from(work_units);
         self.last_frame_end = Some(frame_end);
 
+        let instant_present_fps = if presented {
+            self.presented_frames = self.presented_frames.saturating_add(1);
+            let value = if let Some(prev_present) = self.last_present_end {
+                let dt = frame_end.duration_since(prev_present).as_secs_f64();
+                if dt > 0.0 {
+                    1.0 / dt
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            self.last_present_end = Some(frame_end);
+            if value > 0.0 {
+                self.present_fps_samples.push(value);
+            }
+            value
+        } else {
+            0.0
+        };
+
         self.fps_window[self.fps_window_cursor] = instant_fps;
         self.fps_window_cursor = (self.fps_window_cursor + 1) % self.fps_window.len();
         if self.fps_window_len < self.fps_window.len() {
@@ -1181,6 +1357,12 @@ impl FrameStats {
         self.wfps_window_cursor = (self.wfps_window_cursor + 1) % self.wfps_window.len();
         if self.wfps_window_len < self.wfps_window.len() {
             self.wfps_window_len += 1;
+        }
+        self.present_fps_window[self.present_fps_window_cursor] = instant_present_fps;
+        self.present_fps_window_cursor =
+            (self.present_fps_window_cursor + 1) % self.present_fps_window.len();
+        if self.present_fps_window_len < self.present_fps_window.len() {
+            self.present_fps_window_len += 1;
         }
         if instant_wfps > 0.0 {
             self.work_fps_samples.push(instant_wfps);
@@ -1197,6 +1379,14 @@ impl FrameStats {
             self.wfps_window[..self.wfps_window_len].iter().sum::<f64>()
                 / self.wfps_window_len as f64
         };
+        let avg_present_fps = if self.present_fps_window_len == 0 {
+            0.0
+        } else {
+            self.present_fps_window[..self.present_fps_window_len]
+                .iter()
+                .sum::<f64>()
+                / self.present_fps_window_len as f64
+        };
 
         let should_update_title =
             frame_end.duration_since(self.last_title_update) >= self.title_update_interval;
@@ -1209,6 +1399,8 @@ impl FrameStats {
             avg_fps,
             instant_wfps,
             avg_wfps,
+            instant_present_fps,
+            avg_present_fps,
             should_update_title,
         }
     }
@@ -1231,6 +1423,11 @@ impl FrameStats {
         } else {
             self.total_work_units as f64 / elapsed.as_secs_f64()
         };
+        let avg_present_fps = if elapsed.is_zero() {
+            0.0
+        } else {
+            self.presented_frames as f64 / elapsed.as_secs_f64()
+        };
         let peak_fps = self
             .frame_times_ms
             .iter()
@@ -1239,6 +1436,7 @@ impl FrameStats {
             .map(|ms| 1000.0 / ms)
             .fold(0.0, f64::max);
         let peak_work_fps = self.work_fps_samples.iter().copied().fold(0.0, f64::max);
+        let peak_present_fps = self.present_fps_samples.iter().copied().fold(0.0, f64::max);
         let avg_frame_ms = mean(&self.frame_times_ms);
         let p95_frame_ms = percentile(self.frame_times_ms.clone(), 0.95);
         let p99_frame_ms = percentile(self.frame_times_ms.clone(), 0.99);
@@ -1255,12 +1453,15 @@ impl FrameStats {
 
         ComputedStats {
             total_frames: self.total_frames,
+            presented_frames: self.presented_frames,
             total_work_units: self.total_work_units,
             elapsed,
             avg_fps,
             peak_fps,
             avg_work_fps,
             peak_work_fps,
+            avg_present_fps,
+            peak_present_fps,
             avg_frame_ms,
             p95_frame_ms,
             p99_frame_ms,
@@ -1276,12 +1477,15 @@ impl FrameStats {
 #[derive(Debug, Clone)]
 struct ComputedStats {
     total_frames: u64,
+    presented_frames: u64,
     total_work_units: u64,
     elapsed: Duration,
     avg_fps: f64,
     peak_fps: f64,
     avg_work_fps: f64,
     peak_work_fps: f64,
+    avg_present_fps: f64,
+    peak_present_fps: f64,
     avg_frame_ms: f64,
     p95_frame_ms: f64,
     p99_frame_ms: f64,
@@ -1309,12 +1513,15 @@ struct BenchmarkSummary {
     present_mode: PresentMode,
     resolution: PhysicalSize<u32>,
     total_frames: u64,
+    presented_frames: u64,
     total_work_units: u64,
     elapsed: Duration,
     avg_fps: f64,
     peak_fps: f64,
     avg_work_fps: f64,
     peak_work_fps: f64,
+    avg_present_fps: f64,
+    peak_present_fps: f64,
     avg_frame_ms: f64,
     p95_frame_ms: f64,
     p99_frame_ms: f64,
@@ -1327,6 +1534,7 @@ struct BenchmarkSummary {
     fallback_counts: [u64; 4],
     last_tile_count: u32,
     last_memory_pressure: bool,
+    zram_stats: MpsZramStats,
     mode_override: ModeOverride,
     vsync_override: VsyncOverride,
     warmup_duration: Duration,
@@ -1410,7 +1618,12 @@ fn compute_render_score(stats: &ComputedStats, profile: &MobileGpuProfile) -> Re
         .clamp(2.0, 96.0)
         / 16.0;
 
-    let score_f = stats.avg_fps
+    let effective_display_fps = if stats.avg_present_fps > 0.0 {
+        stats.avg_present_fps
+    } else {
+        stats.avg_fps
+    };
+    let score_f = effective_display_fps
         * resolution_factor
         * (0.60 * stability + 0.40 * work_stability)
         * profile_factor;
@@ -1481,21 +1694,33 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.profile.tile_memory_kb
     );
     println!(
-        "Resolution: {}x{} | Frames: {} | WorkUnits: {} | Elapsed: {:.3}s",
+        "Resolution: {}x{} | Frames: {} | Presented: {} | WorkUnits: {} | Elapsed: {:.3}s",
         summary.resolution.width,
         summary.resolution.height,
         summary.total_frames,
+        summary.presented_frames,
         summary.total_work_units,
         summary.elapsed.as_secs_f64()
     );
     println!(
-        "FPS: avg={:.2} peak={:.2} low1%={:.2}",
+        "Render FPS: avg={:.2} peak={:.2} low1%={:.2}",
         summary.avg_fps, summary.peak_fps, summary.low_1_percent_fps
+    );
+    println!(
+        "Present FPS: avg={:.2} peak={:.2}",
+        summary.avg_present_fps, summary.peak_present_fps
     );
     println!(
         "WFPS: avg={:.2} peak={:.2}",
         summary.avg_work_fps, summary.peak_work_fps
     );
+    if summary.avg_fps > 0.0 {
+        let mismatch = (summary.avg_present_fps / summary.avg_fps).clamp(0.0, 1.0);
+        println!(
+            "Display match ratio: {:.1}% (present/render)",
+            mismatch * 100.0
+        );
+    }
     println!(
         "Frame ms: avg={:.3} p95={:.3} p99={:.3} stddev={:.3}",
         summary.avg_frame_ms,
@@ -1515,6 +1740,15 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.fallback_counts[FallbackLevel::SoftwareRasterize as usize],
         summary.last_tile_count,
         summary.last_memory_pressure
+    );
+    println!(
+        "MPS-ZRAM: pages={} spill={} restore={} evict={} ratio={:.3} saved={} KB",
+        summary.zram_stats.stored_pages,
+        summary.zram_stats.spill_events,
+        summary.zram_stats.restore_events,
+        summary.zram_stats.evict_events,
+        summary.zram_stats.compression_ratio(),
+        summary.zram_stats.saved_bytes() / 1024
     );
     println!(
         "Score: {} [{}] | stability={:.2}% work_stability={:.2}%",

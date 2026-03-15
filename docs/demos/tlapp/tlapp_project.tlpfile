@@ -1,0 +1,10 @@
+tlpfile_v1
+
+[project]
+name = TLApp Showcase Project
+scheduler = auto
+default_scene = main
+
+[scene.main]
+tljoint = main.tljoint
+tljoint_scene = main

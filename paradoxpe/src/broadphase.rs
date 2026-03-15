@@ -86,7 +86,7 @@ impl BroadphasePipeline {
         let workers = rayon::current_num_threads().max(1);
         // Keep enough shards for work-stealing, but avoid tiny shard overhead on high-core CPUs.
         let desired_shards = if body_count >= 4_096 {
-            workers.saturating_mul(2)
+            workers.saturating_mul(3)
         } else {
             workers.saturating_mul(4)
         };
@@ -161,9 +161,9 @@ impl BroadphasePipeline {
             .enumerate()
             .for_each(|(shard_index, local_pairs)| {
                 local_pairs.clear();
-                let start = shard_index * chunk_size;
-                let end = (start + chunk_size).min(body_count);
-                for sorted_index in start..end {
+                // Cyclic scheduling balances SAP work better than contiguous chunks because
+                // lower sorted indices usually have longer overlap scans.
+                for sorted_index in (shard_index..body_count).step_by(shard_count.max(1)) {
                     let dense_a = sorted_dense[sorted_index];
                     let handle_a = handles[dense_a];
                     let aabb_a = aabbs[dense_a];

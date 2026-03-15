@@ -15,15 +15,17 @@ pub mod runtime;
 pub mod scene_workload;
 pub mod tile_planner;
 pub mod tuning;
+pub mod zram;
 
 pub use bridge::{MgsBridge, MgsBridgePlan, MpsWorkloadHint};
 pub use fallback::FallbackChain;
 pub use hardware::{GfxBackend, MobileGpuFamily, MobileGpuProfile, TbdrArchitecture};
 pub use runtime::{
-    choose_pacing_mode, is_unified_memory_profile, present_mode_allows_uncapped,
-    recommended_min_frame_interval, select_present_mode, select_throughput_burst, startup_ramp,
-    AdaptiveBurstController, AggressiveNoVsyncPolicy, RuntimeMode, RuntimePacingMode,
-    ThroughputMemoryPolicy, VsyncMode,
+    choose_pacing_mode, clamp_required_limits_to_supported, is_unified_memory_profile,
+    present_mode_allows_uncapped, recommended_min_frame_interval,
+    safe_default_required_limits_for_adapter, select_present_mode, select_throughput_burst,
+    startup_ramp, AdaptiveBurstController, AggressiveNoVsyncPolicy, DeviceLimitClampReport,
+    RuntimeMode, RuntimePacingMode, ThroughputFramePacer, ThroughputMemoryPolicy, VsyncMode,
 };
 pub use scene_workload::{
     estimate_mps_workload_hint, plan_scene_with_bridge, MobileSceneSnapshot, MobileSceneTuning,
@@ -32,3 +34,4 @@ pub use tile_planner::MgsPlanner;
 pub use tuning::{
     BackendRenderHints, LoadAction, MetalPassHints, MgsTuningProfile, StoreAction, VulkanPassHints,
 };
+pub use zram::{MpsZramConfig, MpsZramError, MpsZramSpillOutcome, MpsZramSpillPool, MpsZramStats};

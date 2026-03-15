@@ -64,7 +64,55 @@ the active phase before broad beta feature expansion.
 
 - implement and validate pre-alpha gates listed in `docs/tileline-pre-alpha-transition.md`
 - keep multi-GPU and mobile fallback behavior in `gms/src` and `mgs/src` aligned with runtime flow
+- keep ARM mobile validation repeatable with the Orange Pi 5 MGS gate:
+  - runner: `scripts/test_mgs_orangepi5.sh`
+  - guide: `docs/mgs-orangepi5-validation.md`
 - prioritize integration bugs over new subsystem scope
+
+### Milestone Snapshot (2026-03-15)
+
+- `MGS` stabilization lane: mostly complete for pre-alpha transition
+- `MGS` memory-pressure controls: ZRAM spill layer + relaxed decrease policy integrated in `mgs/src`
+- Orange Pi 5 validation harness: active (`scripts/test_mgs_orangepi5.sh`) with updated parser for `Render FPS: avg=...`
+- Remaining gate before closing MGS lane:
+  - run the same validation script on actual Orange Pi 5 (Mali/Panthor path)
+  - archive one passing artifact bundle in `dist/mgs/orangepi5/<timestamp>/`
+  - record device-specific FPS/stability baseline in `docs/mgs-orangepi5-validation.md`
+
+## Android Beta Track (Decision-Locked)
+
+Android is the official second platform in beta planning. This track runs in parallel with core
+desktop hardening.
+
+### Locked Defaults
+
+- ABI: `arm64-v8a` (`aarch64-linux-android`)
+- API level: `29+`
+- backend policy: Vulkan-first with fail-soft fallback UX (no hard crash)
+- scheduler policy: Android `auto => MGS`
+- mini editor scope: scene view + start/pause/stop + compile diagnostics
+- input scope: touch + gamepad
+- build path: `cargo-apk`
+
+### Phase Locks
+
+1. Stage 1: APK bring-up + scheduler + fail-soft
+   - shared app-runner layer used by desktop and Android entrypoints
+   - deterministic scheduler precedence for `.tlpfile`
+   - unsupported Vulkan must enter fail-soft mode with clear diagnostics
+2. Stage 2: Mini Editor V1
+   - Android editor-lite shell (scene preview + playback controls + diagnostics)
+   - touch-first preview control while keeping gamepad active
+   - advanced file/text editing remains desktop-focused in this stage
+3. Stage 3: Device + performance gates
+   - minimum two-device gate: one Adreno + one Mali/Panthor
+   - average FPS target >= 30
+   - P95 frame-time target near 33.3 ms band (short spikes diagnosable)
+
+### Release Mapping
+
+- `v0.2.x`: pre-beta Android enablement and policy stabilization
+- `v0.3.0-beta`: Android enters official beta scope
 
 ## Phase 0: Foundation Hardening
 

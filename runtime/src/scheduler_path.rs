@@ -6,6 +6,24 @@
 
 use mgs::MobileGpuProfile;
 
+/// Runtime platform classification used by scheduler policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePlatform {
+    Desktop,
+    Android,
+}
+
+impl RuntimePlatform {
+    /// Build-time platform signal.
+    pub fn current() -> Self {
+        if cfg!(target_os = "android") {
+            Self::Android
+        } else {
+            Self::Desktop
+        }
+    }
+}
+
 /// Graphics scheduler family selected by runtime policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphicsSchedulerPath {
@@ -34,6 +52,14 @@ pub struct GraphicsSchedulerDecision {
 
 /// Select a scheduler path from `wgpu::AdapterInfo`.
 pub fn choose_scheduler_path(adapter_info: &wgpu::AdapterInfo) -> GraphicsSchedulerDecision {
+    choose_scheduler_path_for_platform(adapter_info, RuntimePlatform::current())
+}
+
+/// Select a scheduler path from `wgpu::AdapterInfo` with explicit platform policy.
+pub fn choose_scheduler_path_for_platform(
+    adapter_info: &wgpu::AdapterInfo,
+    platform: RuntimePlatform,
+) -> GraphicsSchedulerDecision {
     let profile = MobileGpuProfile::detect(&adapter_info.name);
     let is_mobile_tbdr = profile.is_mobile_tbdr();
     let is_integrated_or_mobile = matches!(
@@ -41,7 +67,18 @@ pub fn choose_scheduler_path(adapter_info: &wgpu::AdapterInfo) -> GraphicsSchedu
         wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Other
     );
 
-    let (path, reason) = if is_mobile_tbdr && is_integrated_or_mobile {
+    let (path, reason) = if platform == RuntimePlatform::Android {
+        (
+            GraphicsSchedulerPath::Mgs,
+            format!(
+                "android auto policy prefers MGS ({:?}/{:?}, {:?}, {:?})",
+                profile.family,
+                profile.architecture,
+                adapter_info.device_type,
+                adapter_info.backend
+            ),
+        )
+    } else if is_mobile_tbdr && is_integrated_or_mobile {
         (
             GraphicsSchedulerPath::Mgs,
             format!(
@@ -61,7 +98,7 @@ pub fn choose_scheduler_path(adapter_info: &wgpu::AdapterInfo) -> GraphicsSchedu
         (
             GraphicsSchedulerPath::Gms,
             format!(
-                "non-mobile or throughput-oriented adapter ({:?}, {:?})",
+                "desktop auto policy selected throughput path ({:?}, {:?})",
                 adapter_info.device_type, adapter_info.backend
             ),
         )
@@ -107,7 +144,14 @@ mod tests {
     #[test]
     fn chooses_gms_for_discrete_desktop_profile() {
         let info = make_adapter_info("NVIDIA GeForce RTX 5060 Ti", wgpu::DeviceType::DiscreteGpu);
-        let decision = choose_scheduler_path(&info);
+        let decision = choose_scheduler_path_for_platform(&info, RuntimePlatform::Desktop);
         assert_eq!(decision.path, GraphicsSchedulerPath::Gms);
+    }
+
+    #[test]
+    fn chooses_mgs_for_android_even_on_discrete_label() {
+        let info = make_adapter_info("NVIDIA GeForce RTX 5060 Ti", wgpu::DeviceType::DiscreteGpu);
+        let decision = choose_scheduler_path_for_platform(&info, RuntimePlatform::Android);
+        assert_eq!(decision.path, GraphicsSchedulerPath::Mgs);
     }
 }
