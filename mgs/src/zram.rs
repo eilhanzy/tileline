@@ -37,6 +37,10 @@ pub struct MpsZramConfig {
     pub deflate_level: u8,
     /// Number of logical shards used for parallel chunk operations.
     pub compression_shards: usize,
+    /// Maximum bytes that cold (uncompressed) pages may occupy in system RAM.
+    /// Pages demoted from the hot zram pool land here before being dropped.
+    /// Set to `0` to disable the cold tier entirely.
+    pub max_cold_bytes: usize,
 }
 
 impl Default for MpsZramConfig {
@@ -50,6 +54,9 @@ impl Default for MpsZramConfig {
             min_payload_bytes: 2 * 1024,
             deflate_level: 6,
             compression_shards: 4,
+            // 128 MiB cold tier — stays within typical system RAM headroom without
+            // risking OOM on mobile/UMA devices.
+            max_cold_bytes: 128 * 1024 * 1024,
         }
     }
 }
@@ -89,6 +96,14 @@ impl MpsZramConfig {
             cfg.target_compressed_bytes = cfg.target_compressed_bytes.min(12 * 1024 * 1024);
             cfg.hard_compressed_bytes = cfg.hard_compressed_bytes.min(18 * 1024 * 1024);
             cfg.deflate_level = 4;
+            // Tighter cold tier on Apple UMA: shared CPU/GPU memory means cold pages
+            // compete with GPU resources. 64 MiB is a reasonable guard.
+            cfg.max_cold_bytes = 64 * 1024 * 1024;
+        }
+
+        if uma_shared_memory || profile.is_mobile_tbdr() {
+            // Cold tier is already reduced for UMA above; non-Apple UMA also caps at 64 MiB.
+            cfg.max_cold_bytes = cfg.max_cold_bytes.min(64 * 1024 * 1024);
         }
 
         cfg
@@ -109,6 +124,7 @@ pub struct MpsZramSpillOutcome {
 /// Pool-level telemetry.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MpsZramStats {
+    /// Number of pages currently in the hot (compressed) zram tier.
     pub stored_pages: usize,
     pub uncompressed_bytes: usize,
     pub compressed_bytes: usize,
@@ -116,6 +132,16 @@ pub struct MpsZramStats {
     pub restore_events: u64,
     pub evict_events: u64,
     pub failed_restores: u64,
+    /// Number of pages currently in the cold (uncompressed system RAM) tier.
+    pub cold_stored_pages: usize,
+    /// Total uncompressed bytes held by the cold tier.
+    pub cold_bytes: usize,
+    /// Pages demoted from hot zram to the cold system RAM tier.
+    pub cold_spill_events: u64,
+    /// Pages promoted from the cold tier back to the caller.
+    pub cold_restore_events: u64,
+    /// Pages dropped from the cold tier when its budget was exceeded.
+    pub cold_evict_events: u64,
 }
 
 impl MpsZramStats {
@@ -158,7 +184,15 @@ impl std::fmt::Display for MpsZramError {
 
 impl std::error::Error for MpsZramError {}
 
-/// Deterministic compressed spill pool.
+/// Deterministic two-tier compressed spill pool.
+///
+/// **Hot tier** — pages are DEFLATE-compressed and kept in process memory.
+/// When the hot tier exceeds its budget, pages are demoted to the cold tier
+/// instead of being dropped immediately.
+///
+/// **Cold tier** — pages are stored uncompressed in system RAM up to
+/// `max_cold_bytes`. When the cold tier is also over budget, the oldest cold
+/// pages are dropped (evicted). This prevents OOM by bounding total usage.
 ///
 /// The pool is designed to be owned by one runtime thread. Internally, it uses
 /// parallel chunk processing for compression/decompression but does not require
@@ -166,9 +200,13 @@ impl std::error::Error for MpsZramError {}
 #[derive(Debug)]
 pub struct MpsZramSpillPool {
     config: MpsZramConfig,
+    /// Hot tier: DEFLATE-compressed pages.
     pages: HashMap<u64, CompressedPage>,
     lru: VecDeque<(u64, u64)>,
     next_generation: u64,
+    /// Cold tier: uncompressed pages in system RAM, ordered oldest-first.
+    cold_pages: HashMap<u64, Vec<u8>>,
+    cold_lru: VecDeque<u64>,
     stats: MpsZramStats,
 }
 
@@ -180,6 +218,8 @@ impl MpsZramSpillPool {
             pages: HashMap::with_capacity(config.max_pages.max(16)),
             lru: VecDeque::with_capacity(config.max_pages.max(16)),
             next_generation: 1,
+            cold_pages: HashMap::new(),
+            cold_lru: VecDeque::new(),
             stats: MpsZramStats::default(),
         }
     }
@@ -237,31 +277,45 @@ impl MpsZramSpillPool {
         }
     }
 
-    /// Restores a compressed page.
+    /// Restores a page. Checks the hot (compressed) tier first, then falls back
+    /// to the cold (system RAM) tier. Returns `None` if the page is not found in
+    /// either tier.
     pub fn restore(&mut self, page_id: u64) -> Result<Option<Vec<u8>>, MpsZramError> {
-        let Some(page) = self.pages.get(&page_id).cloned() else {
-            return Ok(None);
-        };
-
-        let inflated_chunks = self.decompress_chunks(&page.chunks)?;
-        let mut restored = Vec::with_capacity(page.uncompressed_len);
-        for chunk in inflated_chunks {
-            restored.extend_from_slice(&chunk);
+        // Hot tier lookup.
+        if let Some(page) = self.pages.get(&page_id).cloned() {
+            let inflated_chunks = self.decompress_chunks(&page.chunks)?;
+            let mut restored = Vec::with_capacity(page.uncompressed_len);
+            for chunk in inflated_chunks {
+                restored.extend_from_slice(&chunk);
+            }
+            restored.truncate(page.uncompressed_len);
+            self.stats.restore_events = self.stats.restore_events.saturating_add(1);
+            self.lru.push_back((page_id, page.generation));
+            return Ok(Some(restored));
         }
-        restored.truncate(page.uncompressed_len);
 
-        self.stats.restore_events = self.stats.restore_events.saturating_add(1);
-        self.lru.push_back((page_id, page.generation));
-        Ok(Some(restored))
+        // Cold tier fallback.
+        if let Some(cold) = self.cold_pages.remove(&page_id) {
+            self.stats.cold_bytes = self.stats.cold_bytes.saturating_sub(cold.len());
+            self.stats.cold_stored_pages = self.cold_pages.len();
+            self.stats.cold_restore_events = self.stats.cold_restore_events.saturating_add(1);
+            return Ok(Some(cold));
+        }
+
+        Ok(None)
     }
 
-    /// Clears all compressed pages.
+    /// Clears all pages from both hot and cold tiers.
     pub fn clear(&mut self) {
         self.pages.clear();
         self.lru.clear();
+        self.cold_pages.clear();
+        self.cold_lru.clear();
         self.stats.stored_pages = 0;
         self.stats.uncompressed_bytes = 0;
         self.stats.compressed_bytes = 0;
+        self.stats.cold_stored_pages = 0;
+        self.stats.cold_bytes = 0;
     }
 
     fn compress_payload(&self, payload: &[u8]) -> Vec<Vec<u8>> {
@@ -306,7 +360,7 @@ impl MpsZramSpillPool {
 
     fn enforce_budget(&mut self) -> usize {
         let mut evicted = 0usize;
-        while self.over_budget() {
+        while self.hot_over_budget() {
             let Some((key, generation)) = self.lru.pop_front() else {
                 break;
             };
@@ -318,15 +372,68 @@ impl MpsZramSpillPool {
             if stale {
                 continue;
             }
+            // Try to restore the compressed page so we can demote it to the cold tier.
+            // If cold tier is full or disabled, just drop the page.
+            let demoted = if self.config.max_cold_bytes > 0 {
+                if let Some(page) = self.pages.get(&key).cloned() {
+                    if let Ok(chunks) = self.decompress_chunks(&page.chunks) {
+                        let mut raw: Vec<u8> = Vec::with_capacity(page.uncompressed_len);
+                        for chunk in chunks {
+                            raw.extend_from_slice(&chunk);
+                        }
+                        raw.truncate(page.uncompressed_len);
+                        self.try_demote_to_cold(key, raw)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             if self.remove_page(key) {
-                evicted = evicted.saturating_add(1);
-                self.stats.evict_events = self.stats.evict_events.saturating_add(1);
+                if demoted {
+                    self.stats.cold_spill_events = self.stats.cold_spill_events.saturating_add(1);
+                } else {
+                    evicted = evicted.saturating_add(1);
+                    self.stats.evict_events = self.stats.evict_events.saturating_add(1);
+                }
             }
         }
         evicted
     }
 
-    fn over_budget(&self) -> bool {
+    /// Attempts to store a raw page in the cold tier. Returns `true` on success.
+    /// Enforces the cold budget by evicting the oldest cold pages first.
+    fn try_demote_to_cold(&mut self, key: u64, raw: Vec<u8>) -> bool {
+        if self.config.max_cold_bytes == 0 {
+            return false;
+        }
+        // Make room in the cold tier if needed.
+        while self.stats.cold_bytes.saturating_add(raw.len()) > self.config.max_cold_bytes {
+            let Some(oldest_key) = self.cold_lru.pop_front() else {
+                break;
+            };
+            if let Some(dropped) = self.cold_pages.remove(&oldest_key) {
+                self.stats.cold_bytes = self.stats.cold_bytes.saturating_sub(dropped.len());
+                self.stats.cold_stored_pages = self.cold_pages.len();
+                self.stats.cold_evict_events = self.stats.cold_evict_events.saturating_add(1);
+            }
+        }
+        // If still no room (single page larger than budget), bail.
+        if raw.len() > self.config.max_cold_bytes {
+            return false;
+        }
+        self.stats.cold_bytes = self.stats.cold_bytes.saturating_add(raw.len());
+        self.cold_pages.insert(key, raw);
+        self.cold_lru.push_back(key);
+        self.stats.cold_stored_pages = self.cold_pages.len();
+        true
+    }
+
+    fn hot_over_budget(&self) -> bool {
         self.stats.compressed_bytes > self.config.hard_compressed_bytes
             || self.stats.compressed_bytes > self.config.target_compressed_bytes
             || self.pages.len() > self.config.max_pages
@@ -377,13 +484,47 @@ mod tests {
     }
 
     #[test]
-    fn enforce_budget_evicts_oldest_pages() {
+    fn enforce_budget_demotes_to_cold_then_evicts() {
+        // Hot budget: tiny (2 KiB), cold budget: also tiny (32 KiB).
+        // With 4× 16 KiB pages, the hot tier overflows and pages demote to cold.
+        // When cold also fills up, the oldest cold pages are evicted (dropped).
         let mut pool = MpsZramSpillPool::new(MpsZramConfig {
             chunk_bytes: 4 * 1024,
             min_payload_bytes: 1,
             target_compressed_bytes: 2 * 1024,
             hard_compressed_bytes: 2 * 1024,
             max_pages: 2,
+            max_cold_bytes: 32 * 1024,
+            ..MpsZramConfig::default()
+        });
+
+        for i in 0..4u64 {
+            let payload = vec![i as u8; 16 * 1024];
+            pool.spill(i, &payload);
+        }
+
+        let stats = pool.stats();
+        // Hot tier must respect max_pages.
+        assert!(stats.stored_pages <= 2);
+        // Pages were demoted to cold or evicted — at least one cold spill or hard eviction.
+        assert!(
+            stats.cold_spill_events >= 1 || stats.evict_events >= 1,
+            "expected at least one cold demote or hard eviction"
+        );
+        // Cold tier must not exceed its budget.
+        assert!(stats.cold_bytes <= 32 * 1024);
+    }
+
+    #[test]
+    fn cold_tier_disabled_causes_hard_eviction() {
+        // With max_cold_bytes = 0 the cold tier is off; overflow pages are dropped.
+        let mut pool = MpsZramSpillPool::new(MpsZramConfig {
+            chunk_bytes: 4 * 1024,
+            min_payload_bytes: 1,
+            target_compressed_bytes: 2 * 1024,
+            hard_compressed_bytes: 2 * 1024,
+            max_pages: 2,
+            max_cold_bytes: 0,
             ..MpsZramConfig::default()
         });
 
@@ -395,6 +536,7 @@ mod tests {
         let stats = pool.stats();
         assert!(stats.stored_pages <= 2);
         assert!(stats.evict_events >= 1);
+        assert_eq!(stats.cold_stored_pages, 0);
     }
 
     #[test]

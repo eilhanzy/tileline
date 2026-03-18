@@ -76,6 +76,9 @@ pub struct AdaptiveFrameTelemetry {
     pub in_flight_encoders: u32,
     /// GMS hardware score for the integrated GPU. `0` falls back to baseline.
     pub igpu_gms_hardware_score: u64,
+    /// Number of frames currently queued and waiting to be presented.
+    /// Values > 1 indicate framebuffer congestion.
+    pub pending_frame_count: u32,
 }
 
 impl Default for AdaptiveFrameTelemetry {
@@ -85,6 +88,7 @@ impl Default for AdaptiveFrameTelemetry {
             submitted_encoders: 0,
             in_flight_encoders: 0,
             igpu_gms_hardware_score: 0,
+            pending_frame_count: 0,
         }
     }
 }
@@ -104,6 +108,9 @@ pub struct AdaptiveBufferDecision {
     pub recommended_encoder_submissions: u32,
     /// Whether a new encoder submission should be deferred this frame.
     pub should_defer_encoder_submission: bool,
+    /// True when the framebuffer queue is backed up and spill relief is recommended.
+    /// Callers should activate zram spilling or reduce submission pressure.
+    pub framebuffer_congested: bool,
     /// Current effective CPU map budget in bytes.
     pub cpu_map_budget_bytes: u64,
     /// Current effective GPU shared-buffer budget in bytes.
@@ -399,6 +406,11 @@ impl AdaptiveBuffer {
         let should_defer_encoder_submission =
             telemetry.in_flight_encoders >= self.max_concurrent_encoders;
 
+        // Framebuffer congestion: queue backed up OR encoder window saturated OR in recovery.
+        let framebuffer_congested = telemetry.pending_frame_count > 1
+            || should_defer_encoder_submission
+            || self.mode == AdaptiveBufferMode::StabilityRecovery;
+
         let contention_events = self.contention_events_since_last_reconcile;
         self.contention_events_since_last_reconcile = 0;
 
@@ -409,6 +421,7 @@ impl AdaptiveBuffer {
             max_concurrent_encoders: self.max_concurrent_encoders,
             recommended_encoder_submissions,
             should_defer_encoder_submission,
+            framebuffer_congested,
             cpu_map_budget_bytes: self.cpu_map_budget_bytes,
             gpu_shared_budget_bytes: self.gpu_shared_budget_bytes,
             cpu_mapped_bytes_in_use: self.cpu_mapped_bytes_in_use,
@@ -627,6 +640,7 @@ mod tests {
                 submitted_encoders: 2,
                 in_flight_encoders: 1,
                 igpu_gms_hardware_score: 1_229,
+                pending_frame_count: 0,
             });
             assert!(decision.frame_stddev_ms <= 0.001);
         }
@@ -640,6 +654,7 @@ mod tests {
                 submitted_encoders: 4,
                 in_flight_encoders: 4,
                 igpu_gms_hardware_score: 1_229,
+                pending_frame_count: 0,
             });
         }
 
@@ -658,6 +673,7 @@ mod tests {
                 submitted_encoders: 8,
                 in_flight_encoders: 0,
                 igpu_gms_hardware_score: 1_229, // M4 baseline
+                pending_frame_count: 0,
             });
         }
 

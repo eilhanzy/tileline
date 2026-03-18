@@ -615,6 +615,11 @@ impl WgpuRenderLoopCoordinator {
                 .max(1),
             in_flight_encoders: in_flight_encoders.max(1),
             igpu_gms_hardware_score: igpu_score,
+            // FrameExecutionTelemetry does not track swap-chain queue depth directly.
+            // GMS congestion is already inferred from in_flight_encoders vs the encoder
+            // window; pending_frame_count is left to be wired up if a dedicated
+            // present-queue depth counter is added to FrameExecutionTelemetry later.
+            pending_frame_count: 0,
         };
 
         let decision = self.frame_loop.reconcile_apple_uma(adaptive_input);
