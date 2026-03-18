@@ -1767,9 +1767,13 @@ impl TlAppRuntime {
         // path is active via an env-var override, so their full throughput budget is preserved.
         let mgs_is_mobile_hardware =
             mgs_like_path && !MobileGpuProfile::detect(&adapter_info.name).is_desktop_class();
+        // Mobile-class CPU tuning: Android, actual mobile MGS hardware, or ARM targets other
+        // than macOS (e.g., Raspberry Pi, ARM Linux). macOS on aarch64 is Apple Silicon —
+        // those machines are desktop-class and are handled by the Apple Silicon path below.
         let mobile_class_tuning = matches!(platform, RuntimePlatform::Android)
             || mgs_is_mobile_hardware
-            || cfg!(any(target_arch = "aarch64", target_arch = "arm"));
+            || (cfg!(any(target_arch = "aarch64", target_arch = "arm"))
+                && cfg!(not(target_os = "macos")));
         let little_core_class = mobile_class_tuning && logical_threads <= 8;
         let adaptive_distance_enabled = options.adaptive_distance.resolve(mobile_class_tuning);
         let mut render_distance = options
@@ -1816,6 +1820,18 @@ impl TlAppRuntime {
                 max_tick_hz: if little_core_class { 220.0 } else { 300.0 },
                 ticks_per_render_frame: 1.85,
                 default_tick_hz: (initial_fps_hint * 1.45).clamp(72.0, 180.0),
+            }
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            // Apple Silicon (M-series): desktop-class CPU but a thermally-bounded SoC.
+            // Use an intermediate policy — more aggressive than mobile but capped well
+            // below the full workstation ceiling to avoid unnecessary core activity.
+            // max_tick_hz of 180 Hz is 3× a 60 fps render target, which is ample for
+            // smooth physics; the retune's desktop multipliers are bounded by this cap.
+            TickRatePolicy {
+                min_tick_hz: 30.0,
+                max_tick_hz: (120.0 + logical_threads as f32 * 12.0).clamp(180.0, 300.0),
+                ticks_per_render_frame: 2.0,
+                default_tick_hz: (initial_fps_hint * 1.8).clamp(90.0, 160.0),
             }
         } else {
             TickRatePolicy {

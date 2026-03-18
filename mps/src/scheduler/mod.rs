@@ -11,7 +11,6 @@ pub mod queue;
 
 use crate::balancer::{CorePreference, LoadBalancer, TaskPriority};
 use crate::topology::{CpuClass, CpuTopology};
-use crossbeam::utils::Backoff;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -521,19 +520,36 @@ fn worker_loop(
     // E-cores even when Performance priority is intended.
     apply_thread_qos(worker_class);
 
-    // On macOS the kernel's QoS-aware scheduler responds quickly to unpark(),
-    // so a shorter idle sleep reduces latency between task submission and pickup.
-    // On other platforms we keep the original 250 µs to avoid unnecessary wakeups.
-    #[cfg(target_os = "macos")]
-    let idle_park = Duration::from_micros(50);
+    // Adaptive idle park bounds by platform and core class.
+    //
+    // task submission always calls unpark() on a worker, so the upper bound only
+    // affects truly idle periods — it does NOT add latency to task pickup.
+    //
+    // Apple Silicon (aarch64+macOS): longer caps are safe because the QoS-aware
+    // kernel wakes parked threads promptly. E-core workers get a longer upper
+    // bound so they stay off the scheduler radar when P-cores have capacity.
+    //
+    // x86 macOS: moderate caps — no asymmetric core topology to worry about.
+    //
+    // Other platforms: keep original 250 µs floor, modest 2 ms cap.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (idle_park_min, idle_park_max) = match worker_class {
+        CpuClass::Efficient => (Duration::from_micros(200), Duration::from_millis(8)),
+        _                   => (Duration::from_micros(100), Duration::from_millis(4)),
+    };
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    let (idle_park_min, idle_park_max) = (Duration::from_micros(50), Duration::from_millis(1));
     #[cfg(not(target_os = "macos"))]
-    let idle_park = Duration::from_micros(250);
+    let (idle_park_min, idle_park_max) = (Duration::from_micros(250), Duration::from_millis(2));
 
-    let backoff = Backoff::new();
+    // Current adaptive park duration — doubles on each empty poll, reset on task found.
+    let mut idle_park = idle_park_min;
 
     loop {
         if let Some(task) = queue.pop_for_worker(worker_class) {
-            backoff.reset();
+            // Work found: reset adaptive park so the next idle cycle starts fresh.
+            idle_park = idle_park_min;
+
             let started = Instant::now();
             let result = dispatcher.execute(task.payload);
             class_counters.record(worker_class, elapsed_nanos_u64(started.elapsed()));
@@ -553,10 +569,22 @@ fn worker_loop(
             break;
         }
 
-        if backoff.is_completed() {
+        // No work in queue. Avoid spin-looping (crossbeam Backoff is designed for
+        // lock contention, not queue polling — it burns CPU without doing real work).
+        // Instead, park the thread directly. task submission always calls unpark(),
+        // so latency to task pickup is not affected by the park duration.
+        //
+        // Once idle_park reaches its class maximum the thread parks indefinitely
+        // (park() instead of park_timeout()) so it truly sleeps until woken.
+        // unpark() on the next submission will resume it immediately.
+        if idle_park < idle_park_max {
             thread::park_timeout(idle_park);
+            idle_park = (idle_park * 2).min(idle_park_max);
         } else {
-            backoff.snooze();
+            thread::park();
+            // Reset to minimum after waking from indefinite park so the next
+            // burst of work gets the responsive short-park behavior.
+            idle_park = idle_park_min;
         }
     }
 }
