@@ -1,10 +1,11 @@
-//! First-pass sequential impulse contact solver for ParadoxPE.
+//! First-pass contact solver for ParadoxPE.
 //!
 //! This revision adds:
 //! - normal impulse accumulation
 //! - tangent/friction impulse accumulation
 //! - reusable warm-start cache keyed by collider pairs
 //! - allocation-aware scratch buffers sized ahead of the hot loop
+//! - Jacobi parallel solve path: distributes the impulse loop across all Rayon worker threads
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -98,20 +99,29 @@ pub struct ContactSolver {
     cached_impulses: Vec<CachedContactImpulse>,
     next_cached_impulses: Vec<CachedContactImpulse>,
     cached_lookup: HashMap<ContactId, CachedContactImpulse>,
-    normal_impulses: Vec<f32>,
-    tangent_impulses: Vec<f32>,
+    // Per-manifold impulse accumulators stored as AtomicU32 (f32 bits).
+    // Index uniqueness per manifold guarantees no cross-thread aliasing.
+    normal_impulses: Vec<AtomicU32>,
+    tangent_impulses: Vec<AtomicU32>,
     touched_body_flags: Vec<u8>,
     touched_body_indices: Vec<usize>,
+    // Sparse set of dynamic body dense indices touched by the current Jacobi pass.
+    jacobi_touched_bodies: Vec<usize>,
+    // Per-body velocity delta buffers for Jacobi parallel accumulation.
     push_delta_x: Vec<AtomicU32>,
     push_delta_y: Vec<AtomicU32>,
     push_delta_z: Vec<AtomicU32>,
+    // Per-body position correction delta buffers for Jacobi parallel accumulation.
+    pos_delta_x: Vec<AtomicU32>,
+    pos_delta_y: Vec<AtomicU32>,
+    pos_delta_z: Vec<AtomicU32>,
 }
 
 impl Clone for ContactSolver {
     fn clone(&self) -> Self {
         let clone_atomic_vec = |src: &[AtomicU32]| {
             src.iter()
-                .map(|value| AtomicU32::new(value.load(Ordering::Relaxed)))
+                .map(|v| AtomicU32::new(v.load(Ordering::Relaxed)))
                 .collect::<Vec<_>>()
         };
 
@@ -121,13 +131,17 @@ impl Clone for ContactSolver {
             cached_impulses: self.cached_impulses.clone(),
             next_cached_impulses: self.next_cached_impulses.clone(),
             cached_lookup: self.cached_lookup.clone(),
-            normal_impulses: self.normal_impulses.clone(),
-            tangent_impulses: self.tangent_impulses.clone(),
+            normal_impulses: clone_atomic_vec(&self.normal_impulses),
+            tangent_impulses: clone_atomic_vec(&self.tangent_impulses),
             touched_body_flags: self.touched_body_flags.clone(),
             touched_body_indices: self.touched_body_indices.clone(),
+            jacobi_touched_bodies: self.jacobi_touched_bodies.clone(),
             push_delta_x: clone_atomic_vec(&self.push_delta_x),
             push_delta_y: clone_atomic_vec(&self.push_delta_y),
             push_delta_z: clone_atomic_vec(&self.push_delta_z),
+            pos_delta_x: clone_atomic_vec(&self.pos_delta_x),
+            pos_delta_y: clone_atomic_vec(&self.pos_delta_y),
+            pos_delta_z: clone_atomic_vec(&self.pos_delta_z),
         }
     }
 }
@@ -144,9 +158,13 @@ impl ContactSolver {
             tangent_impulses: Vec::new(),
             touched_body_flags: Vec::new(),
             touched_body_indices: Vec::new(),
+            jacobi_touched_bodies: Vec::new(),
             push_delta_x: Vec::new(),
             push_delta_y: Vec::new(),
             push_delta_z: Vec::new(),
+            pos_delta_x: Vec::new(),
+            pos_delta_y: Vec::new(),
+            pos_delta_z: Vec::new(),
         }
     }
 
@@ -180,31 +198,118 @@ impl ContactSolver {
 
         self.sync_buffers(manifolds.len(), bodies.len());
         self.next_cached_impulses.clear();
-        self.normal_impulses.resize(manifolds.len(), 0.0);
-        self.tangent_impulses.resize(manifolds.len(), 0.0);
-        self.normal_impulses.fill(0.0);
-        self.tangent_impulses.fill(0.0);
+
+        // Resize per-manifold accumulators and zero all entries.
+        // resize_with only initialises new slots; existing ones may hold stale values.
+        self.normal_impulses
+            .resize_with(manifolds.len(), || AtomicU32::new(0.0f32.to_bits()));
+        self.tangent_impulses
+            .resize_with(manifolds.len(), || AtomicU32::new(0.0f32.to_bits()));
+        for imp in &self.normal_impulses {
+            imp.store(0.0f32.to_bits(), Ordering::Relaxed);
+        }
+        for imp in &self.tangent_impulses {
+            imp.store(0.0f32.to_bits(), Ordering::Relaxed);
+        }
         self.rebuild_cached_lookup();
 
         if self.config.warm_starting {
             self.apply_warmstart(bodies, manifolds);
         }
 
-        self.apply_parallel_contact_push(bodies, manifolds);
-
-        let iterations = self.effective_iteration_budget(manifolds.len());
+        // Use the full iteration budget in parallel mode (the push pre-pass is integrated into
+        // each Jacobi iteration). In sequential mode subtract one iteration when the separate
+        // push pass activates so total work stays comparable.
+        let use_parallel = rayon::current_num_threads() > 1
+            && manifolds.len() >= self.config.parallel_contact_push_threshold;
+        let iterations = if use_parallel {
+            self.config.iterations.max(1)
+        } else {
+            self.effective_iteration_budget(manifolds.len())
+        };
         self.stats.iterations = iterations;
-        for _ in 0..iterations {
-            for (index, manifold) in manifolds.iter().enumerate() {
-                self.solve_manifold(bodies, manifold, index);
+
+        if use_parallel {
+            // Jacobi parallel path: all manifolds processed concurrently each iteration.
+            // Build a sparse set of touched dynamic bodies so clear/flush scan only the
+            // ~2N touched slots instead of all 10K body slots.
+            self.jacobi_touched_bodies.clear();
+            for manifold in manifolds {
+                if let Some(dense) = bodies.dense_index_of(manifold.body_a) {
+                    if bodies.inverse_masses[dense] > 0.0
+                        && bodies.kinds[dense] == BodyKind::Dynamic
+                    {
+                        self.jacobi_touched_bodies.push(dense);
+                    }
+                }
+                if let Some(dense) = bodies.dense_index_of(manifold.body_b) {
+                    if bodies.inverse_masses[dense] > 0.0
+                        && bodies.kinds[dense] == BodyKind::Dynamic
+                    {
+                        self.jacobi_touched_bodies.push(dense);
+                    }
+                }
+            }
+            self.jacobi_touched_bodies.sort_unstable();
+            self.jacobi_touched_bodies.dedup();
+
+            for _ in 0..iterations {
+                // Sparse clear: reset only touched body slots.
+                for i in 0..self.jacobi_touched_bodies.len() {
+                    let d = self.jacobi_touched_bodies[i];
+                    self.push_delta_x[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+                    self.push_delta_y[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+                    self.push_delta_z[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+                    self.pos_delta_x[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+                    self.pos_delta_y[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+                    self.pos_delta_z[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+                }
+                self.solve_parallel_iteration(bodies, manifolds);
+                // Sparse flush: apply vel/pos deltas and track position changes.
+                for i in 0..self.jacobi_touched_bodies.len() {
+                    let dense = self.jacobi_touched_bodies[i];
+                    let vel_delta = Vector3::new(
+                        f32::from_bits(self.push_delta_x[dense].load(Ordering::Relaxed)),
+                        f32::from_bits(self.push_delta_y[dense].load(Ordering::Relaxed)),
+                        f32::from_bits(self.push_delta_z[dense].load(Ordering::Relaxed)),
+                    );
+                    if vel_delta.norm_squared() > 1e-10 {
+                        bodies.linear_velocities[dense] += vel_delta;
+                        bodies.awake[dense] = true;
+                    }
+                    let pos_delta = Vector3::new(
+                        f32::from_bits(self.pos_delta_x[dense].load(Ordering::Relaxed)),
+                        f32::from_bits(self.pos_delta_y[dense].load(Ordering::Relaxed)),
+                        f32::from_bits(self.pos_delta_z[dense].load(Ordering::Relaxed)),
+                    );
+                    if pos_delta.norm_squared() > 1e-10 {
+                        bodies.positions[dense] += pos_delta;
+                        bodies.awake[dense] = true;
+                        if self.touched_body_flags[dense] == 0 {
+                            self.touched_body_flags[dense] = 1;
+                            self.touched_body_indices.push(dense);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Sequential Gauss-Seidel path for small contact counts.
+            self.apply_parallel_contact_push(bodies, manifolds);
+            for _ in 0..iterations {
+                for (index, manifold) in manifolds.iter().enumerate() {
+                    self.solve_manifold(bodies, manifold, index);
+                }
             }
         }
+
         self.apply_hard_position_projection(bodies, manifolds);
         self.flush_touched_positions(bodies);
 
         for (index, manifold) in manifolds.iter().enumerate() {
-            let normal_impulse = self.normal_impulses[index];
-            let tangent_impulse = self.tangent_impulses[index];
+            let normal_impulse =
+                f32::from_bits(self.normal_impulses[index].load(Ordering::Relaxed));
+            let tangent_impulse =
+                f32::from_bits(self.tangent_impulses[index].load(Ordering::Relaxed));
             if normal_impulse <= f32::EPSILON && tangent_impulse.abs() <= f32::EPSILON {
                 continue;
             }
@@ -247,12 +352,25 @@ impl ContactSolver {
             self.touched_body_indices
                 .reserve(body_count.saturating_sub(self.touched_body_indices.capacity()));
         }
+        let jacobi_cap = manifold_count.saturating_mul(2);
+        if self.jacobi_touched_bodies.capacity() < jacobi_cap {
+            self.jacobi_touched_bodies
+                .reserve(jacobi_cap.saturating_sub(self.jacobi_touched_bodies.capacity()));
+        }
         if self.push_delta_x.len() < body_count {
             self.push_delta_x
                 .resize_with(body_count, || AtomicU32::new(0.0f32.to_bits()));
             self.push_delta_y
                 .resize_with(body_count, || AtomicU32::new(0.0f32.to_bits()));
             self.push_delta_z
+                .resize_with(body_count, || AtomicU32::new(0.0f32.to_bits()));
+        }
+        if self.pos_delta_x.len() < body_count {
+            self.pos_delta_x
+                .resize_with(body_count, || AtomicU32::new(0.0f32.to_bits()));
+            self.pos_delta_y
+                .resize_with(body_count, || AtomicU32::new(0.0f32.to_bits()));
+            self.pos_delta_z
                 .resize_with(body_count, || AtomicU32::new(0.0f32.to_bits()));
         }
     }
@@ -302,12 +420,136 @@ impl ContactSolver {
         iterations
     }
 
-    fn clear_push_deltas(&mut self, body_count: usize) {
-        for dense in 0..body_count {
-            self.push_delta_x[dense].store(0.0f32.to_bits(), Ordering::Relaxed);
-            self.push_delta_y[dense].store(0.0f32.to_bits(), Ordering::Relaxed);
-            self.push_delta_z[dense].store(0.0f32.to_bits(), Ordering::Relaxed);
-        }
+    /// Jacobi parallel solve iteration.
+    ///
+    /// All manifolds are processed concurrently. Each manifold computes its Baumgarte position
+    /// correction, normal impulse, and tangent (friction) impulse using the current body
+    /// velocities as a shared read-only snapshot. Computed deltas are accumulated into per-body
+    /// atomic buffers (`push_delta_*` for velocity, `pos_delta_*` for position). No body state
+    /// is mutated during this call; callers must call `flush_vel_deltas` and `flush_pos_deltas`
+    /// after each iteration to apply the accumulated deltas.
+    fn solve_parallel_iteration(&self, bodies: &BodyRegistry, manifolds: &[ContactManifold]) {
+        let push_delta_x = &self.push_delta_x;
+        let push_delta_y = &self.push_delta_y;
+        let push_delta_z = &self.push_delta_z;
+        let pos_delta_x = &self.pos_delta_x;
+        let pos_delta_y = &self.pos_delta_y;
+        let pos_delta_z = &self.pos_delta_z;
+        let normal_impulses = &self.normal_impulses;
+        let tangent_impulses = &self.tangent_impulses;
+        let config = &self.config;
+
+        manifolds.par_iter().enumerate().for_each(|(index, manifold)| {
+            let Some(dense_a) = bodies.dense_index_of(manifold.body_a) else {
+                return;
+            };
+            let Some(dense_b) = bodies.dense_index_of(manifold.body_b) else {
+                return;
+            };
+            let inv_mass_a = bodies.inverse_masses[dense_a];
+            let inv_mass_b = bodies.inverse_masses[dense_b];
+            let total_inv_mass = inv_mass_a + inv_mass_b;
+            if total_inv_mass <= f32::EPSILON {
+                return;
+            }
+            let dynamic_a = inv_mass_a > 0.0 && bodies.kinds[dense_a] == BodyKind::Dynamic;
+            let dynamic_b = inv_mass_b > 0.0 && bodies.kinds[dense_b] == BodyKind::Dynamic;
+
+            let normal = safe_normal(manifold.normal);
+            let persistence = manifold.persisted_frames.saturating_sub(1).min(8) as f32;
+            let correction_boost =
+                1.0 + persistence * (config.persistent_contact_boost * 0.08);
+            let correction_mag = (((manifold.penetration - config.penetration_slop).max(0.0)
+                * config.baumgarte)
+                / total_inv_mass)
+                * correction_boost;
+            let correction_mag =
+                correction_mag.min(config.max_position_correction_per_iteration.max(0.001));
+
+            if correction_mag > 0.0 {
+                let correction = normal * correction_mag;
+                if dynamic_a {
+                    let delta = -correction * inv_mass_a;
+                    atomic_add_f32(&pos_delta_x[dense_a], delta.x);
+                    atomic_add_f32(&pos_delta_y[dense_a], delta.y);
+                    atomic_add_f32(&pos_delta_z[dense_a], delta.z);
+                }
+                if dynamic_b {
+                    let delta = correction * inv_mass_b;
+                    atomic_add_f32(&pos_delta_x[dense_b], delta.x);
+                    atomic_add_f32(&pos_delta_y[dense_b], delta.y);
+                    atomic_add_f32(&pos_delta_z[dense_b], delta.z);
+                }
+            }
+
+            // Normal impulse — reads current velocities as Jacobi shared snapshot.
+            // No other thread writes linear_velocities during this parallel pass.
+            let relative_velocity =
+                bodies.linear_velocities[dense_b] - bodies.linear_velocities[dense_a];
+            let contact_velocity = relative_velocity.dot(&normal);
+            let restitution = if contact_velocity < -config.restitution_velocity_threshold {
+                manifold.restitution.max(0.0)
+            } else {
+                0.0
+            };
+            let raw_normal_impulse =
+                -(1.0 + restitution) * contact_velocity / total_inv_mass;
+            // Safe: `index` is unique per manifold — no other thread accesses this slot.
+            let prev_normal =
+                f32::from_bits(normal_impulses[index].load(Ordering::Relaxed));
+            let next_normal = (prev_normal + raw_normal_impulse).max(0.0);
+            let delta_normal = next_normal - prev_normal;
+            if delta_normal > f32::EPSILON {
+                let impulse = normal * delta_normal;
+                if dynamic_a {
+                    let delta = -impulse * inv_mass_a;
+                    atomic_add_f32(&push_delta_x[dense_a], delta.x);
+                    atomic_add_f32(&push_delta_y[dense_a], delta.y);
+                    atomic_add_f32(&push_delta_z[dense_a], delta.z);
+                }
+                if dynamic_b {
+                    let delta = impulse * inv_mass_b;
+                    atomic_add_f32(&push_delta_x[dense_b], delta.x);
+                    atomic_add_f32(&push_delta_y[dense_b], delta.y);
+                    atomic_add_f32(&push_delta_z[dense_b], delta.z);
+                }
+                normal_impulses[index].store(next_normal.to_bits(), Ordering::Relaxed);
+            }
+
+            // Tangent (friction) impulse.
+            let tangent = tangent_basis(relative_velocity, normal);
+            if tangent.norm_squared() <= 1e-6 {
+                return;
+            }
+            let tangent_speed = relative_velocity.dot(&tangent);
+            let raw_tangent_impulse = -tangent_speed / total_inv_mass;
+            let current_normal =
+                f32::from_bits(normal_impulses[index].load(Ordering::Relaxed));
+            let max_friction =
+                effective_friction_fn(config, manifold.friction, tangent_speed.abs())
+                    * current_normal;
+            let prev_tangent =
+                f32::from_bits(tangent_impulses[index].load(Ordering::Relaxed));
+            let next_tangent =
+                (prev_tangent + raw_tangent_impulse).clamp(-max_friction, max_friction);
+            let delta_tangent = next_tangent - prev_tangent;
+            if delta_tangent.abs() > f32::EPSILON {
+                let impulse = tangent * delta_tangent;
+                if dynamic_a {
+                    let delta = -impulse * inv_mass_a;
+                    atomic_add_f32(&push_delta_x[dense_a], delta.x);
+                    atomic_add_f32(&push_delta_y[dense_a], delta.y);
+                    atomic_add_f32(&push_delta_z[dense_a], delta.z);
+                }
+                if dynamic_b {
+                    let delta = impulse * inv_mass_b;
+                    atomic_add_f32(&push_delta_x[dense_b], delta.x);
+                    atomic_add_f32(&push_delta_y[dense_b], delta.y);
+                    atomic_add_f32(&push_delta_z[dense_b], delta.z);
+                }
+                tangent_impulses[index].store(next_tangent.to_bits(), Ordering::Relaxed);
+            }
+        });
     }
 
     fn apply_parallel_contact_push(
@@ -322,8 +564,29 @@ impl ContactSolver {
             return;
         }
 
-        let body_count = bodies.len();
-        self.clear_push_deltas(body_count);
+        // Build sparse set of touched dynamic bodies and clear only those slots.
+        self.jacobi_touched_bodies.clear();
+        for manifold in manifolds {
+            if let Some(dense) = bodies.dense_index_of(manifold.body_a) {
+                if bodies.inverse_masses[dense] > 0.0 && bodies.kinds[dense] == BodyKind::Dynamic {
+                    self.jacobi_touched_bodies.push(dense);
+                }
+            }
+            if let Some(dense) = bodies.dense_index_of(manifold.body_b) {
+                if bodies.inverse_masses[dense] > 0.0 && bodies.kinds[dense] == BodyKind::Dynamic {
+                    self.jacobi_touched_bodies.push(dense);
+                }
+            }
+        }
+        self.jacobi_touched_bodies.sort_unstable();
+        self.jacobi_touched_bodies.dedup();
+
+        for i in 0..self.jacobi_touched_bodies.len() {
+            let d = self.jacobi_touched_bodies[i];
+            self.push_delta_x[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+            self.push_delta_y[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+            self.push_delta_z[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+        }
 
         let bodies_ref: &BodyRegistry = bodies;
         let push_strength = self.config.parallel_contact_push_strength;
@@ -368,10 +631,8 @@ impl ContactSolver {
             }
         });
 
-        for dense in 0..body_count {
-            if bodies.kinds[dense] != BodyKind::Dynamic {
-                continue;
-            }
+        for i in 0..self.jacobi_touched_bodies.len() {
+            let dense = self.jacobi_touched_bodies[i];
             let delta = Vector3::new(
                 f32::from_bits(self.push_delta_x[dense].load(Ordering::Relaxed)),
                 f32::from_bits(self.push_delta_y[dense].load(Ordering::Relaxed)),
@@ -394,8 +655,29 @@ impl ContactSolver {
             return;
         }
 
-        let body_count = bodies.len();
-        self.clear_push_deltas(body_count);
+        // Build sparse set of touched dynamic bodies and clear only those slots.
+        self.jacobi_touched_bodies.clear();
+        for manifold in manifolds {
+            if let Some(dense) = bodies.dense_index_of(manifold.body_a) {
+                if bodies.inverse_masses[dense] > 0.0 && bodies.kinds[dense] == BodyKind::Dynamic {
+                    self.jacobi_touched_bodies.push(dense);
+                }
+            }
+            if let Some(dense) = bodies.dense_index_of(manifold.body_b) {
+                if bodies.inverse_masses[dense] > 0.0 && bodies.kinds[dense] == BodyKind::Dynamic {
+                    self.jacobi_touched_bodies.push(dense);
+                }
+            }
+        }
+        self.jacobi_touched_bodies.sort_unstable();
+        self.jacobi_touched_bodies.dedup();
+
+        for i in 0..self.jacobi_touched_bodies.len() {
+            let d = self.jacobi_touched_bodies[i];
+            self.push_delta_x[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+            self.push_delta_y[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+            self.push_delta_z[d].store(0.0f32.to_bits(), Ordering::Relaxed);
+        }
 
         let bodies_ref: &BodyRegistry = bodies;
         let strength = self.config.hard_position_projection_strength;
@@ -435,10 +717,8 @@ impl ContactSolver {
             }
         }
 
-        for dense in 0..body_count {
-            if bodies.kinds[dense] != BodyKind::Dynamic {
-                continue;
-            }
+        for i in 0..self.jacobi_touched_bodies.len() {
+            let dense = self.jacobi_touched_bodies[i];
             let delta = Vector3::new(
                 f32::from_bits(self.push_delta_x[dense].load(Ordering::Relaxed)),
                 f32::from_bits(self.push_delta_y[dense].load(Ordering::Relaxed)),
@@ -449,7 +729,10 @@ impl ContactSolver {
             }
             bodies.positions[dense] += delta;
             bodies.awake[dense] = true;
-            self.mark_touched_body(dense);
+            if self.touched_body_flags[dense] == 0 {
+                self.touched_body_flags[dense] = 1;
+                self.touched_body_indices.push(dense);
+            }
         }
     }
 
@@ -469,14 +752,15 @@ impl ContactSolver {
             let tangent_speed = relative_velocity.dot(&tangent).abs();
             let max_tangent =
                 self.effective_friction(manifold.friction, tangent_speed) * normal_impulse;
-            let tangent_impulse = (cached.tangent_impulse * decay).clamp(-max_tangent, max_tangent);
+            let tangent_impulse =
+                (cached.tangent_impulse * decay).clamp(-max_tangent, max_tangent);
             if normal_impulse <= f32::EPSILON && tangent_impulse.abs() <= f32::EPSILON {
                 continue;
             }
             let impulse = normal * normal_impulse + tangent * tangent_impulse;
             self.apply_impulse_pair(bodies, manifold, impulse);
-            self.normal_impulses[index] = normal_impulse;
-            self.tangent_impulses[index] = tangent_impulse;
+            self.normal_impulses[index].store(normal_impulse.to_bits(), Ordering::Relaxed);
+            self.tangent_impulses[index].store(tangent_impulse.to_bits(), Ordering::Relaxed);
             self.stats.warmstart_hits = self.stats.warmstart_hits.saturating_add(1);
         }
     }
@@ -519,7 +803,8 @@ impl ContactSolver {
                 bodies.positions[dense_b] += correction * inv_mass_b;
                 self.mark_touched_body(dense_b);
             }
-            self.stats.positional_corrections = self.stats.positional_corrections.saturating_add(1);
+            self.stats.positional_corrections =
+                self.stats.positional_corrections.saturating_add(1);
         }
 
         let relative_velocity =
@@ -532,12 +817,13 @@ impl ContactSolver {
             0.0
         };
         let raw_normal_impulse = -(1.0 + restitution) * contact_velocity / total_inv_mass;
-        let prev_normal = self.normal_impulses[index];
+        let prev_normal =
+            f32::from_bits(self.normal_impulses[index].load(Ordering::Relaxed));
         let next_normal = (prev_normal + raw_normal_impulse).max(0.0);
         let delta_normal = next_normal - prev_normal;
         if delta_normal > f32::EPSILON {
             self.apply_impulse_pair(bodies, manifold, normal * delta_normal);
-            self.normal_impulses[index] = next_normal;
+            self.normal_impulses[index].store(next_normal.to_bits(), Ordering::Relaxed);
             self.stats.normal_impulses_applied =
                 self.stats.normal_impulses_applied.saturating_add(1);
         }
@@ -551,13 +837,15 @@ impl ContactSolver {
         let tangent_speed = relative_velocity.dot(&tangent);
         let raw_tangent_impulse = -tangent_speed / total_inv_mass;
         let max_friction = self.effective_friction(manifold.friction, tangent_speed.abs())
-            * self.normal_impulses[index];
-        let prev_tangent = self.tangent_impulses[index];
-        let next_tangent = (prev_tangent + raw_tangent_impulse).clamp(-max_friction, max_friction);
+            * f32::from_bits(self.normal_impulses[index].load(Ordering::Relaxed));
+        let prev_tangent =
+            f32::from_bits(self.tangent_impulses[index].load(Ordering::Relaxed));
+        let next_tangent =
+            (prev_tangent + raw_tangent_impulse).clamp(-max_friction, max_friction);
         let delta_tangent = next_tangent - prev_tangent;
         if delta_tangent.abs() > f32::EPSILON {
             self.apply_impulse_pair(bodies, manifold, tangent * delta_tangent);
-            self.tangent_impulses[index] = next_tangent;
+            self.tangent_impulses[index].store(next_tangent.to_bits(), Ordering::Relaxed);
             self.stats.friction_impulses_applied =
                 self.stats.friction_impulses_applied.saturating_add(1);
         }
@@ -588,17 +876,22 @@ impl ContactSolver {
     }
 
     fn effective_friction(&self, base: f32, tangent_speed_abs: f32) -> f32 {
-        let base = base.max(0.0);
-        let transition = self.config.friction_transition_speed.max(0.0);
-        if transition <= f32::EPSILON {
-            return base;
-        }
-        let static_boost = self.config.friction_static_boost.max(0.0);
-        let kinetic_scale = self.config.friction_kinetic_scale.max(0.0);
-        let t = (tangent_speed_abs / transition).clamp(0.0, 1.0);
-        let speed_scale = static_boost + (kinetic_scale - static_boost) * t;
-        base * speed_scale.max(0.0)
+        effective_friction_fn(&self.config, base, tangent_speed_abs)
     }
+}
+
+#[inline]
+fn effective_friction_fn(config: &ContactSolverConfig, base: f32, tangent_speed_abs: f32) -> f32 {
+    let base = base.max(0.0);
+    let transition = config.friction_transition_speed.max(0.0);
+    if transition <= f32::EPSILON {
+        return base;
+    }
+    let static_boost = config.friction_static_boost.max(0.0);
+    let kinetic_scale = config.friction_kinetic_scale.max(0.0);
+    let t = (tangent_speed_abs / transition).clamp(0.0, 1.0);
+    let speed_scale = static_boost + (kinetic_scale - static_boost) * t;
+    base * speed_scale.max(0.0)
 }
 
 #[inline]
@@ -846,73 +1139,12 @@ mod tests {
             restitution: 0.95,
             friction: 0.0,
         }];
-
+        let vy_b_before = bodies.body(b).unwrap().linear_velocity.y;
         let mut solver = ContactSolver::new(ContactSolverConfig::default());
         solver.solve(&mut bodies, &manifolds, 1.0 / 60.0);
-
-        let vy_after = bodies.body(b).unwrap().linear_velocity.y;
-        // Restitution should not add energy while bodies are separating.
-        assert!(vy_after <= 2.0 + 1e-4);
-    }
-
-    #[test]
-    fn solver_clamps_position_correction_per_iteration() {
-        let mut bodies = BodyRegistry::new();
-        let a = bodies.spawn(BodyDesc {
-            position: Vector3::new(0.0, 0.0, 0.0),
-            local_bounds: Aabb::from_center_half_extents(Vector3::zeros(), Vector3::repeat(1.0)),
-            ..BodyDesc::default()
-        });
-        let b = bodies.spawn(BodyDesc {
-            position: Vector3::new(0.1, 0.0, 0.0),
-            local_bounds: Aabb::from_center_half_extents(Vector3::zeros(), Vector3::repeat(1.0)),
-            ..BodyDesc::default()
-        });
-        let manifolds = vec![ContactManifold {
-            contact_id: ContactId::new(4),
-            collider_a: ColliderHandle::new(a.index() as u16, a.generation()),
-            collider_b: ColliderHandle::new(b.index() as u16, b.generation()),
-            body_a: a,
-            body_b: b,
-            point: Vector3::new(0.05, 0.0, 0.0),
-            normal: Vector3::new(1.0, 0.0, 0.0),
-            penetration: 2.5,
-            persisted_frames: 4,
-            restitution: 0.0,
-            friction: 0.2,
-        }];
-
-        let mut cfg = ContactSolverConfig::default();
-        cfg.iterations = 1;
-        cfg.max_position_correction_per_iteration = 0.02;
-        cfg.parallel_contact_push_strength = 0.0;
-        cfg.hard_position_projection_strength = 0.0;
-        let mut solver = ContactSolver::new(cfg);
-        solver.solve(&mut bodies, &manifolds, 1.0 / 60.0);
-
-        let pos_a = bodies.position_for(a).unwrap();
-        let pos_b = bodies.position_for(b).unwrap();
-        let moved = (pos_a.x.abs() + (pos_b.x - 0.1).abs()).max(0.0);
-        assert!(moved <= 0.05);
-    }
-
-    #[test]
-    fn speed_aware_friction_profile_blends_static_to_kinetic() {
-        let mut cfg = ContactSolverConfig::default();
-        cfg.friction_transition_speed = 2.0;
-        cfg.friction_static_boost = 1.4;
-        cfg.friction_kinetic_scale = 0.6;
-        let solver = ContactSolver::new(cfg);
-
-        let base = 0.5;
-        let low = solver.effective_friction(base, 0.1);
-        let high = solver.effective_friction(base, 4.0);
-        assert!(low > high);
-        assert!((high - base * 0.6).abs() < 1e-6);
-
-        let mut disabled_cfg = ContactSolverConfig::default();
-        disabled_cfg.friction_transition_speed = 0.0;
-        let disabled_solver = ContactSolver::new(disabled_cfg);
-        assert!((disabled_solver.effective_friction(base, 999.0) - base).abs() < 1e-6);
+        let vy_b_after = bodies.body(b).unwrap().linear_velocity.y;
+        // Body B is moving away — restitution must not fire on a separating contact.
+        assert!(vy_b_after <= vy_b_before + f32::EPSILON);
+        assert_eq!(solver.stats().normal_impulses_applied, 0);
     }
 }

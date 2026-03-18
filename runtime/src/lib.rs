@@ -31,6 +31,7 @@ mod app_runner;
 mod draw_path;
 mod frame_loop;
 mod mas;
+mod physics_mps_runner;
 mod mobile_scene_workload;
 mod network_transport;
 mod pak;

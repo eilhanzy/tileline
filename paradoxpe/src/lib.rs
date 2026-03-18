@@ -51,4 +51,4 @@ pub use snapshot::{
 };
 pub use solver::{ContactSolver, ContactSolverConfig, ContactSolverStats};
 pub use storage::{BodyReadDomain, BodyRegistry, BodyVelocityWriteDomain};
-pub use world::{FixedStepClock, PhysicsWorld, PhysicsWorldConfig};
+pub use world::{FixedStepClock, PhysicsStepTimings, PhysicsWorld, PhysicsWorldConfig};

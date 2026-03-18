@@ -4,6 +4,8 @@
 //! dense generational handles, cache-friendly body storage, allocation-free hot stepping, and a
 //! broadphase pipeline that can scale across Tileline's CPU task execution model.
 
+use std::time::{Duration, Instant};
+
 use nalgebra::Vector3;
 use rayon::prelude::*;
 
@@ -141,8 +143,30 @@ impl Default for PhysicsWorldConfig {
     }
 }
 
-/// Engine-facing ParadoxPE world skeleton.
-#[derive(Debug, Clone)]
+/// Per-substep timing breakdown for identifying physics pipeline bottlenecks.
+/// All durations are summed across all substeps in a single `step()` call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PhysicsStepTimings {
+    pub substeps: u32,
+    pub integrate_us: u64,
+    pub broadphase_us: u64,
+    pub narrowphase_us: u64,
+    pub solver_us: u64,
+    pub sleep_us: u64,
+    pub snapshot_us: u64,
+}
+
+impl PhysicsStepTimings {
+    pub fn total_us(&self) -> u64 {
+        self.integrate_us
+            + self.broadphase_us
+            + self.narrowphase_us
+            + self.solver_us
+            + self.sleep_us
+            + self.snapshot_us
+    }
+}
+
 pub struct PhysicsWorld {
     config: PhysicsWorldConfig,
     clock: FixedStepClock,
@@ -161,6 +185,7 @@ pub struct PhysicsWorld {
     free_contact_snapshots: Vec<u16>,
     contacts: Vec<ContactPair>,
     interpolation: PhysicsInterpolationBuffer,
+    pub last_step_timings: PhysicsStepTimings,
 }
 
 impl PhysicsWorld {
@@ -190,6 +215,7 @@ impl PhysicsWorld {
             free_contact_snapshots: Vec::new(),
             contacts: Vec::new(),
             interpolation: PhysicsInterpolationBuffer::default(),
+            last_step_timings: PhysicsStepTimings::default(),
         }
     }
 
@@ -608,19 +634,40 @@ impl PhysicsWorld {
             return 0;
         }
 
+        let mut timings = PhysicsStepTimings {
+            substeps,
+            ..PhysicsStepTimings::default()
+        };
+
         // Keep interpolation snapshots bounded to one pre-step and one post-step capture per
         // render frame. Capturing per-substep can dominate frame time at high body counts.
+        let t = Instant::now();
         self.interpolation.push_snapshot(self.capture_snapshot());
+        timings.snapshot_us += duration_us(t.elapsed());
+
         let body_count = self.bodies.len();
         // Sleep graph maintenance is useful but costly in huge fully-active scenes. Update it at
         // a lower cadence under heavy load to keep more budget for parallel broadphase/narrowphase.
-        let sleep_update_stride = if body_count >= 3_500 { 2 } else { 1 };
+        let sleep_update_stride = if body_count >= 6_000 {
+            4
+        } else if body_count >= 3_500 {
+            2
+        } else {
+            1
+        };
         for step_index in 0..substeps {
+            let t = Instant::now();
             self.bodies.integrate(fixed_dt, self.config.gravity);
+            timings.integrate_us += duration_us(t.elapsed());
+
+            let t = Instant::now();
             self.broadphase.set_predictive_dt(fixed_dt);
             self.narrowphase.set_predictive_dt(fixed_dt);
             let bodies = &self.bodies;
             self.broadphase.rebuild_pairs_parallel(bodies);
+            timings.broadphase_us += duration_us(t.elapsed());
+
+            let t = Instant::now();
             let candidate_pairs = self.broadphase.candidate_pairs();
             let colliders = &self.colliders;
             let manifolds = self
@@ -628,20 +675,35 @@ impl PhysicsWorld {
                 .rebuild_manifolds(bodies, candidate_pairs, |body| {
                     primary_shape_for_body(colliders, bodies, body)
                 });
+            timings.narrowphase_us += duration_us(t.elapsed());
+
+            let t = Instant::now();
             self.solver.solve(&mut self.bodies, manifolds, fixed_dt);
             self.joint_solver
                 .solve(&mut self.bodies, &self.active_joints, fixed_dt);
             Self::rebuild_contacts_from_manifolds(&mut self.contacts, manifolds);
-            if step_index % sleep_update_stride == 0 || step_index + 1 == substeps {
+            timings.solver_us += duration_us(t.elapsed());
+
+            let is_last = step_index + 1 == substeps;
+            let on_stride = substeps as usize > sleep_update_stride
+                && step_index as usize % sleep_update_stride == 0;
+            if is_last || on_stride {
+                let t = Instant::now();
                 self.sleep_manager.update(
                     &mut self.bodies,
                     manifolds,
                     &self.active_joints,
                     fixed_dt,
                 );
+                timings.sleep_us += duration_us(t.elapsed());
             }
         }
+
+        let t = Instant::now();
         self.interpolation.push_snapshot(self.capture_snapshot());
+        timings.snapshot_us += duration_us(t.elapsed());
+
+        self.last_step_timings = timings;
         substeps
     }
 
@@ -876,7 +938,10 @@ fn primary_shape_for_body(
     ))
 }
 
-#[inline]
+fn duration_us(d: Duration) -> u64 {
+    d.as_micros() as u64
+}
+
 fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t.clamp(0.0, 1.0)
 }

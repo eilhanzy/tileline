@@ -25,6 +25,7 @@ use crate::{
 };
 use gms::safe_default_required_limits_for_adapter;
 use mgs::MobileGpuProfile;
+use crate::physics_mps_runner::{PhysicsMpsRunner, PhysicsStepToken};
 use nalgebra::Vector3;
 use paradoxpe::{
     BroadphaseConfig, ContactSolverConfig, NarrowphaseConfig, PhysicsWorld, PhysicsWorldConfig,
@@ -909,7 +910,12 @@ struct TlAppRuntime {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
-    world: PhysicsWorld,
+    world: PhysicsMpsRunner,
+    /// Pending async physics step submitted before last GPU upload.
+    /// Drained at the start of the next frame before building instances.
+    physics_token: Option<PhysicsStepToken>,
+    /// Metrics from the most recent physics_tick() call (1-frame pipeline lag).
+    last_tick: BounceTankTickMetrics,
     scene: BounceTankSceneController,
     draw_compiler: DrawPathCompiler,
     hud: TelemetryHudComposer,
@@ -1908,7 +1914,7 @@ impl TlAppRuntime {
                 baumgarte: 0.32,
                 penetration_slop: 0.0015,
                 parallel_contact_push_strength: 0.28,
-                parallel_contact_push_threshold: if mobile_class_tuning { 128 } else { 256 },
+                parallel_contact_push_threshold: 16,
                 hard_position_projection_strength: 0.95,
                 hard_position_projection_threshold: if mobile_class_tuning { 96 } else { 128 },
                 max_projection_per_contact: if mobile_class_tuning { 0.08 } else { 0.10 },
@@ -2056,7 +2062,15 @@ impl TlAppRuntime {
             queue,
             config,
             size,
-            world,
+            world: PhysicsMpsRunner::new(world),
+            physics_token: None,
+            last_tick: BounceTankTickMetrics {
+                spawned_this_tick: 0,
+                scattered_this_tick: 0,
+                live_balls: 0,
+                target_balls: 0,
+                fully_spawned: false,
+            },
             scene,
             draw_compiler,
             hud,
@@ -2165,6 +2179,10 @@ impl TlAppRuntime {
             return;
         }
         self.shutdown_prepared = true;
+        // Drain any pending async physics step before shutting down.
+        if let Some(token) = self.physics_token.take() {
+            token.wait();
+        }
         self.console.open = false;
         self.mouse_look_held = false;
         self.look_lock_active = false;
@@ -2404,19 +2422,30 @@ impl TlAppRuntime {
     }
 
     fn reset_simulation_state(&mut self) {
-        let world_config = self.world.config().clone();
+        // Drain any in-flight physics step before replacing the world.
+        if let Some(token) = self.physics_token.take() {
+            token.wait();
+        }
+        self.last_tick = BounceTankTickMetrics {
+            spawned_this_tick: 0,
+            scattered_this_tick: 0,
+            live_balls: 0,
+            target_balls: 0,
+            fully_spawned: false,
+        };
+        let world_config = self.world.borrow().config().clone();
         let scene_config = self.scene.config();
         let sprite_program = self.scene.sprite_program_cloned();
         let ball_mesh_slot = self.scene.ball_mesh_slot();
         let container_mesh_slot = self.scene.container_mesh_slot();
-        self.world = PhysicsWorld::new(world_config);
+        self.world.replace(PhysicsWorld::new(world_config));
         self.scene = BounceTankSceneController::new(scene_config);
         if let Some(program) = sprite_program {
             self.scene.set_sprite_program(program);
         }
         if ball_mesh_slot.is_some() || container_mesh_slot.is_some() {
             let _ = self.scene.apply_runtime_patch(
-                &mut self.world,
+                &mut *self.world.borrow_mut(),
                 BounceTankRuntimePatch {
                     ball_mesh_slot,
                     container_mesh_slot,
@@ -3584,7 +3613,7 @@ impl TlAppRuntime {
                 let fps = self.fps_tracker.snapshot();
                 let fsr = self.renderer.fsr_status();
                 let rt = self.renderer.ray_tracing_status();
-                let gravity = self.world.gravity();
+                let gravity = self.world.borrow().gravity();
                 self.console_feedback(format!(
                     "perf snapshot | fps inst={:.1} ema={:.1} avg={:.1} stddev={:.2}ms | frame_ema={:.2}ms jitter_ema={:.2}ms | fill={:.2}/{:.2} | balls={} draw_limit={:?} | substeps={}/{} manual={:?} | grav=[{:.2},{:.2},{:.2}] | rt={:?}/{} dyn={} | fsr={:?}/{:?} scale={:.2} sharp={:.2}",
                     fps.instant_fps,
@@ -3646,7 +3675,7 @@ impl TlAppRuntime {
                         return RuntimeCommand::Consumed;
                     }
                 };
-                self.world.set_gravity(Vector3::new(x, y, z));
+                self.world.borrow_mut().set_gravity(Vector3::new(x, y, z));
                 self.console_feedback(format!("gravity set to [{x:.3}, {y:.3}, {z:.3}]"));
             }
             "phys.substeps" => {
@@ -3669,6 +3698,7 @@ impl TlAppRuntime {
                     self.manual_max_substeps = Some(substeps);
                     self.max_substeps = substeps;
                     self.world
+                        .borrow_mut()
                         .set_timestep(1.0 / self.tick_hz.max(1.0), self.max_substeps);
                     self.console_feedback(format!("manual max_substeps={substeps}"));
                 }
@@ -5961,7 +5991,7 @@ impl TlAppRuntime {
             .set_force_full_fbx_sphere(force_full_fbx_runtime);
 
         if let Some(cap) = self.adaptive_live_ball_budget {
-            let _ = self.scene.enforce_live_ball_budget(&mut self.world, cap);
+            let _ = self.scene.enforce_live_ball_budget(&mut *self.world.borrow_mut(), cap);
         }
 
         self.tick_retune_timer -= sim_dt;
@@ -6038,6 +6068,7 @@ impl TlAppRuntime {
             let floor_hz = hard_floor.min(catch_up_hz * 0.90).max(24.0);
             self.tick_hz = self.tick_hz.max(floor_hz).min(catch_up_hz);
             self.world
+                .borrow_mut()
                 .set_timestep(1.0 / self.tick_hz, self.max_substeps);
             self.tick_retune_timer = if mobile_path {
                 if ramp_up {
@@ -6064,42 +6095,35 @@ impl TlAppRuntime {
             true
         };
 
-        let (tick, substeps) = if allow_physics_step {
-            let _patch_metrics = self
-                .scene
-                .apply_runtime_patch(&mut self.world, runtime_patch);
-            let tick = self.scene.physics_tick(&mut self.world);
-            self.script_last_spawned = tick.spawned_this_tick;
-            let step_dt = if self.simulation_paused {
-                self.world.config().fixed_dt
-            } else {
-                sim_dt
-            };
-            let substeps = self.world.step(step_dt);
-            self.last_substeps = substeps;
-            let _ = self.scene.reconcile_after_step(&mut self.world);
-            (tick, substeps)
+        // ── Wait for the physics step submitted during last frame's GPU upload ──
+        // On the very first frame physics_token is None, so substeps=0 and we
+        // start with the world's initial state (empty scene).  From frame 2
+        // onward the token is always present and we block here only for the
+        // tail of the step that outlasted the GPU upload window.
+        let t_phys_begin = Instant::now();
+        let substeps = if let Some(token) = self.physics_token.take() {
+            let s = token.wait();
+            let _ = self.scene.reconcile_after_step(&mut *self.world.borrow_mut());
+            self.last_substeps = s;
+            s
         } else {
-            self.script_last_spawned = 0;
             self.last_substeps = 0;
-            (
-                BounceTankTickMetrics {
-                    spawned_this_tick: 0,
-                    scattered_this_tick: 0,
-                    live_balls: self.scene.live_ball_count(),
-                    target_balls: self.scene.config().target_ball_count,
-                    fully_spawned: self.scene.live_ball_count()
-                        >= self.scene.config().target_ball_count,
-                },
-                0,
+            0
+        };
+        // Tick metrics were captured in the previous frame's physics_tick call.
+        let tick = self.last_tick;
+
+        // ── Build frame instances from the just-reconciled physics state ─────
+        let t_scene_begin = Instant::now();
+        let pre_phys_us = (t_phys_begin - frame_begin).as_micros() as u64;
+        let mut frame = {
+            let w = self.world.borrow();
+            self.scene.build_frame_instances_with_ball_limit(
+                &*w,
+                Some(w.interpolation_alpha()),
+                self.adaptive_ball_render_limit,
             )
         };
-
-        let mut frame = self.scene.build_frame_instances_with_ball_limit(
-            &self.world,
-            Some(self.world.interpolation_alpha()),
-            self.adaptive_ball_render_limit,
-        );
         let unknown_light_overrides =
             apply_scene_light_overrides(&mut frame, frame_eval.light_overrides.as_slice());
         let light_pruned = clamp_scene_lights_for_camera(&mut frame, eye, MAX_SCENE_LIGHTS);
@@ -6163,7 +6187,44 @@ impl TlAppRuntime {
             console_layout,
             &mut self.console_overlay_sprites,
         );
+        let t_compile_begin = Instant::now();
+        let scene_us = (t_compile_begin - t_scene_begin).as_micros() as u64;
         let draw = self.draw_compiler.compile(&frame);
+        let t_upload_begin = Instant::now();
+        let compile_us = (t_upload_begin - t_compile_begin).as_micros() as u64;
+
+        // ── Submit next physics step before GPU upload ─────────────────────────
+        // apply_runtime_patch + physics_tick prepare the world for the step,
+        // then step_begin submits world.step(dt) to an MPS Critical worker.
+        // The step runs concurrently with upload_draw_frame (~9 ms), hiding
+        // the ~2 ms physics cost behind the already-serialised GPU work.
+        if allow_physics_step {
+            {
+                let mut w = self.world.borrow_mut();
+                let _patch_metrics = self
+                    .scene
+                    .apply_runtime_patch(&mut *w, runtime_patch);
+                self.last_tick = self.scene.physics_tick(&mut *w);
+                self.script_last_spawned = self.last_tick.spawned_this_tick;
+            }
+            let step_dt = if self.simulation_paused {
+                self.world.borrow().config().fixed_dt
+            } else {
+                sim_dt
+            };
+            self.physics_token = Some(self.world.step_begin(step_dt));
+        } else {
+            self.script_last_spawned = 0;
+            self.last_tick = BounceTankTickMetrics {
+                spawned_this_tick: 0,
+                scattered_this_tick: 0,
+                live_balls: self.scene.live_ball_count(),
+                target_balls: self.scene.config().target_ball_count,
+                fully_spawned: self.scene.live_ball_count()
+                    >= self.scene.config().target_ball_count,
+            };
+        }
+
         let upload = self
             .renderer
             .upload_draw_frame(&self.device, &self.queue, &draw);
@@ -6212,9 +6273,12 @@ impl TlAppRuntime {
         );
         self.renderer.encode_overlay_sprites(&mut encoder, &view);
         self.queue.submit(Some(encoder.finish()));
+        let t_present_begin = Instant::now();
+        let upload_us = (t_present_begin - t_upload_begin).as_micros() as u64;
         output.present();
 
         let frame_end = Instant::now();
+        let present_us = (frame_end - t_present_begin).as_micros() as u64;
         let frame_time = (frame_end - frame_begin).as_secs_f32();
         let report = self.fps_tracker.record(frame_end, frame_time);
         if self.uncapped_dynamic_fps_hint {
@@ -6244,9 +6308,10 @@ impl TlAppRuntime {
             ),
             None => String::new(),
         };
+        let step_timings = self.world.borrow().last_step_timings;
         let console_suffix = self.console_title_suffix();
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | {:?} {} {:?}{}{}{}{}{}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | Phys {}µs (int {}µs bp {}µs np {}µs sv {}µs sl {}µs) | {:?} {} {:?}{}{}{}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
             self.tick_hz,
@@ -6260,6 +6325,12 @@ impl TlAppRuntime {
             if fsr_status.active { "on" } else { "off" },
             fsr_status.render_scale,
             substeps,
+            step_timings.total_us(),
+            step_timings.integrate_us,
+            step_timings.broadphase_us,
+            step_timings.narrowphase_us,
+            step_timings.solver_us,
+            step_timings.sleep_us,
             self.adapter_backend,
             scheduler_label,
             self.present_mode,
@@ -6285,10 +6356,11 @@ impl TlAppRuntime {
         self.window.set_title(&title);
 
         if let Some(report) = report {
-            let broadphase = self.world.broadphase().stats();
-            let narrowphase = self.world.narrowphase().stats();
+            let w = self.world.borrow();
+            let broadphase = w.broadphase().stats();
+            let narrowphase = w.narrowphase().stats();
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | lights: {:>2} | substeps: {} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
@@ -6297,6 +6369,18 @@ impl TlAppRuntime {
                 visible_ball_count,
                 upload.light_count,
                 substeps,
+                step_timings.total_us(),
+                step_timings.integrate_us,
+                step_timings.broadphase_us,
+                step_timings.narrowphase_us,
+                step_timings.solver_us,
+                step_timings.sleep_us,
+                step_timings.snapshot_us,
+                pre_phys_us,
+                scene_us,
+                compile_us,
+                upload_us,
+                present_us,
                 tick.scattered_this_tick,
                 self.last_distance_culled,
                 self.last_distance_blurred,

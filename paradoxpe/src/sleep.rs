@@ -88,9 +88,11 @@ impl SleepIslandManager {
         dt: f32,
     ) {
         self.stats = SleepStats::default();
-        self.prepare_for_bodies(bodies.len());
+        let body_count = bodies.handles.len();
+        self.prepare_for_bodies(body_count);
+
         self.dynamic_dense.clear();
-        for dense in 0..bodies.handles.len() {
+        for dense in 0..body_count {
             if bodies.inverse_masses[dense] > 0.0 {
                 self.dynamic_dense.push(dense);
             }
@@ -114,6 +116,8 @@ impl SleepIslandManager {
         self.island_counts.fill(0);
         self.island_all_slow.fill(true);
         let threshold_sq = self.config.linear_speed_threshold * self.config.linear_speed_threshold;
+
+        // Serial pass: path-compress all roots and count bodies per island.
         let mut islands = 0usize;
         for index in 0..self.dynamic_dense.len() {
             let dense = self.dynamic_dense[index];
@@ -122,11 +126,19 @@ impl SleepIslandManager {
                 islands += 1;
             }
             self.island_counts[root] += 1;
+        }
+        self.stats.islands = islands;
+
+        // Mark islands containing fast bodies as non-sleeping.
+        // After the find() calls above, roots are fully path-compressed so roots[dense]
+        // is the direct root without further find() traversal.
+        for index in 0..self.dynamic_dense.len() {
+            let dense = self.dynamic_dense[index];
+            let root = self.roots[dense];
             if bodies.linear_velocities[dense].norm_squared() > threshold_sq {
                 self.island_all_slow[root] = false;
             }
         }
-        self.stats.islands = islands;
 
         for index in 0..self.dynamic_dense.len() {
             let dense = self.dynamic_dense[index];
@@ -140,6 +152,10 @@ impl SleepIslandManager {
                     bodies.set_sleeping_dense(dense);
                 }
             } else {
+                // Skip redundant writes for bodies already awake with zero timer.
+                if bodies.awake[dense] && bodies.sleep_timers[dense] == 0.0 {
+                    continue;
+                }
                 let was_awake = bodies.awake[dense];
                 bodies.wake_dense(dense);
                 if !was_awake {

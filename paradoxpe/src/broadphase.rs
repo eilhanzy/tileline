@@ -177,19 +177,24 @@ impl BroadphasePipeline {
         self.swept_aabbs.clear();
         self.swept_aabbs.extend(aabbs.iter().copied());
         if self.config.speculative_sweep && self.predictive_dt > 1e-6 {
-            for dense in 0..body_count {
-                if matches!(kinds[dense], BodyKind::Dynamic | BodyKind::Kinematic) {
-                    self.swept_aabbs[dense] = swept_aabb(
-                        aabbs[dense],
-                        velocities[dense],
-                        self.predictive_dt,
-                        self.config.speculative_max_distance,
-                    );
-                }
-            }
+            let predictive_dt = self.predictive_dt;
+            let speculative_max_distance = self.config.speculative_max_distance;
+            self.swept_aabbs
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(dense, swept)| {
+                    if matches!(kinds[dense], BodyKind::Dynamic | BodyKind::Kinematic) {
+                        *swept = swept_aabb(
+                            aabbs[dense],
+                            velocities[dense],
+                            predictive_dt,
+                            speculative_max_distance,
+                        );
+                    }
+                });
         }
         let swept_aabbs = &self.swept_aabbs;
-        self.sorted_dense.sort_unstable_by(|left, right| {
+        self.sorted_dense.par_sort_unstable_by(|left, right| {
             swept_aabbs[*left]
                 .min
                 .x

@@ -69,6 +69,8 @@ pub struct NarrowphasePipeline {
     config: NarrowphaseConfig,
     predictive_dt: f32,
     manifolds: Vec<ContactManifold>,
+    // Scratch buffer reused across frames to avoid per-substep allocation from par_extend.
+    produced_buffer: Vec<ContactManifold>,
     previous_states: Vec<PersistentManifoldState>,
     next_states: Vec<PersistentManifoldState>,
     persisted_lookup: HashMap<ContactId, PersistentManifoldState>,
@@ -79,6 +81,7 @@ impl NarrowphasePipeline {
     pub fn new(config: NarrowphaseConfig) -> Self {
         Self {
             manifolds: Vec::new(),
+            produced_buffer: Vec::new(),
             previous_states: Vec::new(),
             next_states: Vec::new(),
             persisted_lookup: HashMap::new(),
@@ -128,6 +131,10 @@ impl NarrowphasePipeline {
             self.manifolds
                 .reserve(target.saturating_sub(self.manifolds.capacity()));
         }
+        if self.produced_buffer.capacity() < target {
+            self.produced_buffer
+                .reserve(target.saturating_sub(self.produced_buffer.capacity()));
+        }
         if self.previous_states.capacity() < target {
             self.previous_states
                 .reserve(target.saturating_sub(self.previous_states.capacity()));
@@ -171,7 +178,8 @@ impl NarrowphasePipeline {
         }
         let persisted_lookup = &self.persisted_lookup;
 
-        let produced = candidate_pairs
+        self.produced_buffer.clear();
+        self.produced_buffer.par_extend(candidate_pairs
             .par_iter()
             .filter_map(|&(body_a, body_b)| {
                 let (collider_a, shape_a, material_a, filter_a) = collider_lookup(body_a)?;
@@ -232,12 +240,13 @@ impl NarrowphasePipeline {
                     friction,
                 })
             })
-            .collect::<Vec<_>>();
+        );
 
-        let produced_count = produced.len();
+        let produced_count = self.produced_buffer.len();
         let capacity = self.manifolds.capacity();
         let keep_count = produced_count.min(capacity);
-        self.manifolds.extend(produced.into_iter().take(keep_count));
+        self.manifolds
+            .extend_from_slice(&self.produced_buffer[..keep_count]);
 
         self.stats.culled_pairs = candidate_pairs.len().saturating_sub(produced_count);
         if produced_count > capacity {
