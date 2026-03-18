@@ -162,6 +162,19 @@ impl MobileGpuProfile {
     pub fn is_mobile_tbdr(&self) -> bool {
         self.architecture.is_tbdr() && !matches!(self.family, MobileGpuFamily::Unknown)
     }
+
+    /// Profilin Apple M serisi gibi aslında masaüstü/laptop sınıfı bir TBDR olup olmadığını döndürür.
+    /// Runtime bu bayrağı kullanarak cihazı MGS yerine GMS'e yönlendirme kararı alabilir.
+    pub fn is_desktop_class(&self) -> bool {
+        let n = self.name.to_ascii_lowercase();
+        matches!(self.family, MobileGpuFamily::Apple) 
+            && (n.contains(" m1") || n.contains(" m2") || n.contains(" m3")
+                || n.contains(" m4") || n.contains(" m5") || n.contains(" m6")
+                || n.contains(" m7") || n.contains(" m8") || n.contains(" m9")
+                || n.starts_with("m1") || n.starts_with("m2") || n.starts_with("m3")
+                || n.starts_with("m4") || n.starts_with("m5") || n.starts_with("m6")
+                || n.starts_with("m7") || n.starts_with("m8") || n.starts_with("m9"))
+    }
 }
 
 fn classify_family(name: &str) -> MobileGpuFamily {
@@ -179,6 +192,11 @@ fn classify_family(name: &str) -> MobileGpuFamily {
         || name.contains(" m2")
         || name.contains(" m3")
         || name.contains(" m4")
+        || name.contains(" m5")
+        || name.contains(" m6")
+        || name.contains(" m7")
+        || name.contains(" m8")
+        || name.contains(" m9")
     {
         MobileGpuFamily::Apple
     } else {
@@ -301,6 +319,8 @@ fn parse_apple_cores(name: &str) -> u32 {
         8
     } else if name.contains("a14") || name.contains("a13") {
         6
+    } else if name.contains(" m") || name.starts_with("m") {
+        10 // Gelecek/bilinmeyen M serisi (M5 vb.) için güvenli masaüstü tabanı
     } else {
         4
     }

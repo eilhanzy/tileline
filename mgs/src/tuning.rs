@@ -208,12 +208,19 @@ impl MgsTuningProfile {
         let backend_hints =
             BackendRenderHints::from_backend(profile.gfx_backend, profile.architecture);
 
+        let max_draw_calls_per_frame = match profile.family {
+            // Tüm masaüstü sınıfı Apple M-serisi çipler için limiti çok yüksek tutuyoruz
+            MobileGpuFamily::Apple if profile.is_desktop_class() => 8192,
+            MobileGpuFamily::Apple => 2048, // A-serisi çipler için
+            _ => 512, // Standart mobil GPU'lar
+        };
+
         Self {
             thermal_state: ThermalState::Unknown,
             power_saving_mode: false,
             tile_size_override_px: None,
             render_pass_strategy,
-            max_draw_calls_per_frame: 512,
+            max_draw_calls_per_frame,
             vertex_batch_size,
             tile_bandwidth_budget_mb,
             recommended_msaa_samples,

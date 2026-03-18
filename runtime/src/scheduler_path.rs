@@ -78,6 +78,14 @@ pub fn choose_scheduler_path_for_platform(
                 adapter_info.backend
             ),
         )
+    } else if profile.is_desktop_class() {
+        (
+            GraphicsSchedulerPath::Gms,
+            format!(
+                "Apple M-series desktop-class profile detected ({:?}), routing to GMS throughput path",
+                profile.family
+            ),
+        )
     } else if is_mobile_tbdr && is_integrated_or_mobile {
         (
             GraphicsSchedulerPath::Mgs,
@@ -153,5 +161,13 @@ mod tests {
         let info = make_adapter_info("NVIDIA GeForce RTX 5060 Ti", wgpu::DeviceType::DiscreteGpu);
         let decision = choose_scheduler_path_for_platform(&info, RuntimePlatform::Android);
         assert_eq!(decision.path, GraphicsSchedulerPath::Mgs);
+    }
+
+    #[test]
+    fn chooses_gms_for_apple_m_series_desktop_class() {
+        let mut info = make_adapter_info("Apple M4 Max", wgpu::DeviceType::IntegratedGpu);
+        info.backend = wgpu::Backend::Metal;
+        let decision = choose_scheduler_path_for_platform(&info, RuntimePlatform::Desktop);
+        assert_eq!(decision.path, GraphicsSchedulerPath::Gms);
     }
 }
