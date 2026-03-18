@@ -1,28 +1,28 @@
-//! Mobil-spesifik tuning parametreleri.
+//! Mobile-specific tuning parameters.
 //!
-//! GMS'in `GmsRuntimeTuningProfile`'ından farklı olarak bu modül:
-//! - Termal kısıtları (throttling) modeller.
-//! - Güç bütçesi sınırlamalarını dikkate alır.
-//! - TBDR pipeline için render pass ve tile flush stratejileri içerir.
-//! - wgpu veya başka bir GPU API'sine bağımlı değildir.
+//! Unlike GMS's `GmsRuntimeTuningProfile`, this module:
+//! - Models thermal constraints (throttling).
+//! - Considers power budget limitations.
+//! - Includes render pass and tile flush strategies for TBDR pipeline.
+//! - Does not depend on wgpu or any other GPU API.
 
 use crate::hardware::{GfxBackend, MobileGpuFamily, MobileGpuProfile, TbdrArchitecture};
 
-/// Cihazın anlık termal / güç durumu.
+/// Instant thermal / power state of the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThermalState {
-    /// Normal çalışma — tam performans.
+    /// Normal operation — full performance.
     Nominal,
-    /// Hafif ısınma — güç limitli mod.
+    /// Slight warming — power limited mode.
     Warm,
-    /// Kritik — yoğun throttling aktif.
+    /// Critical — heavy throttling active.
     Hot,
-    /// Termal durum bilinmiyor.
+    /// Thermal state unknown.
     Unknown,
 }
 
 impl ThermalState {
-    /// Mevcut termal duruma göre performans çarpanı (0.0 – 1.0).
+    /// Performance multiplier based on the current thermal state (0.0 – 1.0).
     pub fn performance_factor(self) -> f32 {
         match self {
             Self::Nominal => 1.00,
@@ -33,7 +33,7 @@ impl ThermalState {
     }
 }
 
-/// Render pass stratejisi: TBDR tile flush zamanlaması.
+/// Render pass strategy: TBDR tile flush timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderPassStrategy {
     /// Her frame sonunda tek flush — TBDR için ideal.
@@ -145,15 +145,15 @@ impl BackendRenderHints {
 }
 
 fn vulkan_hints(arch: TbdrArchitecture) -> VulkanPassHints {
-    // TBDR Vulkan'da derinlik/stencil'ı DONT_CARE ile store etmek
-    // on-chip tile bellekten DRAM yazımını önler — büyük bant genişliği tasarrufu.
-    let prefer_input = arch.is_tbdr(); // input attachment subpass TBDR'da ücretsiz
+    // Storing depth/stencil with DONT_CARE in TBDR Vulkan
+    // prevents DRAM writing from on-chip tile memory — major bandwidth savings.
+    let prefer_input = arch.is_tbdr(); // input attachment subpass is free in TBDR
     let subpass_count = if arch.is_tbdr() { 2 } else { 1 };
     VulkanPassHints {
         color_load: LoadAction::Clear,
         color_store: StoreAction::Store,
         depth_load: LoadAction::Clear,
-        depth_store: StoreAction::DontCare, // ← TBDR kritik optimizasyon
+        depth_store: StoreAction::DontCare, // ← TBDR critical optimization
         stencil_store: StoreAction::DontCare,
         prefer_input_attachments: prefer_input,
         recommended_subpass_count: subpass_count,
@@ -161,44 +161,44 @@ fn vulkan_hints(arch: TbdrArchitecture) -> VulkanPassHints {
 }
 
 fn metal_hints(arch: TbdrArchitecture) -> MetalPassHints {
-    // Metal'de tile shader desteği Apple A11+ ve tüm M serisinde vardır.
-    // Memoryless depth, depth attachment için DRAM tahsisini tamamen kaldırır.
+    // Tile shader support in Metal exists in Apple A11+ and all M series.
+    // Memoryless depth completely removes DRAM allocation for depth attachment.
     let tile_shaders = matches!(arch, TbdrArchitecture::AppleTbdr);
     MetalPassHints {
         color_load: LoadAction::Clear,
         color_store: StoreAction::Store,
         depth_load: LoadAction::Clear,
-        depth_store: StoreAction::DontCare, // ← memoryless ile birleşir
+        depth_store: StoreAction::DontCare, // ← combines with memoryless
         use_tile_shaders: tile_shaders,
         memoryless_depth: tile_shaders,
     }
 }
 
-/// MGS mobil tuning profili.
+/// MGS mobile tuning profile.
 #[derive(Debug, Clone)]
 pub struct MgsTuningProfile {
-    /// Cihazın termal durumu.
+    /// Thermal state of the device.
     pub thermal_state: ThermalState,
-    /// Güç tasarrufu modunda mı çalışıyoruz?
+    /// Are we operating in power saving mode?
     pub power_saving_mode: bool,
-    /// Tile boyutu geçersiz kılma (None ise donanım önerisi kullanılır).
+    /// Tile size override (hardware recommendation is used if None).
     pub tile_size_override_px: Option<u32>,
-    /// Render pass stratejisi.
+    /// Render pass strategy.
     pub render_pass_strategy: RenderPassStrategy,
-    /// Frame başına maksimum draw call sayısı (0 = sınırsız).
+    /// Maximum draw calls per frame (0 = unlimited).
     pub max_draw_calls_per_frame: u32,
-    /// Vertex batch boyutu (tile başına optimal vertex grubu).
+    /// Vertex batch size (optimal vertex group per tile).
     pub vertex_batch_size: u32,
-    /// Tile başına maksimum bant genişliği kullanımı (MB).
+    /// Maximum bandwidth usage per tile (MB).
     pub tile_bandwidth_budget_mb: f32,
-    /// Framebuffer için önerilen MSAA örnek sayısı (1 = MSAA kapalı).
+    /// Recommended MSAA sample count for the framebuffer (1 = MSAA off).
     pub recommended_msaa_samples: u32,
-    /// Backend'e özgü render pass ipuçları (Vulkan / Metal).
+    /// Backend-specific render pass hints (Vulkan / Metal).
     pub backend_hints: BackendRenderHints,
 }
 
 impl MgsTuningProfile {
-    /// Donanım profilinden varsayılan tuning parametrelerini türetir.
+    /// Derives default tuning parameters from hardware profile.
     pub fn from_profile(profile: &MobileGpuProfile) -> Self {
         let (render_pass_strategy, vertex_batch_size, recommended_msaa_samples) =
             arch_defaults(profile.architecture);
@@ -209,10 +209,10 @@ impl MgsTuningProfile {
             BackendRenderHints::from_backend(profile.gfx_backend, profile.architecture);
 
         let max_draw_calls_per_frame = match profile.family {
-            // Tüm masaüstü sınıfı Apple M-serisi çipler için limiti çok yüksek tutuyoruz
+            // Keep limit very high for all desktop-class Apple M-series chips
             MobileGpuFamily::Apple if profile.is_desktop_class() => 8192,
-            MobileGpuFamily::Apple => 2048, // A-serisi çipler için
-            _ => 512, // Standart mobil GPU'lar
+            MobileGpuFamily::Apple => 2048, // For A-series chips
+            _ => 512, // Standard mobile GPUs
         };
 
         Self {
@@ -228,7 +228,7 @@ impl MgsTuningProfile {
         }
     }
 
-    /// Termal durum günceller ve buna bağlı parametreleri ayarlar.
+    /// Updates thermal state and sets parameters accordingly.
     pub fn apply_thermal_state(mut self, state: ThermalState) -> Self {
         self.thermal_state = state;
         let factor = state.performance_factor();
@@ -243,7 +243,7 @@ impl MgsTuningProfile {
         self
     }
 
-    /// Tile başına efektif bant genişliği bütçesi (MB).
+    /// Effective bandwidth budget per tile (MB).
     pub fn effective_tile_bandwidth_mb(&self) -> f32 {
         self.tile_bandwidth_budget_mb * self.thermal_state.performance_factor()
     }
@@ -252,20 +252,20 @@ impl MgsTuningProfile {
 fn arch_defaults(arch: TbdrArchitecture) -> (RenderPassStrategy, u32, u32) {
     match arch {
         TbdrArchitecture::FlexRender => {
-            // Adreno — Flex Render bazen birden fazla pass'ı iyi yönetir.
+            // Adreno — Flex Render sometimes manages multiple passes well.
             (RenderPassStrategy::SinglePassPerFrame, 256, 4)
         }
         TbdrArchitecture::MaliTbdr => {
-            // Mali — saf TBDR; tek pass en verimli yoldur.
+            // Mali — pure TBDR; single pass is the most efficient way.
             (RenderPassStrategy::SinglePassPerFrame, 128, 4)
         }
         TbdrArchitecture::PowerVrTbdr => (RenderPassStrategy::SinglePassPerFrame, 128, 4),
         TbdrArchitecture::AppleTbdr => {
-            // Apple GPU — büyük tile bellek kapasitesi; MSAA'ya toleranslı.
+            // Apple GPU — large tile memory capacity; tolerant to MSAA.
             (RenderPassStrategy::MergedPasses, 512, 4)
         }
         TbdrArchitecture::Unknown => {
-            // Bilinmeyen: güvenli, düşük profil.
+            // Unknown: safe, low profile.
             (RenderPassStrategy::EagerFlush, 64, 1)
         }
     }
@@ -291,7 +291,7 @@ mod tests {
         let profile = MobileGpuProfile::detect("Adreno 750");
         let tuning =
             MgsTuningProfile::from_profile(&profile).apply_thermal_state(ThermalState::Hot);
-        // 512 * 0.45 = 230 (yuvarlama dahil)
+        // 512 * 0.45 = 230 (including rounding)
         assert!(tuning.max_draw_calls_per_frame < 512);
         assert!(tuning.power_saving_mode);
     }

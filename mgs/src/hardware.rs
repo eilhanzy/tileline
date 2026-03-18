@@ -1,37 +1,37 @@
-//! TBDR-aware mobil GPU tespiti.
+//! TBDR-aware mobile GPU detection.
 //!
-//! Tile-Based Deferred Rendering (TBDR) mimarisini kullanan GPU ailelerini
-//! tespit eder ve profillerini çıkarır.
+//! Detects GPU families using Tile-Based Deferred Rendering (TBDR) architecture
+//! and extracts their profiles.
 //!
-//! Desteklenen aileler:
+//! Supported families:
 //! - **Adreno** (Qualcomm Snapdragon) — Flex Render (hibrit IMR/TBDR)
-//! - **Mali** (ARM) — saf TBDR (Bifrost, Valhall, 5th gen)
-//! - **PowerVR** (Imagination Technologies) — saf TBDR
-//! - **Apple GPU** — TBDR (A/M serisi SoC)
+//! - **Mali** (ARM) — pure TBDR (Bifrost, Valhall, 5th gen)
+//! - **PowerVR** (Imagination Technologies) — pure TBDR
+//! - **Apple GPU** — TBDR (A/M series SoC)
 //!
-//! `wgpu` veya platform API'lerine bağımlılık yoktur; isim tabanlı
-//! sezgisel eşleştirme kullanılır.
+//! No dependency on `wgpu` or platform APIs; uses name-based
+//! heuristic matching.
 
-/// TBDR donanım mimarisi sınıflandırması.
+/// TBDR hardware architecture classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TbdrArchitecture {
     /// Qualcomm Adreno — Flex Render (hibrit IMR/TBDR).
-    /// Tile boyutu genellikle 32×32 veya 64×64 piksel.
+    /// Tile size is usually 32×32 or 64×64 pixels.
     FlexRender,
-    /// ARM Mali Bifrost / Valhall / 5. nesil — saf TBDR.
-    /// Tile boyutu genellikle 16×16 piksel.
+    /// ARM Mali Bifrost / Valhall / 5th gen — pure TBDR.
+    /// Tile size is usually 16×16 pixels.
     MaliTbdr,
-    /// Imagination PowerVR — saf TBDR.
+    /// Imagination PowerVR — pure TBDR.
     PowerVrTbdr,
-    /// Apple GPU (A/M serisi) — TBDR.
+    /// Apple GPU (A/M series) — TBDR.
     AppleTbdr,
-    /// Bilinmiyor veya TBDR desteklemeyen donanım.
+    /// Unknown or hardware not supporting TBDR.
     Unknown,
 }
 
 impl TbdrArchitecture {
-    /// Tile boyutu önerisi (piksel cinsinden kare kenar).
-    /// Scheduler, bu değeri tile budget hesaplamasında temel alır.
+    /// Tile size recommendation (square edge in pixels).
+    /// Scheduler uses this value as a basis for tile budget calculations.
     pub fn recommended_tile_px(self) -> u32 {
         match self {
             Self::FlexRender => 32,
@@ -48,23 +48,23 @@ impl TbdrArchitecture {
     }
 }
 
-/// Mobil GPU ailesi (üretici bazlı sınıflandırma).
+/// Mobile GPU family (manufacturer-based classification).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MobileGpuFamily {
-    /// Qualcomm Snapdragon SoC — Adreno serisi.
+    /// Qualcomm Snapdragon SoC — Adreno series.
     Adreno,
-    /// ARM — Mali Bifrost, Valhall veya 5. nesil.
+    /// ARM — Mali Bifrost, Valhall or 5th gen.
     Mali,
-    /// Imagination Technologies — PowerVR serisi.
+    /// Imagination Technologies — PowerVR series.
     PowerVr,
-    /// Apple Silicon — A/M serisi entegre GPU.
+    /// Apple Silicon — A/M series integrated GPU.
     Apple,
-    /// Tanımlanamayan veya masaüstü GPU.
+    /// Unidentified or desktop GPU.
     Unknown,
 }
 
 impl MobileGpuFamily {
-    /// Kısa etiket (log ve özet ekranları için).
+    /// Short label (for log and summary screens).
     pub fn short_label(self) -> &'static str {
         match self {
             Self::Adreno => "Adreno",
@@ -76,26 +76,26 @@ impl MobileGpuFamily {
     }
 }
 
-/// Grafik backend sınıflandırması.
+/// Graphics backend classification.
 ///
-/// Mobil platformlarda iki temel backend bulunur:
-/// - **Vulkan** — Android (Adreno, Mali, PowerVR)
-/// - **Metal** — iOS / macOS (Apple GPU)
+/// There are two primary backends on mobile platforms:
+/// - **Vulkan** — Android (Adreno, Mali, PowerVR).
+/// - **Metal** — iOS / macOS (Apple Silicon, A series).
 ///
-/// Backend, TBDR'ın render pass semantiğini doğrudan etkiler:
+/// Backend directly affects TBDR render pass semantics:
 /// Vulkan'da `loadOp`/`storeOp`; Metal'de `MTLLoadAction`/`MTLStoreAction`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GfxBackend {
-    /// Vulkan — Android tabanlı mobil cihazlar.
+    /// Vulkan — Android-based mobile devices.
     Vulkan,
-    /// Metal — iOS / macOS (Apple Silicon, A serisi).
+    /// Metal — iOS / macOS (Apple Silicon, A series).
     Metal,
-    /// Backend belirsiz veya saptanamadı.
+    /// Backend unclear or not detected.
     Unknown,
 }
 
 impl GfxBackend {
-    /// Kısa etiket.
+    /// Short label.
     pub fn label(self) -> &'static str {
         match self {
             Self::Vulkan => "Vulkan",
@@ -115,29 +115,29 @@ impl GfxBackend {
     }
 }
 
-/// Tespit edilen mobil GPU profili.
+/// Detected mobile GPU profile.
 #[derive(Debug, Clone)]
 pub struct MobileGpuProfile {
-    /// Ham adapter/cihaz adı (platform API'sinden alınan).
+    /// Raw adapter/device name (obtained from platform API).
     pub name: String,
-    /// Tespit edilen GPU ailesi.
+    /// Detected GPU family.
     pub family: MobileGpuFamily,
-    /// TBDR mimarisi.
+    /// TBDR architecture.
     pub architecture: TbdrArchitecture,
-    /// Grafik backend (Vulkan veya Metal).
+    /// Graphics backend (Vulkan or Metal).
     pub gfx_backend: GfxBackend,
-    /// Tahmini shader core / execution unit sayısı.
+    /// Estimated shader core / execution unit count.
     pub estimated_cores: u32,
-    /// Tahmini paylaşılan bant genişliği (GB/s).
+    /// Estimated shared bandwidth (GB/s).
     pub estimated_bandwidth_gbps: f32,
-    /// Tahmini on-chip tile bellek kapasitesi (KB).
+    /// Estimated on-chip tile memory capacity (KB).
     pub tile_memory_kb: u32,
 }
 
 impl MobileGpuProfile {
-    /// İsim tabanlı sezgisel eşleştirme ile profil çıkarır.
+    /// Extracts profile using name-based heuristic matching.
     ///
-    /// Platform GPU adını küçük harfe çevirerek geçirin.
+    /// Pass the platform GPU name converted to lowercase.
     pub fn detect(name: &str) -> Self {
         let n = name.to_ascii_lowercase();
         let family = classify_family(&n);
@@ -163,8 +163,8 @@ impl MobileGpuProfile {
         self.architecture.is_tbdr() && !matches!(self.family, MobileGpuFamily::Unknown)
     }
 
-    /// Profilin Apple M serisi gibi aslında masaüstü/laptop sınıfı bir TBDR olup olmadığını döndürür.
-    /// Runtime bu bayrağı kullanarak cihazı MGS yerine GMS'e yönlendirme kararı alabilir.
+    /// Returns true if the profile is actually a desktop/laptop class TBDR, like Apple M series.
+    /// Runtime can use this flag to route the device to GMS instead of MGS.
     pub fn is_desktop_class(&self) -> bool {
         let n = self.name.to_ascii_lowercase();
         matches!(self.family, MobileGpuFamily::Apple) 
@@ -185,18 +185,11 @@ fn classify_family(name: &str) -> MobileGpuFamily {
     } else if name.contains("powervr") || name.contains("imagination") {
         MobileGpuFamily::PowerVr
     } else if name.contains("apple")
-        || name.contains(" a1")
-        || name.contains(" a2")
-        || name.contains(" a3")
         || name.contains(" m1")
         || name.contains(" m2")
         || name.contains(" m3")
         || name.contains(" m4")
         || name.contains(" m5")
-        || name.contains(" m6")
-        || name.contains(" m7")
-        || name.contains(" m8")
-        || name.contains(" m9")
     {
         MobileGpuFamily::Apple
     } else {
@@ -235,7 +228,7 @@ fn estimate_cores(name: &str, family: MobileGpuFamily) -> u32 {
 
 fn parse_adreno_cores(name: &str) -> u32 {
     // Adreno shader core count lookup (SPs = Shader Processors).
-    // Üst modeller daha fazla SP'ye sahiptir.
+    // Higher models have more SPs.
     const TABLE: &[(&str, u32)] = &[
         ("adreno 750", 12),
         ("adreno 740", 12),
@@ -266,7 +259,7 @@ fn parse_adreno_cores(name: &str) -> u32 {
 }
 
 fn parse_mali_cores(name: &str) -> u32 {
-    // Mali shader core tahmini (execution engine sayısı).
+    // Mali shader core estimate (number of execution engines).
     const TABLE: &[(&str, u32)] = &[
         ("mali-g925", 16),
         ("mali-g720", 16),

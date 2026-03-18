@@ -60,7 +60,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-// ── Giriş noktası ─────────────────────────────────────────────────────────────
+// ── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn Error>> {
     let options = CliOptions::parse_from_env()?;
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// ── CLI (render_benchmark ile aynı) ──────────────────────────────────────────
+// ── CLI (same as render_benchmark) ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 struct CliOptions {
@@ -151,7 +151,7 @@ impl ModeOverride {
             "auto" => Self::Auto,
             "stable" => Self::Stable,
             "max" | "throughput" => Self::Max,
-            _ => return Err(Box::new(SE(format!("geçersiz --mode: {v}")))),
+            _ => return Err(Box::new(SE(format!("invalid --mode: {v}")))),
         })
     }
 }
@@ -168,7 +168,7 @@ impl VsyncOverride {
             "auto" => Self::Auto,
             "on" | "true" | "1" => Self::On,
             "off" | "false" | "0" => Self::Off,
-            _ => return Err(Box::new(SE(format!("geçersiz --vsync: {v}")))),
+            _ => return Err(Box::new(SE(format!("invalid --vsync: {v}")))),
         })
     }
 }
@@ -185,21 +185,21 @@ impl MultiGpuOverride {
             "auto" => Self::Auto,
             "on" | "true" | "1" => Self::On,
             "off" | "false" | "0" => Self::Off,
-            _ => return Err(Box::new(SE(format!("geçersiz --multi-gpu: {v}")))),
+            _ => return Err(Box::new(SE(format!("invalid --multi-gpu: {v}")))),
         })
     }
 }
 
 fn next_arg(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Box<dyn Error>> {
     it.next()
-        .ok_or_else(|| Box::new(SE(format!("{flag} için değer eksik"))) as _)
+        .ok_or_else(|| Box::new(SE(format!("missing value for {flag}"))) as _)
 }
 fn parse_secs(v: &str, flag: &str) -> Result<Duration, Box<dyn Error>> {
     let s = v
         .parse::<f64>()
-        .map_err(|_| Box::new(SE(format!("{flag}: saniye girin"))) as Box<dyn Error>)?;
+        .map_err(|_| Box::new(SE(format!("{flag}: expected seconds"))) as Box<dyn Error>)?;
     if !s.is_finite() || s < 0.0 {
-        return Err(Box::new(SE(format!("{flag} geçersiz"))));
+        return Err(Box::new(SE(format!("{flag} invalid"))));
     }
     Ok(Duration::from_secs_f64(s))
 }
@@ -207,30 +207,30 @@ fn parse_res(v: &str) -> Result<PhysicalSize<u32>, Box<dyn Error>> {
     let lower = v.to_ascii_lowercase();
     let (w, h) = lower
         .split_once('x')
-        .ok_or_else(|| Box::new(SE(format!("çözünürlük formatı WxH: {v}"))) as Box<dyn Error>)?;
+        .ok_or_else(|| Box::new(SE(format!("resolution format WxH: {v}"))) as Box<dyn Error>)?;
     let width = w
         .parse::<u32>()
-        .map_err(|_| Box::new(SE(format!("genişlik: {w}"))) as Box<dyn Error>)?;
+        .map_err(|_| Box::new(SE(format!("width: {w}"))) as Box<dyn Error>)?;
     let height = h
         .parse::<u32>()
-        .map_err(|_| Box::new(SE(format!("yükseklik: {h}"))) as Box<dyn Error>)?;
+        .map_err(|_| Box::new(SE(format!("height: {h}"))) as Box<dyn Error>)?;
     if width == 0 || height == 0 {
-        return Err(Box::new(SE("boyutlar sıfır olamaz".into())));
+        return Err(Box::new(SE("dimensions cannot be zero".into())));
     }
     Ok(PhysicalSize::new(width, height))
 }
 fn print_usage() {
-    println!("GMS Grafik Benchmark (ekran üstü FPS)");
-    println!("Kullanım: cargo run -p gms --example gms_bench_visual --release -- [options]");
-    println!("  --mode auto|stable|max     (varsayılan: auto)");
-    println!("  --vsync auto|on|off        (varsayılan: auto)");
-    println!("  --multi-gpu auto|on|off    (varsayılan: off)");
-    println!("  --warmup <sn>              (varsayılan: 2)");
-    println!("  --duration <sn>            (varsayılan: 10)");
-    println!("  --resolution <WxH>         (varsayılan: 1280x720)");
+    println!("GMS Graphics Benchmark (on-screen FPS)");
+    println!("Usage: cargo run -p gms --example gms_bench_visual --release -- [options]");
+    println!("  --mode auto|stable|max     (default: auto)");
+    println!("  --vsync auto|on|off        (default: auto)");
+    println!("  --multi-gpu auto|on|off    (default: off)");
+    println!("  --warmup <sec>              (default: 2)");
+    println!("  --duration <sec>            (default: 10)");
+    println!("  --resolution <WxH>         (default: 1280x720)");
 }
 
-// ── Bitmap Piksel Font (5×7, sıfır bağımlılık) ────────────────────────────────
+// ── Bitmap Pixel Font (5×7, zero dependencies) ────────────────────────────────
 //
 // Her glyph 7 satır × 5 sütunluk bir `[u8; 7]` dizisidir.
 // Her satırda bit-4 = en sol sütun, bit-0 = en sağ sütun.
@@ -238,12 +238,12 @@ fn print_usage() {
 const GLYPH_W: usize = 5;
 const GLYPH_H: usize = 7;
 
-/// Tek bir 5×7 glyph — satır başına 1 bayt (bit-4..0 = sütun 0..4).
+/// Single 5x7 glyph — 1 byte per row (bit-4..0 = column 0..4).
 type Glyph = [u8; GLYPH_H];
 
-/// Desteklenen karakter kümesi ve pixmap verisi.
+/// Supported character set and pixmap data.
 ///
-/// `glyph_for(c)` metodu karaktere karşılık gelen glyph'i döner.
+/// `glyph_for(c)` method returns the glyph corresponding to the character.
 struct Font;
 
 impl Font {
@@ -286,7 +286,7 @@ impl Font {
             '-' => [
                 0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
             ],
-            // Büyük harfler
+            // Uppercase
             'A' => [
                 0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
             ],
@@ -326,7 +326,7 @@ impl Font {
             'W' => [
                 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
             ],
-            // Küçük harfler
+            // Lowercase
             'm' => [
                 0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10001, 0b10001,
             ],
@@ -336,22 +336,22 @@ impl Font {
             's' => [
                 0b00000, 0b00000, 0b01110, 0b10000, 0b01110, 0b00001, 0b11110,
             ],
-            // Semboller
+            // Symbols
             'σ' => [
                 0b00000, 0b01111, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
             ],
             'x' => [
                 0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001,
             ],
-            // Fallback: boş
+            // Fallback: empty
             _ => [0b00000; GLYPH_H],
         }
     }
 
-    /// Bir glyph'i RGBA piksel tamponuna `scale` büyütme faktörüyle çizer.
+    /// Blits a glyph to the RGBA pixel buffer with a `scale` factor.
     ///
-    /// `buf_w`: tamponun piksel cinsinden genişliği.
-    /// `fg`: ön plan rengi [R, G, B, A].
+    /// `buf_w`: width of the buffer in pixels.
+    /// `fg`: foreground color [R, G, B, A].
     fn blit(
         buf: &mut [u8],
         buf_w: usize,
@@ -383,7 +383,7 @@ impl Font {
         }
     }
 
-    /// Bir string'i satır başına glyph genişliği + 1 piksel boşluk bırakarak çizer.
+    /// Draws a string with glyph width + 1 pixel spacing per line.
     fn draw_str(
         buf: &mut [u8],
         buf_w: usize,
@@ -400,70 +400,70 @@ impl Font {
     }
 }
 
-// ── HUD veri anlık görüntüsü ─────────────────────────────────────────────────
+// ── HUD data snapshot ─────────────────────────────────────────────────
 
-/// Tek frame için HUD render verisi.
+/// HUD render data for a single frame.
 struct HudSnapshot {
-    /// Smoothed anlık FPS (son 30 frame ağırlıklı ortalaması).
+    /// Smoothed instant FPS (weighted average of the last 30 frames).
     fps: f64,
-    /// Oturum ortalaması FPS.
+    /// Session average FPS.
     avg_fps: f64,
-    /// Tepe FPS.
+    /// Peak FPS.
     peak_fps: f64,
-    /// Ortalama frame-time (ms).
+    /// Average frame-time (ms).
     avg_ms: f64,
     /// p95 frame-time (ms).
     p95_ms: f64,
     /// p99 frame-time (ms).
     p99_ms: f64,
-    /// Frame-time standart sapması (ms).
+    /// Frame-time standard deviation (ms).
     stddev_ms: f64,
-    /// Toplam frame sayısı.
+    /// Total frame count.
     frames: u64,
-    /// Benchmark fazı etiketi (`WARM` / `SMPL` / `DONE`).
+    /// Benchmark phase label (`WARM` / `SMPL` / `DONE`).
     phase: &'static str,
-    /// GPU kısa adı.
+    /// GPU short name.
     gpu_name: String,
-    /// GMS donanım skoru.
+    /// GMS hardware score.
     gms_score: u64,
-    /// Work-units/present (burst modu; 1 = normal).
+    /// Work-units/present (burst mode; 1 = normal).
     work_units: u32,
-    /// Gerçek present mode kısa etiketi ("FIFO", "MAIL", "IMMD", "AUTO").
+    /// Real present mode short label ("FIFO", "MAIL", "IMMD", "AUTO").
     present_mode_label: &'static str,
-    /// Son ≤120 frame-time (ms, f32) — çubuk grafik için.
+    /// Last ≤120 frame-times (ms, f32) — for bar chart.
     recent_ms: Vec<f32>,
 }
 
-// ── HUD Renderer (saf wgpu, sıfır bağımlılık) ────────────────────────────────
+// ── HUD Renderer (pure wgpu, zero dependencies) ────────────────────────────────
 
-/// HUD piksel tamponu boyutları.
+/// HUD pixel buffer dimensions.
 const HUD_PX_W: u32 = 280;
 const HUD_PX_H: u32 = 168;
 const HUD_BYTES: usize = (HUD_PX_W * HUD_PX_H * 4) as usize;
 
-/// HUD'u wgpu ile ekrana çizen renderer.
+/// Renderer that draws the HUD to the screen with wgpu.
 ///
-/// İş akışı:
-/// 1. `update()` — CPU tamponuna glyph + grafik çizer, staging buffer'a kopyalar.
-/// 2. `encode_copy()` — staging buffer'dan GPU tekstürüne kopyalama komutunu encoder'a ekler.
-/// 3. `draw()` — alfa-karıştırmalı quad pass ile HUD tekstürünü yüzeye kompozitler.
+/// Workflow:
+/// 1. `update()` — draws glyphs + graphics to CPU buffer, copies to staging buffer.
+/// 2. `encode_copy()` — adds the staging buffer to GPU texture copy command to encoder.
+/// 3. `draw()` — composites HUD texture onto surface with alpha-blended quad pass.
 struct HudRenderer {
     pipeline: wgpu::RenderPipeline,
-    /// Quad köşe verisi ([x,y,u,v] × 6 köşe); yüzey boyutu değişince güncellenir.
+    /// Quad vertex data ([x,y,u,v] × 6 vertices); updated when surface size changes.
     vertex_buf: wgpu::Buffer,
-    /// CPU → GPU piksel transferi için staging buffer (MAP_WRITE).
+    /// Staging buffer for CPU → GPU pixel transfer (MAP_WRITE).
     staging_buf: wgpu::Buffer,
-    /// GPU tarafındaki HUD tekstürü (Rgba8Unorm).
+    /// HUD texture on the GPU side (Rgba8Unorm).
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
-    /// CPU tarafı piksel tamponu; her frame sıfırlanıp yeniden çizilir.
+    /// CPU side pixel buffer; reset and redrawn every frame.
     pixels: Vec<u8>,
-    /// Geçerli yüzey boyutu; köşe verisi güncelleme kararı için.
+    /// Current surface size; used for vertex data update decision.
     surface_size: PhysicalSize<u32>,
 }
 
 impl HudRenderer {
-    /// Render pipeline, tekstür ve staging buffer'ı oluşturur.
+    /// Creates render pipeline, texture, and staging buffer.
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("hud-shader"),
@@ -540,7 +540,7 @@ impl HudRenderer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    // Alfa karıştırma: HUD şeffaf alanları geçirgen yapar.
+                    // Alpha blending: makes HUD transparent areas permeable.
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -603,7 +603,7 @@ impl HudRenderer {
         }
     }
 
-    /// Yüzey boyutu değiştiyse köşe koordinatlarını (NDC) günceller.
+    /// Updates vertex coordinates (NDC) if surface size changed.
     fn update_vertices_if_needed(&mut self, queue: &wgpu::Queue, sw: u32, sh: u32) {
         if self.surface_size.width == sw && self.surface_size.height == sh {
             return;
@@ -611,10 +611,10 @@ impl HudRenderer {
         self.surface_size = PhysicalSize::new(sw, sh);
         let (sw, sh) = (sw as f32, sh as f32);
         let (qw, qh) = (HUD_PX_W as f32, HUD_PX_H as f32);
-        let ox = 8.0_f32; // ekranda X başlangıcı (piksel)
-        let oy = 8.0_f32; // ekranda Y başlangıcı (piksel)
+        let ox = 8.0_f32; // X start on screen (pixels)
+        let oy = 8.0_f32; // Y start on screen (pixels)
 
-        // Ekran koordinatlarını NDC'ye çevirir (Y aşağıya doğru → NDC'de ters).
+        // Converts screen coordinates to NDC (Y downwards → inverted in NDC).
         let nx = |x: f32| x / sw * 2.0 - 1.0;
         let ny = |y: f32| 1.0 - y / sh * 2.0;
 
@@ -630,7 +630,7 @@ impl HudRenderer {
         queue.write_buffer(&self.vertex_buf, 0, bytemuck_cast_slice(&verts));
     }
 
-    /// CPU tamponunu `snapshot` verisiyle yeniden çizer ve GPU tekstürüne yükler.
+    /// Redraws CPU buffer with `snapshot` data and uploads to GPU texture.
     fn update(&mut self, queue: &wgpu::Queue, snapshot: &HudSnapshot, sw: u32, sh: u32) {
         self.update_vertices_if_needed(queue, sw, sh);
         self.render_to_pixels(snapshot);
@@ -655,9 +655,9 @@ impl HudRenderer {
         );
     }
 
-    /// HUD quad'ını yüzey tekstürü üzerine alfa-karıştırmalı render eder.
+    /// Renders the HUD quad onto the surface texture with alpha blending.
     ///
-    /// `LoadOp::Load` kullanılır; clear-pass çıktısı korunur.
+    /// `LoadOp::Load` is used; clear-pass output is preserved.
     fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("hud-pass"),
@@ -702,14 +702,14 @@ impl HudRenderer {
             [10, 12, 20, 200],
         );
 
-        // ── Faz etiketi ─────────────────────────────────────────────────────────
+        // ── Phase label ─────────────────────────────────────────────────────────
         let phase_color: [u8; 4] = match s.phase {
             "WARM" => [255, 170, 50, 255],
             "SMPL" => [60, 210, 60, 255],
             _ => [100, 180, 255, 255],
         };
         Font::draw_str(buf, w, 6, 4, s.phase, 1, phase_color);
-        // Frame sayısı sağda
+        // Frame count on the right
         let frame_str = format!("{} F", s.frames);
         let chars = frame_str.chars().count();
         let x_right = HUD_PX_W as usize - chars * 7 - 4;
@@ -726,7 +726,7 @@ impl HudRenderer {
         };
         Font::draw_str(buf, w, 6, 14, &fps_str, 3, fps_color);
 
-        // "FPS" veya "WFPS" etiketi, büyük sayının sağına
+        // "FPS" or "WFPS" label, to the right of the large number
         let fps_label = if s.work_units > 1 { "WFPS" } else { "FPS" };
         let fps_right_x = 6 + fps_str.chars().count() * (GLYPH_W + 1) * 3 + 4;
         Font::draw_str(buf, w, fps_right_x, 26, fps_label, 2, [160, 160, 180, 255]);
@@ -735,10 +735,10 @@ impl HudRenderer {
             Font::draw_str(buf, w, fps_right_x, 40, &burst_str, 1, [120, 120, 140, 255]);
         }
 
-        // ── Ayırıcı çizgi ──────────────────────────────────────────────────────
+        // ── Separator line ──────────────────────────────────────────────────────
         fill_rect(buf, w, 4, 50, HUD_PX_W as usize - 8, 1, [60, 60, 80, 200]);
 
-        // ── İstatistik satırları (ölçek 1×) ────────────────────────────────────
+        // ── Statistics lines (scale 1×) ────────────────────────────────────
         let y0 = 54_usize;
         let line_h = 10_usize;
         let stats: &[(&str, String)] = &[
@@ -755,7 +755,7 @@ impl HudRenderer {
             Font::draw_str(buf, w, 30, y, val, 1, [220, 220, 235, 255]);
         }
 
-        // ── Ayırıcı çizgi ──────────────────────────────────────────────────────
+        // ── Separator line ──────────────────────────────────────────────────────
         let chart_y = y0 + stats.len() * line_h + 4;
         fill_rect(
             buf,
@@ -767,10 +767,10 @@ impl HudRenderer {
             [60, 60, 80, 200],
         );
 
-        // ── Frame-time çubuk grafiği ────────────────────────────────────────────
+        // ── Frame-time bar chart ────────────────────────────────────────────
         draw_frame_chart(buf, w, 4, chart_y, &s.recent_ms);
 
-        // ── Alt bilgi: GPU adı + GMS skoru ─────────────────────────────────────
+        // ── Footer info: GPU name + GMS score ─────────────────────────────────────
         let info_y = HUD_PX_H as usize - 20;
         fill_rect(
             buf,
@@ -788,7 +788,7 @@ impl HudRenderer {
     }
 }
 
-/// GPU'da `HUD_PX_W × HUD_PX_H` Rgba8Unorm tekstürü oluşturur.
+/// Creates `HUD_PX_W × HUD_PX_H` Rgba8Unorm texture on the GPU.
 fn create_hud_texture(device: &wgpu::Device) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("hud-texture"),
@@ -806,7 +806,7 @@ fn create_hud_texture(device: &wgpu::Device) -> wgpu::Texture {
     })
 }
 
-/// RGBA tamponunda dikdörtgen doldurur.
+/// Fills a rectangle in the RGBA buffer.
 fn fill_rect(buf: &mut [u8], bw: usize, x: usize, y: usize, w: usize, h: usize, color: [u8; 4]) {
     for row in 0..h {
         for col in 0..w {
@@ -818,16 +818,16 @@ fn fill_rect(buf: &mut [u8], bw: usize, x: usize, y: usize, w: usize, h: usize, 
     }
 }
 
-/// Son ≤120 frame-time değerini renkli çubuk grafik olarak çizer.
+/// Draws the last ≤120 frame-time values as a colored bar chart.
 ///
-/// Yeşil ≤16.67 ms, sarı ≤33.3 ms, kırmızı >33.3 ms.
-/// Yatay beyaz çizgi 16.67 ms (60 FPS) hedefini gösterir.
+/// Green ≤16.67 ms, yellow ≤33.3 ms, red >33.3 ms.
+/// Horizontal white line indicates the 16.67 ms (60 FPS) target.
 fn draw_frame_chart(buf: &mut [u8], bw: usize, ox: usize, oy: usize, times: &[f32]) {
     const TARGET_MS: f32 = 16.67;
     const CHART_H: usize = 32;
     const BAR_W: usize = 2;
 
-    // Arka plan
+    // Background
     fill_rect(
         buf,
         bw,
@@ -864,7 +864,7 @@ fn draw_frame_chart(buf: &mut [u8], bw: usize, ox: usize, oy: usize, times: &[f3
         );
     }
 
-    // 60 FPS hedef çizgisi
+    // 60 FPS target line
     let target_y =
         oy + CHART_H - ((TARGET_MS / max_ms) * CHART_H as f32).min(CHART_H as f32) as usize;
     fill_rect(
@@ -878,11 +878,11 @@ fn draw_frame_chart(buf: &mut [u8], bw: usize, ox: usize, oy: usize, times: &[f3
     );
 }
 
-// ── Güvenli tip dönüşümü (bytemuck yerine kendi implementasyonumuz) ───────────
+// ── Safe type conversion (manual implementation instead of bytemuck) ───────────
 
-/// `[[f32; 4]; 6]` dizisini `&[u8]`'e güvenli şekilde dönüştürür.
+/// Safely converts `[[f32; 4]; 6]` array to `&[u8]`.
 ///
-/// `bytemuck` bağımlılığı olmadan, aynı bellek düzenini manüel olarak kullanır.
+/// Uses the same memory layout manually, without `bytemuck` dependency.
 fn bytemuck_cast_slice(data: &[[f32; 4]; 6]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(
@@ -904,10 +904,10 @@ fn truncate(s: &str, max: usize) -> String {
 // ── HUD WGSL shader ───────────────────────────────────────────────────────────
 
 const HUD_WGSL: &str = r#"
-// HUD overlay shader: tekstürlenmiş quad, alfa karıştırma etkin.
+// HUD overlay shader: textured quad, alpha blending enabled.
 //
-// Vertex: ekran-piksel koordinatları yerine doğrudan NDC alır (CPU tarafında hesaplanmış).
-// Fragment: HUD tekstürünü örnekler; alfa=0 pikseller saydam kalır.
+// Vertex: receives NDC directly instead of screen-pixel coordinates (computed on CPU).
+// Fragment: samples HUD texture; alpha=0 pixels stay transparent.
 
 struct VertexOut {
     @builtin(position) pos: vec4<f32>,
@@ -936,7 +936,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
 // ── ApplicationHandler ────────────────────────────────────────────────────────
 
-/// winit uygulama yöneticisi.
+/// winit application handler.
 struct VisualBenchmarkApp {
     options: CliOptions,
     runtime: Option<VisualRuntime>,
@@ -967,7 +967,7 @@ impl ApplicationHandler for VisualBenchmarkApp {
                 event_loop.set_control_flow(cf);
             }
             Err(e) => {
-                eprintln!("Başlatılamadı: {e}");
+                eprintln!("Failed to start: {e}");
                 event_loop.exit();
             }
         }
@@ -1015,7 +1015,7 @@ impl ApplicationHandler for VisualBenchmarkApp {
                             rt.renderer.reconfigure();
                         }
                         RenderOutcome::OutOfMemory => {
-                            eprintln!("Bellek yetersiz");
+                            eprintln!("Out of memory");
                             event_loop.exit();
                         }
                         RenderOutcome::Timeout | RenderOutcome::Other => {}
@@ -1065,7 +1065,7 @@ impl ApplicationHandler for VisualBenchmarkApp {
 
 // ── VisualRuntime ─────────────────────────────────────────────────────────────
 
-/// Benchmark oturumunun tüm çalışma durumu.
+/// Entire working state of the benchmark session.
 struct VisualRuntime {
     renderer: Renderer,
     multi_gpu: Option<MultiGpuExecutor>,
@@ -1312,7 +1312,7 @@ impl VisualRuntime {
         }
     }
 
-    /// Kısa faz etiketi (4 karakter — bitmap font dostu).
+    /// Short phase label (4 characters — bitmap font friendly).
     fn phase_label(&self) -> &'static str {
         if self.sample_finished {
             "DONE"
@@ -1339,7 +1339,7 @@ impl VisualRuntime {
 
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
-/// wgpu render altyapısı + entegre HUD renderer.
+/// wgpu render infrastructure + integrated HUD renderer.
 struct Renderer {
     window: Arc<Window>,
     _instance: wgpu::Instance,
@@ -1356,7 +1356,7 @@ struct Renderer {
     throughput_target_cursor: usize,
     runtime_tuning: GmsRuntimeTuningProfile,
     presented_frames: u64,
-    /// Ekran üstü HUD katmanı (bitmap font + textured quad pipeline).
+    /// On-screen HUD layer (bitmap font + textured quad pipeline).
     hud: HudRenderer,
 }
 
@@ -1397,7 +1397,7 @@ impl Renderer {
         let capabilities = surface.get_capabilities(&adapter);
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .ok_or_else(|| SE("yüzey uyumsuz".into()))?;
+            .ok_or_else(|| SE("surface incompatible".into()))?;
 
         if let Some(srgb) = capabilities
             .formats
@@ -1407,7 +1407,7 @@ impl Renderer {
         {
             config.format = srgb;
         }
-        // Benchmark varsayılanı: vsync kapalı (max throughput). Sadece --vsync on açar.
+        // Benchmark default: vsync off (max throughput). Only --vsync on enables it.
         let prefer_stable = matches!(options.vsync_override, VsyncOverride::On);
         config.present_mode = select_present_mode(
             &capabilities.present_modes,
@@ -1495,7 +1495,7 @@ impl Renderer {
                 label: Some("gms-bench-visual-enc"),
             });
 
-        // Offscreen burst pass'lar
+        // Offscreen burst passes
         if work_units > 1 {
             self.ensure_throughput_target_ring();
             if let Some(target) = self.current_throughput_target() {
@@ -1513,13 +1513,13 @@ impl Renderer {
             }
         }
 
-        // Ana yüzey clear pass
+        // Main surface clear pass
         for _ in 0..passes_per_work_unit {
             self.clear_phase = (self.clear_phase + 0.0125) % std::f64::consts::TAU;
             encode_clear_pass(&mut encoder, &view, animated_clear_color(self.clear_phase));
         }
 
-        // HUD CPU render + GPU yükleme + kompozitleme
+        // HUD CPU render + GPU upload + composition
         self.hud
             .update(&self.queue, &snapshot, self.size.width, self.size.height);
         self.hud.draw(&mut encoder, &view);
@@ -1634,10 +1634,10 @@ impl Renderer {
 
 // ── FrameStats ────────────────────────────────────────────────────────────────
 
-/// Frame zamanlama istatistikleri.
+/// Frame timing statistics.
 ///
-/// Hem canlı HUD hem de oturum sonu özet için kullanılır.
-/// `recent_frame_ms` rolling buffer, son 120 frame-time'ı f32 olarak tutar.
+/// Used for both live HUD and session end summary.
+/// `recent_frame_ms` rolling buffer, holds the last 120 frame-times as f32.
 struct FrameStats {
     benchmark_start: Instant,
     last_frame_presented_at: Option<Instant>,
@@ -1646,7 +1646,7 @@ struct FrameStats {
     frames: u64,
     frame_intervals_ms: Vec<f64>,
     render_durations_ms: Vec<f64>,
-    /// Rolling buffer — HUD çubuk grafiği için son 120 frame-time (ms).
+    /// Rolling buffer — last 120 frame-times (ms) for HUD bar chart.
     recent_frame_ms: VecDeque<f32>,
     peak_fps: f64,
     resolution: PhysicalSize<u32>,
@@ -1774,7 +1774,7 @@ impl FrameStats {
     }
 }
 
-// ── İstatistik yardımcıları ───────────────────────────────────────────────────
+// ── Statistics helpers ───────────────────────────────────────────────────
 
 fn avg_f64(v: &[f64]) -> Option<f64> {
     if v.is_empty() {
@@ -1813,7 +1813,7 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t.clamp(0.0, 1.0)
 }
 
-// ── Render yardımcıları (render_benchmark ile aynı) ───────────────────────────
+// ── Render helpers (same as render_benchmark) ───────────────────────────
 
 fn animated_clear_color(phase: f64) -> Color {
     let hue = phase.rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
@@ -1927,14 +1927,14 @@ fn select_throughput_burst(
     let burst_ok = match opts.mode_override {
         ModeOverride::Stable => false,
         ModeOverride::Max => true,
-        // macOS/Metal'de Immediate desteklenmez; platform gerçek vsync'i kıramıyorsa
-        // throughput burst tek çaredir — CPU tipleri hariç her GPU'ya izin ver.
+        // Immediate is not supported on macOS/Metal; if the platform cannot break real vsync
+        // throughput burst is the only option — allow any GPU except CPU types.
         ModeOverride::Auto => !matches!(ai.device_type, wgpu::DeviceType::Cpu),
     };
     if !burst_ok || matches!(opts.vsync_override, VsyncOverride::On) {
         return None;
     }
-    // Fifo/AutoVsync seçildiyse (vsync kırılamadı) burst'ü etkinleştir.
+    // If Fifo/AutoVsync selected (vsync couldn't be broken) enable burst.
     let vsync_locked = matches!(
         pm,
         PresentMode::Fifo | PresentMode::FifoRelaxed | PresentMode::AutoVsync
@@ -2061,7 +2061,7 @@ fn match_inventory_profile(
         .cloned()
 }
 
-// ── Skor hesaplama ────────────────────────────────────────────────────────────
+// ── Score calculation ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 struct ComputedFrameStats {
@@ -2081,7 +2081,7 @@ struct ComputedFrameStats {
     resolution: PhysicalSize<u32>,
 }
 
-/// Benchmark sonu performans skoru ve alt faktörler.
+/// Performance score at the end of the benchmark and sub-factors.
 #[derive(Debug, Clone, Copy)]
 struct RenderScore {
     score: u64,
@@ -2151,7 +2151,7 @@ fn score_tier(s: u64) -> &'static str {
     }
 }
 
-// ── Pacing modu ───────────────────────────────────────────────────────────────
+// ── Pacing mode ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 enum BenchmarkPacingMode {
@@ -2181,7 +2181,7 @@ fn choose_pacing_mode(
     }
 }
 
-// ── Özet çıktısı ─────────────────────────────────────────────────────────────
+// ── Summary output ─────────────────────────────────────────────────────────────
 
 struct BenchmarkSummary {
     adapter_name: String,
@@ -2244,31 +2244,31 @@ fn print_summary(s: &BenchmarkSummary) {
         println!("Throughput burst: ×{} WU/present", s.work_units_per_present);
     }
     println!(
-        "Warmup: {:.2}s | Örnek: {:.2}s | Frame: {} | Süre: {:.3}s",
+        "Warmup: {:.2}s | Sample: {:.2}s | Frames: {} | Duration: {:.3}s",
         s.warmup_duration.as_secs_f64(),
         s.sample_duration.as_secs_f64(),
         s.total_frames,
         s.elapsed.as_secs_f64()
     );
     println!(
-        "FPS: ort {:.2} | tepe {:.2} | 1% alt {:.2}",
+        "FPS: avg {:.2} | peak {:.2} | low 1% {:.2}",
         s.avg_fps, s.peak_fps, s.low_1_percent_fps
     );
     println!(
-        "Frame-time(ms): ort {:.3} | p95 {:.3} | p99 {:.3} | σ {:.3}",
+        "Frame-time(ms): avg {:.3} | p95 {:.3} | p99 {:.3} | σ {:.3}",
         s.avg_frame_ms, s.p95_frame_ms, s.p99_frame_ms, s.frame_time_stddev_ms
     );
     println!(
-        "Work-time(ms):  ort {:.3} | p95 {:.3} | p99 {:.3} | σ {:.3}",
+        "Work-time(ms):  avg {:.3} | p95 {:.3} | p99 {:.3} | σ {:.3}",
         s.avg_work_ms, s.p95_work_ms, s.p99_work_ms, s.work_time_stddev_ms
     );
     println!(
-        "GMS HW skoru: {} | keşfedilen GPU: {}",
+        "GMS HW score: {} | discovered GPUs: {}",
         s.gms_hardware_score, s.total_discovered_gpus
     );
-    println!("Render skoru: {} [{}]", s.render_score, s.render_tier);
+    println!("Render score: {} [{}]", s.render_score, s.render_tier);
     println!(
-        "Faktörler => fps {:.1} | rez {:.3} | kararlılık {:.3} | kuyruk {:.3} | gms {:.3}",
+        "Factors => fps {:.1} | res {:.3} | stability {:.3} | tail {:.3} | gms {:.3}",
         s.score_breakdown.fps_term,
         s.score_breakdown.resolution_factor,
         s.score_breakdown.stability_factor,
@@ -2277,7 +2277,7 @@ fn print_summary(s: &BenchmarkSummary) {
     );
     if let Some(mg) = &s.multi_gpu {
         println!(
-            "Multi-GPU: {} → {} | WU/present: {} | pass/WU: {} | toplam WU: {}",
+            "Multi-GPU: {} → {} | WU/present: {} | pass/WU: {} | total WU: {}",
             mg.primary_adapter_name,
             mg.secondary_adapter_name,
             mg.secondary_work_units_per_present,
@@ -2285,14 +2285,14 @@ fn print_summary(s: &BenchmarkSummary) {
             mg.total_secondary_work_units
         );
         println!(
-            "Projeksiyon: tek {:.3}ms → çok {:.3}ms | beklenen kazanç: {:.2}%",
+            "Projection: single {:.3}ms → multi {:.3}ms | expected gain: {:.2}%",
             mg.estimated_single_gpu_frame_ms,
             mg.estimated_multi_gpu_frame_ms,
             mg.projected_score_gain_pct
         );
         if mg.vulkan_version_gate_enabled {
             println!(
-                "Vulkan gate: açık | primary {} | secondary {}",
+                "Vulkan gate: open | primary {} | secondary {}",
                 mg.primary_vulkan_api_version
                     .as_deref()
                     .unwrap_or("unknown"),
@@ -2304,7 +2304,7 @@ fn print_summary(s: &BenchmarkSummary) {
     }
 }
 
-// ── Hata türü ─────────────────────────────────────────────────────────────────
+// ── Error type ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct SE(String);

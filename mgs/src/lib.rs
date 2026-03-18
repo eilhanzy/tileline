@@ -1,11 +1,11 @@
 //! Mobile Graphics Scheduler (MGS)
 //!
 //! TBDR-aware, serial-first workload scheduling for mobile GPU platforms.
-//! Hedef donanım: Adreno (Qualcomm), Mali (ARM).
+//! Target hardware: Adreno (Qualcomm), Mali (ARM).
 //!
-//! GMS (Graphics Multi Scaler) ile sıfır bağımlılık — MGS tamamen bağımsızdır.
-//! GMS paralel, çok-GPU hesaplama için tasarlanmıştır; MGS ise tek-GPU, serial
-//! fallback zinciri ve mobil güç/termal kısıtları için yazılmıştır.
+//! Zero dependency on GMS (Graphics Multi Scaler) — MGS is completely independent.
+//! GMS is designed for parallel, multi-GPU computation; while MGS is written for
+//! single-GPU, serial fallback chain, and mobile power/thermal constraints.
 
 /// Canonical module id used by runtime version commands.
 pub const MODULE_ID: &str = "mgs";
