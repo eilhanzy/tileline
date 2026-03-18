@@ -2,13 +2,12 @@
 //! The detector prioritizes practical, cross-platform behavior:
 //! - logical/physical core counts from `num_cpus`
 //! - vendor information from `raw_cpuid`
+//! - macOS sysctl via libc for Apple Silicon P+E classification
 //! - Linux frequency probing for big.LITTLE classification
 
 use std::cmp::Ordering;
 #[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(target_os = "macos")]
-use std::process::Command;
 
 /// Execution profile of a logical CPU core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +46,9 @@ pub struct CpuTopology {
     pub performance_cores: usize,
     /// Count of classified efficient cores.
     pub efficient_cores: usize,
+    /// True when running natively on Apple Silicon (aarch64 + macOS).
+    /// Used to enable Apple-specific scheduling paths such as QoS hints.
+    pub is_apple_silicon: bool,
     /// Per-core classification data.
     pub cores: Vec<CpuCore>,
 }
@@ -88,6 +90,11 @@ impl CpuTopology {
             .count();
         let has_hybrid = performance_cores > 0 && efficient_cores > 0;
 
+        // Compile-time constant: aarch64 + macOS always means Apple Silicon.
+        // Rosetta 2 (x86_64 binary on Apple Silicon) intentionally returns false
+        // so that the generic x86 scheduler path is used in that configuration.
+        let is_apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+
         Self {
             logical_cores,
             physical_cores,
@@ -95,6 +102,7 @@ impl CpuTopology {
             has_hybrid,
             performance_cores,
             efficient_cores,
+            is_apple_silicon,
             cores,
         }
     }
@@ -216,13 +224,36 @@ fn detect_macos_core_classes(_logical_cores: usize) -> Option<Vec<CpuClass>> {
 
 #[cfg(target_os = "macos")]
 fn read_sysctl_usize(key: &str) -> Option<usize> {
-    let output = Command::new("sysctl").arg("-n").arg(key).output().ok()?;
-    if !output.status.success() {
-        return None;
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_void};
+
+    // Call sysctlbyname(3) directly via FFI instead of spawning a sysctl subprocess.
+    // This avoids process creation overhead with no extra crate dependency.
+    extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> c_int;
     }
 
-    let parsed = String::from_utf8(output.stdout).ok()?;
-    parsed.trim().parse::<usize>().ok()
+    let ckey = CString::new(key).ok()?;
+    let mut value: usize = 0;
+    let mut len: usize = std::mem::size_of::<usize>();
+
+    let ret = unsafe {
+        sysctlbyname(
+            ckey.as_ptr(),
+            &mut value as *mut usize as *mut c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if ret == 0 { Some(value) } else { None }
 }
 
 fn classify_cores(logical_cores: usize, frequencies: Option<&[Option<u64>]>) -> Vec<CpuClass> {

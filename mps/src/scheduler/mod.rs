@@ -15,8 +15,31 @@ use crossbeam::utils::Backoff;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
+
+// On macOS, apply QoS class to worker threads so the kernel routes them to the
+// correct core cluster (P-cores for interactive work, E-cores for background).
+// QoS values come from Apple's <pthread/qos.h>:
+//   QOS_CLASS_USER_INTERACTIVE = 0x21  (highest; preferred on P-cores)
+//   QOS_CLASS_UTILITY          = 0x11  (background-friendly; preferred on E-cores)
+//   QOS_CLASS_DEFAULT          = 0x15  (neutral fallback)
+#[cfg(target_os = "macos")]
+fn apply_thread_qos(class: CpuClass) {
+    extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    let qos: u32 = match class {
+        CpuClass::Performance => 0x21,
+        CpuClass::Efficient   => 0x11,
+        CpuClass::Unknown     => 0x15,
+    };
+    unsafe { pthread_set_qos_class_self_np(qos, 0); }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline(always)]
+fn apply_thread_qos(_class: CpuClass) {}
 
 pub use dispatcher::{DispatchError, DispatchResult, Dispatcher};
 pub use queue::{PriorityTaskQueue, QueueDepth};
@@ -175,6 +198,11 @@ pub struct MpsScheduler {
     failed: Arc<AtomicU64>,
     class_counters: Arc<ClassCounters>,
     next_task_id: AtomicU64,
+    /// Thread handles stored separately so wake_one_worker can unpark without
+    /// needing mutable access to the JoinHandle list.
+    worker_threads: Vec<Thread>,
+    /// Round-robin index for distributing unpark calls across workers.
+    unpark_index: AtomicU64,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -205,6 +233,10 @@ impl MpsScheduler {
             Arc::clone(&class_counters),
         );
 
+        // Collect Thread references from handles so enqueue_payload can unpark
+        // sleeping workers without touching the JoinHandle ownership.
+        let worker_threads: Vec<Thread> = workers.iter().map(|h| h.thread().clone()).collect();
+
         Self {
             topology,
             balancer,
@@ -215,6 +247,8 @@ impl MpsScheduler {
             failed,
             class_counters,
             next_task_id: AtomicU64::new(1),
+            worker_threads,
+            unpark_index: AtomicU64::new(0),
             workers,
         }
     }
@@ -264,12 +298,13 @@ impl MpsScheduler {
         preference: CorePreference,
         tasks: Vec<NativeTask>,
     ) -> Vec<TaskId> {
+        let task_count = tasks.len();
         let queue = self.queue.clone();
         let balancer = self.balancer.clone();
         let submitted = Arc::clone(&self.submitted);
         let next_task_id = &self.next_task_id;
 
-        tasks
+        let ids = tasks
             .into_par_iter()
             .map(|task| {
                 let id = next_task_id.fetch_add(1, Ordering::Relaxed);
@@ -285,7 +320,12 @@ impl MpsScheduler {
                 submitted.fetch_add(1, Ordering::Relaxed);
                 id
             })
-            .collect()
+            .collect();
+
+        // After all tasks are in the queue, wake workers proportional to batch size.
+        // Rayon may have enqueued tasks while workers were parked.
+        self.wake_n_workers(task_count);
+        ids
     }
 
     /// Submit WASM tasks in parallel using Rayon.
@@ -295,12 +335,13 @@ impl MpsScheduler {
         preference: CorePreference,
         tasks: Vec<WasmTask>,
     ) -> Vec<TaskId> {
+        let task_count = tasks.len();
         let queue = self.queue.clone();
         let balancer = self.balancer.clone();
         let submitted = Arc::clone(&self.submitted);
         let next_task_id = &self.next_task_id;
 
-        tasks
+        let ids = tasks
             .into_par_iter()
             .map(|task| {
                 let id = next_task_id.fetch_add(1, Ordering::Relaxed);
@@ -316,7 +357,10 @@ impl MpsScheduler {
                 submitted.fetch_add(1, Ordering::Relaxed);
                 id
             })
-            .collect()
+            .collect();
+
+        self.wake_n_workers(task_count);
+        ids
     }
 
     /// Wait until the queue is drained or a timeout expires.
@@ -373,7 +417,33 @@ impl MpsScheduler {
 
         self.queue.push(envelope);
         self.submitted.fetch_add(1, Ordering::Relaxed);
+        // Wake one parked worker immediately so tasks start executing without
+        // waiting for the next park_timeout cycle (up to 250 µs on other platforms,
+        // 50 µs on macOS). unpark() is a no-op if the target is already running.
+        self.wake_one_worker();
         id
+    }
+
+    /// Unpark one worker in round-robin order.
+    fn wake_one_worker(&self) {
+        if self.worker_threads.is_empty() {
+            return;
+        }
+        let index = self.unpark_index.fetch_add(1, Ordering::Relaxed) as usize;
+        self.worker_threads[index % self.worker_threads.len()].unpark();
+    }
+
+    /// Unpark up to `n` workers for batch submissions.
+    fn wake_n_workers(&self, n: usize) {
+        let total = self.worker_threads.len();
+        if total == 0 {
+            return;
+        }
+        let count = n.min(total);
+        let start = self.unpark_index.fetch_add(count as u64, Ordering::Relaxed) as usize;
+        for i in 0..count {
+            self.worker_threads[(start + i) % total].unpark();
+        }
     }
 }
 
@@ -446,6 +516,19 @@ fn worker_loop(
     failed: Arc<AtomicU64>,
     class_counters: Arc<ClassCounters>,
 ) {
+    // Set macOS QoS class so the kernel schedules this thread on the right
+    // core cluster. Without this hint, all threads may be consolidated onto
+    // E-cores even when Performance priority is intended.
+    apply_thread_qos(worker_class);
+
+    // On macOS the kernel's QoS-aware scheduler responds quickly to unpark(),
+    // so a shorter idle sleep reduces latency between task submission and pickup.
+    // On other platforms we keep the original 250 µs to avoid unnecessary wakeups.
+    #[cfg(target_os = "macos")]
+    let idle_park = Duration::from_micros(50);
+    #[cfg(not(target_os = "macos"))]
+    let idle_park = Duration::from_micros(250);
+
     let backoff = Backoff::new();
 
     loop {
@@ -471,7 +554,7 @@ fn worker_loop(
         }
 
         if backoff.is_completed() {
-            thread::park_timeout(Duration::from_micros(250));
+            thread::park_timeout(idle_park);
         } else {
             backoff.snooze();
         }
