@@ -409,7 +409,7 @@ impl WgpuSceneRenderer {
             color_format,
             Some(wgpu::BlendState::ALPHA_BLENDING),
             false,
-            None,
+            Some(wgpu::Face::Back),
             "runtime-scene-transparent-pipeline",
         );
         let pipeline_sprite =

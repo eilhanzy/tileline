@@ -23,6 +23,11 @@ pub use core::bridge::{
     BridgeFrameId, BridgeFramePlan, BridgeGpuTaskKind, BridgeMpsSubmission, BridgeSubmitReceipt,
     BridgeTaskDescriptor, BridgeTaskRouting, MpsGmsBridge, MpsGmsBridgeConfig, MpsGmsBridgeMetrics,
 };
+pub use core::mgs_bridge::{
+    MgsBridgeFrameId, MgsBridgeFramePlan, MgsBridgeMpsSubmission, MgsBridgeSubmissionId,
+    MgsBridgeSubmitReceipt, MgsBridgeTaskDescriptor, MpsMgsBridge, MpsMgsBridgeConfig,
+    MpsMgsBridgeMetrics,
+};
 pub use gms::{AdaptiveBufferDecision, AdaptiveFrameTelemetry};
 pub use graphics::multigpu::sync::{
     ComposeBarrierState, GpuQueueLane, MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer,

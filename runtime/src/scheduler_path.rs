@@ -50,16 +50,53 @@ pub struct GraphicsSchedulerDecision {
     pub reason: String,
 }
 
+/// Reads the `TILELINE_SCHEDULER` environment variable to force a scheduler path.
+///
+/// Values: `"mgs"` forces MGS, `"gms"` forces GMS.
+/// If the variable is absent or unrecognised, auto-detection is used.
+///
+/// Temporary: remove this function and the `if let` block in
+/// `choose_scheduler_path_for_platform` once MGS testing is complete.
+/// To disable the override without a code change, simply unset `TILELINE_SCHEDULER`.
+fn env_scheduler_override() -> Option<GraphicsSchedulerPath> {
+    match std::env::var("TILELINE_SCHEDULER").as_deref() {
+        Ok("mgs") => Some(GraphicsSchedulerPath::Mgs),
+        Ok("gms") => Some(GraphicsSchedulerPath::Gms),
+        _ => None,
+    }
+}
+
 /// Select a scheduler path from `wgpu::AdapterInfo`.
+///
+/// Respects the `TILELINE_SCHEDULER` env-var override when set.
 pub fn choose_scheduler_path(adapter_info: &wgpu::AdapterInfo) -> GraphicsSchedulerDecision {
     choose_scheduler_path_for_platform(adapter_info, RuntimePlatform::current())
 }
 
 /// Select a scheduler path from `wgpu::AdapterInfo` with explicit platform policy.
+///
+/// `TILELINE_SCHEDULER` overrides platform policy when set.
 pub fn choose_scheduler_path_for_platform(
     adapter_info: &wgpu::AdapterInfo,
     platform: RuntimePlatform,
 ) -> GraphicsSchedulerDecision {
+    // Temporary — remove this block and env_scheduler_override() once MGS testing is done.
+    if let Some(forced) = env_scheduler_override() {
+        let profile = MobileGpuProfile::detect(&adapter_info.name);
+        let reason = format!(
+            "TILELINE_SCHEDULER override active: {:?} forced (adapter: {}, platform: {:?})",
+            forced, adapter_info.name, platform
+        );
+        return GraphicsSchedulerDecision {
+            path: forced,
+            adapter_name: adapter_info.name.clone(),
+            backend: adapter_info.backend,
+            device_type: adapter_info.device_type,
+            mobile_profile: profile,
+            reason,
+        };
+    }
+
     let profile = MobileGpuProfile::detect(&adapter_info.name);
     let is_mobile_tbdr = profile.is_mobile_tbdr();
     let is_integrated_or_mobile = matches!(

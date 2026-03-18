@@ -24,6 +24,7 @@ use crate::{
     MAX_SCENE_LIGHTS,
 };
 use gms::safe_default_required_limits_for_adapter;
+use mgs::MobileGpuProfile;
 use nalgebra::Vector3;
 use paradoxpe::{
     BroadphaseConfig, ContactSolverConfig, NarrowphaseConfig, PhysicsWorld, PhysicsWorldConfig,
@@ -952,6 +953,10 @@ struct TlAppRuntime {
     adaptive_ball_render_limit: Option<usize>,
     adaptive_live_ball_budget: Option<usize>,
     adaptive_low_poly_override: bool,
+    // True only when MGS path was selected AND the adapter is genuine mobile hardware.
+    // Desktop-class adapters (Apple M-series, discrete GPUs) keep this false even when the
+    // MGS path is active via TILELINE_SCHEDULER override.
+    mgs_is_mobile_hardware: bool,
     render_distance: Option<f32>,
     render_distance_min: f32,
     render_distance_max: f32,
@@ -1758,8 +1763,12 @@ impl TlAppRuntime {
         let mgs_like_path = matches!(scheduler_resolution.selected, GraphicsSchedulerPath::Mgs);
         // Treat MGS + ARM/Android as mobile-class scheduling: tighter tick ceilings and smaller
         // chunks help avoid frame-time chopping on heterogeneous SoCs (e.g., RK3588S).
+        // Desktop-class adapters (Apple M-series, discrete GPUs) are excluded even when the MGS
+        // path is active via an env-var override, so their full throughput budget is preserved.
+        let mgs_is_mobile_hardware =
+            mgs_like_path && !MobileGpuProfile::detect(&adapter_info.name).is_desktop_class();
         let mobile_class_tuning = matches!(platform, RuntimePlatform::Android)
-            || mgs_like_path
+            || mgs_is_mobile_hardware
             || cfg!(any(target_arch = "aarch64", target_arch = "arm"));
         let little_core_class = mobile_class_tuning && logical_threads <= 8;
         let adaptive_distance_enabled = options.adaptive_distance.resolve(mobile_class_tuning);
@@ -2075,6 +2084,7 @@ impl TlAppRuntime {
             adaptive_ball_render_limit: None,
             adaptive_live_ball_budget: None,
             adaptive_low_poly_override: false,
+            mgs_is_mobile_hardware,
             render_distance,
             render_distance_min,
             render_distance_max,
@@ -2118,7 +2128,7 @@ impl TlAppRuntime {
             self.next_redraw_at = now + interval;
         } else {
             let mobile_path = matches!(self.platform, RuntimePlatform::Android)
-                || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
+                || self.mgs_is_mobile_hardware;
             if mobile_path {
                 // Avoid uncapped busy-spin on mobile/TBDR paths; it can cause whole-system
                 // chopping even when the app's own FPS appears acceptable.
@@ -2588,7 +2598,7 @@ impl TlAppRuntime {
 
     fn apply_gfx_profile(&mut self, profile: &str) -> Result<String, String> {
         let mobile_path = matches!(self.platform, RuntimePlatform::Android)
-            || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
+            || self.mgs_is_mobile_hardware;
         match profile {
             "low" => {
                 self.fsr_config.mode = FsrMode::On;
@@ -5709,7 +5719,7 @@ impl TlAppRuntime {
     fn render_frame(&mut self) -> Result<(), Box<dyn Error>> {
         let frame_begin = Instant::now();
         let mobile_path = matches!(self.platform, RuntimePlatform::Android)
-            || matches!(self.scheduler_path, GraphicsSchedulerPath::Mgs);
+            || self.mgs_is_mobile_hardware;
         let raw_dt = (frame_begin - self.frame_started_at).as_secs_f32();
         // Keep simulation time real-time (decoupled from render FPS) and only guard against large
         // stalls (alt-tab/debugger) so physics does not enter slow-motion at low FPS.

@@ -4362,6 +4362,7 @@ version = "0.3.0"
 dependencies = [
  "crossbeam",
  "gms",
+ "mgs",
  "mps",
  "paradoxpe",
  "wasm-encoder 0.224.1",
