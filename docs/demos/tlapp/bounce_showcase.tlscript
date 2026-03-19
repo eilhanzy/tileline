@@ -2,6 +2,20 @@
 @parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=128, schedule="performance")
 @deterministic
 def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, key_g_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool, key_w_down: bool, key_s_down: bool, key_a_down: bool, key_d_down: bool, key_up_down: bool, key_down_down: bool, key_left_down: bool, key_right_down: bool, key_space_down: bool, key_ctrl_down: bool, key_shift_down: bool, key_q_down: bool, key_e_down: bool, key_c_down: bool, key_r_down: bool, key_l_down: bool, key_alt_down: bool, key_enter_down: bool, key_escape_down: bool, key_tab_down: bool, mouse_look_down: bool, pad_move_x: float, pad_move_y: float, pad_rise: float, pad_descend: float, pad_look_x: float, pad_look_y: float, pad_sprint_down: bool):
+    # Key bindings:
+    #   WASD, arrow keys : movement (X/Y)
+    #   R, E             : move_z up
+    #   F, Q, C          : move_z down
+    #   Alt              : move_z down (partial)
+    #   Shift            : sprint
+    #   L                : look_on (hold to look around)
+    #   Space            : flashlight toggle
+    #   G                : chaos mode
+    #   Tab              : coordinate space (local / world)
+    #   Ctrl+R           : reset camera
+    #   Alt+Enter        : reset camera
+    #   Escape           : reset camera
+
     set_fbx_full_render(true)
     set_ball_mesh_slot(2)
     set_container_mesh_slot(3)
@@ -202,7 +216,7 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
     set_spawn_per_tick(burst)
 
     set_light_follow_camera(200, true)
-    if key_p_down:
+    if key_space_down:
         set_light_enabled(200, false)
     else:
         set_light_enabled(200, true)

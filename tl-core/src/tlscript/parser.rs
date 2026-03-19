@@ -219,6 +219,9 @@ where
 
     fn parse_block(&mut self) -> Result<Block<'src>, ParseError> {
         let nl = self.expect_newline()?;
+        // Skip blank lines (and any trailing newlines from comment-only lines) that
+        // appear before the opening indent of the block.
+        self.skip_newlines()?;
         let indent = self.expect_token(|k| matches!(k, TokenKind::Indent), "Indent")?;
 
         let mut statements = Vec::new();

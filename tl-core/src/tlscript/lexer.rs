@@ -199,6 +199,27 @@ impl<'src> Lexer<'src> {
                 Some(b'#') => {
                     self.pos = cursor;
                     self.skip_comment();
+                    // Silently consume the newline that ends the comment line so that a
+                    // comment-only line is fully invisible to the parser (no Newline token
+                    // emitted). Without this, the next iteration would return a Newline for
+                    // the `\n` after the `#...` content, which breaks block parsing when
+                    // comments appear before the first statement of an indented block.
+                    match self.bytes.get(self.pos).copied() {
+                        Some(b'\r') => {
+                            self.pos += 1;
+                            if self.bytes.get(self.pos).copied() == Some(b'\n') {
+                                self.pos += 1;
+                            }
+                            self.line = self.line.saturating_add(1);
+                            self.line_start = self.pos;
+                        }
+                        Some(b'\n') => {
+                            self.pos += 1;
+                            self.line = self.line.saturating_add(1);
+                            self.line_start = self.pos;
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
                 Some(b'\n') => {
@@ -686,6 +707,23 @@ mod tests {
         let string_ptr = string_ptr.expect("string present") as usize;
         assert!((src_ptr..src_end).contains(&ident_ptr));
         assert!((src_ptr..src_end).contains(&string_ptr));
+    }
+
+    #[test]
+    fn comments_are_skipped_and_produce_no_tokens() {
+        // Top-level comment, inline comment, comment-only indented line.
+        let src = "# top comment\ndef foo():\n    # inner comment\n    let x: int = 1\n";
+        let kinds = collect_kinds(src);
+        // No token should carry a '#' — comments must vanish entirely.
+        for k in &kinds {
+            if let TokenKind::Identifier(s) = k {
+                assert!(!s.starts_with('#'), "comment leaked into identifier: {s}");
+            }
+        }
+        // The function body must still be present.
+        assert!(kinds.contains(&TokenKind::Def));
+        assert!(kinds.contains(&TokenKind::Let));
+        assert!(kinds.contains(&TokenKind::Indent));
     }
 
     #[test]
