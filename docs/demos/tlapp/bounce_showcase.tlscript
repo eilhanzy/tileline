@@ -202,7 +202,7 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
     set_spawn_per_tick(burst)
 
     set_light_follow_camera(200, true)
-    if key_f_down:
+    if key_p_down:
         set_light_enabled(200, false)
     else:
         set_light_enabled(200, true)
