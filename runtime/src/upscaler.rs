@@ -11,6 +11,10 @@ pub enum FsrMode {
     #[default]
     Auto,
     On,
+    /// Dynamic mode: render scale is driven by scene object proximity each frame.
+    /// The runtime computes a smoothed distance metric and writes it into
+    /// `FsrConfig::render_scale_override` before calling `resolve_fsr_status`.
+    Dynamo,
 }
 
 impl FsrMode {
@@ -19,8 +23,48 @@ impl FsrMode {
             "off" | "0" | "false" => Some(Self::Off),
             "auto" => Some(Self::Auto),
             "on" | "1" | "true" | "fsr1" => Some(Self::On),
+            "dynamo" | "dynamic" => Some(Self::Dynamo),
             _ => None,
         }
+    }
+}
+
+/// Configuration for `FsrMode::Dynamo` distance-driven upscaling.
+///
+/// Objects closer than `near_m` are rendered at native resolution (scale = 1.0).
+/// Objects farther than `far_m` are rendered at `far_scale`.
+/// Scale is linearly interpolated between the two thresholds and smoothed with
+/// an exponential moving average to avoid per-frame flickering.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FsrDynamoConfig {
+    /// Distance in metres below which FSR is fully disabled (render scale = 1.0).
+    pub near_m: f32,
+    /// Distance in metres above which FSR reaches its maximum strength (`far_scale`).
+    pub far_m: f32,
+    /// Render scale applied when all visible objects are at or beyond `far_m`.
+    pub far_scale: f32,
+    /// EMA smoothing coefficient applied to scale changes each frame (0 = instant, higher = slower).
+    /// Typical value: 0.80–0.92.
+    pub smoothing: f32,
+}
+
+impl Default for FsrDynamoConfig {
+    fn default() -> Self {
+        Self {
+            near_m: 6.0,
+            far_m: 28.0,
+            far_scale: 0.67, // Quality preset equivalent
+            smoothing: 0.88,
+        }
+    }
+}
+
+impl FsrDynamoConfig {
+    /// Compute the target render scale for a given nearest-object distance.
+    pub fn scale_for_distance(&self, nearest_m: f32) -> f32 {
+        let t = ((nearest_m - self.near_m) / (self.far_m - self.near_m).max(1e-3))
+            .clamp(0.0, 1.0);
+        1.0 - t * (1.0 - self.far_scale.clamp(0.50, 1.0))
     }
 }
 
@@ -136,6 +180,25 @@ pub fn resolve_fsr_status(config: FsrConfig, backend: wgpu::Backend) -> FsrStatu
                 String::new()
             } else {
                 "fsr mode=on requested but backend unsupported; fail-soft fallback".to_string()
+            },
+        },
+        // Dynamo: the runtime updates render_scale_override each frame based on
+        // nearest-object distance. Resolution falls to native (1.0) when objects are
+        // close and rises to the far_scale when the scene is distant.
+        // Treated identically to On for backend checks; the scale is fully caller-driven.
+        FsrMode::Dynamo => FsrStatus {
+            requested_mode: config.mode,
+            active: backend_supported,
+            render_scale: if backend_supported {
+                requested_scale
+            } else {
+                1.0
+            },
+            sharpness,
+            reason: if backend_supported {
+                "dynamo: distance-driven render scale".to_string()
+            } else {
+                "fsr mode=dynamo requested but backend unsupported; fail-soft fallback".to_string()
             },
         },
     }

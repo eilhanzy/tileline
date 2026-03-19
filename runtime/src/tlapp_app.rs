@@ -13,8 +13,9 @@ use crate::{
     clamp_scene_lights_for_camera, compile_tljoint_scene_from_path,
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, resolve_tileline_version_query,
     tileline_version_entries, BounceTankRuntimePatch, BounceTankSceneConfig,
-    BounceTankSceneController, BounceTankTickMetrics, DrawPathCompiler, FsrConfig, FsrMode,
-    FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode, RuntimePlatform,
+    BounceTankSceneController, BounceTankTickMetrics, DrawPathCompiler, FsrConfig, FsrDynamoConfig,
+    FsrMode, FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode,
+    RuntimePlatform,
     SceneFrameInstances, ScenePrimitive3d, SpriteInstance, SpriteKind, TelemetryHudComposer,
     TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle,
     TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlscriptCoordinateSpace,
@@ -990,6 +991,10 @@ struct TlAppRuntime {
     platform: RuntimePlatform,
     rt_mode: RayTracingMode,
     fsr_config: FsrConfig,
+    /// Dynamo FSR distance thresholds and smoothing parameters.
+    fsr_dynamo_config: FsrDynamoConfig,
+    /// Current smoothed render scale maintained by Dynamo FSR (starts at 1.0 = native).
+    fsr_dynamo_scale: f32,
     shutdown_prepared: bool,
 }
 
@@ -2142,6 +2147,8 @@ impl TlAppRuntime {
             platform,
             rt_mode: RayTracingMode::Auto,
             fsr_config,
+            fsr_dynamo_config: FsrDynamoConfig::default(),
+            fsr_dynamo_scale: 1.0,
             shutdown_prepared: false,
         };
         runtime.sync_console_quick_fields_from_runtime();
@@ -6139,6 +6146,39 @@ impl TlAppRuntime {
                 light_pruned, MAX_SCENE_LIGHTS
             );
         }
+        // ── Dynamo FSR: update render scale based on nearest visible object ────
+        // Runs after frame instances are built so we have the full visible set.
+        // Uses the nearest opaque instance as the proximity signal; if the scene
+        // is empty or FSR mode is not Dynamo, this block is a no-op.
+        if self.fsr_config.mode == FsrMode::Dynamo {
+            let nearest_sq = frame
+                .opaque_3d
+                .iter()
+                .map(|inst| {
+                    let t = inst.transform.translation;
+                    let dx = t[0] - eye[0];
+                    let dy = t[1] - eye[1];
+                    let dz = t[2] - eye[2];
+                    dx * dx + dy * dy + dz * dz
+                })
+                .fold(f32::MAX, f32::min);
+            let nearest_m = if nearest_sq < f32::MAX {
+                nearest_sq.sqrt()
+            } else {
+                self.fsr_dynamo_config.far_m
+            };
+            let target = self.fsr_dynamo_config.scale_for_distance(nearest_m);
+            let s = self.fsr_dynamo_config.smoothing.clamp(0.0, 0.99);
+            self.fsr_dynamo_scale = self.fsr_dynamo_scale * s + target * (1.0 - s);
+            let dynamo_scale = (self.fsr_dynamo_scale * 100.0).round() / 100.0; // snap to 0.01 grid
+            if (dynamo_scale - self.fsr_config.render_scale_override.unwrap_or(-1.0)).abs() > 1e-3
+            {
+                self.fsr_config.render_scale_override = Some(dynamo_scale);
+                self.renderer
+                    .set_fsr_config(&self.queue, self.fsr_config);
+            }
+        }
+
         let distance_stats = apply_render_distance_haze(
             &mut frame,
             eye,

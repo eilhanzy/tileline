@@ -143,7 +143,9 @@ pub use tlsprite_editor::{
     TlspriteEditorPalette, TlspriteEditorTheme, TlspriteListDocument, TlspriteListRow,
 };
 pub use tlsprite_editor_cli::run_from_env as run_tlsprite_editor_from_env;
-pub use upscaler::{resolve_fsr_status, FsrConfig, FsrMode, FsrQualityPreset, FsrStatus};
+pub use upscaler::{
+    resolve_fsr_status, FsrConfig, FsrDynamoConfig, FsrMode, FsrQualityPreset, FsrStatus,
+};
 pub use versioning::{
     resolve_tileline_version_query, tileline_version_entries, TilelineVersionEntry, ENGINE_ID,
     ENGINE_VERSION,
