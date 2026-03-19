@@ -70,6 +70,7 @@ impl TlspriteListRow {
             SpriteKind::Hud => "hud",
             SpriteKind::Camera => "camera",
             SpriteKind::Terrain => "terrain",
+            SpriteKind::LightGlow => "light_glow",
         }
     }
 }

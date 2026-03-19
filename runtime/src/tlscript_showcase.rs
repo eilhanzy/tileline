@@ -20,7 +20,7 @@ use tl_core::{
 
 use crate::scene::{BounceTankRuntimePatch, RayTracingMode, SceneLightOverride};
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 69] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 73] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_container_size",
@@ -78,6 +78,10 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 69] = [
     "set_light_cone",
     "set_light_color",
     "set_light_softness",
+    "set_light_glow_enabled",
+    "set_light_glow_radius",
+    "set_light_glow_intensity",
+    "set_light_follow_camera",
     "set_rt_mode",
     "set_camera_move_speed",
     "set_camera_look_sensitivity",
@@ -1212,6 +1216,36 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
                 state.light_override_mut(id).softness = Some(softness.to_f64() as f32);
             }
             _ => state.warn("set_light_softness expects 2 args"),
+        },
+        "set_light_glow_enabled" => match args {
+            [id, enabled] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).glow_enabled = Some(enabled.to_bool());
+            }
+            _ => state.warn("set_light_glow_enabled expects 2 args"),
+        },
+        "set_light_glow_radius" => match args {
+            [id, radius] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).glow_radius_world =
+                    Some((radius.to_f64() as f32).clamp(0.05, 50.0));
+            }
+            _ => state.warn("set_light_glow_radius expects 2 args"),
+        },
+        "set_light_glow_intensity" => match args {
+            [id, scale] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).glow_intensity_scale =
+                    Some((scale.to_f64() as f32).clamp(0.0, 8.0));
+            }
+            _ => state.warn("set_light_glow_intensity expects 2 args"),
+        },
+        "set_light_follow_camera" => match args {
+            [id, enabled] => {
+                let id = id.to_i64().max(0) as u64;
+                state.light_override_mut(id).follow_camera = Some(enabled.to_bool());
+            }
+            _ => state.warn("set_light_follow_camera expects 2 args"),
         },
         "set_rt_mode" => match args {
             [DemoValue::Str(mode)] => {

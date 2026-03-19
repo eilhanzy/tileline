@@ -24,6 +24,14 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
         set_friction(0.18, 0.12)
         set_friction_profile(1.24, 1.18, 0.78)
         set_restitution_threshold(0.22)
+        set_light_enabled(200, true)
+        set_light_color(200, 1.0, 0.95, 0.82)
+        set_light_intensity(200, 7.0)
+        set_light_range(200, 45.0)
+        set_light_cone(200, 10.0, 20.0)
+        set_light_softness(200, 0.30)
+        set_light_glow_enabled(200, false)
+        set_light_follow_camera(200, true)
 
     set_camera_move_speed(16.0)
     set_camera_look_sensitivity(0.0016)
@@ -197,3 +205,10 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
     if live_balls > 4350:
         burst = 12
     set_spawn_per_tick(burst)
+
+    set_light_follow_camera(200, true)
+    if key_f_down:
+        set_light_enabled(200, false)
+    else:
+        set_light_enabled(200, true)
+

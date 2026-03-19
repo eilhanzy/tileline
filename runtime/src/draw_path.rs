@@ -225,6 +225,7 @@ fn sprite_kind_sort_rank(kind: SpriteKind) -> u8 {
         SpriteKind::Generic => 1,
         SpriteKind::Camera => 2,
         SpriteKind::Hud => 3,
+        SpriteKind::LightGlow => 4,
     }
 }
 

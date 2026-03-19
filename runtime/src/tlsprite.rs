@@ -125,6 +125,9 @@ pub struct TlspriteSpriteDef {
 pub struct TlspriteLightDef {
     pub name: String,
     pub light: SceneLight,
+    /// Whether this light definition requests an auto-generated glow billboard.
+    /// Mirrors `light.glow_enabled`; exposed here for convenient runtime queries.
+    pub glow_enabled: bool,
 }
 
 /// Compiled `.tlsprite` sprite set.
@@ -551,7 +554,8 @@ fn build_notify_state(path: &Path) -> notify::Result<TlspriteWatchState> {
 const TLSPRITE_PACK_MAGIC_V1: &[u8; 8] = b"TLSPK001";
 const TLSPRITE_PACK_MAGIC_V2: &[u8; 8] = b"TLSPK002";
 const TLSPRITE_PACK_MAGIC_V3: &[u8; 8] = b"TLSPK003";
-const TLSPRITE_PACK_MAGIC: &[u8; 8] = TLSPRITE_PACK_MAGIC_V3;
+const TLSPRITE_PACK_MAGIC_V4: &[u8; 8] = b"TLSPK004";
+const TLSPRITE_PACK_MAGIC: &[u8; 8] = TLSPRITE_PACK_MAGIC_V4;
 
 /// In-memory binary pack produced from a `.tlsprite` source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -603,6 +607,7 @@ enum TlspritePackVersion {
     V1,
     V2,
     V3,
+    V4,
 }
 
 /// Source marker returned by cache loads.
@@ -952,6 +957,11 @@ fn encode_tlsprite_pack(program: &TlspriteProgram, source_hash: u64) -> Vec<u8> 
         out.extend_from_slice(&def.light.outer_cone_deg.to_le_bytes());
         out.extend_from_slice(&def.light.softness.to_le_bytes());
         out.extend_from_slice(&def.light.specular_strength.to_le_bytes());
+        // V4: glow + follow_camera fields
+        out.push(u8::from(def.light.glow_enabled));
+        out.extend_from_slice(&def.light.glow_radius_world.to_le_bytes());
+        out.extend_from_slice(&def.light.glow_intensity_scale.to_le_bytes());
+        out.push(u8::from(def.light.follow_camera));
     }
     out
 }
@@ -962,7 +972,7 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
     let source_hash = rd.read_u64()?;
     let sprite_count = rd.read_u32()? as usize;
     let light_count = match version {
-        TlspritePackVersion::V3 => rd.read_u32()? as usize,
+        TlspritePackVersion::V3 | TlspritePackVersion::V4 => rd.read_u32()? as usize,
         TlspritePackVersion::V1 | TlspritePackVersion::V2 => 0,
     };
     let mut sprites = Vec::with_capacity(sprite_count);
@@ -973,7 +983,9 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
         let layer = rd.read_i16()?;
         let kind = match version {
             TlspritePackVersion::V1 => infer_sprite_kind(None, Some(layer)),
-            TlspritePackVersion::V2 | TlspritePackVersion::V3 => {
+            TlspritePackVersion::V2
+            | TlspritePackVersion::V3
+            | TlspritePackVersion::V4 => {
                 sprite_kind_from_tag(rd.read_u8()?)
                     .ok_or_else(|| "invalid packed sprite kind tag".to_string())?
             }
@@ -1040,8 +1052,19 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
         let outer_cone_deg = rd.read_f32()?;
         let softness = rd.read_f32()?;
         let specular_strength = rd.read_f32()?;
+        let (glow_enabled, glow_radius_world, glow_intensity_scale, follow_camera) = match version {
+            TlspritePackVersion::V4 => {
+                let ge = rd.read_u8()? != 0;
+                let gr = rd.read_f32()?;
+                let gi = rd.read_f32()?;
+                let fc = rd.read_u8()? != 0;
+                (ge, gr, gi, fc)
+            }
+            _ => (true, 1.2_f32, 1.0_f32, false),
+        };
         lights.push(TlspriteLightDef {
             name,
+            glow_enabled,
             light: SceneLight {
                 id,
                 enabled,
@@ -1057,6 +1080,10 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
                 casts_shadow,
                 specular_strength,
                 layer,
+                glow_enabled,
+                glow_radius_world,
+                glow_intensity_scale,
+                follow_camera,
             },
         });
     }
@@ -1099,7 +1126,9 @@ impl<'a> ByteReader<'a> {
 
     fn expect_pack_version(&mut self) -> Result<TlspritePackVersion, String> {
         let got = self.read_bytes(8)?;
-        if got == TLSPRITE_PACK_MAGIC_V3 {
+        if got == TLSPRITE_PACK_MAGIC_V4 {
+            Ok(TlspritePackVersion::V4)
+        } else if got == TLSPRITE_PACK_MAGIC_V3 {
             Ok(TlspritePackVersion::V3)
         } else if got == TLSPRITE_PACK_MAGIC_V2 {
             Ok(TlspritePackVersion::V2)
@@ -1252,6 +1281,10 @@ struct PendingEntry {
     softness: Option<f32>,
     casts_shadow: Option<bool>,
     specular_strength: Option<f32>,
+    glow: Option<bool>,
+    glow_radius: Option<f32>,
+    glow_intensity_scale: Option<f32>,
+    follow_camera: Option<bool>,
 }
 
 impl PendingEntry {
@@ -1283,6 +1316,10 @@ impl PendingEntry {
             softness: None,
             casts_shadow: None,
             specular_strength: None,
+            glow: None,
+            glow_radius: None,
+            glow_intensity_scale: None,
+            follow_camera: None,
         }
     }
 
@@ -1380,6 +1417,18 @@ impl PendingEntry {
             }
             "specular_strength" => {
                 self.specular_strength = parse_scalar::<f32>(value, line, key, diagnostics);
+            }
+            "glow" => {
+                self.glow = parse_scalar::<bool>(value, line, key, diagnostics);
+            }
+            "glow_radius" => {
+                self.glow_radius = parse_scalar::<f32>(value, line, key, diagnostics);
+            }
+            "glow_intensity_scale" => {
+                self.glow_intensity_scale = parse_scalar::<f32>(value, line, key, diagnostics);
+            }
+            "follow_camera" => {
+                self.follow_camera = parse_scalar::<bool>(value, line, key, diagnostics);
             }
             _ => diagnostics.push(TlspriteDiagnostic {
                 level: TlspriteDiagnosticLevel::Warning,
@@ -1538,6 +1587,10 @@ impl PendingEntry {
         let softness = self.softness.unwrap_or(0.35).clamp(0.0, 1.0);
         let casts_shadow = self.casts_shadow.unwrap_or(true);
         let specular_strength = self.specular_strength.unwrap_or(1.0).clamp(0.0, 8.0);
+        let glow_enabled = self.glow.unwrap_or(true);
+        let glow_radius_world = self.glow_radius.unwrap_or(1.2).clamp(0.05, 50.0);
+        let glow_intensity_scale = self.glow_intensity_scale.unwrap_or(1.0).clamp(0.0, 8.0);
+        let follow_camera = self.follow_camera.unwrap_or(false);
 
         let len = (direction[0] * direction[0]
             + direction[1] * direction[1]
@@ -1553,6 +1606,7 @@ impl PendingEntry {
 
         Some(TlspriteLightDef {
             name: self.name,
+            glow_enabled,
             light: SceneLight {
                 id: light_id,
                 enabled: true,
@@ -1568,6 +1622,10 @@ impl PendingEntry {
                 casts_shadow,
                 specular_strength,
                 layer: self.layer.unwrap_or(0),
+                glow_enabled,
+                glow_radius_world,
+                glow_intensity_scale,
+                follow_camera,
             },
         })
     }
@@ -1628,6 +1686,14 @@ fn sprite_kind_defaults(kind: SpriteKind) -> SpriteKindDefaults {
             texture_slot: 3,
             layer: -40,
         },
+        SpriteKind::LightGlow => SpriteKindDefaults {
+            position: [0.0, 0.0, 0.0],
+            size: [0.2, 0.2],
+            rotation_rad: 0.0,
+            color_rgba: [1.0, 1.0, 0.8, 1.0],
+            texture_slot: 0,
+            layer: 100,
+        },
     }
 }
 
@@ -1637,6 +1703,7 @@ fn sprite_kind_to_tag(kind: SpriteKind) -> u8 {
         SpriteKind::Hud => 1,
         SpriteKind::Camera => 2,
         SpriteKind::Terrain => 3,
+        SpriteKind::LightGlow => 4,
     }
 }
 
@@ -1805,12 +1872,13 @@ fn parse_sprite_kind(
         "hud" | "ui" => Some(SpriteKind::Hud),
         "camera" => Some(SpriteKind::Camera),
         "terrain" => Some(SpriteKind::Terrain),
+        "light_glow" | "glow" => Some(SpriteKind::LightGlow),
         other => {
             diagnostics.push(TlspriteDiagnostic {
                 level: TlspriteDiagnosticLevel::Error,
                 line,
                 message: format!(
-                    "invalid kind '{other}', expected 'generic', 'hud', 'camera', or 'terrain'"
+                    "invalid kind '{other}', expected 'generic', 'hud', 'camera', 'terrain', or 'light_glow'"
                 ),
             });
             None

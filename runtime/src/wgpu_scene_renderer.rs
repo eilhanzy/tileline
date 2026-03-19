@@ -135,7 +135,10 @@ struct GpuBatchRange {
 struct UploadPlan {
     instances_3d: Vec<GpuInstance3d>,
     ranges: Vec<GpuBatchRange>,
+    /// Regular (alpha-blended) sprites.
     sprites: Vec<GpuSpriteInstance>,
+    /// Additive-blended light glow sprites, uploaded after regular sprites.
+    glow_sprites: Vec<GpuSpriteInstance>,
 }
 
 /// Upload summary for one frame.
@@ -190,6 +193,7 @@ pub struct WgpuSceneRenderer {
     pipeline_opaque: wgpu::RenderPipeline,
     pipeline_transparent: wgpu::RenderPipeline,
     pipeline_sprite: wgpu::RenderPipeline,
+    pipeline_sprite_glow: wgpu::RenderPipeline,
     pipeline_sprite_overlay: wgpu::RenderPipeline,
     pipeline_upscale: wgpu::RenderPipeline,
     _depth_texture: wgpu::Texture,
@@ -216,6 +220,8 @@ pub struct WgpuSceneRenderer {
     overlay_sprite_instance_capacity_bytes: usize,
     ranges: Vec<GpuBatchRange>,
     sprite_count: u32,
+    glow_sprite_start: u32,
+    glow_sprite_count: u32,
     overlay_sprite_count: u32,
     light_count: u32,
     force_full_fbx_sphere: bool,
@@ -414,6 +420,8 @@ impl WgpuSceneRenderer {
         );
         let pipeline_sprite =
             create_sprite_pipeline(device, &layout_sprite, &shader_sprite, color_format);
+        let pipeline_sprite_glow =
+            create_sprite_glow_pipeline(device, &layout_sprite, &shader_sprite, color_format);
         let pipeline_sprite_overlay =
             create_sprite_overlay_pipeline(device, &layout_sprite, &shader_sprite, color_format);
         let pipeline_upscale =
@@ -501,6 +509,7 @@ impl WgpuSceneRenderer {
             pipeline_opaque,
             pipeline_transparent,
             pipeline_sprite,
+            pipeline_sprite_glow,
             pipeline_sprite_overlay,
             pipeline_upscale,
             _depth_texture: depth_texture,
@@ -527,6 +536,8 @@ impl WgpuSceneRenderer {
             overlay_sprite_instance_capacity_bytes: std::mem::size_of::<GpuSpriteInstance>(),
             ranges: Vec::new(),
             sprite_count: 0,
+            glow_sprite_start: 0,
+            glow_sprite_count: 0,
             overlay_sprite_count: 0,
             light_count: 0,
             force_full_fbx_sphere: false,
@@ -659,7 +670,10 @@ impl WgpuSceneRenderer {
     ) -> WgpuSceneRendererUploadStats {
         let plan = build_upload_plan(draw);
         let required_3d_bytes = plan.instances_3d.len() * std::mem::size_of::<GpuInstance3d>();
-        let required_sprite_bytes = plan.sprites.len() * std::mem::size_of::<GpuSpriteInstance>();
+        // Regular and glow sprites share one buffer: [regular..., glow...]
+        let total_sprite_count = plan.sprites.len() + plan.glow_sprites.len();
+        let required_sprite_bytes =
+            total_sprite_count * std::mem::size_of::<GpuSpriteInstance>();
 
         ensure_buffer_capacity(
             device,
@@ -692,9 +706,20 @@ impl WgpuSceneRenderer {
                 bytemuck::cast_slice(plan.sprites.as_slice()),
             );
         }
+        let glow_byte_offset =
+            (plan.sprites.len() * std::mem::size_of::<GpuSpriteInstance>()) as u64;
+        if !plan.glow_sprites.is_empty() {
+            queue.write_buffer(
+                &self.sprite_instance_buffer,
+                glow_byte_offset,
+                bytemuck::cast_slice(plan.glow_sprites.as_slice()),
+            );
+        }
 
         self.ranges = plan.ranges;
         self.sprite_count = plan.sprites.len() as u32;
+        self.glow_sprite_start = plan.sprites.len() as u32;
+        self.glow_sprite_count = plan.glow_sprites.len() as u32;
         self.upload_lights(
             queue,
             draw.lights.as_slice(),
@@ -821,6 +846,41 @@ impl WgpuSceneRenderer {
         self.fsr_status.clone()
     }
 
+    /// Current camera eye position (world space).
+    pub fn camera_eye(&self) -> [f32; 3] {
+        self.camera_eye
+    }
+
+    /// Project a world-space position to NDC using the renderer's current camera.
+    /// Returns `Some([ndc_x, ndc_y, ndc_depth])` when the point is in front of the camera,
+    /// or `None` when it is behind (clip.w ≤ 0).
+    pub fn world_to_ndc(&self, world_pos: [f32; 3]) -> Option<[f32; 3]> {
+        use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3};
+        let aspect =
+            (self.surface_width.max(1) as f32) / (self.surface_height.max(1) as f32);
+        let proj = Perspective3::new(aspect.max(0.1), 60f32.to_radians(), 0.1, 500.0);
+        let view = Isometry3::look_at_rh(
+            &Point3::new(self.camera_eye[0], self.camera_eye[1], self.camera_eye[2]),
+            &Point3::new(self.camera_target[0], self.camera_target[1], self.camera_target[2]),
+            &Vector3::new(0.0, 1.0, 0.0),
+        );
+        let view_proj: Matrix4<f32> = proj.to_homogeneous() * view.to_homogeneous();
+        let p = Point3::new(world_pos[0], world_pos[1], world_pos[2]);
+        let clip = view_proj * p.to_homogeneous();
+        if clip.w <= 0.0 {
+            return None;
+        }
+        Some([clip.x / clip.w, clip.y / clip.w, clip.z / clip.w])
+    }
+
+    /// Compute the NDC half-size for a world-radius sphere at clip.w distance.
+    /// Useful for sizing light glow sprites to be perspective-correct.
+    pub fn world_radius_to_ndc_half_size(&self, world_radius: f32, clip_w: f32) -> f32 {
+        let fov_y = 60f32.to_radians();
+        let focal = 1.0 / (fov_y * 0.5).tan();
+        (world_radius / clip_w.max(0.01)) * focal
+    }
+
     pub fn encode(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -904,15 +964,27 @@ impl WgpuSceneRenderer {
             }
         }
 
-        if self.sprite_count > 0 {
-            pass.set_pipeline(&self.pipeline_sprite);
+        if self.sprite_count > 0 || self.glow_sprite_count > 0 {
             pass.set_bind_group(0, &self.sprite_atlas_bind_group, &[]);
             pass.set_bind_group(1, &self.scene_bind_group, &[]);
             pass.set_vertex_buffer(0, self.sprite_vertex_buffer.slice(..));
-            let sprite_bytes =
-                (self.sprite_count as usize * std::mem::size_of::<GpuSpriteInstance>()) as u64;
-            pass.set_vertex_buffer(1, self.sprite_instance_buffer.slice(0..sprite_bytes));
-            pass.draw(0..6, 0..self.sprite_count);
+            let total_sprite_bytes = ((self.sprite_count + self.glow_sprite_count) as usize
+                * std::mem::size_of::<GpuSpriteInstance>()) as u64;
+            pass.set_vertex_buffer(
+                1,
+                self.sprite_instance_buffer.slice(0..total_sprite_bytes),
+            );
+
+            if self.sprite_count > 0 {
+                pass.set_pipeline(&self.pipeline_sprite);
+                pass.draw(0..6, 0..self.sprite_count);
+            }
+
+            if self.glow_sprite_count > 0 {
+                pass.set_pipeline(&self.pipeline_sprite_glow);
+                let glow_end = self.glow_sprite_start + self.glow_sprite_count;
+                pass.draw(0..6, self.glow_sprite_start..glow_end);
+            }
         }
         drop(pass);
 
@@ -1148,7 +1220,7 @@ fn build_upload_plan(draw: &RuntimeDrawFrame) -> UploadPlan {
     }
 
     for sprite in &draw.sprites {
-        plan.sprites.push(GpuSpriteInstance {
+        let gpu = GpuSpriteInstance {
             translate_size: [
                 sprite.position[0],
                 sprite.position[1],
@@ -1164,7 +1236,13 @@ fn build_upload_plan(draw: &RuntimeDrawFrame) -> UploadPlan {
                 0.0,
                 0.0,
             ],
-        });
+        };
+        // LightGlow sprites go into the separate additive-blend bucket.
+        if sprite.kind == SpriteKind::LightGlow {
+            plan.glow_sprites.push(gpu);
+        } else {
+            plan.sprites.push(gpu);
+        }
     }
 
     plan
@@ -1452,6 +1530,79 @@ fn create_sprite_pipeline(
     })
 }
 
+/// Additive-blend sprite pipeline for light glow billboards.
+/// Result = src_color * src_alpha + dst_color (premultiplied-alpha additive).
+fn create_sprite_glow_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    const ADDITIVE: wgpu::BlendState = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("runtime-scene-sprite-glow-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuSpriteVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuSpriteInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        1 => Float32x4,
+                        2 => Float32x4,
+                        3 => Float32x4,
+                        4 => Float32x4,
+                        5 => Float32x4
+                    ],
+                },
+            ],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(ADDITIVE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_sprite_overlay_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1548,6 +1699,7 @@ fn sprite_kind_code(kind: SpriteKind) -> u32 {
         SpriteKind::Hud => 1,
         SpriteKind::Camera => 2,
         SpriteKind::Terrain => 3,
+        SpriteKind::LightGlow => 4,
     }
 }
 
@@ -1558,6 +1710,8 @@ fn sprite_kind_atlas_row(kind: SpriteKind) -> u32 {
         SpriteKind::Hud => 1,
         SpriteKind::Camera => 2,
         SpriteKind::Terrain => 3,
+        // LightGlow is fully procedural — atlas UV is unused; map to row 0.
+        SpriteKind::LightGlow => 0,
     }
 }
 
@@ -2426,6 +2580,33 @@ fn terrain_style(base_color: vec3<f32>, uv: vec2<f32>, atlas_uv: vec2<f32>, slot
     return mix(grad, grad * vec3<f32>(0.72, 0.88, 0.72), stripe * 0.35);
 }
 
+/// Procedural radial glow disk for light billboard sprites (kind == 4).
+/// Returns rgba: bright core fading to transparent edge, rendered additive.
+fn light_glow_style(base_color: vec3<f32>, uv: vec2<f32>) -> vec4<f32> {
+    let centered = uv - vec2<f32>(0.5, 0.5);
+    let dist = length(centered);
+
+    // Tight bright core — very small, very bright.
+    let core = 1.0 - smoothstep(0.0, 0.08, dist);
+    // Mid-range soft halo.
+    let halo = (1.0 - smoothstep(0.04, 0.38, dist)) * 0.55;
+    // Wide outer atmospheric scatter.
+    let scatter = (1.0 - smoothstep(0.18, 0.50, dist)) * 0.18;
+
+    let brightness = core + halo + scatter;
+
+    // Subtle chromatic aberration: red channel extends slightly further.
+    let red_extra = (1.0 - smoothstep(0.06, 0.22, dist)) * 0.18;
+    let color = vec3<f32>(
+        base_color.r * brightness + red_extra,
+        base_color.g * brightness,
+        base_color.b * brightness,
+    );
+
+    // Alpha drives the additive accumulation weight.
+    return vec4<f32>(color, brightness);
+}
+
 fn camera_style(base_color: vec3<f32>, uv: vec2<f32>, atlas_uv: vec2<f32>, slot: f32) -> vec3<f32> {
     let centered = uv - vec2<f32>(0.5, 0.5);
     let dist = length(centered);
@@ -2444,6 +2625,12 @@ fn fs_main(input: VSOut) -> @location(0) vec4<f32> {
     let sampled = textureSample(sprite_tex, sprite_smp, input.atlas_uv);
     var color = input.color.rgb * sampled.rgb;
     let alpha = input.color.a * sampled.a;
+
+    // LightGlow (kind == 4): fully procedural radial glow, rendered additive.
+    // Returns early so the atlas sample and alpha are overridden completely.
+    if kind == 4 {
+        return light_glow_style(input.color.rgb, input.uv);
+    }
 
     if kind == 2 {
         color = camera_style(color, input.uv, input.atlas_uv, slot);

@@ -43,3 +43,20 @@ layer = 151
 position = 0.78, 0.84, 0.0
 rotation_rad = 0.0
 color = 0.88, 0.94, 1.0, 0.80
+
+[light.flashlight]
+entry_kind = light
+light_id = 200
+light_type = spot
+position = 0.0, 12.0, 36.0
+direction = 0.0, 0.0, -1.0
+color = 1.0, 0.95, 0.82
+intensity = 9.0
+range = 55.0
+inner_cone_deg = 10.0
+outer_cone_deg = 20.0
+softness = 0.30
+casts_shadow = true
+specular_strength = 1.4
+glow = false
+follow_camera = true

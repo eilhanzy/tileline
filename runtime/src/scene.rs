@@ -106,6 +106,10 @@ pub enum SpriteKind {
     Hud,
     Camera,
     Terrain,
+    /// Screen-space light glow billboard. Rendered with additive blending.
+    /// Position must be in NDC (-1..1 x, -1..1 y, 0..1 depth).
+    /// color_rgba carries light color (rgb) and intensity scale (a).
+    LightGlow,
 }
 
 impl Default for SpriteKind {
@@ -157,6 +161,14 @@ pub struct SceneLight {
     pub casts_shadow: bool,
     pub specular_strength: f32,
     pub layer: i16,
+    /// Whether this light emits a visible glow billboard sprite.
+    pub glow_enabled: bool,
+    /// World-space radius of the glow billboard (metres). Default 1.2.
+    pub glow_radius_world: f32,
+    /// Multiplier on the glow color intensity. Default 1.0.
+    pub glow_intensity_scale: f32,
+    /// When true the runtime moves this light to camera eye + forward each frame (flashlight).
+    pub follow_camera: bool,
 }
 
 impl Default for SceneLight {
@@ -176,6 +188,10 @@ impl Default for SceneLight {
             casts_shadow: true,
             specular_strength: 1.0,
             layer: 0,
+            glow_enabled: true,
+            glow_radius_world: 1.2,
+            glow_intensity_scale: 1.0,
+            follow_camera: false,
         }
     }
 }
@@ -193,6 +209,12 @@ pub struct SceneLightOverride {
     pub inner_cone_deg: Option<f32>,
     pub outer_cone_deg: Option<f32>,
     pub softness: Option<f32>,
+    pub glow_enabled: Option<bool>,
+    pub glow_radius_world: Option<f32>,
+    pub glow_intensity_scale: Option<f32>,
+    /// When `true` the runtime replaces this light's position and direction each frame
+    /// with the camera eye position and forward vector.
+    pub follow_camera: Option<bool>,
 }
 
 impl SceneLightOverride {
@@ -223,6 +245,18 @@ impl SceneLightOverride {
         }
         if let Some(softness) = self.softness {
             light.softness = softness;
+        }
+        if let Some(glow_enabled) = self.glow_enabled {
+            light.glow_enabled = glow_enabled;
+        }
+        if let Some(glow_radius_world) = self.glow_radius_world {
+            light.glow_radius_world = glow_radius_world.clamp(0.05, 50.0);
+        }
+        if let Some(glow_intensity_scale) = self.glow_intensity_scale {
+            light.glow_intensity_scale = glow_intensity_scale.clamp(0.0, 8.0);
+        }
+        if let Some(follow_camera) = self.follow_camera {
+            light.follow_camera = follow_camera;
         }
     }
 }

@@ -6133,6 +6133,12 @@ impl TlAppRuntime {
         };
         let unknown_light_overrides =
             apply_scene_light_overrides(&mut frame, frame_eval.light_overrides.as_slice());
+        // Follow-camera lights: move to camera eye and look along camera forward vector.
+        let cam_forward = self.camera.forward_vector();
+        for light in frame.lights.iter_mut().filter(|l| l.follow_camera) {
+            light.position = eye;
+            light.direction = [cam_forward.x, cam_forward.y, cam_forward.z];
+        }
         let light_pruned = clamp_scene_lights_for_camera(&mut frame, eye, MAX_SCENE_LIGHTS);
         if unknown_light_overrides > 0 && self.script_frame_index % 180 == 0 {
             eprintln!(
@@ -6220,6 +6226,49 @@ impl TlAppRuntime {
             },
             &mut frame.sprites,
         );
+        // ── Light glow billboards ──────────────────────────────────────────────
+        // For each enabled scene light, project its world position to NDC and
+        // emit a LightGlow sprite. These are rendered with additive blending so
+        // multiple overlapping glows accumulate naturally.
+        for light in frame
+            .lights
+            .iter()
+            .filter(|l| l.enabled && l.glow_enabled && l.intensity > 0.01)
+        {
+            if let Some(ndc) = self.renderer.world_to_ndc(light.position) {
+                // ndc = [x, y, depth]; clip.w approximated from camera distance.
+                let cam = self.renderer.camera_eye();
+                let dx = light.position[0] - cam[0];
+                let dy = light.position[1] - cam[1];
+                let dz = light.position[2] - cam[2];
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(0.1);
+                // World radius: prefer per-light config, fall back to intensity-derived heuristic.
+                let world_r = if (light.glow_radius_world - 1.2).abs() > 1e-3 {
+                    light.glow_radius_world
+                } else {
+                    (light.intensity.sqrt() * 0.6 + light.range * 0.04).clamp(0.1, 8.0)
+                };
+                let half = self.renderer.world_radius_to_ndc_half_size(world_r, dist);
+                let intensity_scale =
+                    (light.intensity / 8.0).clamp(0.1, 1.5) * light.glow_intensity_scale;
+                frame.sprites.push(SpriteInstance {
+                    sprite_id: light.id,
+                    kind: SpriteKind::LightGlow,
+                    position: [ndc[0], ndc[1], ndc[2].clamp(0.0, 1.0)],
+                    size: [half * 2.0, half * 2.0],
+                    rotation_rad: 0.0,
+                    color_rgba: [
+                        light.color[0] * intensity_scale,
+                        light.color[1] * intensity_scale,
+                        light.color[2] * intensity_scale,
+                        1.0,
+                    ],
+                    texture_slot: 0,
+                    layer: 100,
+                });
+            }
+        }
+
         self.console_overlay_sprites.clear();
         let console_layout = ConsoleUiLayout::from_size(self.size);
         Self::append_console_overlay_sprites(
