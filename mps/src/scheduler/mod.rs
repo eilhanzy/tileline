@@ -200,6 +200,10 @@ pub struct MpsScheduler {
     /// Thread handles stored separately so wake_one_worker can unpark without
     /// needing mutable access to the JoinHandle list.
     worker_threads: Vec<Thread>,
+    /// Number of Performance-class workers at the front of worker_threads.
+    /// preferred_core_ids() sorts P-cores first, so workers[0..performance_worker_count]
+    /// are P-core workers and workers[performance_worker_count..] are E-core workers.
+    performance_worker_count: usize,
     /// Round-robin index for distributing unpark calls across workers.
     unpark_index: AtomicU64,
     workers: Vec<JoinHandle<()>>,
@@ -234,7 +238,10 @@ impl MpsScheduler {
 
         // Collect Thread references from handles so enqueue_payload can unpark
         // sleeping workers without touching the JoinHandle ownership.
+        // preferred_core_ids() sorts P-cores first, so the first `performance_cores`
+        // entries are always Performance-class workers.
         let worker_threads: Vec<Thread> = workers.iter().map(|h| h.thread().clone()).collect();
+        let performance_worker_count = topology.performance_cores.min(worker_threads.len());
 
         Self {
             topology,
@@ -247,6 +254,7 @@ impl MpsScheduler {
             class_counters,
             next_task_id: AtomicU64::new(1),
             worker_threads,
+            performance_worker_count,
             unpark_index: AtomicU64::new(0),
             workers,
         }
@@ -416,20 +424,30 @@ impl MpsScheduler {
 
         self.queue.push(envelope);
         self.submitted.fetch_add(1, Ordering::Relaxed);
-        // Wake one parked worker immediately so tasks start executing without
-        // waiting for the next park_timeout cycle (up to 250 µs on other platforms,
-        // 50 µs on macOS). unpark() is a no-op if the target is already running.
-        self.wake_one_worker();
+        // Wake a worker that can actually service this task's preferred class.
+        // Waking only a round-robin worker risks unparking an E-core worker for a
+        // Performance-preferred task: the E-core would fail to steal it (spill_to_any
+        // is false at low queue depth) and park again, leaving the P-core workers
+        // asleep and the task stranded — causing an indefinite block on token.wait().
+        self.wake_worker_for_class(decision.preferred_class);
         id
     }
 
-    /// Unpark one worker in round-robin order.
-    fn wake_one_worker(&self) {
-        if self.worker_threads.is_empty() {
+    /// Unpark one worker that can service the given class, round-robin within that class.
+    /// Falls back to the full pool if no class-specific workers exist.
+    fn wake_worker_for_class(&self, class: CpuClass) {
+        let total = self.worker_threads.len();
+        if total == 0 {
             return;
         }
+        let p = self.performance_worker_count;
+        let (start, len) = match class {
+            CpuClass::Performance if p > 0 => (0, p),
+            CpuClass::Efficient if p < total => (p, total - p),
+            _ => (0, total),
+        };
         let index = self.unpark_index.fetch_add(1, Ordering::Relaxed) as usize;
-        self.worker_threads[index % self.worker_threads.len()].unpark();
+        self.worker_threads[start + index % len].unpark();
     }
 
     /// Unpark up to `n` workers for batch submissions.
