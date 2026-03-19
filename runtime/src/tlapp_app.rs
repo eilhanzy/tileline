@@ -2035,7 +2035,15 @@ impl TlAppRuntime {
             eprintln!("[tlsprite watch] backend={:?}", sprite_loader.backend());
             let event = sprite_loader.reload_into_cache(&mut sprite_cache);
             print_tlsprite_event("[tlsprite boot]", event);
+            for diag in sprite_loader.diagnostics() {
+                eprintln!("[tlsprite diag] {:?} line {}: {}", diag.level, diag.line, diag.message);
+            }
             if let Some(program) = sprite_cache.program_for_path(sprite_loader.path()).cloned() {
+                eprintln!(
+                    "[tlsprite boot] loaded sprites={} lights={}",
+                    program.sprites().len(),
+                    program.lights().len()
+                );
                 force_full_fbx_from_sprite = program.requires_full_fbx_render();
                 scene.set_sprite_program(program.clone());
                 bind_renderer_meshes_from_tlsprite(
@@ -2043,6 +2051,11 @@ impl TlAppRuntime {
                     &device,
                     sprite_loader.path(),
                     &program,
+                );
+            } else {
+                eprintln!(
+                    "[tlsprite boot] WARNING: sprite program not loaded from '{}' — lights will be unavailable",
+                    sprite_loader.path().display()
                 );
             }
             (Some(sprite_loader), Some(sprite_cache))

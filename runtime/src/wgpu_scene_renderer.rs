@@ -2757,7 +2757,10 @@ fn sample_shadow(slot: i32, world_pos: vec3<f32>) -> f32 {
     }
     let proj = light_space.xyz / light_space.w;
     // Convert GL NDC z [-1,1] → depth buffer [0,1].
-    let depth_ref = clamp(proj.z * 0.5 + 0.5, 0.0, 1.0);
+    // wgpu stores depth as NDC z directly (nalgebra OpenGL projection maps the far half
+    // of the frustum to [0,1], which wgpu clips and stores as-is).  The old * 0.5 + 0.5
+    // remapping was incorrect and caused everything to appear self-shadowed.
+    let depth_ref = clamp(proj.z - 0.002, 0.0, 1.0);
     // Convert GL NDC xy [-1,1] → UV [0,1], flipping Y (NDC +y up, UV +y down).
     let uv = proj.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
     if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
@@ -2826,7 +2829,9 @@ fn evaluate_light(light: LightData, normal: vec3<f32>, world_pos: vec3<f32>, bas
 fn fs_main(input: VSOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     let dpx = dpdx(input.world_pos);
     let dpy = dpdy(input.world_pos);
-    var normal = normalize(cross(dpx, dpy));
+    // cross(dpy, dpx) gives outward-facing normals for front faces in wgpu window-space
+    // (window y increases downward, so cross(dpx,dpy) produces inward normals — swap to fix).
+    var normal = normalize(cross(dpy, dpx));
     if !is_front {
         normal = -normal;
     }
