@@ -774,6 +774,7 @@ impl TlAppRuntime {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tlapp-encoder"),
             });
+        self.renderer.build_rt_acceleration_structures(&mut encoder);
         self.renderer.encode(
             &mut encoder,
             &view,

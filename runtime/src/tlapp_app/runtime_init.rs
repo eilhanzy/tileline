@@ -32,7 +32,7 @@ impl TlAppRuntime {
             platform, adapter_info.name, adapter_info.backend, adapter_bootstrap.bootstrap_note
         );
 
-        let (required_limits, limit_clamp_report) =
+        let (mut required_limits, limit_clamp_report) =
             safe_default_required_limits_for_adapter(&adapter);
         if limit_clamp_report.any_clamped() {
             eprintln!(
@@ -44,11 +44,29 @@ impl TlAppRuntime {
                 required_limits.max_texture_array_layers
             );
         }
+        // Request RT feature if the adapter supports it; ignored if unavailable.
+        let enabled_rt_features =
+            wgpu::Features::EXPERIMENTAL_RAY_QUERY & adapter.features();
+
+        // RT requires non-zero acceleration structure limits (all default to 0).
+        if !enabled_rt_features.is_empty() {
+            required_limits.max_acceleration_structures_per_shader_stage = 1;
+            required_limits.max_blas_geometry_count = 1;
+            required_limits.max_blas_primitive_count = 1024;
+            // 16 384 covers 8 000 balls + tank walls with headroom to spare.
+            required_limits.max_tlas_instance_count = 16_384;
+        }
+
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("tlapp-device"),
-                required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+                required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                    | enabled_rt_features,
                 required_limits,
+                // SAFETY: EXPERIMENTAL_RAY_QUERY may have implementation bugs; we accept
+                // this risk on hardware that reports the feature and fall back to PCF
+                // shadow maps when the feature is absent.
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                 ..Default::default()
             }))?;
 

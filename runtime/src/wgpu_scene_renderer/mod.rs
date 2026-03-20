@@ -167,6 +167,20 @@ struct GpuBatchRange {
     count: u32,
 }
 
+/// Which BLAS a CPU-side RT instance references.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RtBlasKind {
+    Box,
+    Sphere,
+}
+
+/// CPU-side record used each frame to populate the TLAS.
+struct RtInstance {
+    /// Row-major 3×4 affine transform (wgpu TlasInstance format).
+    transform: [f32; 12],
+    blas_kind: RtBlasKind,
+}
+
 #[derive(Default)]
 struct UploadPlan {
     instances_3d: Vec<GpuInstance3d>,
@@ -275,6 +289,23 @@ pub struct WgpuSceneRenderer {
     camera_target: [f32; 3],
     custom_mesh_slots: BTreeMap<u8, GpuMesh>,
     ray_tracing_status: SceneRayTracingStatus,
+    // ── Ray-tracing acceleration structures ────────────────────────────────
+    /// BLAS for unit box geometry. None when RT is unsupported.
+    rt_blas_box: Option<wgpu::Blas>,
+    /// BLAS for unit sphere geometry. None when RT is unsupported.
+    rt_blas_sphere: Option<wgpu::Blas>,
+    /// Top-level acceleration structure rebuilt every frame. None when RT is unsupported.
+    rt_tlas: Option<wgpu::Tlas>,
+    /// Bind group layout for group 1 (RT-only pipelines): just the TLAS binding.
+    _rt_tlas_bgl: Option<wgpu::BindGroupLayout>,
+    /// Bind group for the TLAS (group 1 in RT 3D pipelines).
+    rt_tlas_bg: Option<wgpu::BindGroup>,
+    /// RT-enabled opaque 3D pipeline (uses scene_3d_rt.wgsl).
+    pipeline_opaque_rt: Option<wgpu::RenderPipeline>,
+    /// RT-enabled transparent 3D pipeline.
+    pipeline_transparent_rt: Option<wgpu::RenderPipeline>,
+    /// CPU-side instance list rebuilt every upload_draw_frame call; fed into the TLAS.
+    rt_instances: Vec<RtInstance>,
     fsr_config: FsrConfig,
     fsr_status: FsrStatus,
     surface_width: u32,
@@ -703,6 +734,39 @@ impl WgpuSceneRenderer {
             mapped_at_creation: false,
         });
 
+        // ── RT infrastructure (only when both RT features are enabled) ─────────
+        let rt_infra = if supports_ray_query(device, adapter_backend) {
+            Some(create_rt_infrastructure(
+                device,
+                queue,
+                &camera_bgl,
+                color_format,
+                msaa_sample_count,
+            ))
+        } else {
+            None
+        };
+        let (
+            rt_blas_box,
+            rt_blas_sphere,
+            rt_tlas,
+            rt_tlas_bgl_opt,
+            rt_tlas_bg,
+            pipeline_opaque_rt,
+            pipeline_transparent_rt,
+        ) = match rt_infra {
+            Some(r) => (
+                Some(r.blas_box),
+                Some(r.blas_sphere),
+                Some(r.tlas),
+                Some(r.tlas_bgl),
+                Some(r.tlas_bg),
+                Some(r.pipeline_opaque_rt),
+                Some(r.pipeline_transparent_rt),
+            ),
+            None => (None, None, None, None, None, None, None),
+        };
+
         let renderer = Self {
             adapter_backend,
             surface_color_format: color_format,
@@ -761,6 +825,14 @@ impl WgpuSceneRenderer {
                 RayTracingMode::Auto,
                 supports_ray_query(device, adapter_backend),
             ),
+            rt_blas_box,
+            rt_blas_sphere,
+            rt_tlas,
+            _rt_tlas_bgl: rt_tlas_bgl_opt,
+            rt_tlas_bg,
+            pipeline_opaque_rt,
+            pipeline_transparent_rt,
+            rt_instances: Vec::new(),
             fsr_config: FsrConfig::default(),
             fsr_status: resolve_fsr_status(FsrConfig::default(), adapter_backend),
             surface_width: surface_width.max(1),
@@ -994,6 +1066,35 @@ impl WgpuSceneRenderer {
         self.sprite_count = plan.sprites.len() as u32;
         self.glow_sprite_start = plan.sprites.len() as u32;
         self.glow_sprite_count = plan.glow_sprites.len() as u32;
+
+        // Build CPU-side RT instance list for TLAS population this frame.
+        if self.ray_tracing_status.active && self.rt_tlas.is_some() {
+            let cap = self.ray_tracing_status.rt_dynamic_cap as usize;
+            self.rt_instances.clear();
+            'outer: for batch in &draw.opaque_batches {
+                let blas_kind = match batch.key.primitive_code {
+                    1 => RtBlasKind::Box,
+                    _ => RtBlasKind::Sphere, // Sphere proxy for built-in + custom meshes.
+                };
+                for instance in &batch.instances {
+                    if self.rt_instances.len() >= cap {
+                        break 'outer;
+                    }
+                    self.rt_instances.push(RtInstance {
+                        transform: col_major_4x4_to_row_major_3x4(
+                            instance.model_cols[0],
+                            instance.model_cols[1],
+                            instance.model_cols[2],
+                            instance.model_cols[3],
+                        ),
+                        blas_kind,
+                    });
+                }
+            }
+        } else {
+            self.rt_instances.clear();
+        }
+
         self.upload_lights(
             queue,
             draw.lights.as_slice(),
@@ -1034,6 +1135,58 @@ impl WgpuSceneRenderer {
             fsr_active: self.fsr_status.active,
             fsr_scale: self.fsr_status.render_scale,
         }
+    }
+
+    /// Populates the TLAS with the current frame's opaque instances and records the build
+    /// command into `encoder`. Must be called before `encode()` when RT is active.
+    pub fn build_rt_acceleration_structures(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if !self.ray_tracing_status.active {
+            return;
+        }
+        if self.rt_tlas.is_none() || self.rt_blas_box.is_none() || self.rt_blas_sphere.is_none() {
+            return;
+        }
+
+        let cap = self.ray_tracing_status.rt_dynamic_cap as usize;
+        let inst_count = self.rt_instances.len().min(cap);
+
+        static RT_LOG_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let count = RT_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count < 5 || count % 300 == 0 {
+            eprintln!(
+                "[rt-tlas] frame={count} rt_instances={} inst_count={inst_count} cap={cap}",
+                self.rt_instances.len()
+            );
+        }
+
+        // Build TlasInstances from CPU-side data; TlasInstance::new clones the BLAS handle
+        // so we can release the borrow on rt_blas_* before mutating rt_tlas.
+        let tlas_instances: Vec<Option<wgpu::TlasInstance>> = self.rt_instances[..inst_count]
+            .iter()
+            .map(|inst| {
+                let blas = match inst.blas_kind {
+                    RtBlasKind::Sphere => self.rt_blas_sphere.as_ref().unwrap(),
+                    RtBlasKind::Box => self.rt_blas_box.as_ref().unwrap(),
+                };
+                Some(wgpu::TlasInstance::new(blas, inst.transform, 0, 0xff))
+            })
+            .collect();
+
+        let tlas = self.rt_tlas.as_mut().unwrap();
+        let tlas_len = tlas.get().len();
+
+        for (i, inst) in tlas_instances.into_iter().enumerate() {
+            tlas[i] = inst;
+        }
+        // Clear any slots beyond the current instance count.
+        for i in inst_count..tlas_len {
+            tlas[i] = None;
+        }
+
+        encoder.build_acceleration_structures(
+            std::iter::empty::<&wgpu::BlasBuildEntry>(),
+            std::iter::once(&*tlas),
+        );
     }
 
     /// Upload console/UI overlay sprites that must be rendered at native surface resolution.
@@ -1161,8 +1314,11 @@ impl WgpuSceneRenderer {
         target: &wgpu::TextureView,
         clear: wgpu::Color,
     ) {
-        // Shadow depth passes must run before the main scene pass.
-        self.encode_shadow_passes(encoder);
+        // When RT is active the fragment shader traces shadow rays, so PCF shadow map
+        // passes are skipped.  The forward path still needs them.
+        if !self.ray_tracing_status.active {
+            self.encode_shadow_passes(encoder);
+        }
 
         let (source_width, source_height, _, _, fsr_scene_active) = self.compute_fsr_source_dims();
         let scene_target = if fsr_scene_active {
@@ -1208,7 +1364,27 @@ impl WgpuSceneRenderer {
         if !self.ranges.is_empty() {
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
-            pass.set_pipeline(&self.pipeline_opaque);
+            // Select RT vs standard pipelines; bind the TLAS as group 1 when RT is active.
+            let rt_active = self.ray_tracing_status.active
+                && self.pipeline_opaque_rt.is_some()
+                && self.rt_tlas_bg.is_some();
+
+            if rt_active {
+                pass.set_bind_group(1, self.rt_tlas_bg.as_ref().unwrap(), &[]);
+            }
+
+            let pipeline_opaque = if rt_active {
+                self.pipeline_opaque_rt.as_ref().unwrap()
+            } else {
+                &self.pipeline_opaque
+            };
+            let pipeline_transparent = if rt_active {
+                self.pipeline_transparent_rt.as_ref().unwrap()
+            } else {
+                &self.pipeline_transparent
+            };
+
+            pass.set_pipeline(pipeline_opaque);
             for range in self.ranges.iter().filter(|r| r.lane == DrawLane::Opaque) {
                 draw_3d_range(
                     &mut pass,
@@ -1222,7 +1398,7 @@ impl WgpuSceneRenderer {
                 );
             }
 
-            pass.set_pipeline(&self.pipeline_transparent);
+            pass.set_pipeline(pipeline_transparent);
             for range in self
                 .ranges
                 .iter()
@@ -2785,6 +2961,8 @@ fn atlas_ascii_glyph_rgba(slot: u16, px: u32, py: u32, tile: u32) -> Option<[u8;
 
 const SCENE_3D_WGSL: &str = include_str!("scene_3d.wgsl");
 
+const SCENE_3D_RT_WGSL: &str = include_str!("scene_3d_rt.wgsl");
+
 const SCENE_SPRITE_WGSL: &str = include_str!("scene_sprite.wgsl");
 
 const SCENE_UPSCALE_WGSL: &str = include_str!("scene_upscale.wgsl");
@@ -2792,6 +2970,314 @@ const SCENE_UPSCALE_WGSL: &str = include_str!("scene_upscale.wgsl");
 /// Depth-only vertex shader for the shadow map pass.
 /// Each draw uses the per-slot uniform (group 0, binding 0) containing the light view-proj.
 const SCENE_SHADOW_WGSL: &str = include_str!("scene_shadow.wgsl");
+
+// ── RT infrastructure ─────────────────────────────────────────────────────────
+
+struct RtInfrastructure {
+    blas_box: wgpu::Blas,
+    blas_sphere: wgpu::Blas,
+    tlas: wgpu::Tlas,
+    tlas_bgl: wgpu::BindGroupLayout,
+    tlas_bg: wgpu::BindGroup,
+    pipeline_opaque_rt: wgpu::RenderPipeline,
+    pipeline_transparent_rt: wgpu::RenderPipeline,
+}
+
+/// Converts a column-major 4×4 model matrix (stored as 4 column vecs) to a
+/// row-major 3×4 affine matrix required by `wgpu::TlasInstance`.
+fn col_major_4x4_to_row_major_3x4(
+    c0: [f32; 4],
+    c1: [f32; 4],
+    c2: [f32; 4],
+    c3: [f32; 4],
+) -> [f32; 12] {
+    [
+        c0[0], c1[0], c2[0], c3[0], // row 0
+        c0[1], c1[1], c2[1], c3[1], // row 1
+        c0[2], c1[2], c2[2], c3[2], // row 2
+    ]
+}
+
+/// Creates vertex + index buffers with `BLAS_INPUT` usage for the unit box geometry.
+/// Returns (vertex_buffer, index_buffer).
+fn create_rt_blas_buffers_box(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
+    let vertices = [
+        GpuVertex3d { position: [-0.5, -0.5, -0.5] },
+        GpuVertex3d { position: [ 0.5, -0.5, -0.5] },
+        GpuVertex3d { position: [ 0.5,  0.5, -0.5] },
+        GpuVertex3d { position: [-0.5,  0.5, -0.5] },
+        GpuVertex3d { position: [-0.5, -0.5,  0.5] },
+        GpuVertex3d { position: [ 0.5, -0.5,  0.5] },
+        GpuVertex3d { position: [ 0.5,  0.5,  0.5] },
+        GpuVertex3d { position: [-0.5,  0.5,  0.5] },
+    ];
+    let indices: [u16; 36] = [
+        0, 1, 2, 2, 3, 0,
+        4, 6, 5, 6, 4, 7,
+        0, 4, 5, 5, 1, 0,
+        3, 2, 6, 6, 7, 3,
+        1, 5, 6, 6, 2, 1,
+        0, 3, 7, 7, 4, 0,
+    ];
+    let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rt-blas-box-vb"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::BLAS_INPUT,
+    });
+    let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rt-blas-box-ib"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::BLAS_INPUT,
+    });
+    (vb, ib)
+}
+
+/// Creates vertex + index buffers with `BLAS_INPUT` usage for a subdivided icosphere proxy.
+/// One subdivision of an icosahedron → 42 vertices, 80 triangles at radius 0.5.
+/// Matches the FBX render mesh (normalized to [-0.5, 0.5] unit box).
+/// Returns (vertex_buffer, index_buffer).
+fn create_rt_blas_buffers_sphere(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
+    use std::collections::HashMap;
+
+    let t = (1.0 + 5.0_f32.sqrt()) * 0.5;
+    let base_verts: [[f32; 3]; 12] = [
+        [-1.0,  t,  0.0], [ 1.0,  t,  0.0],
+        [-1.0, -t,  0.0], [ 1.0, -t,  0.0],
+        [ 0.0, -1.0,  t], [ 0.0,  1.0,  t],
+        [ 0.0, -1.0, -t], [ 0.0,  1.0, -t],
+        [ t,  0.0, -1.0], [ t,  0.0,  1.0],
+        [-t,  0.0, -1.0], [-t,  0.0,  1.0],
+    ];
+    let base_tris: [[u16; 3]; 20] = [
+        [0,11,5], [0,5,1], [0,1,7], [0,7,10], [0,10,11],
+        [1,5,9], [5,11,4], [11,10,2], [10,7,6], [7,1,8],
+        [3,9,4], [3,4,2], [3,2,6], [3,6,8], [3,8,9],
+        [4,9,5], [2,4,11], [6,2,10], [8,6,7], [9,8,1],
+    ];
+
+    // Normalize base vertices to radius 0.5.
+    let mut verts: Vec<[f32; 3]> = base_verts
+        .iter()
+        .map(|p| {
+            let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-6);
+            [p[0] / len * 0.5, p[1] / len * 0.5, p[2] / len * 0.5]
+        })
+        .collect();
+    let mut tris: Vec<[u16; 3]> = base_tris.to_vec();
+
+    // One subdivision pass: split each triangle into 4 sub-triangles.
+    let mut midpoint_cache: HashMap<(u16, u16), u16> = HashMap::new();
+    let mut get_mid = |a: u16, b: u16, vs: &mut Vec<[f32; 3]>| -> u16 {
+        let key = if a < b { (a, b) } else { (b, a) };
+        if let Some(&idx) = midpoint_cache.get(&key) {
+            return idx;
+        }
+        let pa = vs[a as usize];
+        let pb = vs[b as usize];
+        let mid = [
+            (pa[0] + pb[0]) * 0.5,
+            (pa[1] + pb[1]) * 0.5,
+            (pa[2] + pb[2]) * 0.5,
+        ];
+        let len = (mid[0] * mid[0] + mid[1] * mid[1] + mid[2] * mid[2]).sqrt().max(1e-6);
+        let idx = vs.len() as u16;
+        vs.push([mid[0] / len * 0.5, mid[1] / len * 0.5, mid[2] / len * 0.5]);
+        midpoint_cache.insert(key, idx);
+        idx
+    };
+
+    let old_tris = std::mem::take(&mut tris);
+    for tri in &old_tris {
+        let a = tri[0];
+        let b = tri[1];
+        let c = tri[2];
+        let ab = get_mid(a, b, &mut verts);
+        let bc = get_mid(b, c, &mut verts);
+        let ca = get_mid(c, a, &mut verts);
+        tris.push([a, ab, ca]);
+        tris.push([b, bc, ab]);
+        tris.push([c, ca, bc]);
+        tris.push([ab, bc, ca]);
+    }
+
+    let vertices: Vec<GpuVertex3d> = verts
+        .iter()
+        .map(|p| GpuVertex3d { position: *p })
+        .collect();
+    let indices: Vec<u16> = tris.iter().flat_map(|t| t.iter().copied()).collect();
+    let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rt-blas-sphere-vb"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::BLAS_INPUT,
+    });
+    let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rt-blas-sphere-ib"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::BLAS_INPUT,
+    });
+    (vb, ib)
+}
+
+fn create_rt_infrastructure(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    camera_bgl: &wgpu::BindGroupLayout,
+    color_format: wgpu::TextureFormat,
+    msaa_sample_count: u32,
+) -> RtInfrastructure {
+    // Bind group layout for group 1: just the TLAS.
+    let tlas_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("runtime-rt-tlas-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+            count: None,
+        }],
+    });
+
+    // RT pipeline layout: group 0 = scene data, group 1 = TLAS.
+    let layout_3d_rt = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("runtime-scene-3d-rt-layout"),
+        bind_group_layouts: &[camera_bgl, &tlas_bgl],
+        immediate_size: 0,
+    });
+
+    let shader_3d_rt = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("runtime-scene-3d-rt-shader"),
+        source: wgpu::ShaderSource::Wgsl(SCENE_3D_RT_WGSL.into()),
+    });
+
+    let pipeline_opaque_rt = create_3d_pipeline(
+        device,
+        &layout_3d_rt,
+        &shader_3d_rt,
+        color_format,
+        Some(wgpu::BlendState::REPLACE),
+        true,
+        Some(wgpu::Face::Back),
+        "runtime-scene-opaque-rt-pipeline",
+        msaa_sample_count,
+    );
+    let pipeline_transparent_rt = create_3d_pipeline(
+        device,
+        &layout_3d_rt,
+        &shader_3d_rt,
+        color_format,
+        Some(wgpu::BlendState::ALPHA_BLENDING),
+        false,
+        Some(wgpu::Face::Back),
+        "runtime-scene-transparent-rt-pipeline",
+        msaa_sample_count,
+    );
+
+    // BLAS: box (8 vertices, 36 u16 indices).
+    let (box_vb, box_ib) = create_rt_blas_buffers_box(device);
+    let blas_size_box = wgpu::BlasTriangleGeometrySizeDescriptor {
+        vertex_format: wgpu::VertexFormat::Float32x3,
+        vertex_count: 8,
+        index_format: Some(wgpu::IndexFormat::Uint16),
+        index_count: Some(36),
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    let blas_box = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("rt-blas-box"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::Triangles {
+            descriptors: vec![blas_size_box.clone()],
+        },
+    );
+
+    // BLAS: sphere (42 vertices, 240 u16 indices — subdivided icosphere at radius 0.5).
+    let (sph_vb, sph_ib) = create_rt_blas_buffers_sphere(device);
+    let sph_vertex_count = sph_vb.size() as u32 / std::mem::size_of::<GpuVertex3d>() as u32;
+    let sph_index_count = sph_ib.size() as u32 / std::mem::size_of::<u16>() as u32;
+    let blas_size_sphere = wgpu::BlasTriangleGeometrySizeDescriptor {
+        vertex_format: wgpu::VertexFormat::Float32x3,
+        vertex_count: sph_vertex_count,
+        index_format: Some(wgpu::IndexFormat::Uint16),
+        index_count: Some(sph_index_count),
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    let blas_sphere = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("rt-blas-sphere"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::Triangles {
+            descriptors: vec![blas_size_sphere.clone()],
+        },
+    );
+
+    // Build both BLASes in a one-shot command encoder.
+    let mut blas_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("rt-blas-init-encoder"),
+    });
+    let build_box = wgpu::BlasBuildEntry {
+        blas: &blas_box,
+        geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
+            size: &blas_size_box,
+            vertex_buffer: &box_vb,
+            first_vertex: 0,
+            vertex_stride: std::mem::size_of::<GpuVertex3d>() as u64,
+            index_buffer: Some(&box_ib),
+            first_index: Some(0),
+            transform_buffer: None,
+            transform_buffer_offset: None,
+        }]),
+    };
+    let build_sphere = wgpu::BlasBuildEntry {
+        blas: &blas_sphere,
+        geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
+            size: &blas_size_sphere,
+            vertex_buffer: &sph_vb,
+            first_vertex: 0,
+            vertex_stride: std::mem::size_of::<GpuVertex3d>() as u64,
+            index_buffer: Some(&sph_ib),
+            first_index: Some(0),
+            transform_buffer: None,
+            transform_buffer_offset: None,
+        }]),
+    };
+    let blas_builds = [build_box, build_sphere];
+    blas_encoder.build_acceleration_structures(
+        blas_builds.iter(),
+        std::iter::empty::<&wgpu::Tlas>(),
+    );
+    queue.submit(Some(blas_encoder.finish()));
+
+    // TLAS rebuilt each frame with up to RT_DYNAMIC_CAP instances.
+    let tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        label: Some("rt-scene-tlas"),
+        max_instances: RT_DYNAMIC_CAP,
+        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_BUILD,
+        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+    });
+
+    // The TLAS bind group is stable across per-frame TLAS rebuilds.
+    let tlas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("runtime-rt-tlas-bg"),
+        layout: &tlas_bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: tlas.as_binding(),
+        }],
+    });
+
+    RtInfrastructure {
+        blas_box,
+        blas_sphere,
+        tlas,
+        tlas_bgl,
+        tlas_bg,
+        pipeline_opaque_rt,
+        pipeline_transparent_rt,
+    }
+}
 
 fn create_shadow_pipeline(
     device: &wgpu::Device,
