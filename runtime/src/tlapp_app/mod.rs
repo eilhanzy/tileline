@@ -1117,16 +1117,16 @@ fn choose_aggressive_tick_hz(
     if fps_ratio > 1.05 {
         multiplier += if mobile_path { 0.15 } else { 0.45 };
     }
-    // Ball count cost scaling: more balls = heavier per-tick physics cost.
-    // Keep a modest damping so the peak target Hz doesn't climb unrealistically
-    // high — the real anti-oscillation work is done by the asymmetric ramp
-    // smoothing in the caller (slow ramp-up, fast ramp-down).
-    if live_balls > 5_000 {
-        let excess = ((live_balls - 5_000) as f32 / 5_000.0).min(5.0);
+    // Slight ball-count scaling: with many balls each tick is heavier, but the
+    // asymmetric smoothing (slow ramp-up) is the primary stabilizer. Keep this
+    // damping very light — over-damping drops tick Hz too far, reducing both
+    // physics quality and CPU utilization.
+    if live_balls > 8_000 {
+        let excess = ((live_balls - 8_000) as f32 / 10_000.0).min(3.0);
         let damping = if mobile_path {
-            1.0 - (excess * 0.06).min(0.22)
+            1.0 - (excess * 0.04).min(0.10)
         } else {
-            1.0 - (excess * 0.04).min(0.18)
+            1.0 - (excess * 0.03).min(0.08)
         };
         multiplier *= damping;
     }
