@@ -487,6 +487,8 @@ fn empty_frame_output() -> TlscriptShowcaseFrameOutput {
     TlscriptShowcaseFrameOutput {
         patch: BounceTankRuntimePatch::default(),
         light_overrides: Vec::new(),
+        ball_metallic: None,
+        ball_roughness: None,
         rt_mode: None,
         force_full_fbx_sphere: None,
         camera_move_speed: None,

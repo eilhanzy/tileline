@@ -1492,8 +1492,8 @@ impl BounceTankSceneController {
             }
 
             let color = hsv_to_rgb(self.rand01(), 0.72, 0.96);
-            let roughness = self.rand_range(0.16, 0.86);
-            let metallic = self.rand_range(0.0, 0.30);
+            let roughness = self.rand_range(0.05, 0.85);
+            let metallic = self.rand_range(0.0, 1.0);
             self.balls.push(BallVisual {
                 body,
                 radius,

@@ -527,6 +527,21 @@ impl TlAppRuntime {
         };
         let unknown_light_overrides =
             apply_scene_light_overrides(&mut frame, frame_eval.light_overrides.as_slice());
+        // Apply global ball material overrides from tlscript.
+        if frame_eval.ball_metallic.is_some() || frame_eval.ball_roughness.is_some() {
+            for instance in frame
+                .opaque_3d
+                .iter_mut()
+                .filter(|i| matches!(i.primitive, ScenePrimitive3d::Sphere))
+            {
+                if let Some(m) = frame_eval.ball_metallic {
+                    instance.material.metallic = m.clamp(0.0, 1.0);
+                }
+                if let Some(r) = frame_eval.ball_roughness {
+                    instance.material.roughness = r.clamp(0.0, 1.0);
+                }
+            }
+        }
         // Follow-camera lights: move to camera eye and look along camera forward vector.
         // Offset the light slightly below the eye (like a flashlight held at chest level)
         // so that shadow-casting objects create visible shadows on surfaces behind them.

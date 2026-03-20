@@ -20,7 +20,7 @@ use tl_core::{
 
 use crate::scene::{BounceTankRuntimePatch, RayTracingMode, SceneLightOverride};
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 73] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 75] = [
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_container_size",
@@ -82,6 +82,8 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 73] = [
     "set_light_glow_radius",
     "set_light_glow_intensity",
     "set_light_follow_camera",
+    "set_ball_metallic",
+    "set_ball_roughness",
     "set_rt_mode",
     "set_camera_move_speed",
     "set_camera_look_sensitivity",
@@ -241,6 +243,8 @@ impl Default for TlscriptShowcaseControlInput {
 pub struct TlscriptShowcaseFrameOutput {
     pub patch: BounceTankRuntimePatch,
     pub light_overrides: Vec<SceneLightOverride>,
+    pub ball_metallic: Option<f32>,
+    pub ball_roughness: Option<f32>,
     pub rt_mode: Option<RayTracingMode>,
     pub force_full_fbx_sphere: Option<bool>,
     pub camera_move_speed: Option<f32>,
@@ -491,6 +495,8 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         TlscriptShowcaseFrameOutput {
             patch: state.patch,
             light_overrides: state.light_overrides_values(),
+            ball_metallic: state.ball_metallic,
+            ball_roughness: state.ball_roughness,
             rt_mode: state.rt_mode,
             force_full_fbx_sphere: state.force_full_fbx_sphere,
             camera_move_speed: state.camera_move_speed,
@@ -733,6 +739,8 @@ struct EvalState {
     camera_sprint: Option<bool>,
     camera_look_active: Option<bool>,
     camera_reset_pose: bool,
+    ball_metallic: Option<f32>,
+    ball_roughness: Option<f32>,
     warnings: Vec<String>,
     steps: usize,
     max_steps: usize,
@@ -759,6 +767,8 @@ impl EvalState {
             camera_sprint: None,
             camera_look_active: None,
             camera_reset_pose: false,
+            ball_metallic: None,
+            ball_roughness: None,
             warnings: Vec::new(),
             steps: 0,
             max_steps: max_steps.max(1),
@@ -1246,6 +1256,14 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
                 state.light_override_mut(id).follow_camera = Some(enabled.to_bool());
             }
             _ => state.warn("set_light_follow_camera expects 2 args"),
+        },
+        "set_ball_metallic" => match args {
+            [v] => state.ball_metallic = Some(v.to_f64() as f32),
+            _ => state.warn("set_ball_metallic expects 1 arg (0.0 – 1.0)"),
+        },
+        "set_ball_roughness" => match args {
+            [v] => state.ball_roughness = Some(v.to_f64() as f32),
+            _ => state.warn("set_ball_roughness expects 1 arg (0.0 – 1.0)"),
         },
         "set_rt_mode" => match args {
             [DemoValue::Str(mode)] => {
