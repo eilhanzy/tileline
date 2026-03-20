@@ -412,6 +412,8 @@ impl WgpuSceneRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            // LessEqual: returns 1.0 when sampled_depth ≤ depth_ref.
+            // In sample_shadow we invert the result so shadow_sum accumulates 1.0=lit, 0.0=shadow.
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
@@ -2750,29 +2752,44 @@ fn vs_main(input: VSIn) -> VSOut {
 
 /// 3×3 PCF shadow sample from the shadow map depth array.
 /// Returns 1.0 = fully lit, 0.0 = fully in shadow.
+///
+/// Uses `textureLoad` + manual comparison rather than `textureSampleCompare` so
+/// the comparison direction is explicit and portable across Metal / Vulkan / DX12.
+/// Depth convention: 0 = near, 1 = far.  A surface is LIT when the stored nearest-
+/// occluder depth is ≥ (fragment depth − bias), i.e. nothing is significantly closer
+/// to the light than the fragment itself.
 fn sample_shadow(slot: i32, world_pos: vec3<f32>) -> f32 {
     let light_space = u_shadow.light_view_proj[slot] * vec4<f32>(world_pos, 1.0);
     if light_space.w <= 0.0 {
         return 1.0;
     }
     let proj = light_space.xyz / light_space.w;
-    // Convert GL NDC z [-1,1] → depth buffer [0,1].
-    // wgpu stores depth as NDC z directly (nalgebra OpenGL projection maps the far half
-    // of the frustum to [0,1], which wgpu clips and stores as-is).  The old * 0.5 + 0.5
-    // remapping was incorrect and caused everything to appear self-shadowed.
-    let depth_ref = clamp(proj.z - 0.002, 0.0, 1.0);
+    // proj.z is OpenGL NDC [-1, 1].  The shadow depth pass VS goes through naga's
+    // Metal/wgpu z-correction so the depth buffer stores (z_gl + 1) * 0.5 ∈ [0, 1].
+    // We must apply the same conversion before comparing against stored depth.
+    if proj.z < -1.0 || proj.z > 1.0 {
+        return 1.0;
+    }
+    let wgpu_z = proj.z * 0.5 + 0.5;
+    let depth_test = wgpu_z - 0.0005;
     // Convert GL NDC xy [-1,1] → UV [0,1], flipping Y (NDC +y up, UV +y down).
     let uv = proj.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
     if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
         return 1.0;
     }
-    // 3×3 PCF kernel.
-    let texel = 1.0 / 1024.0;
+    // 3×3 PCF kernel — textureLoad returns raw f32 depth, comparison is explicit.
+    // A fragment is lit  when stored_depth >= depth_test (occluder is not closer).
+    // A fragment is dark when stored_depth <  depth_test (occluder is closer to light).
+    let map_size = 1024;
     var shadow_sum = 0.0;
     for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
         for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
-            let offset = vec2<f32>(f32(dx), f32(dy)) * texel;
-            shadow_sum += textureSampleCompare(shadow_map, shadow_smp, uv + offset, slot, depth_ref);
+            let px = vec2<i32>(
+                clamp(i32(uv.x * f32(map_size)) + dx, 0, map_size - 1),
+                clamp(i32(uv.y * f32(map_size)) + dy, 0, map_size - 1),
+            );
+            let stored = textureLoad(shadow_map, px, slot, 0);
+            shadow_sum += select(0.0, 1.0, stored >= depth_test);
         }
     }
     return shadow_sum / 9.0;
@@ -2787,8 +2804,13 @@ fn evaluate_light(light: LightData, normal: vec3<f32>, world_pos: vec3<f32>, bas
         return vec3<f32>(0.0);
     }
 
+    // Distance falloff: squared smoothstep edge-rolloff combined with a gentle
+    // linear-distance term to prevent the near-source hotspot from blowing out.
+    // 1/(1+k*d) with k≈0.10 gives ~50% reduction at 10 units, preserving mid-range
+    // luminosity while keeping the light physically believable.
     var attenuation = 1.0 - smoothstep(range * 0.65, range, distance);
     attenuation *= attenuation;
+    attenuation *= 1.0 / (1.0 + distance * 0.10);
 
     if light.position_kind.w > 0.5 {
         let spot_axis = normalize(-light.direction_inner.xyz);
@@ -2814,8 +2836,10 @@ fn evaluate_light(light: LightData, normal: vec3<f32>, world_pos: vec3<f32>, bas
     if shadow_slot >= 0 && u32(shadow_slot) < u_shadow.shadow_count {
         // Shadow map available for this light — use PCF.
         shadow_term = sample_shadow(shadow_slot, world_pos);
-    } else if u_lighting.rt_active > 0u && light.shadow.x > 0.5 {
-        // Fall back to RT-approximate soft shadow hint.
+    } else if light.shadow.x > 0.5 {
+        // No shadow map slot available — fall back to an analytic soft-shadow approximation
+        // that works on all platforms (including Metal). The penumbra floor is derived from
+        // the light's softness parameter: a very soft light has a higher ambient floor.
         let penumbra_floor = mix(0.35, 0.80, 1.0 - light.params.z);
         shadow_term = mix(penumbra_floor, 1.0, ndotl);
     }
@@ -3133,8 +3157,8 @@ fn create_shadow_pipeline(
             depth_compare: wgpu::CompareFunction::LessEqual,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState {
-                constant: 2,
-                slope_scale: 2.0,
+                constant: 1,
+                slope_scale: 0.0,
                 clamp: 0.0,
             },
         }),
