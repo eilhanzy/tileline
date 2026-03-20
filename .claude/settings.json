@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /Users/eilhanzy/Projects/tileline/runtime/src/wgpu_scene_renderer/*.wgsl /Users/eilhanzy/Projects/tileline/runtime/src/wgpu_scene_renderer/mod.rs)"
+    ]
+  }
+}
