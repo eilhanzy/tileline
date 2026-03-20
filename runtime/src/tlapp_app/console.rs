@@ -21,6 +21,7 @@ pub struct RuntimeConsoleState {
     pub quick_fps_cap: String,
     pub quick_render_distance: String,
     pub quick_fsr_sharpness: String,
+    pub quick_msaa: String,
     pub log_scroll: usize,
     pub log_filter: RuntimeConsoleLogFilter,
     pub log_tail_limit: Option<usize>,
@@ -94,6 +95,8 @@ pub struct ConsoleUiLayout {
     pub distance_size: (f32, f32),
     pub sharpness_center: (f32, f32),
     pub sharpness_size: (f32, f32),
+    pub msaa_center: (f32, f32),
+    pub msaa_size: (f32, f32),
     pub apply_center: (f32, f32),
     pub apply_size: (f32, f32),
 }
@@ -120,6 +123,8 @@ impl ConsoleUiLayout {
             distance_size: (0.84 * text_scale, 0.06 * text_scale),
             sharpness_center: (0.50 * sx, 0.46 * sy),
             sharpness_size: (0.84 * text_scale, 0.06 * text_scale),
+            msaa_center: (0.50 * sx, 0.405 * sy),
+            msaa_size: (0.84 * text_scale, 0.06 * text_scale),
             apply_center: (0.52 * sx, 0.32 * sy),
             apply_size: (0.84 * text_scale, 0.06 * text_scale),
         }
@@ -147,6 +152,7 @@ pub enum RuntimeConsoleEditTarget {
     FpsCap,
     RenderDistance,
     FsrSharpness,
+    Msaa,
 }
 
 impl RuntimeConsoleEditTarget {
@@ -156,6 +162,7 @@ impl RuntimeConsoleEditTarget {
             Self::FpsCap => "fps_cap",
             Self::RenderDistance => "render_distance",
             Self::FsrSharpness => "fsr_sharpness",
+            Self::Msaa => "msaa",
         }
     }
 
@@ -164,7 +171,8 @@ impl RuntimeConsoleEditTarget {
             Self::Command => Self::FpsCap,
             Self::FpsCap => Self::RenderDistance,
             Self::RenderDistance => Self::FsrSharpness,
-            Self::FsrSharpness => Self::Command,
+            Self::FsrSharpness => Self::Msaa,
+            Self::Msaa => Self::Command,
         }
     }
 }
@@ -185,6 +193,7 @@ impl Default for RuntimeConsoleState {
             quick_fps_cap: "60".to_string(),
             quick_render_distance: "off".to_string(),
             quick_fsr_sharpness: "0.35".to_string(),
+            quick_msaa: "4".to_string(),
             log_scroll: 0,
             log_filter: RuntimeConsoleLogFilter::All,
             log_tail_limit: None,

@@ -21,6 +21,7 @@ use crate::upscaler::{resolve_fsr_status, FsrConfig, FsrStatus};
 const SPRITE_ATLAS_GRID_DIM: u32 = 16;
 const SPRITE_ATLAS_TILE_SIZE: u32 = 64;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub const DEFAULT_MSAA_SAMPLE_COUNT: u32 = 4;
 /// Max shadow-casting lights that get their own shadow map each frame.
 const MAX_SHADOW_LIGHTS: usize = 4;
 /// Resolution of each shadow map (square). 1024 gives good quality for a flashlight at scene scale.
@@ -231,8 +232,18 @@ pub struct WgpuSceneRenderer {
     pipeline_sprite_glow: wgpu::RenderPipeline,
     pipeline_sprite_overlay: wgpu::RenderPipeline,
     pipeline_upscale: wgpu::RenderPipeline,
+    msaa_sample_count: u32,
+    // Stored to allow pipeline rebuild when MSAA count changes at runtime.
+    pipeline_layout_3d: wgpu::PipelineLayout,
+    _shader_3d: wgpu::ShaderModule,
+    pipeline_layout_sprite: wgpu::PipelineLayout,
+    _shader_sprite: wgpu::ShaderModule,
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    _msaa_color_texture: wgpu::Texture,
+    msaa_color_view: wgpu::TextureView,
+    _msaa_depth_texture: wgpu::Texture,
+    msaa_depth_view: wgpu::TextureView,
     _fsr_scene_texture: wgpu::Texture,
     fsr_scene_view: wgpu::TextureView,
     fsr_bind_group_layout: wgpu::BindGroupLayout,
@@ -290,6 +301,7 @@ impl WgpuSceneRenderer {
         surface_width: u32,
         surface_height: u32,
         adapter_backend: wgpu::Backend,
+        msaa_sample_count: u32,
     ) -> Self {
         let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("runtime-scene-camera-bgl"),
@@ -595,6 +607,7 @@ impl WgpuSceneRenderer {
             true,
             Some(wgpu::Face::Back),
             "runtime-scene-opaque-pipeline",
+            msaa_sample_count,
         );
         let pipeline_transparent = create_3d_pipeline(
             device,
@@ -605,11 +618,12 @@ impl WgpuSceneRenderer {
             false,
             Some(wgpu::Face::Back),
             "runtime-scene-transparent-pipeline",
+            msaa_sample_count,
         );
         let pipeline_sprite =
-            create_sprite_pipeline(device, &layout_sprite, &shader_sprite, color_format);
+            create_sprite_pipeline(device, &layout_sprite, &shader_sprite, color_format, msaa_sample_count);
         let pipeline_sprite_glow =
-            create_sprite_glow_pipeline(device, &layout_sprite, &shader_sprite, color_format);
+            create_sprite_glow_pipeline(device, &layout_sprite, &shader_sprite, color_format, msaa_sample_count);
         let pipeline_sprite_overlay =
             create_sprite_overlay_pipeline(device, &layout_sprite, &shader_sprite, color_format);
         let pipeline_upscale =
@@ -620,6 +634,8 @@ impl WgpuSceneRenderer {
             surface_height.max(1),
             "runtime-scene-depth",
         );
+        let (msaa_color_texture, msaa_color_view, msaa_depth_texture, msaa_depth_view) =
+            create_msaa_resources(device, color_format, surface_width.max(1), surface_height.max(1), msaa_sample_count);
         let (fsr_scene_texture, fsr_scene_view) = create_fsr_scene_resources(
             device,
             color_format,
@@ -694,6 +710,11 @@ impl WgpuSceneRenderer {
             scene_bind_group,
             light_buffer,
             lighting_buffer,
+            msaa_sample_count,
+            pipeline_layout_3d: layout_3d,
+            _shader_3d: shader_3d,
+            pipeline_layout_sprite: layout_sprite,
+            _shader_sprite: shader_sprite,
             pipeline_opaque,
             pipeline_transparent,
             pipeline_sprite,
@@ -702,6 +723,10 @@ impl WgpuSceneRenderer {
             pipeline_upscale,
             _depth_texture: depth_texture,
             depth_view,
+            _msaa_color_texture: msaa_color_texture,
+            msaa_color_view,
+            _msaa_depth_texture: msaa_depth_texture,
+            msaa_depth_view,
             _fsr_scene_texture: fsr_scene_texture,
             fsr_scene_view,
             fsr_bind_group_layout: fsr_bgl,
@@ -767,6 +792,12 @@ impl WgpuSceneRenderer {
         );
         self._depth_texture = depth_texture;
         self.depth_view = depth_view;
+        let (msaa_ct, msaa_cv, msaa_dt, msaa_dv) =
+            create_msaa_resources(device, self.surface_color_format, self.surface_width, self.surface_height, self.msaa_sample_count);
+        self._msaa_color_texture = msaa_ct;
+        self.msaa_color_view = msaa_cv;
+        self._msaa_depth_texture = msaa_dt;
+        self.msaa_depth_view = msaa_dv;
         let (fsr_scene_texture, fsr_scene_view) = create_fsr_scene_resources(
             device,
             self.surface_color_format,
@@ -795,6 +826,53 @@ impl WgpuSceneRenderer {
             ],
         });
         self.write_fsr_uniform(queue);
+    }
+
+    pub fn msaa_sample_count(&self) -> u32 {
+        self.msaa_sample_count
+    }
+
+    /// Change MSAA sample count at runtime. Rebuilds MSAA textures and the four affected pipelines.
+    /// Valid values: 1 (off), 2, or 4. Other values are clamped to the nearest supported count.
+    pub fn set_msaa_sample_count(&mut self, device: &wgpu::Device, count: u32) {
+        let count = match count {
+            0 | 1 => 1,
+            2 | 3 => 2,
+            _ => 4,
+        };
+        if self.msaa_sample_count == count {
+            return;
+        }
+        self.msaa_sample_count = count;
+        let (ct, cv, dt, dv) = create_msaa_resources(
+            device,
+            self.surface_color_format,
+            self.surface_width,
+            self.surface_height,
+            count,
+        );
+        self._msaa_color_texture = ct;
+        self.msaa_color_view = cv;
+        self._msaa_depth_texture = dt;
+        self.msaa_depth_view = dv;
+        self.pipeline_opaque = create_3d_pipeline(
+            device, &self.pipeline_layout_3d, &self._shader_3d,
+            self.surface_color_format, Some(wgpu::BlendState::REPLACE),
+            true, Some(wgpu::Face::Back), "runtime-scene-opaque-pipeline", count,
+        );
+        self.pipeline_transparent = create_3d_pipeline(
+            device, &self.pipeline_layout_3d, &self._shader_3d,
+            self.surface_color_format, Some(wgpu::BlendState::ALPHA_BLENDING),
+            false, Some(wgpu::Face::Back), "runtime-scene-transparent-pipeline", count,
+        );
+        self.pipeline_sprite = create_sprite_pipeline(
+            device, &self.pipeline_layout_sprite, &self._shader_sprite,
+            self.surface_color_format, count,
+        );
+        self.pipeline_sprite_glow = create_sprite_glow_pipeline(
+            device, &self.pipeline_layout_sprite, &self._shader_sprite,
+            self.surface_color_format, count,
+        );
     }
 
     /// Overrides the active camera transform used by scene rendering.
@@ -1095,19 +1173,19 @@ impl WgpuSceneRenderer {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("runtime-scene-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: scene_target,
+                view: &self.msaa_color_view,
                 depth_slice: None,
-                resolve_target: None,
+                resolve_target: Some(scene_target),
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(clear),
-                    store: wgpu::StoreOp::Store,
+                    store: wgpu::StoreOp::Discard,
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.depth_view,
+                view: &self.msaa_depth_view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
+                    store: wgpu::StoreOp::Discard,
                 }),
                 stencil_ops: None,
             }),
@@ -1712,6 +1790,7 @@ fn create_3d_pipeline(
     depth_write_enabled: bool,
     cull_mode: Option<wgpu::Face>,
     label: &str,
+    sample_count: u32,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
@@ -1763,7 +1842,10 @@ fn create_3d_pipeline(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     })
@@ -1774,6 +1856,7 @@ fn create_sprite_pipeline(
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
+    sample_count: u32,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("runtime-scene-sprite-pipeline"),
@@ -1822,7 +1905,10 @@ fn create_sprite_pipeline(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     })
@@ -1835,6 +1921,7 @@ fn create_sprite_glow_pipeline(
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
+    sample_count: u32,
 ) -> wgpu::RenderPipeline {
     const ADDITIVE: wgpu::BlendState = wgpu::BlendState {
         color: wgpu::BlendComponent {
@@ -1895,7 +1982,10 @@ fn create_sprite_glow_pipeline(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     })
@@ -2491,6 +2581,38 @@ fn create_fsr_scene_resources(
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+fn create_msaa_resources(
+    device: &wgpu::Device,
+    color_format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::Texture, wgpu::TextureView) {
+    let color_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("runtime-scene-msaa-color"),
+        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: color_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let color_view = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("runtime-scene-msaa-depth"),
+        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (color_tex, color_view, depth_tex, depth_view)
 }
 
 fn create_default_sprite_atlas_resources(

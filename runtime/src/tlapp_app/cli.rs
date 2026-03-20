@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use winit::dpi::PhysicalSize;
 
-use crate::{FsrMode, FsrQualityPreset, GraphicsSchedulerPath};
+use crate::{FsrMode, FsrQualityPreset, GraphicsSchedulerPath, DEFAULT_MSAA_SAMPLE_COUNT};
 
 #[derive(Debug, Clone)]
 pub struct CliOptions {
@@ -16,6 +16,7 @@ pub struct CliOptions {
     pub render_distance: Option<f32>,
     pub adaptive_distance: ToggleAuto,
     pub distance_blur: ToggleAuto,
+    pub msaa: u32,
     pub fsr_mode: FsrMode,
     pub fsr_quality: FsrQualityPreset,
     pub fsr_sharpness: f32,
@@ -38,6 +39,7 @@ impl Default for CliOptions {
             render_distance: None,
             adaptive_distance: ToggleAuto::Auto,
             distance_blur: ToggleAuto::Auto,
+            msaa: DEFAULT_MSAA_SAMPLE_COUNT,
             fsr_mode: FsrMode::Auto,
             fsr_quality: FsrQualityPreset::Quality,
             fsr_sharpness: 0.35,
@@ -94,6 +96,10 @@ impl CliOptions {
                 "--distance-blur" => {
                     let value = next_arg(&mut args, "--distance-blur")?;
                     options.distance_blur = ToggleAuto::parse(&value, "--distance-blur")?;
+                }
+                "--msaa" => {
+                    let value = next_arg(&mut args, "--msaa")?;
+                    options.msaa = parse_msaa(&value)?;
                 }
                 "--fsr" => {
                     let value = next_arg(&mut args, "--fsr")?;
@@ -298,6 +304,15 @@ pub fn parse_render_distance(value: &str) -> Result<Option<f32>, Box<dyn Error>>
     Ok(Some(distance))
 }
 
+pub fn parse_msaa(value: &str) -> Result<u32, Box<dyn Error>> {
+    match value.to_ascii_lowercase().as_str() {
+        "off" | "1" => Ok(1),
+        "2" => Ok(2),
+        "4" => Ok(4),
+        _ => Err(format!("invalid --msaa value: {value} (expected off|2|4)").into()),
+    }
+}
+
 pub fn parse_fsr_sharpness(value: &str) -> Result<f32, Box<dyn Error>> {
     let parsed = value
         .parse::<f32>()
@@ -332,6 +347,7 @@ fn print_usage() {
     println!("  --render-distance <N|off> Distance cull radius for 3D balls (default: auto)");
     println!("  --adaptive-distance <mode> Adaptive distance tuning: auto|on|off (default: auto)");
     println!("  --distance-blur <mode>    Distance haze blur: auto|on|off (default: auto)");
+    println!("  --msaa <off|2|4>          MSAA sample count (default: 4)");
     println!("  --fsr off|auto|on         FSR policy mode (default: auto)");
     println!("  --fsr-quality <preset>    FSR quality: native|ultra|quality|balanced|performance");
     println!("  --fsr-sharpness <0..1>    FSR sharpen amount (default: 0.35)");

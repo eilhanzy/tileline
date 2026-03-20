@@ -20,7 +20,7 @@ mod runtime_scene;
 
 pub use self::cli::{
     CliOptions, VsyncMode, TickProfile, ToggleAuto, SchedulerResolution,
-    parse_fps_cap, parse_render_distance, parse_fsr_sharpness, parse_fsr_scale,
+    parse_fps_cap, parse_render_distance, parse_fsr_sharpness, parse_fsr_scale, parse_msaa,
 };
 pub use self::console::{
     RuntimeConsoleState, ConsoleUiLayout, RuntimeConsoleLogLine, RuntimeConsoleLogLevel,

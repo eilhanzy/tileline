@@ -31,6 +31,11 @@ impl TlAppRuntime {
             .map(|value| format!("{value:.1}"))
             .unwrap_or_else(|| "off".to_string());
         self.console.quick_fsr_sharpness = format!("{:.2}", self.fsr_config.sharpness);
+        self.console.quick_msaa = if self.renderer.msaa_sample_count() > 1 {
+            format!("{}", self.renderer.msaa_sample_count())
+        } else {
+            "off".to_string()
+        };
     }
 
     pub(super) fn classify_console_feedback(message: &str) -> RuntimeConsoleLogLevel {
@@ -102,6 +107,7 @@ impl TlAppRuntime {
             RuntimeConsoleEditTarget::FpsCap => &mut self.console.quick_fps_cap,
             RuntimeConsoleEditTarget::RenderDistance => &mut self.console.quick_render_distance,
             RuntimeConsoleEditTarget::FsrSharpness => &mut self.console.quick_fsr_sharpness,
+            RuntimeConsoleEditTarget::Msaa => &mut self.console.quick_msaa,
         }
     }
 
@@ -149,6 +155,18 @@ impl TlAppRuntime {
                         self.fsr_config.sharpness = sharpness;
                         self.renderer.set_fsr_config(&self.queue, self.fsr_config);
                         self.console_feedback(format!("fsr sharpness set to {sharpness:.2}"));
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+                RuntimeCommand::Consumed
+            }
+            RuntimeConsoleEditTarget::Msaa => {
+                let value = self.console.quick_msaa.trim();
+                match parse_msaa(value) {
+                    Ok(count) => {
+                        self.renderer.set_msaa_sample_count(&self.device, count);
+                        let label = if count > 1 { format!("msaa {count}x") } else { "msaa off".to_string() };
+                        self.console_feedback(format!("{label} applied"));
                     }
                     Err(err) => self.console_feedback(err.to_string()),
                 }
@@ -930,6 +948,7 @@ impl TlAppRuntime {
                             "gfx.fsr_quality <native|ultra|quality|balanced|performance>",
                             "gfx.fsr_sharpness <0..1>",
                             "gfx.fsr_scale <auto|0.5..1>",
+                            "gfx.msaa <off|2|4>",
                             "gfx.profile <low|med|high|ultra>",
                             "gfx.render_distance <off|N>",
                             "gfx.adaptive_distance <auto|on|off>",
@@ -2033,6 +2052,21 @@ impl TlAppRuntime {
                     Err(err) => self.console_feedback(err.to_string()),
                 }
             }
+            "gfx.msaa" => {
+                let Some(value) = parts.next() else {
+                    self.console_feedback("usage: gfx.msaa <off|4>");
+                    return RuntimeCommand::Consumed;
+                };
+                match parse_msaa(value) {
+                    Ok(count) => {
+                        self.renderer.set_msaa_sample_count(&self.device, count);
+                        let label = if count > 1 { format!("msaa {count}x") } else { "msaa off".to_string() };
+                        self.console_feedback(format!("{label} applied"));
+                        self.console.quick_msaa = if count > 1 { format!("{count}") } else { "off".to_string() };
+                    }
+                    Err(err) => self.console_feedback(err.to_string()),
+                }
+            }
             "gfx.fsr_scale" => {
                 let Some(value) = parts.next() else {
                     self.console_feedback("usage: gfx.fsr_scale <auto|0.5..1>");
@@ -2614,16 +2648,19 @@ impl TlAppRuntime {
             format!("FPS CAP: {}", console.quick_fps_cap),
             format!("RENDER DISTANCE: {}", console.quick_render_distance),
             format!("FSR SHARPNESS: {}", console.quick_fsr_sharpness),
+            format!("MSAA: {}", console.quick_msaa),
         ];
         let active_fps = console.edit_target == RuntimeConsoleEditTarget::FpsCap;
         let active_rd = console.edit_target == RuntimeConsoleEditTarget::RenderDistance;
         let active_sharp = console.edit_target == RuntimeConsoleEditTarget::FsrSharpness;
+        let active_msaa = console.edit_target == RuntimeConsoleEditTarget::Msaa;
         let mut settings_y = 0.57;
         for (index, line) in settings.into_iter().enumerate() {
             let is_active = match index {
                 0 => active_fps,
                 1 => active_rd,
-                _ => active_sharp,
+                2 => active_sharp,
+                _ => active_msaa,
             };
             Self::push_console_text_line(
                 sprites,
@@ -2833,6 +2870,8 @@ impl TlAppRuntime {
         let _ = self.apply_active_console_edit_target();
         self.console.edit_target = RuntimeConsoleEditTarget::FsrSharpness;
         let _ = self.apply_active_console_edit_target();
+        self.console.edit_target = RuntimeConsoleEditTarget::Msaa;
+        let _ = self.apply_active_console_edit_target();
         self.console.edit_target = previous_target;
     }
 
@@ -2864,6 +2903,11 @@ impl TlAppRuntime {
         if Self::point_in_rect(cursor, layout.sharpness_center, layout.sharpness_size) {
             self.console.edit_target = RuntimeConsoleEditTarget::FsrSharpness;
             self.console_feedback("active edit box: fsr_sharpness");
+            return;
+        }
+        if Self::point_in_rect(cursor, layout.msaa_center, layout.msaa_size) {
+            self.console.edit_target = RuntimeConsoleEditTarget::Msaa;
+            self.console_feedback("active edit box: msaa");
             return;
         }
         if Self::point_in_rect(cursor, layout.apply_center, layout.apply_size) {

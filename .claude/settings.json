@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(wc -l /Users/eilhanzy/Projects/tileline/runtime/src/wgpu_scene_renderer/*.wgsl /Users/eilhanzy/Projects/tileline/runtime/src/wgpu_scene_renderer/mod.rs)"
+      "Bash(wc -l /Users/eilhanzy/Projects/tileline/runtime/src/wgpu_scene_renderer/*.wgsl /Users/eilhanzy/Projects/tileline/runtime/src/wgpu_scene_renderer/mod.rs)",
+      "Bash(grep -n \"apply_fps_cap_runtime\" /Users/eilhanzy/Projects/tileline/runtime/src/tlapp_app/*.rs)"
     ]
   }
 }

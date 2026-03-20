@@ -47,6 +47,7 @@ impl TlAppRuntime {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("tlapp-device"),
+                required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
                 required_limits,
                 ..Default::default()
             }))?;
@@ -422,6 +423,7 @@ impl TlAppRuntime {
             size.width,
             size.height,
             adapter_info.backend,
+            options.msaa,
         );
         renderer.set_ray_tracing_mode(&queue, RayTracingMode::Auto);
         let fsr_config = FsrConfig {

@@ -155,5 +155,5 @@ pub use wgpu_render_loop::{
     SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,
 };
 pub use wgpu_scene_renderer::{
-    SceneRayTracingStatus, WgpuSceneRenderer, WgpuSceneRendererUploadStats,
+    SceneRayTracingStatus, WgpuSceneRenderer, WgpuSceneRendererUploadStats, DEFAULT_MSAA_SAMPLE_COUNT,
 };
