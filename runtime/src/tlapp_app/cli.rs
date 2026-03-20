@@ -12,6 +12,7 @@ pub struct CliOptions {
     pub resolution: PhysicalSize<u32>,
     pub vsync: VsyncMode,
     pub fps_cap: Option<f32>,
+    pub pipeline_mode: PipelineMode,
     pub tick_profile: TickProfile,
     pub tick_cap: Option<f32>,
     pub render_distance: Option<f32>,
@@ -36,6 +37,7 @@ impl Default for CliOptions {
             resolution: PhysicalSize::new(1280, 720),
             vsync: VsyncMode::Auto,
             fps_cap: Some(60.0),
+            pipeline_mode: PipelineMode::default_for_build(),
             tick_profile: TickProfile::Max,
             tick_cap: None,
             render_distance: None,
@@ -60,6 +62,7 @@ impl CliOptions {
     pub fn parse_from_env() -> Result<Self, Box<dyn Error>> {
         let mut options = Self::default();
         let mut args = env::args().skip(1);
+        let mut pipeline_explicit = false;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -82,6 +85,11 @@ impl CliOptions {
                 "--fps-cap" => {
                     let value = next_arg(&mut args, "--fps-cap")?;
                     options.fps_cap = parse_fps_cap(&value)?;
+                }
+                "--pipeline" => {
+                    let value = next_arg(&mut args, "--pipeline")?;
+                    options.pipeline_mode = PipelineMode::parse(&value)?;
+                    pipeline_explicit = true;
                 }
                 "--tick-profile" => {
                     let value = next_arg(&mut args, "--tick-profile")?;
@@ -161,6 +169,14 @@ impl CliOptions {
             }
         }
 
+        if !pipeline_explicit {
+            if let Ok(value) = env::var("TILELINE_PIPELINE") {
+                options.pipeline_mode = PipelineMode::parse(&value).map_err(|_| {
+                    format!("invalid TILELINE_PIPELINE value: {value} (expected parallel|legacy)")
+                })?;
+            }
+        }
+
         if let Some(fps_cap) = options.fps_cap {
             if !(fps_cap.is_finite() && fps_cap > 1.0) {
                 return Err("--fps-cap must be > 1.0 or 'off'".into());
@@ -194,6 +210,12 @@ pub enum TickProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineMode {
+    Parallel,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToggleAuto {
     Auto,
     On,
@@ -215,6 +237,33 @@ impl TickProfile {
             _ => {
                 Err(format!("invalid --tick-profile value: {value} (expected balanced|max)").into())
             }
+        }
+    }
+}
+
+impl PipelineMode {
+    pub fn default_for_build() -> Self {
+        if cfg!(feature = "parallel_pipeline_v2") {
+            Self::Parallel
+        } else {
+            Self::Legacy
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        match value.to_ascii_lowercase().as_str() {
+            "parallel" | "v2" => Ok(Self::Parallel),
+            "legacy" | "v1" => Ok(Self::Legacy),
+            _ => {
+                Err(format!("invalid --pipeline value: {value} (expected parallel|legacy)").into())
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Parallel => "parallel",
+            Self::Legacy => "legacy",
         }
     }
 }
@@ -362,6 +411,9 @@ fn print_usage() {
     println!("  --resolution <WxH>        Window size (default: 1280x720)");
     println!("  --vsync auto|on|off       Present mode preference (default: auto)");
     println!("  --fps-cap <N|off>         Frame cap target (default: 60)");
+    println!(
+        "  --pipeline <mode>         Runtime frame pipeline: parallel|legacy (default: parallel)"
+    );
     println!("  --tick-profile <mode>     Physics tick planner: balanced|max (default: max)");
     println!("  --tick-cap <Hz|off>       Maximum physics tick Hz (default: off = auto)");
     println!("  --render-distance <N|off> Distance cull radius for 3D balls (default: auto)");
@@ -407,8 +459,6 @@ fn print_version_overview() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     fn make_adapter_info(
         name: &str,
         backend: wgpu::Backend,
@@ -431,8 +481,8 @@ mod tests {
 
     #[test]
     fn android_auto_scheduler_prefers_mgs() {
-        use crate::{TlpfileGraphicsScheduler, RuntimePlatform, GraphicsSchedulerPath};
         use super::super::resolve_project_scheduler;
+        use crate::{GraphicsSchedulerPath, RuntimePlatform, TlpfileGraphicsScheduler};
         let info = make_adapter_info(
             "NVIDIA GeForce RTX 5060 Ti",
             wgpu::Backend::Vulkan,
@@ -449,8 +499,8 @@ mod tests {
 
     #[test]
     fn android_explicit_gms_requires_supported_backend() {
-        use crate::{TlpfileGraphicsScheduler, RuntimePlatform};
         use super::super::resolve_project_scheduler;
+        use crate::{RuntimePlatform, TlpfileGraphicsScheduler};
         let info = make_adapter_info(
             "Mali-G610",
             wgpu::Backend::Gl,
@@ -467,8 +517,8 @@ mod tests {
 
     #[test]
     fn android_explicit_mgs_is_accepted() {
-        use crate::{TlpfileGraphicsScheduler, RuntimePlatform, GraphicsSchedulerPath};
         use super::super::resolve_project_scheduler;
+        use crate::{GraphicsSchedulerPath, RuntimePlatform, TlpfileGraphicsScheduler};
         let info = make_adapter_info(
             "Adreno 740",
             wgpu::Backend::Vulkan,

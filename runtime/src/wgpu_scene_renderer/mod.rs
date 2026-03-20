@@ -431,12 +431,11 @@ impl WgpuSceneRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let shadow_map_array_view =
-            shadow_map_texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("runtime-shadow-map-array"),
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                ..Default::default()
-            });
+        let shadow_map_array_view = shadow_map_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("runtime-shadow-map-array"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         let shadow_map_layer_views: Vec<wgpu::TextureView> = (0..MAX_SHADOW_LIGHTS)
             .map(|i| {
                 shadow_map_texture.create_view(&wgpu::TextureViewDescriptor {
@@ -467,20 +466,19 @@ impl WgpuSceneRenderer {
             mapped_at_creation: false,
         });
         // ── Shadow pass per-slot bind group layout + resources ──────────────────
-        let shadow_pass_bgl =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("runtime-shadow-pass-bgl"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
+        let shadow_pass_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("runtime-shadow-pass-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
         let shadow_pass_buffers: Vec<wgpu::Buffer> = (0..MAX_SHADOW_LIGHTS)
             .map(|i| {
                 device.create_buffer(&wgpu::BufferDescriptor {
@@ -651,10 +649,20 @@ impl WgpuSceneRenderer {
             "runtime-scene-transparent-pipeline",
             msaa_sample_count,
         );
-        let pipeline_sprite =
-            create_sprite_pipeline(device, &layout_sprite, &shader_sprite, color_format, msaa_sample_count);
-        let pipeline_sprite_glow =
-            create_sprite_glow_pipeline(device, &layout_sprite, &shader_sprite, color_format, msaa_sample_count);
+        let pipeline_sprite = create_sprite_pipeline(
+            device,
+            &layout_sprite,
+            &shader_sprite,
+            color_format,
+            msaa_sample_count,
+        );
+        let pipeline_sprite_glow = create_sprite_glow_pipeline(
+            device,
+            &layout_sprite,
+            &shader_sprite,
+            color_format,
+            msaa_sample_count,
+        );
         let pipeline_sprite_overlay =
             create_sprite_overlay_pipeline(device, &layout_sprite, &shader_sprite, color_format);
         let pipeline_upscale =
@@ -666,7 +674,13 @@ impl WgpuSceneRenderer {
             "runtime-scene-depth",
         );
         let (msaa_color_texture, msaa_color_view, msaa_depth_texture, msaa_depth_view) =
-            create_msaa_resources(device, color_format, surface_width.max(1), surface_height.max(1), msaa_sample_count);
+            create_msaa_resources(
+                device,
+                color_format,
+                surface_width.max(1),
+                surface_height.max(1),
+                msaa_sample_count,
+            );
         let (fsr_scene_texture, fsr_scene_view) = create_fsr_scene_resources(
             device,
             color_format,
@@ -864,8 +878,13 @@ impl WgpuSceneRenderer {
         );
         self._depth_texture = depth_texture;
         self.depth_view = depth_view;
-        let (msaa_ct, msaa_cv, msaa_dt, msaa_dv) =
-            create_msaa_resources(device, self.surface_color_format, self.surface_width, self.surface_height, self.msaa_sample_count);
+        let (msaa_ct, msaa_cv, msaa_dt, msaa_dv) = create_msaa_resources(
+            device,
+            self.surface_color_format,
+            self.surface_width,
+            self.surface_height,
+            self.msaa_sample_count,
+        );
         self._msaa_color_texture = msaa_ct;
         self.msaa_color_view = msaa_cv;
         self._msaa_depth_texture = msaa_dt;
@@ -928,22 +947,40 @@ impl WgpuSceneRenderer {
         self._msaa_depth_texture = dt;
         self.msaa_depth_view = dv;
         self.pipeline_opaque = create_3d_pipeline(
-            device, &self.pipeline_layout_3d, &self._shader_3d,
-            self.surface_color_format, Some(wgpu::BlendState::REPLACE),
-            true, Some(wgpu::Face::Back), "runtime-scene-opaque-pipeline", count,
+            device,
+            &self.pipeline_layout_3d,
+            &self._shader_3d,
+            self.surface_color_format,
+            Some(wgpu::BlendState::REPLACE),
+            true,
+            Some(wgpu::Face::Back),
+            "runtime-scene-opaque-pipeline",
+            count,
         );
         self.pipeline_transparent = create_3d_pipeline(
-            device, &self.pipeline_layout_3d, &self._shader_3d,
-            self.surface_color_format, Some(wgpu::BlendState::ALPHA_BLENDING),
-            false, Some(wgpu::Face::Back), "runtime-scene-transparent-pipeline", count,
+            device,
+            &self.pipeline_layout_3d,
+            &self._shader_3d,
+            self.surface_color_format,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            false,
+            Some(wgpu::Face::Back),
+            "runtime-scene-transparent-pipeline",
+            count,
         );
         self.pipeline_sprite = create_sprite_pipeline(
-            device, &self.pipeline_layout_sprite, &self._shader_sprite,
-            self.surface_color_format, count,
+            device,
+            &self.pipeline_layout_sprite,
+            &self._shader_sprite,
+            self.surface_color_format,
+            count,
         );
         self.pipeline_sprite_glow = create_sprite_glow_pipeline(
-            device, &self.pipeline_layout_sprite, &self._shader_sprite,
-            self.surface_color_format, count,
+            device,
+            &self.pipeline_layout_sprite,
+            &self._shader_sprite,
+            self.surface_color_format,
+            count,
         );
     }
 
@@ -1018,8 +1055,7 @@ impl WgpuSceneRenderer {
         let required_3d_bytes = plan.instances_3d.len() * std::mem::size_of::<GpuInstance3d>();
         // Regular and glow sprites share one buffer: [regular..., glow...]
         let total_sprite_count = plan.sprites.len() + plan.glow_sprites.len();
-        let required_sprite_bytes =
-            total_sprite_count * std::mem::size_of::<GpuSpriteInstance>();
+        let required_sprite_bytes = total_sprite_count * std::mem::size_of::<GpuSpriteInstance>();
 
         ensure_buffer_capacity(
             device,
@@ -1274,12 +1310,15 @@ impl WgpuSceneRenderer {
     /// or `None` when it is behind (clip.w ≤ 0).
     pub fn world_to_ndc(&self, world_pos: [f32; 3]) -> Option<[f32; 3]> {
         use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3};
-        let aspect =
-            (self.surface_width.max(1) as f32) / (self.surface_height.max(1) as f32);
+        let aspect = (self.surface_width.max(1) as f32) / (self.surface_height.max(1) as f32);
         let proj = Perspective3::new(aspect.max(0.1), 60f32.to_radians(), 0.1, 500.0);
         let view = Isometry3::look_at_rh(
             &Point3::new(self.camera_eye[0], self.camera_eye[1], self.camera_eye[2]),
-            &Point3::new(self.camera_target[0], self.camera_target[1], self.camera_target[2]),
+            &Point3::new(
+                self.camera_target[0],
+                self.camera_target[1],
+                self.camera_target[2],
+            ),
             &Vector3::new(0.0, 1.0, 0.0),
         );
         let view_proj: Matrix4<f32> = proj.to_homogeneous() * view.to_homogeneous();
@@ -1413,11 +1452,9 @@ impl WgpuSceneRenderer {
             pass.set_bind_group(1, &self.scene_bind_group, &[]);
             pass.set_vertex_buffer(0, self.sprite_vertex_buffer.slice(..));
             let total_sprite_bytes = ((self.sprite_count + self.glow_sprite_count) as usize
-                * std::mem::size_of::<GpuSpriteInstance>()) as u64;
-            pass.set_vertex_buffer(
-                1,
-                self.sprite_instance_buffer.slice(0..total_sprite_bytes),
-            );
+                * std::mem::size_of::<GpuSpriteInstance>())
+                as u64;
+            pass.set_vertex_buffer(1, self.sprite_instance_buffer.slice(0..total_sprite_bytes));
 
             if self.sprite_count > 0 {
                 pass.set_pipeline(&self.pipeline_sprite);
@@ -1588,7 +1625,6 @@ impl WgpuSceneRenderer {
         }
         shadow_uniform.shadow_count = slot as u32;
         self.shadow_active_count = slot as u32;
-
 
         queue.write_buffer(
             &self.shadow_uniform_buffer,
@@ -1845,7 +1881,16 @@ fn gpu_light_from_scene(light: &SceneLight, shadow_slot: i32) -> GpuLight {
             kind,
         ],
         direction_inner: [direction[0], direction[1], direction[2], inner],
-        color_intensity: [color[0], color[1], color[2], if light.enabled { light.intensity.max(0.0) } else { 0.0 }],
+        color_intensity: [
+            color[0],
+            color[1],
+            color[2],
+            if light.enabled {
+                light.intensity.max(0.0)
+            } else {
+                0.0
+            },
+        ],
         params: [
             light.range.max(0.05),
             outer,
@@ -1853,12 +1898,7 @@ fn gpu_light_from_scene(light: &SceneLight, shadow_slot: i32) -> GpuLight {
             light.specular_strength.clamp(0.0, 8.0),
         ],
         // shadow.y encodes shadow slot: -1.0 = no shadow map, 0..3 = active slot.
-        shadow: [
-            f32::from(light.casts_shadow),
-            shadow_slot as f32,
-            0.0,
-            0.0,
-        ],
+        shadow: [f32::from(light.casts_shadow), shadow_slot as f32, 0.0, 0.0],
     }
 }
 
@@ -2756,10 +2796,19 @@ fn create_msaa_resources(
     width: u32,
     height: u32,
     sample_count: u32,
-) -> (wgpu::Texture, wgpu::TextureView, wgpu::Texture, wgpu::TextureView) {
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+) {
     let color_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("runtime-scene-msaa-color"),
-        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count,
         dimension: wgpu::TextureDimension::D2,
@@ -2770,7 +2819,11 @@ fn create_msaa_resources(
     let color_view = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("runtime-scene-msaa-depth"),
-        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count,
         dimension: wgpu::TextureDimension::D2,
@@ -2993,21 +3046,33 @@ fn col_major_4x4_to_row_major_3x4(
 /// Returns (vertex_buffer, index_buffer).
 fn create_rt_blas_buffers_box(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
     let vertices = [
-        GpuVertex3d { position: [-0.5, -0.5, -0.5] },
-        GpuVertex3d { position: [ 0.5, -0.5, -0.5] },
-        GpuVertex3d { position: [ 0.5,  0.5, -0.5] },
-        GpuVertex3d { position: [-0.5,  0.5, -0.5] },
-        GpuVertex3d { position: [-0.5, -0.5,  0.5] },
-        GpuVertex3d { position: [ 0.5, -0.5,  0.5] },
-        GpuVertex3d { position: [ 0.5,  0.5,  0.5] },
-        GpuVertex3d { position: [-0.5,  0.5,  0.5] },
+        GpuVertex3d {
+            position: [-0.5, -0.5, -0.5],
+        },
+        GpuVertex3d {
+            position: [0.5, -0.5, -0.5],
+        },
+        GpuVertex3d {
+            position: [0.5, 0.5, -0.5],
+        },
+        GpuVertex3d {
+            position: [-0.5, 0.5, -0.5],
+        },
+        GpuVertex3d {
+            position: [-0.5, -0.5, 0.5],
+        },
+        GpuVertex3d {
+            position: [0.5, -0.5, 0.5],
+        },
+        GpuVertex3d {
+            position: [0.5, 0.5, 0.5],
+        },
+        GpuVertex3d {
+            position: [-0.5, 0.5, 0.5],
+        },
     ];
     let indices: [u16; 36] = [
-        0, 1, 2, 2, 3, 0,
-        4, 6, 5, 6, 4, 7,
-        0, 4, 5, 5, 1, 0,
-        3, 2, 6, 6, 7, 3,
-        1, 5, 6, 6, 2, 1,
+        0, 1, 2, 2, 3, 0, 4, 6, 5, 6, 4, 7, 0, 4, 5, 5, 1, 0, 3, 2, 6, 6, 7, 3, 1, 5, 6, 6, 2, 1,
         0, 3, 7, 7, 4, 0,
     ];
     let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3032,18 +3097,40 @@ fn create_rt_blas_buffers_sphere(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::
 
     let t = (1.0 + 5.0_f32.sqrt()) * 0.5;
     let base_verts: [[f32; 3]; 12] = [
-        [-1.0,  t,  0.0], [ 1.0,  t,  0.0],
-        [-1.0, -t,  0.0], [ 1.0, -t,  0.0],
-        [ 0.0, -1.0,  t], [ 0.0,  1.0,  t],
-        [ 0.0, -1.0, -t], [ 0.0,  1.0, -t],
-        [ t,  0.0, -1.0], [ t,  0.0,  1.0],
-        [-t,  0.0, -1.0], [-t,  0.0,  1.0],
+        [-1.0, t, 0.0],
+        [1.0, t, 0.0],
+        [-1.0, -t, 0.0],
+        [1.0, -t, 0.0],
+        [0.0, -1.0, t],
+        [0.0, 1.0, t],
+        [0.0, -1.0, -t],
+        [0.0, 1.0, -t],
+        [t, 0.0, -1.0],
+        [t, 0.0, 1.0],
+        [-t, 0.0, -1.0],
+        [-t, 0.0, 1.0],
     ];
     let base_tris: [[u16; 3]; 20] = [
-        [0,11,5], [0,5,1], [0,1,7], [0,7,10], [0,10,11],
-        [1,5,9], [5,11,4], [11,10,2], [10,7,6], [7,1,8],
-        [3,9,4], [3,4,2], [3,2,6], [3,6,8], [3,8,9],
-        [4,9,5], [2,4,11], [6,2,10], [8,6,7], [9,8,1],
+        [0, 11, 5],
+        [0, 5, 1],
+        [0, 1, 7],
+        [0, 7, 10],
+        [0, 10, 11],
+        [1, 5, 9],
+        [5, 11, 4],
+        [11, 10, 2],
+        [10, 7, 6],
+        [7, 1, 8],
+        [3, 9, 4],
+        [3, 4, 2],
+        [3, 2, 6],
+        [3, 6, 8],
+        [3, 8, 9],
+        [4, 9, 5],
+        [2, 4, 11],
+        [6, 2, 10],
+        [8, 6, 7],
+        [9, 8, 1],
     ];
 
     // Normalize base vertices to radius 0.5.
@@ -3070,7 +3157,9 @@ fn create_rt_blas_buffers_sphere(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::
             (pa[1] + pb[1]) * 0.5,
             (pa[2] + pb[2]) * 0.5,
         ];
-        let len = (mid[0] * mid[0] + mid[1] * mid[1] + mid[2] * mid[2]).sqrt().max(1e-6);
+        let len = (mid[0] * mid[0] + mid[1] * mid[1] + mid[2] * mid[2])
+            .sqrt()
+            .max(1e-6);
         let idx = vs.len() as u16;
         vs.push([mid[0] / len * 0.5, mid[1] / len * 0.5, mid[2] / len * 0.5]);
         midpoint_cache.insert(key, idx);
@@ -3091,10 +3180,7 @@ fn create_rt_blas_buffers_sphere(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::
         tris.push([ab, bc, ca]);
     }
 
-    let vertices: Vec<GpuVertex3d> = verts
-        .iter()
-        .map(|p| GpuVertex3d { position: *p })
-        .collect();
+    let vertices: Vec<GpuVertex3d> = verts.iter().map(|p| GpuVertex3d { position: *p }).collect();
     let indices: Vec<u16> = tris.iter().flat_map(|t| t.iter().copied()).collect();
     let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("rt-blas-sphere-vb"),
@@ -3122,7 +3208,9 @@ fn create_rt_infrastructure(
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+            ty: wgpu::BindingType::AccelerationStructure {
+                vertex_return: false,
+            },
             count: None,
         }],
     });
@@ -3235,10 +3323,8 @@ fn create_rt_infrastructure(
         }]),
     };
     let blas_builds = [build_box, build_sphere];
-    blas_encoder.build_acceleration_structures(
-        blas_builds.iter(),
-        std::iter::empty::<&wgpu::Tlas>(),
-    );
+    blas_encoder
+        .build_acceleration_structures(blas_builds.iter(), std::iter::empty::<&wgpu::Tlas>());
     queue.submit(Some(blas_encoder.finish()));
 
     // TLAS rebuilt each frame with up to RT_DYNAMIC_CAP instances.

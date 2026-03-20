@@ -253,7 +253,11 @@ fn read_sysctl_usize(key: &str) -> Option<usize> {
         )
     };
 
-    if ret == 0 { Some(value) } else { None }
+    if ret == 0 {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 fn classify_cores(logical_cores: usize, frequencies: Option<&[Option<u64>]>) -> Vec<CpuClass> {

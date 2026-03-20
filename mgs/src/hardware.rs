@@ -167,13 +167,25 @@ impl MobileGpuProfile {
     /// Runtime can use this flag to route the device to GMS instead of MGS.
     pub fn is_desktop_class(&self) -> bool {
         let n = self.name.to_ascii_lowercase();
-        matches!(self.family, MobileGpuFamily::Apple) 
-            && (n.contains(" m1") || n.contains(" m2") || n.contains(" m3")
-                || n.contains(" m4") || n.contains(" m5") || n.contains(" m6")
-                || n.contains(" m7") || n.contains(" m8") || n.contains(" m9")
-                || n.starts_with("m1") || n.starts_with("m2") || n.starts_with("m3")
-                || n.starts_with("m4") || n.starts_with("m5") || n.starts_with("m6")
-                || n.starts_with("m7") || n.starts_with("m8") || n.starts_with("m9"))
+        matches!(self.family, MobileGpuFamily::Apple)
+            && (n.contains(" m1")
+                || n.contains(" m2")
+                || n.contains(" m3")
+                || n.contains(" m4")
+                || n.contains(" m5")
+                || n.contains(" m6")
+                || n.contains(" m7")
+                || n.contains(" m8")
+                || n.contains(" m9")
+                || n.starts_with("m1")
+                || n.starts_with("m2")
+                || n.starts_with("m3")
+                || n.starts_with("m4")
+                || n.starts_with("m5")
+                || n.starts_with("m6")
+                || n.starts_with("m7")
+                || n.starts_with("m8")
+                || n.starts_with("m9"))
     }
 }
 

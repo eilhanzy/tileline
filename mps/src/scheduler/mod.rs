@@ -11,7 +11,6 @@ pub mod queue;
 
 use crate::balancer::{CorePreference, LoadBalancer, TaskPriority};
 use crate::topology::{CpuClass, CpuTopology};
-use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle, Thread};
@@ -30,10 +29,12 @@ fn apply_thread_qos(class: CpuClass, _core_id: usize) {
     }
     let qos: u32 = match class {
         CpuClass::Performance => 0x21,
-        CpuClass::Efficient   => 0x11,
-        CpuClass::Unknown     => 0x15,
+        CpuClass::Efficient => 0x11,
+        CpuClass::Unknown => 0x15,
     };
-    unsafe { pthread_set_qos_class_self_np(qos, 0); }
+    unsafe {
+        pthread_set_qos_class_self_np(qos, 0);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -65,17 +66,25 @@ fn apply_thread_qos(class: CpuClass, core_id: usize) {
     // Performance workers get nice -2 (slight boost), Efficient workers get nice 5.
     let nice_val: libc::c_int = match class {
         CpuClass::Performance => -2,
-        CpuClass::Unknown     =>  0,
-        CpuClass::Efficient   =>  5,
+        CpuClass::Unknown => 0,
+        CpuClass::Efficient => 5,
     };
-    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice_val); }
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, nice_val);
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[inline(always)]
 fn apply_thread_qos(_class: CpuClass, _core_id: usize) {}
 
-pub use dispatcher::{DispatchError, DispatchResult, Dispatcher};
+pub use dispatcher::{
+    CompletedPhysicsFrame, DispatchError, DispatchResult, Dispatcher,
+    DispatcherDoubleBufferedTransforms, DispatcherPhase, DispatcherPhaseCallbacks,
+    DispatcherTaskContext, DispatcherTransformSample, PhysicsDispatchTicket,
+    PhysicsDispatchTrigger, SceneBuildTicket, TaskDispatcher, TaskDispatcherConfig,
+    TaskDispatcherMetrics,
+};
 pub use queue::{PriorityTaskQueue, QueueDepth};
 
 /// Unique task identifier.
@@ -253,7 +262,9 @@ impl MpsScheduler {
             topology.logical_cores,
             topology.performance_cores,
             topology.efficient_cores,
-            topology.logical_cores.saturating_sub(topology.performance_cores + topology.efficient_cores),
+            topology
+                .logical_cores
+                .saturating_sub(topology.performance_cores + topology.efficient_cores),
             topology.has_hybrid,
             topology.vendor.as_deref().unwrap_or("unknown"),
             topology.logical_cores,
@@ -344,7 +355,7 @@ impl MpsScheduler {
         self.enqueue_payload(priority, preference, TaskPayload::Wasm(task))
     }
 
-    /// Submit native tasks in parallel using Rayon.
+    /// Submit native tasks without relying on Rayon.
     pub fn submit_batch_native(
         &self,
         priority: TaskPriority,
@@ -352,36 +363,29 @@ impl MpsScheduler {
         tasks: Vec<NativeTask>,
     ) -> Vec<TaskId> {
         let task_count = tasks.len();
-        let queue = self.queue.clone();
-        let balancer = self.balancer.clone();
-        let submitted = Arc::clone(&self.submitted);
-        let next_task_id = &self.next_task_id;
+        let mut ids = Vec::with_capacity(task_count);
+        for task in tasks {
+            let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+            let decision = self
+                .balancer
+                .decide(priority, preference, self.queue.total_len());
+            let envelope = TaskEnvelope::new(
+                id,
+                priority,
+                decision.preferred_class,
+                decision.spill_to_any,
+                TaskPayload::Native(task),
+            );
+            self.queue.push(envelope);
+            self.submitted.fetch_add(1, Ordering::Relaxed);
+            ids.push(id);
+        }
 
-        let ids = tasks
-            .into_par_iter()
-            .map(|task| {
-                let id = next_task_id.fetch_add(1, Ordering::Relaxed);
-                let decision = balancer.decide(priority, preference, queue.total_len());
-                let envelope = TaskEnvelope::new(
-                    id,
-                    priority,
-                    decision.preferred_class,
-                    decision.spill_to_any,
-                    TaskPayload::Native(task),
-                );
-                queue.push(envelope);
-                submitted.fetch_add(1, Ordering::Relaxed);
-                id
-            })
-            .collect();
-
-        // After all tasks are in the queue, wake workers proportional to batch size.
-        // Rayon may have enqueued tasks while workers were parked.
         self.wake_n_workers(task_count);
         ids
     }
 
-    /// Submit WASM tasks in parallel using Rayon.
+    /// Submit WASM tasks without relying on Rayon.
     pub fn submit_batch_wasm(
         &self,
         priority: TaskPriority,
@@ -389,28 +393,23 @@ impl MpsScheduler {
         tasks: Vec<WasmTask>,
     ) -> Vec<TaskId> {
         let task_count = tasks.len();
-        let queue = self.queue.clone();
-        let balancer = self.balancer.clone();
-        let submitted = Arc::clone(&self.submitted);
-        let next_task_id = &self.next_task_id;
-
-        let ids = tasks
-            .into_par_iter()
-            .map(|task| {
-                let id = next_task_id.fetch_add(1, Ordering::Relaxed);
-                let decision = balancer.decide(priority, preference, queue.total_len());
-                let envelope = TaskEnvelope::new(
-                    id,
-                    priority,
-                    decision.preferred_class,
-                    decision.spill_to_any,
-                    TaskPayload::Wasm(task),
-                );
-                queue.push(envelope);
-                submitted.fetch_add(1, Ordering::Relaxed);
-                id
-            })
-            .collect();
+        let mut ids = Vec::with_capacity(task_count);
+        for task in tasks {
+            let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+            let decision = self
+                .balancer
+                .decide(priority, preference, self.queue.total_len());
+            let envelope = TaskEnvelope::new(
+                id,
+                priority,
+                decision.preferred_class,
+                decision.spill_to_any,
+                TaskPayload::Wasm(task),
+            );
+            self.queue.push(envelope);
+            self.submitted.fetch_add(1, Ordering::Relaxed);
+            ids.push(id);
+        }
 
         self.wake_n_workers(task_count);
         ids
@@ -602,7 +601,7 @@ fn worker_loop(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let (idle_park_min, idle_park_max) = match worker_class {
         CpuClass::Efficient => (Duration::from_micros(200), Duration::from_millis(8)),
-        _                   => (Duration::from_micros(100), Duration::from_millis(4)),
+        _ => (Duration::from_micros(100), Duration::from_millis(4)),
     };
     #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     let (idle_park_min, idle_park_max) = (Duration::from_micros(50), Duration::from_millis(1));

@@ -23,7 +23,6 @@ miniz_oxide = "0.8.9"
 num_cpus.workspace = true
 percent-encoding = "2.3.1"
 raw-cpuid.workspace = true
-rayon.workspace = true
 sha1 = "0.10.6"
 sha2 = "0.10.9"
 wasmer.workspace = true

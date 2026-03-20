@@ -179,9 +179,8 @@ impl NarrowphasePipeline {
         let persisted_lookup = &self.persisted_lookup;
 
         self.produced_buffer.clear();
-        self.produced_buffer.par_extend(candidate_pairs
-            .par_iter()
-            .filter_map(|&(body_a, body_b)| {
+        self.produced_buffer
+            .par_extend(candidate_pairs.par_iter().filter_map(|&(body_a, body_b)| {
                 let (collider_a, shape_a, material_a, filter_a) = collider_lookup(body_a)?;
                 let (collider_b, shape_b, material_b, filter_b) = collider_lookup(body_b)?;
                 if !collision_filter_allows(filter_a, filter_b) {
@@ -239,8 +238,7 @@ impl NarrowphasePipeline {
                     restitution,
                     friction,
                 })
-            })
-        );
+            }));
 
         let produced_count = self.produced_buffer.len();
         let capacity = self.manifolds.capacity();

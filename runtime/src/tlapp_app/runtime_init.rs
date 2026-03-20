@@ -45,8 +45,7 @@ impl TlAppRuntime {
             );
         }
         // Request RT feature if the adapter supports it; silently skip on non-RT hardware.
-        let enabled_rt_features =
-            wgpu::Features::EXPERIMENTAL_RAY_QUERY & adapter.features();
+        let enabled_rt_features = wgpu::Features::EXPERIMENTAL_RAY_QUERY & adapter.features();
         eprintln!(
             "[runtime bootstrap] ray_query={} adapter='{}'",
             !enabled_rt_features.is_empty(),
@@ -263,6 +262,48 @@ impl TlAppRuntime {
             scheduler_resolution.selected,
             scheduler_resolution.fallback_applied,
             scheduler_resolution.reason
+        );
+        let mut pipeline_mode = options.pipeline_mode;
+        if matches!(pipeline_mode, PipelineMode::Parallel)
+            && !cfg!(feature = "parallel_pipeline_v2")
+        {
+            eprintln!(
+                "[pipeline] requested parallel pipeline, but feature 'parallel_pipeline_v2' is disabled at build time; falling back to legacy"
+            );
+            pipeline_mode = PipelineMode::Legacy;
+        }
+        let fallback_bridge_path = match scheduler_resolution.selected {
+            GraphicsSchedulerPath::Gms => RuntimeBridgePath::GmsPath,
+            GraphicsSchedulerPath::Mgs => RuntimeBridgePath::MgsPath,
+        };
+        let runtime_bridge = if matches!(pipeline_mode, PipelineMode::Parallel) {
+            Some(RuntimeBridgeOrchestrator::new_for_scheduler(
+                scheduler_resolution.selected,
+                &adapter_info.name,
+                RuntimeBridgeConfig::default(),
+                size.width.max(1),
+                size.height.max(1),
+            ))
+        } else {
+            None
+        };
+        let runtime_bridge_metrics = runtime_bridge
+            .as_ref()
+            .map(RuntimeBridgeOrchestrator::metrics)
+            .unwrap_or(RuntimeBridgeMetrics {
+                bridge_path: fallback_bridge_path,
+                queued_plan_depth: 0,
+                bridge_tick_published_frames: 0,
+                bridge_tick_drained_plans: 0,
+                frame_plans_popped: 0,
+            });
+        let runtime_bridge_telemetry =
+            RuntimeBridgeTelemetry::new(runtime_bridge_metrics.bridge_path);
+        eprintln!(
+            "[pipeline] mode={} bridge_path={} enabled={}",
+            pipeline_mode.as_str(),
+            runtime_bridge_metrics.bridge_path.as_str(),
+            runtime_bridge.is_some()
         );
 
         let logical_threads = std::thread::available_parallelism()
@@ -536,7 +577,10 @@ impl TlAppRuntime {
             let event = sprite_loader.reload_into_cache(&mut sprite_cache);
             print_tlsprite_event("[tlsprite boot]", event);
             for diag in sprite_loader.diagnostics() {
-                eprintln!("[tlsprite diag] {:?} line {}: {}", diag.level, diag.line, diag.message);
+                eprintln!(
+                    "[tlsprite diag] {:?} line {}: {}",
+                    diag.level, diag.line, diag.message
+                );
             }
             if let Some(program) = sprite_cache.program_for_path(sprite_loader.path()).cloned() {
                 eprintln!(
@@ -644,6 +688,7 @@ impl TlAppRuntime {
             last_distance_blurred: 0,
             last_framebuffer_fill_ratio: 0.0,
             framebuffer_fill_ema: 0.0,
+            adaptive_load_pressure_ema: 0.0,
             distance_retune_timer: 0.0,
             frame_time_ema_ms: 0.0,
             frame_time_jitter_ema_ms: 0.0,
@@ -655,6 +700,11 @@ impl TlAppRuntime {
             scheduler_path: scheduler_resolution.selected,
             scheduler_reason: scheduler_resolution.reason,
             scheduler_fallback_applied: scheduler_resolution.fallback_applied,
+            pipeline_mode,
+            runtime_bridge,
+            runtime_bridge_metrics,
+            runtime_bridge_telemetry,
+            bridge_frame_counter: 1,
             adapter_backend: adapter_info.backend,
             adapter_name: adapter_info.name,
             present_mode: selected_present_mode,

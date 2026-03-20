@@ -2609,7 +2609,6 @@ dependencies = [
  "num_cpus",
  "percent-encoding",
  "raw-cpuid",
- "rayon",
  "sha1",
  "sha2 0.10.9",
  "wasmer",
@@ -3261,6 +3260,7 @@ dependencies = [
 name = "paradoxpe"
 version = "0.3.0"
 dependencies = [
+ "mps",
  "nalgebra",
  "rayon",
 ]

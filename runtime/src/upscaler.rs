@@ -62,8 +62,7 @@ impl Default for FsrDynamoConfig {
 impl FsrDynamoConfig {
     /// Compute the target render scale for a given nearest-object distance.
     pub fn scale_for_distance(&self, nearest_m: f32) -> f32 {
-        let t = ((nearest_m - self.near_m) / (self.far_m - self.near_m).max(1e-3))
-            .clamp(0.0, 1.0);
+        let t = ((nearest_m - self.near_m) / (self.far_m - self.near_m).max(1e-3)).clamp(0.0, 1.0);
         1.0 - t * (1.0 - self.far_scale.clamp(0.50, 1.0))
     }
 }

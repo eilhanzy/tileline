@@ -19,7 +19,9 @@ pub mod balancer;
 pub mod key_bruteforce;
 pub mod key_decode;
 pub mod scheduler;
+pub mod thread_pool;
 pub mod topology;
+pub mod worker;
 
 pub use balancer::{CorePreference, LoadBalancer, RoutingDecision, TaskPriority};
 pub use key_bruteforce::{
@@ -36,7 +38,16 @@ pub use key_decode::{
     EXPECTED_RECORD_LENGTHS, KEY_KIND, KEY_PREFIX,
 };
 pub use scheduler::{
-    ClassExecutionMetrics, DispatchError, DispatchResult, Dispatcher, MpsScheduler, NativeTask,
-    SchedulerMetrics, TaskEnvelope, TaskId, TaskPayload, WasmTask,
+    ClassExecutionMetrics, CompletedPhysicsFrame, DispatchError, DispatchResult, Dispatcher,
+    DispatcherDoubleBufferedTransforms, DispatcherPhase, DispatcherPhaseCallbacks,
+    DispatcherTaskContext, DispatcherTransformSample, MpsScheduler, NativeTask,
+    PhysicsDispatchTicket, PhysicsDispatchTrigger, SceneBuildTicket, SchedulerMetrics,
+    TaskDispatcher, TaskDispatcherConfig, TaskDispatcherMetrics, TaskEnvelope, TaskId, TaskPayload,
+    WasmTask,
+};
+pub use thread_pool::{
+    DoubleBufferedTransformStorage, MpsThreadPool, MpsThreadPoolConfig, MpsThreadPoolMetrics,
+    PhysicsFrameTicket, PhysicsJobContext, PhysicsPhase, PhysicsPhaseCallbacks, PhysicsStepTrigger,
+    ThreadPoolError, TransformSample,
 };
 pub use topology::{CpuClass, CpuCore, CpuTopology};

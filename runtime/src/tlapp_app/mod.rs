@@ -7,30 +7,30 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+pub mod camera;
 pub mod cli;
 pub mod console;
-pub mod camera;
 pub mod fps;
 
-mod runtime_init;
-mod runtime_render;
-mod runtime_input;
 mod runtime_console;
+mod runtime_init;
+mod runtime_input;
+mod runtime_render;
 mod runtime_scene;
 
+pub use self::camera::{CameraInputState, FreeCameraController, GamepadManager};
 pub use self::cli::{
-    CliOptions, VsyncMode, TickProfile, ToggleAuto, SchedulerResolution,
-    parse_fps_cap, parse_render_distance, parse_fsr_sharpness, parse_fsr_scale, parse_msaa,
+    parse_fps_cap, parse_fsr_scale, parse_fsr_sharpness, parse_msaa, parse_render_distance,
+    CliOptions, PipelineMode, SchedulerResolution, TickProfile, ToggleAuto, VsyncMode,
 };
 pub use self::console::{
-    RuntimeConsoleState, ConsoleUiLayout, RuntimeConsoleLogLine, RuntimeConsoleLogLevel,
-    RuntimeConsoleLogFilter, RuntimeConsoleEditTarget, RuntimeConsoleTailFollow,
-    RuntimeConsoleFileWatch, empty_showcase_output,
+    empty_showcase_output, ConsoleUiLayout, RuntimeConsoleEditTarget, RuntimeConsoleFileWatch,
+    RuntimeConsoleLogFilter, RuntimeConsoleLogLevel, RuntimeConsoleLogLine, RuntimeConsoleState,
+    RuntimeConsoleTailFollow,
 };
-pub use self::camera::{FreeCameraController, CameraInputState, GamepadManager};
 pub use self::fps::{FpsTracker, RenderDistanceStats};
 
-
+use crate::physics_mps_runner::{PhysicsMpsRunner, PhysicsStepToken};
 use crate::{
     app_runner, apply_scene_light_overrides, choose_scheduler_path_for_platform,
     clamp_scene_lights_for_camera, compile_tljoint_scene_from_path,
@@ -38,10 +38,10 @@ use crate::{
     tileline_version_entries, BounceTankRuntimePatch, BounceTankSceneConfig,
     BounceTankSceneController, BounceTankTickMetrics, DrawPathCompiler, FsrConfig, FsrDynamoConfig,
     FsrMode, FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode,
-    RuntimePlatform,
-    SceneFrameInstances, ScenePrimitive3d, SpriteInstance, SpriteKind, TelemetryHudComposer,
-    TelemetryHudSample, TickRatePolicy, TljointDiagnosticLevel, TljointSceneBundle,
-    TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
+    RuntimeBridgeConfig, RuntimeBridgeMetrics, RuntimeBridgeOrchestrator, RuntimeBridgePath,
+    RuntimeBridgeTick, RuntimeFramePlan, RuntimePlatform, SceneFrameInstances, ScenePrimitive3d,
+    SpriteInstance, SpriteKind, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
+    TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
     TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
     TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram,
     TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION,
@@ -49,7 +49,6 @@ use crate::{
 };
 use gms::safe_default_required_limits_for_adapter;
 use mgs::MobileGpuProfile;
-use crate::physics_mps_runner::{PhysicsMpsRunner, PhysicsStepToken};
 use nalgebra::Vector3;
 use paradoxpe::{
     BroadphaseConfig, ContactSolverConfig, NarrowphaseConfig, PhysicsWorld, PhysicsWorldConfig,
@@ -152,6 +151,64 @@ enum RuntimeCommand {
     Exit,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeBridgeTelemetry {
+    bridge_path: RuntimeBridgePath,
+    queued_plan_depth: usize,
+    bridge_pump_published: usize,
+    bridge_pump_drained: usize,
+    physics_lag_frames: u64,
+    used_fallback_plan: bool,
+    latest_plan_frame_id: Option<u64>,
+    latest_plan_kind: &'static str,
+    latest_submission_frame_id: Option<u64>,
+    latest_submission_tasks: u32,
+}
+
+impl RuntimeBridgeTelemetry {
+    fn new(bridge_path: RuntimeBridgePath) -> Self {
+        Self {
+            bridge_path,
+            queued_plan_depth: 0,
+            bridge_pump_published: 0,
+            bridge_pump_drained: 0,
+            physics_lag_frames: 0,
+            used_fallback_plan: false,
+            latest_plan_frame_id: None,
+            latest_plan_kind: "none",
+            latest_submission_frame_id: None,
+            latest_submission_tasks: 0,
+        }
+    }
+
+    fn update_tick(
+        &mut self,
+        tick: &RuntimeBridgeTick,
+        plan: Option<&RuntimeFramePlan>,
+        latest_submission_frame_id: Option<u64>,
+    ) {
+        self.bridge_path = tick.bridge_path;
+        self.queued_plan_depth = tick.queued_plan_depth;
+        self.bridge_pump_published = tick.bridge_pump_published;
+        self.bridge_pump_drained = tick.bridge_pump_drained;
+        self.used_fallback_plan = tick.used_fallback_plan;
+
+        if let Some(plan) = plan {
+            self.latest_plan_frame_id = Some(plan.frame_id());
+            self.latest_plan_kind = match plan {
+                RuntimeFramePlan::Gms(_) => "gms-plan",
+                RuntimeFramePlan::Mgs(_) => "mgs-plan",
+            };
+        }
+
+        self.latest_submission_frame_id = latest_submission_frame_id;
+        self.physics_lag_frames = match (latest_submission_frame_id, self.latest_plan_frame_id) {
+            (Some(submitted), Some(planned)) => submitted.saturating_sub(planned),
+            _ => 0,
+        };
+    }
+}
+
 pub fn run_from_env() -> Result<(), Box<dyn Error>> {
     configure_parallel_runtime();
     if cfg!(debug_assertions) {
@@ -190,13 +247,6 @@ fn configure_parallel_runtime() {
         }
     });
 }
-
-
-
-
-
-
-
 
 fn gms_supported_on_platform(platform: RuntimePlatform, adapter_info: &wgpu::AdapterInfo) -> bool {
     match platform {
@@ -324,9 +374,6 @@ fn build_vulkan_unavailable_message(
     }
 }
 
-
-
-
 fn is_valid_tlscript_ident(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -337,13 +384,6 @@ fn is_valid_tlscript_ident(name: &str) -> bool {
     }
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
-
-
-
-
-
-
-
 
 fn parse_console_f32_in_range(value: &str, label: &str, min: f32, max: f32) -> Result<f32, String> {
     let parsed = value
@@ -384,8 +424,6 @@ fn bootstrap_uncapped_fps_hint(logical_threads: usize) -> f32 {
     // Start from a conservative-but-fast target and let runtime sampling retune to hardware limit.
     (170.0 + logical_threads as f32 * 7.5).clamp(170.0, 420.0)
 }
-
-
 
 struct TlApp {
     options: CliOptions,
@@ -656,6 +694,7 @@ struct TlAppRuntime {
     last_distance_blurred: usize,
     last_framebuffer_fill_ratio: f32,
     framebuffer_fill_ema: f32,
+    adaptive_load_pressure_ema: f32,
     distance_retune_timer: f32,
     frame_time_ema_ms: f32,
     frame_time_jitter_ema_ms: f32,
@@ -667,6 +706,11 @@ struct TlAppRuntime {
     scheduler_path: GraphicsSchedulerPath,
     scheduler_reason: String,
     scheduler_fallback_applied: bool,
+    pipeline_mode: PipelineMode,
+    runtime_bridge: Option<RuntimeBridgeOrchestrator>,
+    runtime_bridge_metrics: RuntimeBridgeMetrics,
+    runtime_bridge_telemetry: RuntimeBridgeTelemetry,
+    bridge_frame_counter: u64,
     adapter_backend: wgpu::Backend,
     adapter_name: String,
     present_mode: wgpu::PresentMode,
@@ -771,19 +815,6 @@ impl<'src> ScriptRuntime<'src> {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn merge_showcase_output(
     merged: &mut TlscriptShowcaseFrameOutput,
@@ -1074,17 +1105,6 @@ fn scheduler_path_label(path: GraphicsSchedulerPath) -> &'static str {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
 fn choose_aggressive_tick_hz(
     policy: TickRatePolicy,
     profile: TickProfile,
@@ -1258,6 +1278,106 @@ fn smooth_tick_hz(current_hz: f32, target_hz: f32, alpha: f32) -> f32 {
     current_hz + (target_hz - current_hz) * alpha
 }
 
+fn clamp_tick_target_delta(
+    current_hz: f32,
+    target_hz: f32,
+    max_rise_ratio: f32,
+    max_drop_ratio: f32,
+) -> f32 {
+    let current_hz = current_hz.max(1.0);
+    let rise = current_hz * max_rise_ratio.max(1.0);
+    let drop = current_hz * max_drop_ratio.clamp(0.0, 1.0);
+    target_hz.clamp(drop.min(current_hz), rise.max(current_hz))
+}
+
+fn physics_safe_tick_ceiling_hz(
+    total_step_us: u64,
+    measured_substeps: u32,
+    profile: TickProfile,
+    logical_threads: usize,
+    mobile_path: bool,
+) -> Option<f32> {
+    if total_step_us == 0 || measured_substeps == 0 {
+        return None;
+    }
+
+    let per_substep_us = total_step_us as f32 / measured_substeps.max(1) as f32;
+    if per_substep_us <= f32::EPSILON {
+        return None;
+    }
+
+    let cpu_budget_ratio = match (profile, mobile_path) {
+        (TickProfile::Balanced, true) => 0.42,
+        (TickProfile::Balanced, false) => 0.52,
+        (TickProfile::Max, true) => 0.48,
+        (TickProfile::Max, false) => 0.62,
+    };
+    let thread_gain = if mobile_path {
+        (logical_threads as f32 / 8.0).clamp(0.75, 1.10)
+    } else {
+        (logical_threads as f32 / 12.0).clamp(0.85, 1.25)
+    };
+    let ceiling = (1_000_000.0 / per_substep_us) * cpu_budget_ratio * thread_gain;
+    let hard_cap = if mobile_path { 180.0 } else { 420.0 };
+    Some(ceiling.clamp(24.0, hard_cap))
+}
+
+fn smooth_fps_limit_hint(
+    current_hint_hz: f32,
+    measured_hint_hz: f32,
+    mobile_path: bool,
+) -> f32 {
+    let current_hint_hz = current_hint_hz.max(24.0);
+    let measured_hint_hz = measured_hint_hz.max(24.0);
+    let ramp_up = measured_hint_hz > current_hint_hz;
+    let alpha = if ramp_up {
+        if mobile_path { 0.05 } else { 0.06 }
+    } else if mobile_path {
+        0.16
+    } else {
+        0.14
+    };
+    let max_rise_ratio = if mobile_path { 1.03 } else { 1.05 };
+    let max_drop_ratio = if mobile_path { 0.88 } else { 0.92 };
+    let clamped_target = clamp_tick_target_delta(
+        current_hint_hz,
+        measured_hint_hz,
+        max_rise_ratio,
+        max_drop_ratio,
+    );
+    smooth_tick_hz(current_hint_hz, clamped_target, alpha)
+}
+
+fn stabilize_runtime_load_pressure(
+    current_pressure_ema: f32,
+    raw_pressure: u32,
+    jitter_ms: f32,
+    mobile_path: bool,
+) -> f32 {
+    let raw_pressure = raw_pressure as f32;
+    if current_pressure_ema <= f32::EPSILON {
+        return raw_pressure;
+    }
+
+    let overload = raw_pressure > current_pressure_ema;
+    let alpha = if overload {
+        if jitter_ms > 3.0 {
+            0.62
+        } else if mobile_path {
+            0.52
+        } else {
+            0.46
+        }
+    } else if jitter_ms > 2.0 {
+        0.16
+    } else if mobile_path {
+        0.12
+    } else {
+        0.10
+    };
+    current_pressure_ema + (raw_pressure - current_pressure_ema) * alpha
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RuntimeLoadPlan {
     visible_ball_limit: Option<usize>,
@@ -1268,18 +1388,17 @@ struct RuntimeLoadPlan {
     tick_scale: f32,
 }
 
-fn choose_runtime_load_plan(
+fn estimate_runtime_load_pressure(
     ema_fps: f32,
     frame_time_ms: f32,
     live_balls: usize,
     last_substeps: u32,
     max_substeps: u32,
     parallel_ready: bool,
-    logical_threads: usize,
     mobile_path: bool,
     framebuffer_fill_ema: f32,
     render_distance: Option<f32>,
-) -> RuntimeLoadPlan {
+) -> u32 {
     let mut pressure = 0u32;
     let fps = ema_fps.clamp(1.0, 240.0);
     if fps < 55.0 {
@@ -1342,6 +1461,16 @@ fn choose_runtime_load_plan(
         }
     }
 
+    pressure
+}
+
+fn runtime_load_plan_for_pressure(
+    pressure: u32,
+    live_balls: usize,
+    logical_threads: usize,
+    mobile_path: bool,
+    framebuffer_fill_ema: f32,
+) -> RuntimeLoadPlan {
     let thread_scale = if mobile_path {
         (logical_threads as f32 / 6.0).clamp(0.70, 2.20)
     } else {
@@ -1411,6 +1540,46 @@ fn choose_runtime_load_plan(
     }
 }
 
+fn choose_runtime_load_plan(
+    ema_fps: f32,
+    frame_time_ms: f32,
+    live_balls: usize,
+    last_substeps: u32,
+    max_substeps: u32,
+    parallel_ready: bool,
+    logical_threads: usize,
+    mobile_path: bool,
+    framebuffer_fill_ema: f32,
+    render_distance: Option<f32>,
+    pressure_ema: f32,
+    jitter_ms: f32,
+) -> (RuntimeLoadPlan, f32, u32) {
+    let raw_pressure = estimate_runtime_load_pressure(
+        ema_fps,
+        frame_time_ms,
+        live_balls,
+        last_substeps,
+        max_substeps,
+        parallel_ready,
+        mobile_path,
+        framebuffer_fill_ema,
+        render_distance,
+    );
+    let smoothed_pressure =
+        stabilize_runtime_load_pressure(pressure_ema, raw_pressure, jitter_ms, mobile_path);
+    let stable_pressure = smoothed_pressure.ceil().max(raw_pressure as f32 * 0.85) as u32;
+    (
+        runtime_load_plan_for_pressure(
+            stable_pressure,
+            live_balls,
+            logical_threads,
+            mobile_path,
+            framebuffer_fill_ema,
+        ),
+        smoothed_pressure,
+        raw_pressure,
+    )
+}
 
 fn count_rendered_balls(frame: &SceneFrameInstances) -> usize {
     frame
@@ -1548,4 +1717,3 @@ fn print_tlsprite_event(prefix: &str, event: TlspriteHotReloadEvent) {
         }
     }
 }
-

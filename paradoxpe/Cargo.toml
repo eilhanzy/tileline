@@ -4,5 +4,6 @@ version = "0.3.0"
 edition = "2021"
 
 [dependencies]
+mps = { path = "../mps" }
 nalgebra.workspace = true
 rayon.workspace = true

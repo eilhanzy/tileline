@@ -4,6 +4,8 @@
 //! integration, and `.tlscript @parallel(domain="bodies")` hooks can read/write slices without
 //! lock contention or pointer chasing.
 
+use std::ops::Range;
+
 use nalgebra::{UnitQuaternion, Vector3};
 use rayon::prelude::*;
 
@@ -299,64 +301,40 @@ impl BodyRegistry {
         updated
     }
 
-    pub fn integrate(&mut self, dt: f32, gravity: Vector3<f32>) {
-        if self.handles.len() < 768 || rayon::current_num_threads() <= 1 {
-            self.integrate_serial(dt, gravity);
+    /// Build a deterministic dense-index shard plan for integration.
+    ///
+    /// The output vector is reused by the caller to avoid per-step allocations.
+    pub fn plan_integration_shards(
+        &self,
+        preferred_shards: usize,
+        min_chunk_size: usize,
+        out: &mut Vec<Range<usize>>,
+    ) {
+        out.clear();
+        let body_count = self.handles.len();
+        if body_count == 0 {
             return;
         }
 
-        self.positions
-            .par_iter_mut()
-            .zip(self.linear_velocities.par_iter_mut())
-            .zip(self.accumulated_forces.par_iter_mut())
-            .zip(self.aabbs.par_iter_mut())
-            .zip(self.kinds.par_iter())
-            .zip(self.awake.par_iter())
-            .zip(self.inverse_masses.par_iter())
-            .zip(self.linear_dampings.par_iter())
-            .zip(self.local_bounds.par_iter())
-            .for_each(
-                |(
-                    (
-                        (
-                            (
-                                ((((position, linear_velocity), accumulated_force), aabb), kind),
-                                awake,
-                            ),
-                            inverse_mass,
-                        ),
-                        linear_damping,
-                    ),
-                    local_bounds,
-                )| {
-                    match *kind {
-                        BodyKind::Static => {
-                            *accumulated_force = Vector3::zeros();
-                            *aabb = local_bounds.translated(*position);
-                        }
-                        BodyKind::Kinematic => {
-                            *position += *linear_velocity * dt;
-                            *aabb = local_bounds.translated(*position);
-                        }
-                        BodyKind::Dynamic => {
-                            if !*awake {
-                                *accumulated_force = Vector3::zeros();
-                                return;
-                            }
-                            let acceleration = gravity + *accumulated_force * *inverse_mass;
-                            *linear_velocity += acceleration * dt;
-                            *linear_velocity *= 1.0 - linear_damping.clamp(0.0, 0.95);
-                            *position += *linear_velocity * dt;
-                            *accumulated_force = Vector3::zeros();
-                            *aabb = local_bounds.translated(*position);
-                        }
-                    }
-                },
-            );
+        let preferred = preferred_shards.max(1);
+        let min_chunk = min_chunk_size.max(32);
+        let chunk = body_count.div_ceil(preferred).max(min_chunk);
+        let shard_count = body_count.div_ceil(chunk).max(1);
+        if out.capacity() < shard_count {
+            out.reserve(shard_count.saturating_sub(out.capacity()));
+        }
+
+        let mut start = 0usize;
+        while start < body_count {
+            let end = (start + chunk).min(body_count);
+            out.push(start..end);
+            start = end;
+        }
     }
 
-    fn integrate_serial(&mut self, dt: f32, gravity: Vector3<f32>) {
-        for dense in 0..self.handles.len() {
+    /// Integrate one dense-index shard.
+    pub fn integrate_range(&mut self, range: Range<usize>, dt: f32, gravity: Vector3<f32>) {
+        for dense in range {
             match self.kinds[dense] {
                 BodyKind::Static => {
                     self.accumulated_forces[dense] = Vector3::zeros();
@@ -382,6 +360,89 @@ impl BodyRegistry {
                 }
             }
         }
+    }
+
+    /// Integrate using a caller-provided shard plan.
+    ///
+    /// The shard plan is contiguous and deterministic, which lets us parallelize
+    /// hot-body integration without reallocating or reordering dense storage.
+    pub fn integrate_with_shards(
+        &mut self,
+        dt: f32,
+        gravity: Vector3<f32>,
+        shards: &[Range<usize>],
+    ) {
+        if shards.is_empty() {
+            self.integrate_range(0..self.handles.len(), dt, gravity);
+            return;
+        }
+
+        let Some(chunk_size) = uniform_shard_chunk_size(shards, self.handles.len()) else {
+            for shard in shards {
+                self.integrate_range(shard.clone(), dt, gravity);
+            }
+            return;
+        };
+
+        if rayon::current_num_threads() <= 1 || self.handles.len() < chunk_size.saturating_mul(2) {
+            for shard in shards {
+                self.integrate_range(shard.clone(), dt, gravity);
+            }
+            return;
+        }
+
+        let kinds = &self.kinds;
+        let awake = &self.awake;
+        let local_bounds = &self.local_bounds;
+        let inverse_masses = &self.inverse_masses;
+        let linear_dampings = &self.linear_dampings;
+
+        self.positions
+            .par_chunks_mut(chunk_size)
+            .zip(self.linear_velocities.par_chunks_mut(chunk_size))
+            .zip(self.accumulated_forces.par_chunks_mut(chunk_size))
+            .zip(self.aabbs.par_chunks_mut(chunk_size))
+            .zip(kinds.par_chunks(chunk_size))
+            .zip(awake.par_chunks(chunk_size))
+            .zip(local_bounds.par_chunks(chunk_size))
+            .zip(inverse_masses.par_chunks(chunk_size))
+            .zip(linear_dampings.par_chunks(chunk_size))
+            .for_each(
+                |(
+                    (
+                        (
+                            (
+                                (
+                                    (((positions, linear_velocities), accumulated_forces), aabbs),
+                                    kinds,
+                                ),
+                                awake,
+                            ),
+                            local_bounds,
+                        ),
+                        inverse_masses,
+                    ),
+                    linear_dampings,
+                )| {
+                    integrate_chunk(
+                        positions,
+                        linear_velocities,
+                        accumulated_forces,
+                        aabbs,
+                        kinds,
+                        awake,
+                        local_bounds,
+                        inverse_masses,
+                        linear_dampings,
+                        dt,
+                        gravity,
+                    );
+                },
+            );
+    }
+
+    pub fn integrate(&mut self, dt: f32, gravity: Vector3<f32>) {
+        self.integrate_range(0..self.handles.len(), dt, gravity);
     }
 
     pub fn aabb_for(&self, handle: BodyHandle) -> Option<Aabb> {
@@ -514,6 +575,70 @@ impl BodyRegistry {
     }
 }
 
+fn uniform_shard_chunk_size(shards: &[Range<usize>], total_len: usize) -> Option<usize> {
+    let first = shards.first()?;
+    let chunk_size = first.len().max(1);
+    let mut expected_start = 0usize;
+    for (index, shard) in shards.iter().enumerate() {
+        if shard.start != expected_start || shard.end > total_len || shard.start > shard.end {
+            return None;
+        }
+        if index + 1 < shards.len() && shard.len() != chunk_size {
+            return None;
+        }
+        if index + 1 == shards.len() && shard.len() > chunk_size {
+            return None;
+        }
+        expected_start = shard.end;
+    }
+
+    if expected_start != total_len {
+        return None;
+    }
+
+    Some(chunk_size)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn integrate_chunk(
+    positions: &mut [Vector3<f32>],
+    linear_velocities: &mut [Vector3<f32>],
+    accumulated_forces: &mut [Vector3<f32>],
+    aabbs: &mut [Aabb],
+    kinds: &[BodyKind],
+    awake: &[bool],
+    local_bounds: &[Aabb],
+    inverse_masses: &[f32],
+    linear_dampings: &[f32],
+    dt: f32,
+    gravity: Vector3<f32>,
+) {
+    for dense in 0..positions.len() {
+        match kinds[dense] {
+            BodyKind::Static => {
+                accumulated_forces[dense] = Vector3::zeros();
+                aabbs[dense] = local_bounds[dense].translated(positions[dense]);
+            }
+            BodyKind::Kinematic => {
+                positions[dense] += linear_velocities[dense] * dt;
+                aabbs[dense] = local_bounds[dense].translated(positions[dense]);
+            }
+            BodyKind::Dynamic => {
+                if !awake[dense] {
+                    accumulated_forces[dense] = Vector3::zeros();
+                    continue;
+                }
+                let acceleration = gravity + accumulated_forces[dense] * inverse_masses[dense];
+                linear_velocities[dense] += acceleration * dt;
+                linear_velocities[dense] *= 1.0 - linear_dampings[dense].clamp(0.0, 0.95);
+                positions[dense] += linear_velocities[dense] * dt;
+                accumulated_forces[dense] = Vector3::zeros();
+                aabbs[dense] = local_bounds[dense].translated(positions[dense]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +681,34 @@ mod tests {
         let write = registry.write_velocity_domain();
         assert_eq!(write.handles.len(), 2);
         assert_eq!(write.linear_velocities.len(), 2);
+    }
+
+    #[test]
+    fn integrate_with_shards_matches_serial_integration() {
+        let mut serial = BodyRegistry::new();
+        let mut parallel = BodyRegistry::new();
+        for index in 0..257 {
+            let desc = BodyDesc {
+                position: Vector3::new(index as f32 * 0.1, 10.0 + index as f32 * 0.02, 0.0),
+                linear_velocity: Vector3::new(0.5, -0.25, 0.1),
+                linear_damping: 0.015,
+                ..BodyDesc::default()
+            };
+            serial.spawn(desc.clone());
+            parallel.spawn(desc);
+        }
+
+        let gravity = Vector3::new(0.0, -9.81, 0.0);
+        let dt = 1.0 / 120.0;
+        serial.integrate(dt, gravity);
+
+        let mut shards = Vec::new();
+        parallel.plan_integration_shards(8, 32, &mut shards);
+        parallel.integrate_with_shards(dt, gravity, &shards);
+
+        assert_eq!(serial.positions, parallel.positions);
+        assert_eq!(serial.linear_velocities, parallel.linear_velocities);
+        assert_eq!(serial.accumulated_forces, parallel.accumulated_forces);
+        assert_eq!(serial.aabbs, parallel.aabbs);
     }
 }

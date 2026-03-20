@@ -10,8 +10,8 @@ impl TlAppRuntime {
             }
             self.next_redraw_at = now + interval;
         } else {
-            let mobile_path = matches!(self.platform, RuntimePlatform::Android)
-                || self.mgs_is_mobile_hardware;
+            let mobile_path =
+                matches!(self.platform, RuntimePlatform::Android) || self.mgs_is_mobile_hardware;
             if mobile_path {
                 // Avoid uncapped busy-spin on mobile/TBDR paths; it can cause whole-system
                 // chopping even when the app's own FPS appears acceptable.
@@ -165,8 +165,8 @@ impl TlAppRuntime {
 
     pub(super) fn render_frame(&mut self) -> Result<(), Box<dyn Error>> {
         let frame_begin = Instant::now();
-        let mobile_path = matches!(self.platform, RuntimePlatform::Android)
-            || self.mgs_is_mobile_hardware;
+        let mobile_path =
+            matches!(self.platform, RuntimePlatform::Android) || self.mgs_is_mobile_hardware;
         let raw_dt = (frame_begin - self.frame_started_at).as_secs_f32();
         // Keep simulation time real-time (decoupled from render FPS) and only guard against large
         // stalls (alt-tab/debugger) so physics does not enter slow-motion at low FPS.
@@ -295,9 +295,12 @@ impl TlAppRuntime {
             self.distance_retune_timer = if mobile_path { 0.22 } else { 0.28 };
         }
         self.refresh_distance_blur_state(mobile_path);
-        let mut load_plan = choose_runtime_load_plan(
+        let effective_load_frame_time_ms =
+            (self.frame_time_ema_ms + self.frame_time_jitter_ema_ms * 0.35)
+                .max(frame_ms.min(self.frame_time_ema_ms.max(frame_ms)));
+        let (mut load_plan, smoothed_pressure, raw_pressure) = choose_runtime_load_plan(
             self.fps_tracker.ema_fps(),
-            raw_dt * 1_000.0,
+            effective_load_frame_time_ms,
             live_balls,
             self.last_substeps,
             self.max_substeps,
@@ -306,11 +309,17 @@ impl TlAppRuntime {
             mobile_path,
             self.framebuffer_fill_ema,
             self.render_distance,
+            self.adaptive_load_pressure_ema,
+            self.frame_time_jitter_ema_ms,
         );
+        self.adaptive_load_pressure_ema = smoothed_pressure;
         let moderate_jitter = self.frame_time_ema_ms > self.frame_time_budget_ms * 1.10
             || self.frame_time_jitter_ema_ms > 1.8;
         let severe_jitter = self.frame_time_ema_ms > self.frame_time_budget_ms * 1.25
             || self.frame_time_jitter_ema_ms > 3.2;
+        if raw_pressure >= 7 && smoothed_pressure >= 5.0 {
+            load_plan.tick_scale *= if mobile_path { 0.78 } else { 0.84 };
+        }
         if moderate_jitter {
             load_plan.tick_scale *= 0.82;
             load_plan.max_substeps = load_plan.max_substeps.min(8);
@@ -392,9 +401,12 @@ impl TlAppRuntime {
             .set_force_full_fbx_sphere(force_full_fbx_runtime);
 
         if let Some(cap) = self.adaptive_live_ball_budget {
-            let _ = self.scene.enforce_live_ball_budget(&mut *self.world.borrow_mut(), cap);
+            let _ = self
+                .scene
+                .enforce_live_ball_budget(&mut *self.world.borrow_mut(), cap);
         }
 
+        let last_step_timings = self.world.borrow().last_step_timings;
         self.tick_retune_timer -= sim_dt;
         if self.tick_retune_timer <= 0.0 {
             self.max_substeps = self
@@ -427,30 +439,36 @@ impl TlAppRuntime {
                 (self.fps_tracker.ema_fps().max(1.0) * self.max_substeps as f32 * catch_up_factor)
                     .clamp(24.0, 900.0);
             desired_hz = desired_hz.min(catch_up_hz);
+            if let Some(physics_ceiling_hz) = physics_safe_tick_ceiling_hz(
+                last_step_timings.total_us(),
+                last_step_timings.substeps.max(self.last_substeps),
+                self.tick_profile,
+                self.mps_logical_threads,
+                mobile_path,
+            ) {
+                desired_hz = desired_hz.min(physics_ceiling_hz);
+            }
             if let Some(cap) = self.tick_cap {
                 desired_hz = desired_hz.min(cap);
             }
             let ramp_up = desired_hz > self.tick_hz;
             let base_smoothing = if mobile_path {
                 match (self.tick_profile, ramp_up) {
-                    (TickProfile::Max, true) => 0.48,
-                    (TickProfile::Max, false) => 0.30,
-                    (_, true) => 0.42,
-                    (_, false) => 0.26,
+                    (TickProfile::Max, true) => 0.16,
+                    (TickProfile::Max, false) => 0.52,
+                    (_, true) => 0.14,
+                    (_, false) => 0.44,
                 }
             } else {
                 match (self.tick_profile, ramp_up) {
-                    (TickProfile::Max, true) => 0.86,
-                    (TickProfile::Max, false) => 0.55,
-                    (_, true) => 0.72,
-                    (_, false) => 0.42,
+                    (TickProfile::Max, true) => 0.12,
+                    (TickProfile::Max, false) => 0.46,
+                    (_, true) => 0.10,
+                    (_, false) => 0.38,
                 }
             };
-            // Asymmetric smoothing by direction:
-            //   Ramp-down (substep pressure) → keep responsive (high alpha)
-            //   Ramp-up (headroom detected) → slow down significantly to prevent
-            //     oscillation where the system repeatedly overshoots then retreats.
-            // At high ball counts ramp-up is slowed further, proportional to cost.
+            // Ramp-up is intentionally much slower than ramp-down so the fixed-step
+            // controller does not overshoot into CPU saturation and frame drops.
             let smoothing = if ramp_up {
                 let ball_brake = if live_balls > 5_000 {
                     let excess = ((live_balls - 5_000) as f32 / 5_000.0).min(5.0);
@@ -461,10 +479,29 @@ impl TlAppRuntime {
                 // Ramp-up alpha: already lower than ramp-down, braked further by ball count.
                 base_smoothing * ball_brake
             } else {
-                // Ramp-down keeps full alpha — respond quickly to substep pressure.
                 base_smoothing
             };
-            self.tick_hz = smooth_tick_hz(self.tick_hz, desired_hz, smoothing);
+            let max_rise_ratio = if severe_jitter {
+                1.01
+            } else if moderate_jitter {
+                1.03
+            } else if mobile_path {
+                1.05
+            } else {
+                1.08
+            };
+            let max_drop_ratio = if severe_jitter {
+                0.68
+            } else if moderate_jitter {
+                0.78
+            } else if mobile_path {
+                0.84
+            } else {
+                0.88
+            };
+            let clamped_target_hz =
+                clamp_tick_target_delta(self.tick_hz, desired_hz, max_rise_ratio, max_drop_ratio);
+            self.tick_hz = smooth_tick_hz(self.tick_hz, clamped_target_hz, smoothing);
             let hard_floor = match self.tick_profile {
                 TickProfile::Balanced => 35.0,
                 TickProfile::Max => {
@@ -498,15 +535,18 @@ impl TlAppRuntime {
             self.world
                 .borrow_mut()
                 .set_timestep(1.0 / self.tick_hz, self.max_substeps);
-            // Retune interval: ramp-up intervals grow with ball count to prevent
-            // rapid oscillation. Ramp-down uses the base interval so we react
-            // to substep pressure without delay.
+            // Retune interval is asymmetric for the same reason as smoothing:
+            // rising tick is slow and conservative, falling tick is faster.
             let base_interval = if mobile_path {
-                if ramp_up { 0.12 } else { 0.08 }
+                if ramp_up {
+                    0.24
+                } else {
+                    0.08
+                }
             } else if ramp_up {
-                0.08
+                0.18
             } else {
-                0.16
+                0.07
             };
             let interval_scale = if ramp_up && live_balls > 5_000 {
                 let excess = ((live_balls - 5_000) as f32 / 5_000.0).min(5.0);
@@ -537,7 +577,9 @@ impl TlAppRuntime {
         let t_phys_begin = Instant::now();
         let substeps = if let Some(token) = self.physics_token.take() {
             let s = token.wait();
-            let _ = self.scene.reconcile_after_step(&mut *self.world.borrow_mut());
+            let _ = self
+                .scene
+                .reconcile_after_step(&mut *self.world.borrow_mut());
             self.last_substeps = s;
             s
         } else {
@@ -546,6 +588,26 @@ impl TlAppRuntime {
         };
         // Tick metrics were captured in the previous frame's physics_tick call.
         let tick = self.last_tick;
+        let mut active_runtime_plan: Option<RuntimeFramePlan> = None;
+        if let Some(bridge) = self.runtime_bridge.as_mut() {
+            let bridge_tick = bridge.tick_and_plan();
+            active_runtime_plan = bridge_tick.plan.clone();
+            let latest_submission_frame_id =
+                self.runtime_bridge_telemetry.latest_submission_frame_id;
+            self.runtime_bridge_telemetry.update_tick(
+                &bridge_tick,
+                active_runtime_plan.as_ref(),
+                latest_submission_frame_id,
+            );
+            self.runtime_bridge_metrics = bridge.metrics();
+        } else {
+            self.runtime_bridge_telemetry.bridge_pump_published = 0;
+            self.runtime_bridge_telemetry.bridge_pump_drained = 0;
+            self.runtime_bridge_telemetry.queued_plan_depth = 0;
+            self.runtime_bridge_telemetry.used_fallback_plan = false;
+            self.runtime_bridge_telemetry.physics_lag_frames = 0;
+            self.runtime_bridge_metrics.queued_plan_depth = 0;
+        }
 
         // ── Build frame instances from the just-reconciled physics state ─────
         let t_scene_begin = Instant::now();
@@ -634,11 +696,9 @@ impl TlAppRuntime {
             let s = self.fsr_dynamo_config.smoothing.clamp(0.0, 0.99);
             self.fsr_dynamo_scale = self.fsr_dynamo_scale * s + target * (1.0 - s);
             let dynamo_scale = (self.fsr_dynamo_scale * 100.0).round() / 100.0; // snap to 0.01 grid
-            if (dynamo_scale - self.fsr_config.render_scale_override.unwrap_or(-1.0)).abs() > 1e-3
-            {
+            if (dynamo_scale - self.fsr_config.render_scale_override.unwrap_or(-1.0)).abs() > 1e-3 {
                 self.fsr_config.render_scale_override = Some(dynamo_scale);
-                self.renderer
-                    .set_fsr_config(&self.queue, self.fsr_config);
+                self.renderer.set_fsr_config(&self.queue, self.fsr_config);
             }
         }
 
@@ -663,6 +723,26 @@ impl TlAppRuntime {
         }
         self.retune_adaptive_pacer(sim_dt, mobile_path);
         let visible_ball_count = count_rendered_balls(&frame);
+        if let Some(bridge) = self.runtime_bridge.as_mut() {
+            let frame_id = self.bridge_frame_counter;
+            self.bridge_frame_counter = self.bridge_frame_counter.saturating_add(1);
+            let submission = bridge.submit_scene_workload(
+                frame_id,
+                &frame,
+                tick.live_balls,
+                self.size.width.max(1),
+                self.size.height.max(1),
+            );
+            self.runtime_bridge_telemetry.latest_submission_frame_id = Some(submission.frame_id());
+            self.runtime_bridge_telemetry.latest_submission_tasks = submission.submitted_tasks();
+            self.runtime_bridge_telemetry.physics_lag_frames = self
+                .runtime_bridge_telemetry
+                .latest_submission_frame_id
+                .zip(self.runtime_bridge_telemetry.latest_plan_frame_id)
+                .map(|(submitted, planned)| submitted.saturating_sub(planned))
+                .unwrap_or(0);
+            self.runtime_bridge_metrics = bridge.metrics();
+        }
         let _hud = self.hud.append_to_sprites(
             TelemetryHudSample {
                 fps: self.fps_tracker.ema_fps(),
@@ -747,9 +827,7 @@ impl TlAppRuntime {
         if allow_physics_step {
             {
                 let mut w = self.world.borrow_mut();
-                let _patch_metrics = self
-                    .scene
-                    .apply_runtime_patch(&mut *w, runtime_patch);
+                let _patch_metrics = self.scene.apply_runtime_patch(&mut *w, runtime_patch);
                 self.last_tick = self.scene.physics_tick(&mut *w);
                 self.script_last_spawned = self.last_tick.spawned_this_tick;
             }
@@ -831,8 +909,12 @@ impl TlAppRuntime {
         if self.uncapped_dynamic_fps_hint {
             let measured_hint = self.fps_tracker.dynamic_uncapped_fps_hint();
             let upper_hint = if mobile_path { 144.0 } else { 1_200.0 };
-            self.fps_limit_hint =
-                smooth_tick_hz(self.fps_limit_hint, measured_hint, 0.22).clamp(48.0, upper_hint);
+            self.fps_limit_hint = smooth_fps_limit_hint(
+                self.fps_limit_hint,
+                measured_hint,
+                mobile_path,
+            )
+            .clamp(48.0, upper_hint);
         }
         let pacing_suffix = self
             .frame_cap_interval
@@ -845,6 +927,33 @@ impl TlAppRuntime {
                 }
             });
         let scheduler_label = scheduler_path_label(self.scheduler_path);
+        let bridge_plan_label = active_runtime_plan
+            .as_ref()
+            .map(|plan| match plan {
+                RuntimeFramePlan::Gms(_) => "gms",
+                RuntimeFramePlan::Mgs(_) => "mgs",
+            })
+            .unwrap_or(self.runtime_bridge_telemetry.latest_plan_kind);
+        let bridge_frame_label = self
+            .runtime_bridge_telemetry
+            .latest_plan_frame_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let bridge_suffix = format!(
+            " | bridge {} {}#{} q{} +{} -{} lag{}{}",
+            self.runtime_bridge_telemetry.bridge_path.as_str(),
+            bridge_plan_label,
+            bridge_frame_label,
+            self.runtime_bridge_telemetry.queued_plan_depth,
+            self.runtime_bridge_telemetry.bridge_pump_published,
+            self.runtime_bridge_telemetry.bridge_pump_drained,
+            self.runtime_bridge_telemetry.physics_lag_frames,
+            if self.runtime_bridge_telemetry.used_fallback_plan {
+                " fb"
+            } else {
+                ""
+            }
+        );
         let distance_suffix = match self.render_distance {
             Some(distance) => format!(
                 " | rd {:.0}m c{} b{} fill {:.2}",
@@ -856,9 +965,10 @@ impl TlAppRuntime {
             None => String::new(),
         };
         let step_timings = self.world.borrow().last_step_timings;
+        let physics_pool_metrics = self.world.thread_pool_metrics();
         let console_suffix = self.console_title_suffix();
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | Phys {}µs (int {}µs bp {}µs np {}µs sv {}µs sl {}µs) | {:?} {} {:?}{}{}{}{}{}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | Phys {}µs (int {}µs bp {}µs np {}µs sv {}µs sl {}µs) | {:?} {} {:?}{}{}{}{}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
             self.tick_hz,
@@ -896,6 +1006,7 @@ impl TlAppRuntime {
             } else {
                 String::new()
             },
+            bridge_suffix,
             distance_suffix,
             pacing_suffix,
             console_suffix,
@@ -907,7 +1018,7 @@ impl TlAppRuntime {
             let broadphase = w.broadphase().stats();
             let narrowphase = w.narrowphase().stats();
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | phys_workers: {} | phys_queue: {} | phys_inflight: {} | phys_frame: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {} | pipeline: {} | bridge_path: {} | queued_plan_depth: {} | bridge_pump_published: {} | bridge_pump_drained: {} | physics_lag_frames: {} | bridge_fallback: {}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
@@ -951,6 +1062,10 @@ impl TlAppRuntime {
                     fsr_status.reason.as_str()
                 },
                 self.mps_logical_threads,
+                physics_pool_metrics.worker_count,
+                physics_pool_metrics.queued_jobs,
+                physics_pool_metrics.in_flight_jobs,
+                physics_pool_metrics.latest_completed_frame.unwrap_or(0),
                 broadphase.shard_count,
                 broadphase.candidate_pairs,
                 narrowphase.manifolds,
@@ -960,7 +1075,14 @@ impl TlAppRuntime {
                 self.present_mode,
                 self.scheduler_fallback_applied,
                 self.adapter_name,
-                self.scheduler_reason
+                self.scheduler_reason,
+                self.pipeline_mode.as_str(),
+                self.runtime_bridge_telemetry.bridge_path.as_str(),
+                self.runtime_bridge_telemetry.queued_plan_depth,
+                self.runtime_bridge_telemetry.bridge_pump_published,
+                self.runtime_bridge_telemetry.bridge_pump_drained,
+                self.runtime_bridge_telemetry.physics_lag_frames,
+                self.runtime_bridge_telemetry.used_fallback_plan,
             );
         }
 

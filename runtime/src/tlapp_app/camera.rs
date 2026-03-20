@@ -141,8 +141,7 @@ impl FreeCameraController {
 
     pub fn apply_script_rotate_delta_deg(&mut self, delta_deg: [f32; 2]) {
         self.yaw_rad += delta_deg[0].to_radians();
-        self.pitch_rad =
-            (self.pitch_rad + delta_deg[1].to_radians()).clamp(-1.553_343, 1.553_343);
+        self.pitch_rad = (self.pitch_rad + delta_deg[1].to_radians()).clamp(-1.553_343, 1.553_343);
     }
 
     pub fn set_mouse_sensitivity(&mut self, sensitivity: f32) {

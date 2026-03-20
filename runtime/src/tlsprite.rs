@@ -983,9 +983,7 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
         let layer = rd.read_i16()?;
         let kind = match version {
             TlspritePackVersion::V1 => infer_sprite_kind(None, Some(layer)),
-            TlspritePackVersion::V2
-            | TlspritePackVersion::V3
-            | TlspritePackVersion::V4 => {
+            TlspritePackVersion::V2 | TlspritePackVersion::V3 | TlspritePackVersion::V4 => {
                 sprite_kind_from_tag(rd.read_u8()?)
                     .ok_or_else(|| "invalid packed sprite kind tag".to_string())?
             }

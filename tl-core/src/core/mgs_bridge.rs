@@ -203,12 +203,10 @@ impl MgsFrameAccumulator {
             .saturating_add(record.descriptor.transfer_size_kb);
 
         if record.descriptor.target_width > 0 {
-            self.max_target_width =
-                self.max_target_width.max(record.descriptor.target_width);
+            self.max_target_width = self.max_target_width.max(record.descriptor.target_width);
         }
         if record.descriptor.target_height > 0 {
-            self.max_target_height =
-                self.max_target_height.max(record.descriptor.target_height);
+            self.max_target_height = self.max_target_height.max(record.descriptor.target_height);
         }
 
         let budget = record.descriptor.latency_budget_ms;
@@ -300,10 +298,7 @@ impl MpsMgsBridge {
     }
 
     /// Submit a CPU task to MPS and register a lock-free completion record for MGS planning.
-    pub fn submit_mps_task(
-        &self,
-        submission: MgsBridgeMpsSubmission,
-    ) -> MgsBridgeSubmitReceipt {
+    pub fn submit_mps_task(&self, submission: MgsBridgeMpsSubmission) -> MgsBridgeSubmitReceipt {
         let MgsBridgeMpsSubmission { descriptor, task } = submission;
         let bridge_submission_id = self
             .next_bridge_submission_id

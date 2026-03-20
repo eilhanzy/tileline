@@ -165,7 +165,11 @@ impl TlAppRuntime {
                 match parse_msaa(value) {
                     Ok(count) => {
                         self.renderer.set_msaa_sample_count(&self.device, count);
-                        let label = if count > 1 { format!("msaa {count}x") } else { "msaa off".to_string() };
+                        let label = if count > 1 {
+                            format!("msaa {count}x")
+                        } else {
+                            "msaa off".to_string()
+                        };
                         self.console_feedback(format!("{label} applied"));
                     }
                     Err(err) => self.console_feedback(err.to_string()),
@@ -255,7 +259,11 @@ impl TlAppRuntime {
         })
     }
 
-    pub(super) fn resolve_console_existing_path(&self, raw_path: &str, op: &str) -> Result<PathBuf, String> {
+    pub(super) fn resolve_console_existing_path(
+        &self,
+        raw_path: &str,
+        op: &str,
+    ) -> Result<PathBuf, String> {
         let candidate = self.resolve_console_candidate_path(raw_path)?;
         let canonical = candidate
             .canonicalize()
@@ -747,7 +755,14 @@ impl TlAppRuntime {
             .map(|w| w.path.display().to_string())
             .unwrap_or_else(|| "off".to_string());
         format!(
-            "fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={}",
+            "pipeline={} bridge_path={} queued_plan_depth={} bridge_pump_published={} bridge_pump_drained={} physics_lag_frames={} bridge_fallback={} fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={}",
+            self.pipeline_mode.as_str(),
+            self.runtime_bridge_telemetry.bridge_path.as_str(),
+            self.runtime_bridge_telemetry.queued_plan_depth,
+            self.runtime_bridge_telemetry.bridge_pump_published,
+            self.runtime_bridge_telemetry.bridge_pump_drained,
+            self.runtime_bridge_telemetry.physics_lag_frames,
+            self.runtime_bridge_telemetry.used_fallback_plan,
             self.present_mode,
             self.rt_mode,
             if rt.active { "on" } else { "off" },
@@ -1114,7 +1129,17 @@ impl TlAppRuntime {
                 let rt = self.renderer.ray_tracing_status();
                 let gravity = self.world.borrow().gravity();
                 self.console_feedback(format!(
-                    "perf snapshot | fps inst={:.1} ema={:.1} avg={:.1} stddev={:.2}ms | frame_ema={:.2}ms jitter_ema={:.2}ms | fill={:.2}/{:.2} | balls={} draw_limit={:?} | substeps={}/{} manual={:?} | grav=[{:.2},{:.2},{:.2}] | rt={:?}/{} dyn={} | fsr={:?}/{:?} scale={:.2} sharp={:.2}",
+                    "perf snapshot | pipeline={} bridge_path={} q={} +{} -{} lag={} fallback={} totals[published={} drained={} popped={}] | fps inst={:.1} ema={:.1} avg={:.1} stddev={:.2}ms | frame_ema={:.2}ms jitter_ema={:.2}ms | fill={:.2}/{:.2} | balls={} draw_limit={:?} | substeps={}/{} manual={:?} | grav=[{:.2},{:.2},{:.2}] | rt={:?}/{} dyn={} | fsr={:?}/{:?} scale={:.2} sharp={:.2}",
+                    self.pipeline_mode.as_str(),
+                    self.runtime_bridge_telemetry.bridge_path.as_str(),
+                    self.runtime_bridge_telemetry.queued_plan_depth,
+                    self.runtime_bridge_telemetry.bridge_pump_published,
+                    self.runtime_bridge_telemetry.bridge_pump_drained,
+                    self.runtime_bridge_telemetry.physics_lag_frames,
+                    self.runtime_bridge_telemetry.used_fallback_plan,
+                    self.runtime_bridge_metrics.bridge_tick_published_frames,
+                    self.runtime_bridge_metrics.bridge_tick_drained_plans,
+                    self.runtime_bridge_metrics.frame_plans_popped,
                     fps.instant_fps,
                     fps.ema_fps,
                     fps.avg_fps,
@@ -2060,9 +2085,17 @@ impl TlAppRuntime {
                 match parse_msaa(value) {
                     Ok(count) => {
                         self.renderer.set_msaa_sample_count(&self.device, count);
-                        let label = if count > 1 { format!("msaa {count}x") } else { "msaa off".to_string() };
+                        let label = if count > 1 {
+                            format!("msaa {count}x")
+                        } else {
+                            "msaa off".to_string()
+                        };
                         self.console_feedback(format!("{label} applied"));
-                        self.console.quick_msaa = if count > 1 { format!("{count}") } else { "off".to_string() };
+                        self.console.quick_msaa = if count > 1 {
+                            format!("{count}")
+                        } else {
+                            "off".to_string()
+                        };
                     }
                     Err(err) => self.console_feedback(err.to_string()),
                 }

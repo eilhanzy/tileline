@@ -63,6 +63,21 @@ impl TlAppRuntime {
         self.simulation_step_budget = 0;
         self.tick_retune_timer = 0.0;
         self.distance_retune_timer = 0.0;
+        self.adaptive_load_pressure_ema = 0.0;
+        if let Some(bridge) = self.runtime_bridge.as_ref() {
+            self.runtime_bridge_metrics = bridge.metrics();
+            self.runtime_bridge_telemetry = RuntimeBridgeTelemetry::new(bridge.path());
+        } else {
+            self.runtime_bridge_telemetry.queued_plan_depth = 0;
+            self.runtime_bridge_telemetry.bridge_pump_published = 0;
+            self.runtime_bridge_telemetry.bridge_pump_drained = 0;
+            self.runtime_bridge_telemetry.physics_lag_frames = 0;
+            self.runtime_bridge_telemetry.latest_plan_frame_id = None;
+            self.runtime_bridge_telemetry.latest_submission_frame_id = None;
+            self.runtime_bridge_telemetry.latest_submission_tasks = 0;
+            self.runtime_bridge_telemetry.used_fallback_plan = false;
+            self.runtime_bridge_telemetry.latest_plan_kind = "none";
+        }
     }
 
     pub(super) fn apply_bundle_sprite_program(
@@ -246,8 +261,8 @@ impl TlAppRuntime {
     }
 
     pub(super) fn apply_gfx_profile(&mut self, profile: &str) -> Result<String, String> {
-        let mobile_path = matches!(self.platform, RuntimePlatform::Android)
-            || self.mgs_is_mobile_hardware;
+        let mobile_path =
+            matches!(self.platform, RuntimePlatform::Android) || self.mgs_is_mobile_hardware;
         match profile {
             "low" => {
                 self.fsr_config.mode = FsrMode::On;

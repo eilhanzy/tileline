@@ -6,6 +6,10 @@
 
 use std::time::{Duration, Instant};
 
+use mps::{
+    DispatcherDoubleBufferedTransforms, DispatcherTransformSample, DoubleBufferedTransformStorage,
+    TransformSample,
+};
 use nalgebra::Vector3;
 use rayon::prelude::*;
 
@@ -167,6 +171,21 @@ impl PhysicsStepTimings {
     }
 }
 
+/// Precomputed execution plan for one `step()` call.
+///
+/// This separates cheap scheduling decisions from the hot substep loop so
+/// external runtimes can eventually drive world phases through a custom
+/// dispatcher without duplicating planning logic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicsStepExecutionPlan {
+    /// Number of fixed substeps to process for this frame.
+    pub substeps: u32,
+    /// Fixed simulation delta used by all substeps.
+    pub fixed_dt: f32,
+    /// Sleep graph update cadence under high load.
+    pub sleep_update_stride: usize,
+}
+
 pub struct PhysicsWorld {
     config: PhysicsWorldConfig,
     clock: FixedStepClock,
@@ -184,6 +203,7 @@ pub struct PhysicsWorld {
     contact_snapshots: Vec<Slot<ContactSnapshot>>,
     free_contact_snapshots: Vec<u16>,
     contacts: Vec<ContactPair>,
+    integration_shards: Vec<std::ops::Range<usize>>,
     interpolation: PhysicsInterpolationBuffer,
     pub last_step_timings: PhysicsStepTimings,
 }
@@ -214,6 +234,7 @@ impl PhysicsWorld {
             contact_snapshots: Vec::new(),
             free_contact_snapshots: Vec::new(),
             contacts: Vec::new(),
+            integration_shards: Vec::new(),
             interpolation: PhysicsInterpolationBuffer::default(),
             last_step_timings: PhysicsStepTimings::default(),
         }
@@ -225,6 +246,11 @@ impl PhysicsWorld {
 
     pub fn fixed_step_clock(&self) -> &FixedStepClock {
         &self.clock
+    }
+
+    /// Current dense body count in the world.
+    pub fn body_count(&self) -> usize {
+        self.bodies.len()
     }
 
     /// Current world gravity vector applied to dynamic body integration.
@@ -627,27 +653,21 @@ impl PhysicsWorld {
         }
     }
 
-    pub fn step(&mut self, dt: f32) -> u32 {
+    /// Build a deterministic execution plan for the next fixed-step run.
+    pub fn prepare_step_execution(&mut self, dt: f32) -> Option<PhysicsStepExecutionPlan> {
         let substeps = self.clock.accumulate(dt);
-        let fixed_dt = self.clock.fixed_dt();
         if substeps == 0 {
-            return 0;
+            return None;
         }
 
-        let mut timings = PhysicsStepTimings {
-            substeps,
-            ..PhysicsStepTimings::default()
-        };
-
-        // Keep interpolation snapshots bounded to one pre-step and one post-step capture per
-        // render frame. Capturing per-substep can dominate frame time at high body counts.
-        let t = Instant::now();
-        self.interpolation.push_snapshot(self.capture_snapshot());
-        timings.snapshot_us += duration_us(t.elapsed());
-
         let body_count = self.bodies.len();
-        // Sleep graph maintenance is useful but costly in huge fully-active scenes. Update it at
-        // a lower cadence under heavy load to keep more budget for parallel broadphase/narrowphase.
+        let preferred_shards = std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1);
+        self.bodies
+            .plan_integration_shards(preferred_shards, 256, &mut self.integration_shards);
+
+        // Sleep graph maintenance is useful but costly in huge fully-active scenes.
         let sleep_update_stride = if body_count >= 6_000 {
             4
         } else if body_count >= 3_500 {
@@ -655,56 +675,110 @@ impl PhysicsWorld {
         } else {
             1
         };
-        for step_index in 0..substeps {
-            let t = Instant::now();
-            self.bodies.integrate(fixed_dt, self.config.gravity);
-            timings.integrate_us += duration_us(t.elapsed());
 
-            let t = Instant::now();
-            self.broadphase.set_predictive_dt(fixed_dt);
-            self.narrowphase.set_predictive_dt(fixed_dt);
-            let bodies = &self.bodies;
-            self.broadphase.rebuild_pairs_parallel(bodies);
-            timings.broadphase_us += duration_us(t.elapsed());
+        Some(PhysicsStepExecutionPlan {
+            substeps,
+            fixed_dt: self.clock.fixed_dt(),
+            sleep_update_stride,
+        })
+    }
 
-            let t = Instant::now();
-            let candidate_pairs = self.broadphase.candidate_pairs();
-            let colliders = &self.colliders;
-            let manifolds = self
-                .narrowphase
-                .rebuild_manifolds(bodies, candidate_pairs, |body| {
-                    primary_shape_for_body(colliders, bodies, body)
-                });
-            timings.narrowphase_us += duration_us(t.elapsed());
-
-            let t = Instant::now();
-            self.solver.solve(&mut self.bodies, manifolds, fixed_dt);
-            self.joint_solver
-                .solve(&mut self.bodies, &self.active_joints, fixed_dt);
-            Self::rebuild_contacts_from_manifolds(&mut self.contacts, manifolds);
-            timings.solver_us += duration_us(t.elapsed());
-
-            let is_last = step_index + 1 == substeps;
-            let on_stride = substeps as usize > sleep_update_stride
-                && step_index as usize % sleep_update_stride == 0;
-            if is_last || on_stride {
-                let t = Instant::now();
-                self.sleep_manager.update(
-                    &mut self.bodies,
-                    manifolds,
-                    &self.active_joints,
-                    fixed_dt,
-                );
-                timings.sleep_us += duration_us(t.elapsed());
-            }
+    /// Execute an already planned fixed-step run.
+    pub fn step_with_execution_plan(&mut self, plan: PhysicsStepExecutionPlan) -> u32 {
+        if plan.substeps == 0 {
+            return 0;
         }
 
+        let mut timings = PhysicsStepTimings {
+            substeps: plan.substeps,
+            ..PhysicsStepTimings::default()
+        };
+
+        self.capture_pre_step_snapshot(&mut timings);
+
+        for step_index in 0..plan.substeps {
+            self.execute_substep(&plan, step_index, &mut timings);
+        }
+
+        self.capture_post_step_snapshot(&mut timings);
+        self.last_step_timings = timings;
+        plan.substeps
+    }
+
+    /// Run one fixed-step update with deterministic planning + execution.
+    pub fn step(&mut self, dt: f32) -> u32 {
+        let Some(plan) = self.prepare_step_execution(dt) else {
+            return 0;
+        };
+        self.step_with_execution_plan(plan)
+    }
+
+    fn capture_pre_step_snapshot(&mut self, timings: &mut PhysicsStepTimings) {
+        // Keep interpolation snapshots bounded to one pre-step capture per render frame.
         let t = Instant::now();
         self.interpolation.push_snapshot(self.capture_snapshot());
         timings.snapshot_us += duration_us(t.elapsed());
+    }
 
-        self.last_step_timings = timings;
-        substeps
+    fn capture_post_step_snapshot(&mut self, timings: &mut PhysicsStepTimings) {
+        // Keep interpolation snapshots bounded to one post-step capture per render frame.
+        let t = Instant::now();
+        self.interpolation.push_snapshot(self.capture_snapshot());
+        timings.snapshot_us += duration_us(t.elapsed());
+    }
+
+    fn execute_substep(
+        &mut self,
+        plan: &PhysicsStepExecutionPlan,
+        step_index: u32,
+        timings: &mut PhysicsStepTimings,
+    ) {
+        let t = Instant::now();
+        self.bodies.integrate_with_shards(
+            plan.fixed_dt,
+            self.config.gravity,
+            &self.integration_shards,
+        );
+        timings.integrate_us += duration_us(t.elapsed());
+
+        let t = Instant::now();
+        self.broadphase.set_predictive_dt(plan.fixed_dt);
+        self.narrowphase.set_predictive_dt(plan.fixed_dt);
+        let bodies = &self.bodies;
+        self.broadphase.rebuild_pairs_parallel(bodies);
+        timings.broadphase_us += duration_us(t.elapsed());
+
+        let t = Instant::now();
+        let candidate_pairs = self.broadphase.candidate_pairs();
+        let colliders = &self.colliders;
+        let manifolds = self
+            .narrowphase
+            .rebuild_manifolds(bodies, candidate_pairs, |body| {
+                primary_shape_for_body(colliders, bodies, body)
+            });
+        timings.narrowphase_us += duration_us(t.elapsed());
+
+        let t = Instant::now();
+        self.solver
+            .solve(&mut self.bodies, manifolds, plan.fixed_dt);
+        self.joint_solver
+            .solve(&mut self.bodies, &self.active_joints, plan.fixed_dt);
+        Self::rebuild_contacts_from_manifolds(&mut self.contacts, manifolds);
+        timings.solver_us += duration_us(t.elapsed());
+
+        let is_last = step_index + 1 == plan.substeps;
+        let on_stride = plan.substeps as usize > plan.sleep_update_stride
+            && step_index as usize % plan.sleep_update_stride == 0;
+        if is_last || on_stride {
+            let t = Instant::now();
+            self.sleep_manager.update(
+                &mut self.bodies,
+                manifolds,
+                &self.active_joints,
+                plan.fixed_dt,
+            );
+            timings.sleep_us += duration_us(t.elapsed());
+        }
     }
 
     pub fn capture_snapshot(&self) -> PhysicsSnapshot {
@@ -740,6 +814,54 @@ impl PhysicsWorld {
             tick: self.clock.tick(),
             bodies: bodies_out,
         }
+    }
+
+    /// Export the latest body transforms into MPS-owned double-buffered storage.
+    pub fn write_render_transforms_to_storage(
+        &self,
+        storage: &DoubleBufferedTransformStorage,
+        slot: usize,
+    ) -> usize {
+        let read = self.bodies.read_domain();
+        let body_len = read.handles.len().min(storage.capacity());
+        for index in 0..body_len {
+            let position = read.positions[index];
+            let rotation = read.rotations[index];
+            let q = rotation.quaternion();
+            storage.write_transform_to_slot(
+                slot,
+                index,
+                TransformSample {
+                    position: [position.x, position.y, position.z],
+                    rotation: [q.i, q.j, q.k, q.w],
+                },
+            );
+        }
+        body_len
+    }
+
+    /// Export the latest body transforms into the bare-metal dispatcher buffers.
+    pub fn write_render_transforms_to_dispatcher_storage(
+        &self,
+        storage: &DispatcherDoubleBufferedTransforms,
+        slot: usize,
+    ) -> usize {
+        let read = self.bodies.read_domain();
+        let body_len = read.handles.len().min(storage.capacity());
+        for index in 0..body_len {
+            let position = read.positions[index];
+            let rotation = read.rotations[index];
+            let q = rotation.quaternion();
+            storage.write_transform_to_slot(
+                slot,
+                index,
+                DispatcherTransformSample {
+                    position: [position.x, position.y, position.z],
+                    rotation: [q.i, q.j, q.k, q.w],
+                },
+            );
+        }
+        body_len
     }
 
     pub fn restore_snapshot(&mut self, snapshot: &PhysicsSnapshot) -> usize {

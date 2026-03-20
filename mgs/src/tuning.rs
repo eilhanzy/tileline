@@ -212,7 +212,7 @@ impl MgsTuningProfile {
             // Keep limit very high for all desktop-class Apple M-series chips
             MobileGpuFamily::Apple if profile.is_desktop_class() => 8192,
             MobileGpuFamily::Apple => 2048, // For A-series chips
-            _ => 512, // Standard mobile GPUs
+            _ => 512,                       // Standard mobile GPUs
         };
 
         Self {

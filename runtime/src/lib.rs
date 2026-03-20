@@ -31,11 +31,14 @@ mod app_runner;
 mod draw_path;
 mod frame_loop;
 mod mas;
-mod physics_mps_runner;
+mod mgs_frame_loop;
+mod mobile_scene_dispatch;
 mod mobile_scene_workload;
 mod network_transport;
 mod pak;
+mod physics_mps_runner;
 mod pre_alpha_loop;
+mod runtime_bridge;
 mod scene;
 mod scene_dispatch;
 mod scene_workload;
@@ -67,6 +70,13 @@ pub use mas::{
     AudioBufferBlock, MasConfig, MasCoreAffinity, MasMetrics, MasPriority, MasSubmission,
     MultiAudioScheduler,
 };
+pub use mgs_frame_loop::{
+    MgsFrameLoopRuntime, MgsFrameLoopRuntimeConfig, MgsFrameLoopRuntimeMetrics,
+    MgsRuntimeTickResult,
+};
+pub use mobile_scene_dispatch::{
+    submit_mobile_hint_to_bridge, MobileSceneDispatchConfig, MobileSceneDispatchSubmission,
+};
 pub use mobile_scene_workload::{
     build_mobile_scene_snapshot, estimate_mobile_workload_hint, MobileSceneWorkloadBridgeConfig,
 };
@@ -84,6 +94,11 @@ pub use pak::{
 pub use pre_alpha_loop::{
     RuntimeFramePhase, RuntimePhaseOrderMetrics, RuntimePhaseOrderTracker, RuntimePhaseViolation,
     PRE_ALPHA_PHASE_ORDER,
+};
+pub use runtime_bridge::{
+    runtime_bridge_path_from_scheduler, RuntimeBridgeConfig, RuntimeBridgeMetrics,
+    RuntimeBridgeOrchestrator, RuntimeBridgePath, RuntimeBridgeSubmission, RuntimeBridgeTick,
+    RuntimeFramePlan,
 };
 pub use scene::{
     apply_scene_light_overrides, clamp_scene_lights_for_camera, BounceTankPatchMetrics,
@@ -155,5 +170,6 @@ pub use wgpu_render_loop::{
     SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,
 };
 pub use wgpu_scene_renderer::{
-    SceneRayTracingStatus, WgpuSceneRenderer, WgpuSceneRendererUploadStats, DEFAULT_MSAA_SAMPLE_COUNT,
+    SceneRayTracingStatus, WgpuSceneRenderer, WgpuSceneRendererUploadStats,
+    DEFAULT_MSAA_SAMPLE_COUNT,
 };
