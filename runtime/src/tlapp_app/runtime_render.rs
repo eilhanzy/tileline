@@ -431,7 +431,7 @@ impl TlAppRuntime {
                 desired_hz = desired_hz.min(cap);
             }
             let ramp_up = desired_hz > self.tick_hz;
-            let smoothing = if mobile_path {
+            let base_smoothing = if mobile_path {
                 match (self.tick_profile, ramp_up) {
                     (TickProfile::Max, true) => 0.48,
                     (TickProfile::Max, false) => 0.30,
@@ -445,6 +445,24 @@ impl TlAppRuntime {
                     (_, true) => 0.72,
                     (_, false) => 0.42,
                 }
+            };
+            // Asymmetric smoothing by direction:
+            //   Ramp-down (substep pressure) → keep responsive (high alpha)
+            //   Ramp-up (headroom detected) → slow down significantly to prevent
+            //     oscillation where the system repeatedly overshoots then retreats.
+            // At high ball counts ramp-up is slowed further, proportional to cost.
+            let smoothing = if ramp_up {
+                let ball_brake = if live_balls > 5_000 {
+                    let excess = ((live_balls - 5_000) as f32 / 5_000.0).min(5.0);
+                    1.0 - (excess * 0.10).min(0.55)
+                } else {
+                    1.0
+                };
+                // Ramp-up alpha: already lower than ramp-down, braked further by ball count.
+                base_smoothing * ball_brake
+            } else {
+                // Ramp-down keeps full alpha — respond quickly to substep pressure.
+                base_smoothing
             };
             self.tick_hz = smooth_tick_hz(self.tick_hz, desired_hz, smoothing);
             let hard_floor = match self.tick_profile {
@@ -480,17 +498,23 @@ impl TlAppRuntime {
             self.world
                 .borrow_mut()
                 .set_timestep(1.0 / self.tick_hz, self.max_substeps);
-            self.tick_retune_timer = if mobile_path {
-                if ramp_up {
-                    0.12
-                } else {
-                    0.08
-                }
+            // Retune interval: ramp-up intervals grow with ball count to prevent
+            // rapid oscillation. Ramp-down uses the base interval so we react
+            // to substep pressure without delay.
+            let base_interval = if mobile_path {
+                if ramp_up { 0.12 } else { 0.08 }
             } else if ramp_up {
                 0.08
             } else {
                 0.16
             };
+            let interval_scale = if ramp_up && live_balls > 5_000 {
+                let excess = ((live_balls - 5_000) as f32 / 5_000.0).min(5.0);
+                1.0 + (excess * 0.30).min(1.5)
+            } else {
+                1.0
+            };
+            self.tick_retune_timer = base_interval * interval_scale;
         }
 
         self.script_frame_index = self.script_frame_index.saturating_add(1);

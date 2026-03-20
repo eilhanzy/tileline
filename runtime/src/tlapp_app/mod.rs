@@ -1117,27 +1117,35 @@ fn choose_aggressive_tick_hz(
     if fps_ratio > 1.05 {
         multiplier += if mobile_path { 0.15 } else { 0.45 };
     }
-    if live_balls > 3_500 {
-        multiplier += if mobile_path { 0.12 } else { 0.2 };
-    }
-    if live_balls > 5_500 {
-        multiplier += if mobile_path { 0.16 } else { 0.25 };
-    }
-    if live_balls > 8_000 {
-        multiplier += if mobile_path { 0.18 } else { 0.25 };
+    // Ball count cost scaling: more balls = heavier per-tick physics cost.
+    // Keep a modest damping so the peak target Hz doesn't climb unrealistically
+    // high — the real anti-oscillation work is done by the asymmetric ramp
+    // smoothing in the caller (slow ramp-up, fast ramp-down).
+    if live_balls > 5_000 {
+        let excess = ((live_balls - 5_000) as f32 / 5_000.0).min(5.0);
+        let damping = if mobile_path {
+            1.0 - (excess * 0.06).min(0.22)
+        } else {
+            1.0 - (excess * 0.04).min(0.18)
+        };
+        multiplier *= damping;
     }
 
     let mut target_hz = fps_limit * multiplier * fps_ratio;
-    if last_substeps + 1 >= max_substeps {
-        target_hz *= match profile {
-            TickProfile::Balanced => 0.62,
-            TickProfile::Max => 0.78,
-        };
-    } else if last_substeps >= max_substeps.saturating_sub(3) {
-        target_hz *= match profile {
-            TickProfile::Balanced => 0.78,
-            TickProfile::Max => 0.90,
-        };
+    // Progressive substep pressure: instead of a hard cliff at max_substeps
+    // (which causes oscillation), use a smooth ramp that starts damping when
+    // substeps reach ~60% of max and increases to full damping at 100%.
+    if max_substeps > 1 {
+        let substep_ratio = last_substeps as f32 / max_substeps as f32;
+        if substep_ratio > 0.60 {
+            // 0.60 → 0.0 damping, 1.0 → full damping
+            let pressure = ((substep_ratio - 0.60) / 0.40).clamp(0.0, 1.0);
+            let max_damping = match profile {
+                TickProfile::Balanced => 0.45,
+                TickProfile::Max => 0.30,
+            };
+            target_hz *= 1.0 - pressure * max_damping;
+        }
     }
     if fps < 45.0 {
         target_hz *= match profile {

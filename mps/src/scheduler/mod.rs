@@ -38,13 +38,25 @@ fn apply_thread_qos(class: CpuClass, _core_id: usize) {
 
 #[cfg(target_os = "linux")]
 fn apply_thread_qos(class: CpuClass, core_id: usize) {
-    // Pin the worker to its assigned core via sched_setaffinity.
-    // This prevents the kernel from migrating the thread across cores,
-    // which would thrash L1/L2 caches and increase memory latency.
+    // Soft-affinity: set the worker's preferred core plus its immediate
+    // neighbours (core_id ± 1). This keeps L2 cache warm on the preferred
+    // core while allowing the kernel to migrate the thread when that core
+    // is overloaded (e.g. a heavy physics step running on it). Strict
+    // single-core pinning causes one core to spike to 100% while the rest
+    // idle — the opposite of what we want.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
+        let ncpus = libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as usize;
+        // Primary core
         libc::CPU_SET(core_id, &mut set);
+        // Allow migration to ±1 neighbour for load sharing
+        if core_id > 0 {
+            libc::CPU_SET(core_id - 1, &mut set);
+        }
+        if core_id + 1 < ncpus {
+            libc::CPU_SET(core_id + 1, &mut set);
+        }
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
     }
 
@@ -594,12 +606,14 @@ fn worker_loop(
     };
     #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     let (idle_park_min, idle_park_max) = (Duration::from_micros(50), Duration::from_millis(1));
-    // Linux desktop: aggressive wake-up. Thread affinity keeps the core warm
-    // and unpark() from task submission ensures no added latency. The short
-    // upper bound prevents indefinite sleep from hiding behind the backoff
-    // when rapid bursts arrive close together.
+    // Linux desktop: moderate idle backoff. Task submission always calls
+    // unpark() so the floor only affects re-check cadence after a spurious
+    // wake — real tasks are picked up immediately. The 100 µs floor keeps
+    // bursty wake-ups fast without burning CPU on idle polls. The 1 ms
+    // ceiling means a sleeping worker checks back at most once per ms
+    // before falling into indefinite park (zero-CPU sleep until unparked).
     #[cfg(target_os = "linux")]
-    let (idle_park_min, idle_park_max) = (Duration::from_micros(30), Duration::from_micros(500));
+    let (idle_park_min, idle_park_max) = (Duration::from_micros(100), Duration::from_millis(1));
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let (idle_park_min, idle_park_max) = (Duration::from_micros(250), Duration::from_millis(2));
 
