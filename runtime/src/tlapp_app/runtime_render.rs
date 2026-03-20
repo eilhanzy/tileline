@@ -528,9 +528,24 @@ impl TlAppRuntime {
         let unknown_light_overrides =
             apply_scene_light_overrides(&mut frame, frame_eval.light_overrides.as_slice());
         // Follow-camera lights: move to camera eye and look along camera forward vector.
+        // Offset the light slightly below the eye (like a flashlight held at chest level)
+        // so that shadow-casting objects create visible shadows on surfaces behind them.
+        // Without the offset, light == camera means every shadow falls exactly behind the
+        // caster and is therefore occluded from the camera's view.
         let cam_forward = self.camera.forward_vector();
+        let cam_right = cam_forward.cross(&nalgebra::Vector3::y());
+        let cam_right = if cam_right.norm() > 1e-4 {
+            cam_right.normalize()
+        } else {
+            nalgebra::Vector3::x()
+        };
+        let cam_down = cam_forward.cross(&cam_right);
         for light in frame.lights.iter_mut().filter(|l| l.follow_camera) {
-            light.position = eye;
+            light.position = [
+                eye[0] + cam_down.x * 1.5,
+                eye[1] + cam_down.y * 1.5,
+                eye[2] + cam_down.z * 1.5,
+            ];
             light.direction = [cam_forward.x, cam_forward.y, cam_forward.z];
         }
         let light_pruned = clamp_scene_lights_for_camera(&mut frame, eye, MAX_SCENE_LIGHTS);

@@ -109,9 +109,9 @@ fn sample_shadow(slot: i32, world_pos: vec3<f32>) -> f32 {
         return 1.0;
     }
     let wgpu_z = proj.z * 0.5 + 0.5;
-    // Bias of 0.0001: at typical d≈12 the depth gradient is ~0.000347/unit,
-    // so 0.0001 lets balls with ≥0.3 unit height difference cast visible shadows
-    // while staying ≫ float32 precision (~3e-7) to avoid self-shadowing acne.
+    // Bias: near=0.5, far≈60.5 → gradient ≈ near*far/((far-near)*z²).
+    // At z=5:  gradient ≈ 0.004/unit → bias ≈ 0.025 units (well below ball radius).
+    // At z=30: gradient ≈ 0.00056/unit → bias ≈ 0.18 units (still catches small balls).
     let depth_test = wgpu_z - 0.0001;
     // Convert GL NDC xy [-1,1] → UV [0,1], flipping Y (NDC +y up, UV +y down).
     let uv = proj.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
@@ -201,7 +201,7 @@ fn fs_main(input: VSOut, @builtin(front_facing) is_front: bool) -> @location(0) 
         normal = -normal;
     }
 
-    var lit = input.color.rgb * 0.10;
+    var lit = input.color.rgb * 0.04;
     let light_count = min(u_lighting.light_count, 32u);
     if light_count == 0u {
         let fallback_dir = normalize(vec3<f32>(0.42, 0.74, 0.52));

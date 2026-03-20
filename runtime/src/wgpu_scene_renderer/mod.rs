@@ -280,6 +280,8 @@ pub struct WgpuSceneRenderer {
     pipeline_shadow: wgpu::RenderPipeline,
     /// Number of shadow slots filled this frame (≤ MAX_SHADOW_LIGHTS).
     shadow_active_count: u32,
+    /// Frame counter for throttling diagnostic prints.
+    shadow_diag_frame: u32,
 }
 
 impl WgpuSceneRenderer {
@@ -748,6 +750,7 @@ impl WgpuSceneRenderer {
             shadow_pass_bind_groups,
             pipeline_shadow,
             shadow_active_count: 0,
+            shadow_diag_frame: 0,
         };
         renderer.write_camera_uniform(queue, surface_width.max(1), surface_height.max(1));
         renderer.write_lighting_uniform(queue, 0);
@@ -1343,6 +1346,54 @@ impl WgpuSceneRenderer {
         }
         shadow_uniform.shadow_count = slot as u32;
         self.shadow_active_count = slot as u32;
+
+        // ── Diagnostic (remove once shadows confirmed working) ─────────────────
+        self.shadow_diag_frame = self.shadow_diag_frame.wrapping_add(1);
+        if self.shadow_diag_frame % 300 == 1 {
+            eprintln!(
+                "[shadow diag] lights={} shadow_active={} shadow_count={} opaque_ranges={}",
+                selected,
+                self.shadow_active_count,
+                shadow_uniform.shadow_count,
+                self.ranges.iter().filter(|r| r.lane == DrawLane::Opaque).count(),
+            );
+            for (i, light) in lights.iter().take(selected).enumerate() {
+                eprintln!(
+                    "  light[{}] kind={:?} enabled={} casts_shadow={} pos={:.2?} dir={:.3?} slot={}",
+                    i, light.kind, light.enabled, light.casts_shadow,
+                    light.position, light.direction, shadow_slots[i],
+                );
+            }
+            // Transform test points through light view-proj to verify matrix.
+            for s in 0..slot {
+                let vp = nalgebra::Matrix4::from_column_slice(
+                    &shadow_uniform.light_view_proj[s],
+                );
+                let test_points: &[(&str, [f32; 3])] = &[
+                    ("floor-center", [0.0, 0.0, 0.0]),
+                    ("floor-front",  [0.0, 0.0, -10.0]),
+                    ("ball-mid",     [0.0, 1.0, 0.0]),
+                ];
+                for (name, pt) in test_points {
+                    let p = nalgebra::Vector4::new(pt[0], pt[1], pt[2], 1.0);
+                    let clip = vp * p;
+                    if clip.w.abs() > 1e-6 {
+                        let ndc = clip.xyz() / clip.w;
+                        let wgpu_z = ndc.z * 0.5 + 0.5;
+                        let uv_x = ndc.x * 0.5 + 0.5;
+                        let uv_y = -ndc.y * 0.5 + 0.5;
+                        eprintln!(
+                            "  slot[{}] {} → ndc=({:.4},{:.4},{:.4}) wgpu_z={:.6} uv=({:.4},{:.4}) w={:.4}",
+                            s, name, ndc.x, ndc.y, ndc.z, wgpu_z, uv_x, uv_y, clip.w,
+                        );
+                    } else {
+                        eprintln!("  slot[{}] {} → w≈0 (behind light)", s, name);
+                    }
+                }
+            }
+        }
+        // ──────────────────────────────────────────────────────────────────────
+
         queue.write_buffer(
             &self.shadow_uniform_buffer,
             0,
@@ -1630,7 +1681,7 @@ fn compute_spotlight_view_proj(light: &SceneLight) -> [f32; 16] {
     let fov_y = ((light.outer_cone_deg * 2.0 + 6.0) as f32)
         .clamp(10.0, 170.0)
         .to_radians();
-    let proj = Perspective3::new(1.0, fov_y, 0.05, light.range.max(1.0) * 1.1);
+    let proj = Perspective3::new(1.0, fov_y, 0.5, light.range.max(1.0) * 1.1);
     let view_proj: Matrix4<f32> = proj.to_homogeneous() * view.to_homogeneous();
     let mut out = [0f32; 16];
     out.copy_from_slice(view_proj.as_slice());
@@ -2713,11 +2764,7 @@ fn create_shadow_pipeline(
             depth_write_enabled: true,
             depth_compare: wgpu::CompareFunction::LessEqual,
             stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState {
-                constant: 1,
-                slope_scale: 0.0,
-                clamp: 0.0,
-            },
+            bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
