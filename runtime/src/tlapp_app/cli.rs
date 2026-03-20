@@ -13,6 +13,7 @@ pub struct CliOptions {
     pub vsync: VsyncMode,
     pub fps_cap: Option<f32>,
     pub tick_profile: TickProfile,
+    pub tick_cap: Option<f32>,
     pub render_distance: Option<f32>,
     pub adaptive_distance: ToggleAuto,
     pub distance_blur: ToggleAuto,
@@ -36,6 +37,7 @@ impl Default for CliOptions {
             vsync: VsyncMode::Auto,
             fps_cap: Some(60.0),
             tick_profile: TickProfile::Max,
+            tick_cap: None,
             render_distance: None,
             adaptive_distance: ToggleAuto::Auto,
             distance_blur: ToggleAuto::Auto,
@@ -84,6 +86,10 @@ impl CliOptions {
                 "--tick-profile" => {
                     let value = next_arg(&mut args, "--tick-profile")?;
                     options.tick_profile = TickProfile::parse(&value)?;
+                }
+                "--tick-cap" => {
+                    let value = next_arg(&mut args, "--tick-cap")?;
+                    options.tick_cap = parse_tick_cap(&value)?;
                 }
                 "--render-distance" => {
                     let value = next_arg(&mut args, "--render-distance")?;
@@ -313,6 +319,19 @@ pub fn parse_msaa(value: &str) -> Result<u32, Box<dyn Error>> {
     }
 }
 
+pub fn parse_tick_cap(value: &str) -> Result<Option<f32>, Box<dyn Error>> {
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let hz = value
+        .parse::<f32>()
+        .map_err(|_| format!("invalid --tick-cap value: {value} (expected Hz number or off)"))?;
+    if !hz.is_finite() || hz < 24.0 {
+        return Err("--tick-cap must be >= 24.0 Hz or 'off'".into());
+    }
+    Ok(Some(hz))
+}
+
 pub fn parse_fsr_sharpness(value: &str) -> Result<f32, Box<dyn Error>> {
     let parsed = value
         .parse::<f32>()
@@ -344,6 +363,7 @@ fn print_usage() {
     println!("  --vsync auto|on|off       Present mode preference (default: auto)");
     println!("  --fps-cap <N|off>         Frame cap target (default: 60)");
     println!("  --tick-profile <mode>     Physics tick planner: balanced|max (default: max)");
+    println!("  --tick-cap <Hz|off>       Maximum physics tick Hz (default: off = auto)");
     println!("  --render-distance <N|off> Distance cull radius for 3D balls (default: auto)");
     println!("  --adaptive-distance <mode> Adaptive distance tuning: auto|on|off (default: auto)");
     println!("  --distance-blur <mode>    Distance haze blur: auto|on|off (default: auto)");

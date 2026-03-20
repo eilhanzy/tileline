@@ -427,6 +427,9 @@ impl TlAppRuntime {
                 (self.fps_tracker.ema_fps().max(1.0) * self.max_substeps as f32 * catch_up_factor)
                     .clamp(24.0, 900.0);
             desired_hz = desired_hz.min(catch_up_hz);
+            if let Some(cap) = self.tick_cap {
+                desired_hz = desired_hz.min(cap);
+            }
             let ramp_up = desired_hz > self.tick_hz;
             let smoothing = if mobile_path {
                 match (self.tick_profile, ramp_up) {
@@ -468,6 +471,12 @@ impl TlAppRuntime {
             };
             let floor_hz = hard_floor.min(catch_up_hz * 0.90).max(24.0);
             self.tick_hz = self.tick_hz.max(floor_hz).min(catch_up_hz);
+            // Apply user-specified tick cap. This limits how fast the physics
+            // ticks, keeping the main thread from over-spinning on timestep
+            // calculations and giving more headroom to the MPS worker pool.
+            if let Some(cap) = self.tick_cap {
+                self.tick_hz = self.tick_hz.min(cap);
+            }
             self.world
                 .borrow_mut()
                 .set_timestep(1.0 / self.tick_hz, self.max_substeps);

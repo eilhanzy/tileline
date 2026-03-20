@@ -2603,6 +2603,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "md-5",
  "miniz_oxide",
  "num_cpus",

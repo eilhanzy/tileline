@@ -44,9 +44,14 @@ impl TlAppRuntime {
                 required_limits.max_texture_array_layers
             );
         }
-        // Request RT feature if the adapter supports it; ignored if unavailable.
+        // Request RT feature if the adapter supports it; silently skip on non-RT hardware.
         let enabled_rt_features =
             wgpu::Features::EXPERIMENTAL_RAY_QUERY & adapter.features();
+        eprintln!(
+            "[runtime bootstrap] ray_query={} adapter='{}'",
+            !enabled_rt_features.is_empty(),
+            adapter_info.name,
+        );
 
         // RT requires non-zero acceleration structure limits (all default to 0).
         if !enabled_rt_features.is_empty() {
@@ -57,16 +62,23 @@ impl TlAppRuntime {
             required_limits.max_tlas_instance_count = 16_384;
         }
 
+        // Only opt into experimental features when the adapter actually supports RT.
+        // On non-RT hardware the unsafe token is unnecessary and would be misleading.
+        let experimental_features = if enabled_rt_features.is_empty() {
+            Default::default()
+        } else {
+            // SAFETY: EXPERIMENTAL_RAY_QUERY may have implementation bugs; we accept
+            // this risk on hardware that reports the feature and fall back to PCF
+            // shadow maps when the feature is absent.
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        };
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("tlapp-device"),
                 required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
                     | enabled_rt_features,
                 required_limits,
-                // SAFETY: EXPERIMENTAL_RAY_QUERY may have implementation bugs; we accept
-                // this risk on hardware that reports the feature and fall back to PCF
-                // shadow maps when the feature is absent.
-                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+                experimental_features,
                 ..Default::default()
             }))?;
 
@@ -604,6 +616,7 @@ impl TlAppRuntime {
             cursor_position: None,
             tick_policy,
             tick_profile: options.tick_profile,
+            tick_cap: options.tick_cap,
             tick_hz: 1.0 / fixed_dt.max(1e-6),
             fps_limit_hint,
             uncapped_dynamic_fps_hint,

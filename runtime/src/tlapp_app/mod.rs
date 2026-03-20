@@ -625,6 +625,7 @@ struct TlAppRuntime {
     cursor_position: Option<(f32, f32)>,
     tick_policy: TickRatePolicy,
     tick_profile: TickProfile,
+    tick_cap: Option<f32>,
     tick_hz: f32,
     fps_limit_hint: f32,
     uncapped_dynamic_fps_hint: bool,

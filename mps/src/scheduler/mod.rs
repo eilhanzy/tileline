@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 //   QOS_CLASS_UTILITY          = 0x11  (background-friendly; preferred on E-cores)
 //   QOS_CLASS_DEFAULT          = 0x15  (neutral fallback)
 #[cfg(target_os = "macos")]
-fn apply_thread_qos(class: CpuClass) {
+fn apply_thread_qos(class: CpuClass, _core_id: usize) {
     extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
@@ -36,9 +36,32 @@ fn apply_thread_qos(class: CpuClass) {
     unsafe { pthread_set_qos_class_self_np(qos, 0); }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn apply_thread_qos(class: CpuClass, core_id: usize) {
+    // Pin the worker to its assigned core via sched_setaffinity.
+    // This prevents the kernel from migrating the thread across cores,
+    // which would thrash L1/L2 caches and increase memory latency.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core_id, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+
+    // Set thread niceness to hint at relative priority.
+    // Lower nice = higher kernel scheduling priority.
+    // Performance workers get nice -2 (slight boost), Efficient workers get nice 5.
+    let nice_val: libc::c_int = match class {
+        CpuClass::Performance => -2,
+        CpuClass::Unknown     =>  0,
+        CpuClass::Efficient   =>  5,
+    };
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice_val); }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[inline(always)]
-fn apply_thread_qos(_class: CpuClass) {}
+fn apply_thread_qos(_class: CpuClass, _core_id: usize) {}
 
 pub use dispatcher::{DispatchError, DispatchResult, Dispatcher};
 pub use queue::{PriorityTaskQueue, QueueDepth};
@@ -212,7 +235,18 @@ pub struct MpsScheduler {
 impl MpsScheduler {
     /// Create a scheduler using detected topology and full logical core parallelism.
     pub fn new() -> Self {
-        Self::with_topology(CpuTopology::detect())
+        let topology = CpuTopology::detect();
+        eprintln!(
+            "[mps] cores={} (P={} E={} U={}) hybrid={} vendor={} workers={}",
+            topology.logical_cores,
+            topology.performance_cores,
+            topology.efficient_cores,
+            topology.logical_cores.saturating_sub(topology.performance_cores + topology.efficient_cores),
+            topology.has_hybrid,
+            topology.vendor.as_deref().unwrap_or("unknown"),
+            topology.logical_cores,
+        );
+        Self::with_topology(topology)
     }
 
     /// Create a scheduler using a caller-provided topology snapshot.
@@ -508,6 +542,7 @@ fn spawn_workers(
             .spawn(move || {
                 worker_loop(
                     worker_class,
+                    core_id,
                     worker_queue,
                     worker_dispatcher,
                     worker_shutdown,
@@ -526,6 +561,7 @@ fn spawn_workers(
 
 fn worker_loop(
     worker_class: CpuClass,
+    core_id: usize,
     queue: PriorityTaskQueue,
     dispatcher: Arc<Dispatcher>,
     shutdown: Arc<AtomicBool>,
@@ -533,10 +569,11 @@ fn worker_loop(
     failed: Arc<AtomicU64>,
     class_counters: Arc<ClassCounters>,
 ) {
-    // Set macOS QoS class so the kernel schedules this thread on the right
-    // core cluster. Without this hint, all threads may be consolidated onto
-    // E-cores even when Performance priority is intended.
-    apply_thread_qos(worker_class);
+    // Platform-specific thread hints:
+    // - macOS: QoS class so the kernel routes to the right core cluster.
+    // - Linux: sched_setaffinity pins the thread to its core; nice value
+    //   gives the scheduler a priority hint.
+    apply_thread_qos(worker_class, core_id);
 
     // Adaptive idle park bounds by platform and core class.
     //
@@ -557,7 +594,13 @@ fn worker_loop(
     };
     #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     let (idle_park_min, idle_park_max) = (Duration::from_micros(50), Duration::from_millis(1));
-    #[cfg(not(target_os = "macos"))]
+    // Linux desktop: aggressive wake-up. Thread affinity keeps the core warm
+    // and unpark() from task submission ensures no added latency. The short
+    // upper bound prevents indefinite sleep from hiding behind the backoff
+    // when rapid bursts arrive close together.
+    #[cfg(target_os = "linux")]
+    let (idle_park_min, idle_park_max) = (Duration::from_micros(30), Duration::from_micros(500));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let (idle_park_min, idle_park_max) = (Duration::from_micros(250), Duration::from_millis(2));
 
     // Current adaptive park duration — doubles on each empty poll, reset on task found.

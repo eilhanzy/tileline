@@ -30,7 +30,7 @@ const DEFAULT_SPHERE_FBX_BYTES: &[u8] = include_bytes!("../../../docs/demos/sphe
 // Hysteresis avoids rapid mesh-mode flapping when instance counts hover around thresholds.
 const SPHERE_LOD_ENABLE_THRESHOLD: usize = 2_500;
 const SPHERE_LOD_DISABLE_THRESHOLD: usize = 1_800;
-const RT_DYNAMIC_CAP: u32 = 1_024;
+const RT_DYNAMIC_CAP: u32 = 16_384;
 const TEXT_GLYPH_SLOT_BASE: u16 = 128;
 
 #[repr(C)]
@@ -1149,15 +1149,6 @@ impl WgpuSceneRenderer {
 
         let cap = self.ray_tracing_status.rt_dynamic_cap as usize;
         let inst_count = self.rt_instances.len().min(cap);
-
-        static RT_LOG_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let count = RT_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count < 5 || count % 300 == 0 {
-            eprintln!(
-                "[rt-tlas] frame={count} rt_instances={} inst_count={inst_count} cap={cap}",
-                self.rt_instances.len()
-            );
-        }
 
         // Build TlasInstances from CPU-side data; TlasInstance::new clones the BLAS handle
         // so we can release the borrow on rt_blas_* before mutating rt_tlas.
