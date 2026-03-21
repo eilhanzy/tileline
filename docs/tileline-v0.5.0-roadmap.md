@@ -9,6 +9,7 @@ runtime-first engine core.
 The release theme is:
 
 - keep the rendering stack feature-complete enough to build real scenes
+- add a first-class 2D side-view foundation for a Terraria-like survival sandbox path
 - optimize the existing ray tracing / shader / lighting path instead of endlessly re-authoring it
 - add the missing asset-facing pieces (`effects`, `textures`)
 - perform a serious ParadoxPE + MPS revision
@@ -23,6 +24,8 @@ The engine already has these major pieces in place:
 - ray tracing: present in hybrid form, but still needs optimization and stronger fallback behavior
 - runtime scene path: working
 - `.tlscript` + `.tlsprite` authoring path: working
+- sprite-oriented runtime authoring already exists, so 2D should extend the real runtime path instead
+  of creating a separate mini-engine
 - ParadoxPE: real physics core, but still not fully exploiting MPS
 - MPS: custom dispatcher foundation exists, but runtime integration is not yet the final form
 
@@ -34,14 +37,18 @@ features**, not on inventing entirely new subsystems.
 `v0.5.0` should deliver all of the following:
 
 - an optimized forward + hybrid RT render path that is stable in the runtime
+- a first-class orthographic / side-view 2D runtime path
+- a chunked tile-world foundation suitable for Terraria-like digging/building scenes
 - a usable effects layer on top of the current shader/light stack
 - first-class texture support in the runtime scene/material path
 - a first-class SPIR-V shader path for the raw Vulkan backend
 - a more aggressively parallel ParadoxPE execution model
+- a flat-2D ParadoxPE mode for side-view terrain/body collision
 - a stricter MPS-driven runtime execution path with fewer serial bottlenecks
 - a Linux-first raw Vulkan backend inside `tl-core`
 - no shipping runtime dependence on `Bevy` scheduling/tasks
 - no hot-path runtime/physics dependence on `rayon`
+- no shipping runtime render-path dependence on `wgpu`
 
 ## Non-Goals
 
@@ -52,6 +59,7 @@ These are intentionally out of scope for `v0.5.0`:
 - complete editor productization
 - broad asset import coverage beyond what is needed for the runtime scene path
 - fully finished multiplayer gameplay loop
+- full survival gameplay systems such as inventory, crafting, AI, fluids, biomes, or day-night loops
 
 ## Definition Of Done
 
@@ -59,12 +67,17 @@ These are intentionally out of scope for `v0.5.0`:
 
 - RT can be enabled without destabilizing the main runtime path
 - lights, shaders, textures, and effects all work together in the same scene path
+- one canonical side-view 2D scene path works in runtime without example-only hacks
+- chunked tile worlds can render, scroll, and mutate locally through dig/place updates
+- ParadoxPE flat-2D mode exists and is the canonical 2D terrain/body collision path
+- 2D camera, animation, and VFX can coexist on the same runtime scene path
 - SPIR-V is a supported, documented shader/runtime artifact path for Vulkan scene rendering
 - the Vulkan backend migration path inside `tl-core` is real and no longer speculative
 - ParadoxPE no longer depends on coarse serial stepping in its main hot path
 - MPS is the primary CPU execution path for physics/runtime jobs
 - no `Bevy App/System/bevy_tasks` dependence exists in shipping runtime execution
 - no `rayon` dependence remains in shipping hot paths for physics/runtime scheduling
+- no `wgpu`-backed render path remains in shipping runtime execution
 - the runtime can explain performance regressions through telemetry instead of guesswork
 
 ## Workstream A: Render Stack Optimization
@@ -299,7 +312,7 @@ Acceptance gates:
 - runtime performance no longer depends on general-purpose task stealing behavior
 - overlap path is not just present but measurably useful
 
-## Workstream E: Rayon / Bevy Independence
+## Workstream E: Rayon / Bevy / WGPU Independence
 
 This is a hard release theme, not a stretch goal.
 
@@ -329,14 +342,136 @@ Acceptance gate:
 
 - shipping runtime/physics hot paths are no longer backed by `rayon`
 
+### E3. WGPU Independence
+
+Target work:
+
+- complete migration from `runtime` rendering hot paths to the canonical raw Vulkan backend
+- remove remaining `wgpu` ownership from shipping TLApp runtime rendering flow
+- keep migration incremental during development, but lock shipping target to Vulkan-native ownership
+- ensure renderer telemetry and console status report Vulkan-native path details instead of `wgpu` terms
+
+Acceptance gate:
+
+- shipping runtime render path is no longer backed by `wgpu`
+
 Note:
 
 - temporary use in tools, offline processing, or non-hot-path utilities can be tolerated during
   migration, but the release goal is to stop depending on it for the actual runtime-critical path.
 
+## Workstream F: 2D Foundation
+
+This workstream turns the existing sprite-oriented runtime into a real 2D side-view engine path
+instead of treating 2D as a toy layer on top of 3D.
+
+Chosen defaults:
+
+- first 2D target: Terraria-like side-view survival sandbox
+- world model: chunked tile world
+- physics strategy: ParadoxPE flat-2D
+- content priority: tilemap -> animation -> VFX
+- `v0.5.0` scope: engine foundation + digging/building, not full survival gameplay systems
+
+### F1. 2D Runtime Rendering
+
+Target work:
+
+- add orthographic / side-view camera mode as a first-class runtime scene mode
+- add a tilemap draw path using atlas-backed quads or batches through the canonical renderer
+- keep HUD and sprite overlays on the same 2D-friendly render path instead of splitting them away
+- support deterministic layer ordering with room for future parallax expansion
+- keep 2D as an extension of the canonical renderer migration, including the Vulkan path, instead of
+  creating another temporary render fork
+
+Acceptance gates:
+
+- one 2D scene can render tile layers, animated sprites, and overlays together
+- camera motion is stable and does not rely on 3D fallback behavior
+- 2D batching stays central so the path does not regress into per-sprite draw overhead
+
+### F2. Chunked Tile World
+
+Target work:
+
+- define chunked tile storage as the canonical world model for 2D sandbox scenes
+- support tile mutation operations needed for dig, place, and visible update flows
+- keep tile updates local to changed chunks instead of assuming whole-world rebuilds
+- add chunk visibility and chunk update telemetry so larger worlds remain diagnosable
+
+Acceptance gates:
+
+- chunked worlds load, scroll, render, and mutate without rebuilding the whole map
+- tile changes are reflected within bounded frame cost
+- runtime telemetry can explain chunk visibility/update pressure
+
+### F3. ParadoxPE Flat-2D
+
+Target work:
+
+- add a flat-2D execution mode in ParadoxPE instead of a separate lightweight physics engine
+- constrain motion and collision semantics to side-view 2D
+- support tile terrain collision plus simple 2D-friendly actor shapes first (AABB/capsule-style)
+- align broadphase and narrowphase data flow with chunked tile terrain updates
+- keep the implementation deterministic-first and avoid overcommitting to full rigid-body sandbox
+  behavior in `v0.5.0`
+
+Acceptance gates:
+
+- player and actor movement collides correctly with tile terrain
+- dig/place updates can invalidate or rebuild only the relevant collision region
+- no global collision rebuild is required for local terrain edits
+
+### F4. 2D Content And Authoring Path
+
+Target work:
+
+- extend `.tlsprite` with 2D atlas, tile, and animation-facing metadata
+- extend `.tlscript` with 2D camera movement, tile query, dig/place, and 2D spawn helpers
+- keep `.tljoint` and runtime loading as the composition point for 2D scenes too
+- prioritize engine-owned runtime loading instead of example-owned loaders
+- keep 2D `.tlsprite` additions additive so current light and 3D bindings remain valid
+
+Acceptance gates:
+
+- a 2D scene can be authored without hardcoding engine internals into examples
+- script-driven dig/place and sprite animation work through supported APIs
+- scripts do not need to manage low-level chunk internals directly
+
+### F5. 2D Validation Scenarios
+
+Representative acceptance scenes:
+
+- a small static side-view map
+- a medium chunked map with repeated dig/place activity
+- a stress scene with many visible tiles, animated actors, and HUD overlays
+
+Validation rules:
+
+- a side-view chunked tile scene loads and scrolls correctly
+- tiles can be dug and placed repeatedly without full-world rebuild behavior
+- 2D actor collision against terrain remains stable after tile edits
+- animated sprite characters render correctly on top of the tile world
+- 2D scene frame pacing remains diagnosable from telemetry
+- the 2D path works through runtime content loading, not only through bespoke examples
+
 ## Milestones
 
-### Milestone 1: Rendering Core Consolidation
+### Milestone 1: 2D Foundation First
+
+Target contents:
+
+- Workstream F baseline delivery (`F1` + `F2` core)
+- initial 2D runtime rendering path (orthographic camera + tile/sprite layer composition)
+- chunked tile-world scene representation and local mutation loop (dig/place)
+- 2D authoring flow anchored in `.tlsprite` + `.tlscript` + `.tljoint`
+
+Exit criteria:
+
+- one canonical 2D side-view scene path supports tiles + sprites + overlays
+- chunked tile dig/place path is functional without full-world rebuild behavior
+
+### Milestone 2: Render + Effects + Texture Consolidation
 
 Target contents:
 
@@ -350,32 +485,23 @@ Target contents:
 Exit criteria:
 
 - one canonical runtime scene path supports shaders + lights + textures + optional RT/effects
+- 2D content path reuses the canonical renderer instead of a side renderer
 
-### Milestone 2: Physics + MPS Restructure
-
-Target contents:
-
-- ParadoxPE phase refactor
-- stronger MPS dispatch ownership
-- lower serial fraction in world step
-- better physics telemetry
-
-Exit criteria:
-
-- physics step is measurably more parallel and less bottlenecked
-
-### Milestone 3: Dependency Exit + Release Hardening
+### Milestone 3: MPS + Independence Hardening
 
 Target contents:
 
+- stronger MPS dispatch ownership in runtime
+- ParadoxPE phase refactor and lower serial world-step fraction
 - `rayon` hot-path exit
 - `Bevy` runtime-path exit
+- `wgpu` shipping render-path exit
 - regression validation
 - final docs and release notes
 
 Exit criteria:
 
-- `v0.5.0` can be shipped without pretending the core still depends on generic schedulers
+- `v0.5.0` can be shipped without depending on generic schedulers or `wgpu` in shipping runtime
 
 ## Validation Gates
 
@@ -457,12 +583,12 @@ execution.
 
 The most productive order for `v0.5.0` is:
 
-1. render optimization and texture/effects foundation
-2. ParadoxPE phase refactor
-3. MPS ownership expansion
-4. `rayon` hot-path removal
-5. final Bevy independence cleanup
-6. release hardening + docs + validation
+1. Workstream F first: 2D foundation (`side-view` + `chunked tile world` + dig/place basics)
+2. Workstream A: render stack optimization
+3. Workstream B: effects + texture support
+4. Workstream D with `F3` bridge: MPS ownership expansion and 2D-ready runtime overlap
+5. Workstream E: Rayon / Bevy / WGPU independence cleanup
+6. final release hardening + docs + validation
 
 This order matters because it avoids doing dependency cleanup before the replacement execution path
 is strong enough.

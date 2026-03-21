@@ -13,7 +13,7 @@ in `src/` crates (not benchmark-only code).
 - `tileline-alpha-plan.md`: Alpha A1 scope for `.tlsprite` list editor, MAS scaffold, and theme baseline
 - `tileline-pre-beta-fsr-plan.md`: pre-beta milestones with FSR 1.0, adaptive quality, and full input accessibility
 - `tileline-beta-roadmap.md`: phased beta roadmap, integration milestones, and deferred scope
-- `tileline-v0.5.0-roadmap.md`: v0.5.0 roadmap for render optimization, effects/textures, ParadoxPE + MPS revision, and Rayon/Bevy independence
+- `tileline-v0.5.0-roadmap.md`: v0.5.0 roadmap for 2D-first execution, render optimization, effects/textures, ParadoxPE + MPS revision, and Rayon/Bevy/WGPU independence
 - `tileline-v0.3.0-foundation.md`: v0.3.0 foundation scope for runtime FSR policy and decentralized NPS topology
 - `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
 - `nps-runtime-plan.md`: canonical NPS channel, tick, snapshot, and transport runtime plan
