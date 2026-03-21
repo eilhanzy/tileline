@@ -32,8 +32,10 @@ impl TlAppRuntime {
             return;
         }
         self.present_mode = mode;
-        self.config.present_mode = mode;
-        self.surface.configure(&self.device, &self.config);
+        if let (Some(surface), Some(config)) = (self.surface.as_ref(), self.config.as_mut()) {
+            config.present_mode = mode;
+            surface.configure(&self.device, config);
+        }
     }
 
     pub(super) fn apply_fps_cap_runtime(&mut self, cap: Option<f32>) {
@@ -152,9 +154,11 @@ impl TlAppRuntime {
             return;
         }
         self.size = new_size;
-        self.config.width = new_size.width;
-        self.config.height = new_size.height;
-        self.surface.configure(&self.device, &self.config);
+        if let (Some(surface), Some(config)) = (self.surface.as_ref(), self.config.as_mut()) {
+            config.width = new_size.width;
+            config.height = new_size.height;
+            surface.configure(&self.device, config);
+        }
         self.renderer.resize(
             &self.device,
             &self.queue,
@@ -233,6 +237,18 @@ impl TlAppRuntime {
             );
         }
 
+        if let Some(preset) = frame_eval.performance_preset {
+            let scenario = match preset {
+                TlscriptPerformancePreset::Showcase8k => PerformanceContractScenario::Showcase8k,
+                TlscriptPerformancePreset::Dense30k => PerformanceContractScenario::Dense30k,
+                TlscriptPerformancePreset::Extreme60k => PerformanceContractScenario::Extreme60k,
+            };
+            let _ = self.apply_performance_contract_preset(scenario);
+        }
+        if let Some(profile) = frame_eval.gfx_profile {
+            let _ = self.apply_gfx_profile(profile.as_str());
+        }
+
         if let Some(speed) = frame_eval.camera_move_speed {
             self.camera.set_move_speed(speed);
         }
@@ -295,9 +311,9 @@ impl TlAppRuntime {
             self.distance_retune_timer = if mobile_path { 0.22 } else { 0.28 };
         }
         self.refresh_distance_blur_state(mobile_path);
-        let effective_load_frame_time_ms =
-            (self.frame_time_ema_ms + self.frame_time_jitter_ema_ms * 0.35)
-                .max(frame_ms.min(self.frame_time_ema_ms.max(frame_ms)));
+        let effective_load_frame_time_ms = (self.frame_time_ema_ms
+            + self.frame_time_jitter_ema_ms * 0.35)
+            .max(frame_ms.min(self.frame_time_ema_ms.max(frame_ms)));
         let (mut load_plan, smoothed_pressure, raw_pressure) = choose_runtime_load_plan(
             self.fps_tracker.ema_fps(),
             effective_load_frame_time_ms,
@@ -815,7 +831,7 @@ impl TlAppRuntime {
         );
         let t_compile_begin = Instant::now();
         let scene_us = (t_compile_begin - t_scene_begin).as_micros() as u64;
-        let draw = self.draw_compiler.compile(&frame);
+        let mut draw = self.draw_compiler.compile(&frame);
         let t_upload_begin = Instant::now();
         let compile_us = (t_upload_begin - t_compile_begin).as_micros() as u64;
 
@@ -849,72 +865,97 @@ impl TlAppRuntime {
             };
         }
 
-        let upload = self
-            .renderer
-            .upload_draw_frame(&self.device, &self.queue, &draw);
-        self.renderer.upload_overlay_sprites(
-            &self.device,
-            &self.queue,
-            self.console_overlay_sprites.as_slice(),
-        );
-        let rt_status = self.renderer.ray_tracing_status();
-        let fsr_status = self.renderer.fsr_status();
+        let (upload, rt_status, fsr_status, upload_us, present_us) = match &mut self.renderer {
+            TlAppRenderer::Wgpu(renderer) => {
+                let upload = renderer.upload_draw_frame(&self.device, &self.queue, &draw);
+                renderer.upload_overlay_sprites(
+                    &self.device,
+                    &self.queue,
+                    self.console_overlay_sprites.as_slice(),
+                );
+                let rt_status = renderer.ray_tracing_status();
+                let fsr_status = renderer.fsr_status();
 
-        let output = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                let surface = self
+                    .surface
+                    .as_ref()
+                    .ok_or("wgpu renderer selected without a configured surface")?;
+                let config = self
+                    .config
+                    .as_ref()
+                    .ok_or("wgpu renderer selected without a configured surface config")?;
+                let output = match surface.get_current_texture() {
+                    Ok(frame) => frame,
+                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                        surface.configure(&self.device, config);
+                        return Ok(());
+                    }
+                    Err(wgpu::SurfaceError::OutOfMemory) => {
+                        return Err("wgpu surface out of memory".into());
+                    }
+                    Err(wgpu::SurfaceError::Timeout) => {
+                        return Ok(());
+                    }
+                    Err(wgpu::SurfaceError::Other) => {
+                        return Ok(());
+                    }
+                };
+
+                let view = output
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("tlapp-encoder"),
+                        });
+                renderer.build_rt_acceleration_structures(&mut encoder);
+                renderer.encode(
+                    &mut encoder,
+                    &view,
+                    wgpu::Color {
+                        r: 0.07,
+                        g: 0.09,
+                        b: 0.12,
+                        a: 1.0,
+                    },
+                );
+                renderer.encode_overlay_sprites(&mut encoder, &view);
+                self.queue.submit(Some(encoder.finish()));
+                let t_present_begin = Instant::now();
+                let upload_us = (t_present_begin - t_upload_begin).as_micros() as u64;
+                output.present();
+                let present_us = (Instant::now() - t_present_begin).as_micros() as u64;
+                (upload, rt_status, fsr_status, upload_us, present_us)
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                return Err("wgpu surface out of memory".into());
-            }
-            Err(wgpu::SurfaceError::Timeout) => {
-                return Ok(());
-            }
-            Err(wgpu::SurfaceError::Other) => {
-                return Ok(());
+            #[cfg(target_os = "linux")]
+            TlAppRenderer::Vulkan(renderer) => {
+                if !self.console_overlay_sprites.is_empty() {
+                    draw.sprites
+                        .extend(self.console_overlay_sprites.iter().cloned());
+                    draw.stats.sprite_instances = draw.sprites.len();
+                    draw.stats.total_draw_calls = draw.stats.opaque_batches
+                        + draw.stats.transparent_batches
+                        + usize::from(draw.stats.sprite_instances > 0);
+                }
+                let _frame_result = renderer.render_draw_frame(self.script_frame_index, &draw)?;
+                let upload = renderer.last_upload_stats();
+                let rt_status = renderer.ray_tracing_status();
+                let fsr_status = renderer.fsr_status();
+                let upload_us = (Instant::now() - t_upload_begin).as_micros() as u64;
+                (upload, rt_status, fsr_status, upload_us, 0)
             }
         };
 
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tlapp-encoder"),
-            });
-        self.renderer.build_rt_acceleration_structures(&mut encoder);
-        self.renderer.encode(
-            &mut encoder,
-            &view,
-            wgpu::Color {
-                r: 0.07,
-                g: 0.09,
-                b: 0.12,
-                a: 1.0,
-            },
-        );
-        self.renderer.encode_overlay_sprites(&mut encoder, &view);
-        self.queue.submit(Some(encoder.finish()));
-        let t_present_begin = Instant::now();
-        let upload_us = (t_present_begin - t_upload_begin).as_micros() as u64;
-        output.present();
-
         let frame_end = Instant::now();
-        let present_us = (frame_end - t_present_begin).as_micros() as u64;
         let frame_time = (frame_end - frame_begin).as_secs_f32();
         let report = self.fps_tracker.record(frame_end, frame_time);
         if self.uncapped_dynamic_fps_hint {
             let measured_hint = self.fps_tracker.dynamic_uncapped_fps_hint();
             let upper_hint = if mobile_path { 144.0 } else { 1_200.0 };
-            self.fps_limit_hint = smooth_fps_limit_hint(
-                self.fps_limit_hint,
-                measured_hint,
-                mobile_path,
-            )
-            .clamp(48.0, upper_hint);
+            self.fps_limit_hint =
+                smooth_fps_limit_hint(self.fps_limit_hint, measured_hint, mobile_path)
+                    .clamp(48.0, upper_hint);
         }
         let pacing_suffix = self
             .frame_cap_interval
@@ -967,8 +1008,10 @@ impl TlAppRuntime {
         let step_timings = self.world.borrow().last_step_timings;
         let physics_pool_metrics = self.world.thread_pool_metrics();
         let console_suffix = self.console_title_suffix();
+        let render_backend_label = self.renderer.backend_label();
+        let performance_contract = self.performance_contract_evaluation();
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | Phys {}µs (int {}µs bp {}µs np {}µs sv {}µs sl {}µs) | {:?} {} {:?}{}{}{}{}{}{}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | Phys {}µs (int {}µs bp {}µs np {}µs sv {}µs sl {}µs) | contract {}:{} | {:?} {} {} {:?}{}{}{}{}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
             self.tick_hz,
@@ -988,7 +1031,10 @@ impl TlAppRuntime {
             step_timings.narrowphase_us,
             step_timings.solver_us,
             step_timings.sleep_us,
+            performance_contract.scenario.label(),
+            performance_contract.tier.label(),
             self.adapter_backend,
+            render_backend_label,
             scheduler_label,
             self.present_mode,
             if self.scheduler_fallback_applied {
@@ -1017,8 +1063,15 @@ impl TlAppRuntime {
             let w = self.world.borrow();
             let broadphase = w.broadphase().stats();
             let narrowphase = w.narrowphase().stats();
+            let performance_contract = evaluate_performance_contract(
+                tick.live_balls,
+                report,
+                self.tick_hz,
+                self.frame_time_jitter_ema_ms,
+                self.runtime_bridge_telemetry.physics_lag_frames,
+            );
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | phys_workers: {} | phys_queue: {} | phys_inflight: {} | phys_frame: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {} | pipeline: {} | bridge_path: {} | queued_plan_depth: {} | bridge_pump_published: {} | bridge_pump_drained: {} | physics_lag_frames: {} | bridge_fallback: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | contract: {}:{} stable={} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | phys_workers: {} | phys_queue: {} | phys_inflight: {} | phys_frame: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | render_backend: {} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {} | pipeline: {} | bridge_path: {} | queued_plan_depth: {} | bridge_pump_published: {} | bridge_pump_drained: {} | physics_lag_frames: {} | bridge_fallback: {}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
@@ -1044,6 +1097,9 @@ impl TlAppRuntime {
                 self.last_distance_blurred,
                 self.last_framebuffer_fill_ratio,
                 self.framebuffer_fill_ema,
+                performance_contract.scenario.label(),
+                performance_contract.tier.label(),
+                performance_contract.stable,
                 self.rt_mode,
                 rt_status.active,
                 rt_status.rt_dynamic_count,
@@ -1071,6 +1127,7 @@ impl TlAppRuntime {
                 narrowphase.manifolds,
                 self.platform,
                 self.adapter_backend,
+                render_backend_label,
                 scheduler_label,
                 self.present_mode,
                 self.scheduler_fallback_applied,

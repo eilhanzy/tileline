@@ -8,7 +8,9 @@
 //!   race on the same write path
 
 use crate::topology::{CpuClass, CpuTopology};
-use crate::worker::{spawn_worker, WorkerLaunchConfig, WorkerSignal};
+use crate::worker::{
+    normalize_worker_launch_for_host, spawn_worker, WorkerLaunchConfig, WorkerSignal,
+};
 use crossbeam::queue::SegQueue;
 use std::io;
 use std::ops::Range;
@@ -532,7 +534,7 @@ impl MpsThreadPool {
         let mut workers = Vec::with_capacity(config.worker_core_ids.len());
         for (worker_index, &logical_core_id) in config.worker_core_ids.iter().enumerate() {
             let class = topology.class_for_core(logical_core_id);
-            let launch = WorkerLaunchConfig::new(
+            let mut launch = WorkerLaunchConfig::new(
                 worker_index,
                 logical_core_id,
                 class,
@@ -541,6 +543,7 @@ impl MpsThreadPool {
                 config.spin_iterations,
                 config.yield_iterations,
             );
+            normalize_worker_launch_for_host(&mut launch);
 
             let worker_queue = Arc::clone(&queue);
             let worker_signal = Arc::clone(&signal);

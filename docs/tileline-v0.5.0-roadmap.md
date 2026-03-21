@@ -36,8 +36,10 @@ features**, not on inventing entirely new subsystems.
 - an optimized forward + hybrid RT render path that is stable in the runtime
 - a usable effects layer on top of the current shader/light stack
 - first-class texture support in the runtime scene/material path
+- a first-class SPIR-V shader path for the raw Vulkan backend
 - a more aggressively parallel ParadoxPE execution model
 - a stricter MPS-driven runtime execution path with fewer serial bottlenecks
+- a Linux-first raw Vulkan backend inside `tl-core`
 - no shipping runtime dependence on `Bevy` scheduling/tasks
 - no hot-path runtime/physics dependence on `rayon`
 
@@ -57,6 +59,8 @@ These are intentionally out of scope for `v0.5.0`:
 
 - RT can be enabled without destabilizing the main runtime path
 - lights, shaders, textures, and effects all work together in the same scene path
+- SPIR-V is a supported, documented shader/runtime artifact path for Vulkan scene rendering
+- the Vulkan backend migration path inside `tl-core` is real and no longer speculative
 - ParadoxPE no longer depends on coarse serial stepping in its main hot path
 - MPS is the primary CPU execution path for physics/runtime jobs
 - no `Bevy App/System/bevy_tasks` dependence exists in shipping runtime execution
@@ -99,18 +103,29 @@ Current status:
 
 - functional
 - not yet fully optimized around real runtime scene pressure
+- canonical SPIR-V shader artifacts now live in-repo under `tl-core/assets/shaders/spv/`
+- the active Vulkan path no longer depends on runtime GLSL compilation or `shaderc` build glue
 
 Target work:
 
 - reduce redundant pipeline/state churn
 - harden material/shader parameter flow from `.tlsprite` / runtime scene data
 - formalize shader feature flags instead of ad-hoc branching
+- formalize a canonical SPIR-V path:
+  - keep precompiled `.spv` modules as the official shader artifact for shipping/runtime-facing Vulkan paths
+  - move any optional shader authoring/transpile tools outside the hot build/runtime path
+  - pipeline-layout compatibility rules that are explicit instead of implicit
+- add shader/pipeline cache policy around SPIR-V modules so common scene boots do not constantly
+  rebuild the same pipelines
 - ensure the runtime scene path does not require showcase-only glue
 
 Acceptance gates:
 
 - no per-frame shader-state thrash for common scene updates
 - one stable default material path for opaque + transparent scene content
+- SPIR-V-backed Vulkan pipelines can be built repeatably without ad-hoc shader glue
+- in-repo `.spv` artifacts are consumed by the Vulkan backend without runtime GLSL compilation
+  or `shaderc` in the active path
 
 ### A3. Lighting Optimization
 
@@ -130,6 +145,42 @@ Acceptance gates:
 
 - lighting remains visually stable under scene motion
 - light-heavy scenes do not explode frame variance without explanation
+
+### A4. Raw Vulkan Backend Transition
+
+Current status:
+
+- a Linux-first `ash` backend skeleton exists in `tl-core`
+- the broader runtime still contains `wgpu`-based paths that must be migrated deliberately
+- native MultiGPU bootstrap/probing now exists in the Vulkan backend as an execution skeleton
+- runtime now has an explicit draw-frame -> Vulkan snapshot handoff helper
+- runtime now also has a first dedicated Vulkan scene renderer adapter that can turn
+  `RuntimeDrawFrame` into a Vulkan snapshot + explicit MGPU frame plan
+- TLApp runtime now carries a shared renderer surface (`wgpu` + experimental `TILELINE_RENDERER=vulkan`)
+  so the cutover can proceed incrementally without forking the app loop
+- bridge/sync submission tracking has started moving from raw `wgpu` types toward backend-neutral handles
+
+Target work:
+
+- move `tl-core` graphics ownership toward raw Vulkan objects and frame resources
+- define the canonical `Render N` state-snapshot handoff from MPS/ParadoxPE into Vulkan-visible
+  memory
+- treat SPIR-V as the official shader artifact for the Vulkan path, not a side detail
+- preserve explicit multi-GPU planning so the Vulkan path does not regress from current GMS/MGS
+  topology work
+- keep present mode policy Linux-first with `MAILBOX` preference and explicit fallback to
+  `IMMEDIATE` / `FIFO`
+- formalize command pool / command buffer / persistently mapped buffer ownership
+- migrate runtime-facing renderer layers toward the new Vulkan backend in stages instead of
+  breaking the engine in one patch
+
+Acceptance gates:
+
+- `tl-core` contains a real Vulkan backend implementation instead of a placeholder document
+- double-buffered snapshot upload is explicit and renderer-owned
+- SPIR-V module creation / pipeline creation is part of the canonical Vulkan backend path
+- secondary GPU planning remains a first-class migration concern instead of being deferred away
+- the migration path away from `wgpu` is documented, incremental, and testable
 
 ## Workstream B: Effects And Texture Support
 
@@ -291,8 +342,10 @@ Target contents:
 
 - RT optimization pass 1
 - shader/light cleanup
+- SPIR-V shader artifact path and pipeline-cache groundwork
 - first stable effect hooks
 - initial texture pipeline
+- raw Vulkan backend backbone in `tl-core`
 
 Exit criteria:
 
@@ -328,17 +381,71 @@ Exit criteria:
 
 The release should be validated against real workloads, not just compile success.
 
+## Performance Contract
+
+`v0.5.0` needs a measurable performance contract, not just a generic promise to "optimize later."
+
+The contract below assumes Linux-first desktop validation on a Ryzen 9 7900-class CPU for the
+primary gate, with Orange Pi 5 / Mali remaining the mobile-class sanity gate.
+
+### Scenario Matrix
+
+| Scenario | Current rough baseline | `v0.5.0` ship target | Stretch target |
+| --- | --- | --- | --- |
+| `8k` balls / normal showcase density | `58-60 FPS`, generally good behavior, some variance under load spikes | lock `60 FPS` with lower frame variance, `240-360 Hz` effective tick, no sustained governor hunting | `60+ FPS` uncapped, `360+ Hz` effective tick with stable frametime pacing |
+| `30k` balls / dense contact stress | about `16 FPS`, about `40 Hz` tick, major drops still possible | `30-45 FPS`, `90-140 Hz` effective tick, bounded degradation instead of collapse | `45-60 FPS`, `140+ Hz` tick in lighter-contact windows, no catastrophic drop clusters |
+| `60k` objects / extreme stress scene | not a stable production path yet | keep simulation alive with predictable quality reduction, `15-25 FPS`, `60-90 Hz` effective tick, no runaway oscillation | `25-35 FPS`, `90+ Hz` tick with island/contact budgeting and stronger scene partitioning |
+
+Notes:
+
+- `8k` is the "must feel polished" gate.
+- `30k` is the main "serious engine credibility" gate.
+- `60k` is a stress/diagnostic gate, not a requirement for full visual parity.
+
+### Frametiming And Stability Rules
+
+These rules matter as much as average FPS:
+
+- no long governor oscillation where tick rate repeatedly overshoots and then panics downward
+- no unexplained frame-time spikes that cannot be diagnosed from telemetry
+- `P95` frame time on the `8k` desktop gate should stay near the `60 FPS` band
+- `30k` scenes may degrade, but degradation must be smooth, bounded, and explainable
+- overload should prefer:
+  - render quality reduction
+  - light/effect budget reduction
+  - RT fallback
+  instead of physics collapse or random drop clusters
+
+### Expected Gain Budget
+
+This is the rough optimization budget for the `v0.5.0` independence work:
+
+| Work item | Expected gain | Main reason |
+| --- | --- | --- |
+| `wgpu -> raw Vulkan` | about `5%-25%` typical, occasionally higher | lower render overhead, explicit present/upload control, tighter pipeline ownership |
+| `rayon/bevy_tasks -> MPS-native scheduler` | about `20%-80%` depending on scene | lower scheduling overhead, better overlap, better core ownership |
+| `ParadoxPE phase refactor + solver/contact scaling` | about `1.3x-2x` on heavy dense scenes | less serial hot-path work, lower contact explosion cost |
+| Combined `v0.5.0` payoff | roughly `1.3x-2x` realistic, `2x-3x` stretch on the worst current bottlenecks | render + scheduler + physics scaling improvements stacking together |
+
+This budget is intentionally conservative. The biggest wins should come from removing serial
+bottlenecks in ParadoxPE and making MPS the real hot-path scheduler, with raw Vulkan then
+removing renderer overhead and giving us better control over pacing, uploads, and MultiGPU
+execution.
+
 ### Desktop Gate
 
 - target class: Ryzen 9 7900 / similar high-core desktop CPU
 - TLApp showcase remains stable under normal runtime usage
 - dense physics scenes show lower frame-time variance than current `v0.4.x`/early `v0.5.0` state
+- `8k` scene satisfies the ship-target row in the scenario matrix
+- `30k` scene satisfies the ship-target row in the scenario matrix
 
 ### ARM / Mobile-Class Gate
 
 - Orange Pi 5 / Mali path remains functional
 - mobile-safe presets still behave predictably
 - fallback quality controls remain bounded and understandable
+- mobile-safe scenes should keep `30+ FPS` behavior without severe chopping
 
 ### Regression Gate
 

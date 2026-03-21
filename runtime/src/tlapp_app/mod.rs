@@ -28,7 +28,7 @@ pub use self::console::{
     RuntimeConsoleLogFilter, RuntimeConsoleLogLevel, RuntimeConsoleLogLine, RuntimeConsoleState,
     RuntimeConsoleTailFollow,
 };
-pub use self::fps::{FpsTracker, RenderDistanceStats};
+pub use self::fps::{FpsReport, FpsTracker, RenderDistanceStats};
 
 use crate::physics_mps_runner::{PhysicsMpsRunner, PhysicsStepToken};
 use crate::{
@@ -37,14 +37,15 @@ use crate::{
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, resolve_tileline_version_query,
     tileline_version_entries, BounceTankRuntimePatch, BounceTankSceneConfig,
     BounceTankSceneController, BounceTankTickMetrics, DrawPathCompiler, FsrConfig, FsrDynamoConfig,
-    FsrMode, FsrQualityPreset, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode,
+    FsrMode, FsrQualityPreset, FsrStatus, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode,
     RuntimeBridgeConfig, RuntimeBridgeMetrics, RuntimeBridgeOrchestrator, RuntimeBridgePath,
     RuntimeBridgeTick, RuntimeFramePlan, RuntimePlatform, SceneFrameInstances, ScenePrimitive3d,
     SpriteInstance, SpriteKind, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
     TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
-    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
-    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlspriteHotReloadEvent, TlspriteProgram,
-    TlspriteProgramCache, TlspriteWatchReloader, WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION,
+    TlscriptPerformancePreset, TlscriptShowcaseConfig, TlscriptShowcaseControlInput,
+    TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
+    TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader,
+    VulkanSceneRenderer, VulkanSceneRendererConfig, WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION,
     MAX_SCENE_LIGHTS,
 };
 use gms::safe_default_required_limits_for_adapter;
@@ -101,6 +102,9 @@ const CONSOLE_HELP_COMMANDS: &[&str] = &[
     "sim.status | sim.pause | sim.resume | sim.step <n> | sim.reset",
     "scene.reload | sprite.reload | script.reload",
     "perf.snapshot",
+    "perf.contract [8k|30k|60k]",
+    "perf.report [8k|30k|60k]",
+    "perf.preset <8k|30k|60k>",
     "phys.gravity <x y z>",
     "phys.substeps <auto|n>",
     "cam.speed <v>",
@@ -165,6 +169,165 @@ struct RuntimeBridgeTelemetry {
     latest_submission_tasks: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerformanceContractScenario {
+    Showcase8k,
+    Dense30k,
+    Extreme60k,
+}
+
+impl PerformanceContractScenario {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Showcase8k => "8k",
+            Self::Dense30k => "30k",
+            Self::Extreme60k => "60k",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "8k" | "showcase" | "showcase8k" => Some(Self::Showcase8k),
+            "30k" | "dense" | "dense30k" => Some(Self::Dense30k),
+            "60k" | "extreme" | "extreme60k" | "stress" => Some(Self::Extreme60k),
+            _ => None,
+        }
+    }
+
+    fn reference_balls(self) -> usize {
+        match self {
+            Self::Showcase8k => 8_000,
+            Self::Dense30k => 30_000,
+            Self::Extreme60k => 60_000,
+        }
+    }
+
+    fn recommended_gfx_profile(self, mobile_path: bool) -> &'static str {
+        match (self, mobile_path) {
+            (Self::Showcase8k, false) => "high",
+            (Self::Showcase8k, true) => "med",
+            (Self::Dense30k, false) => "med",
+            (Self::Dense30k, true) => "low",
+            (Self::Extreme60k, _) => "low",
+        }
+    }
+
+    fn recommended_spawn_per_tick(self, logical_threads: usize, mobile_path: bool) -> usize {
+        let thread_scale = if mobile_path {
+            (logical_threads as f32 / 6.0).clamp(0.70, 2.20)
+        } else {
+            (logical_threads as f32 / 8.0).clamp(0.75, 4.0)
+        };
+        let base = match (self, mobile_path) {
+            (Self::Showcase8k, true) => 72.0,
+            (Self::Showcase8k, false) => 96.0,
+            (Self::Dense30k, true) => 88.0,
+            (Self::Dense30k, false) => 128.0,
+            (Self::Extreme60k, true) => 96.0,
+            (Self::Extreme60k, false) => 144.0,
+        };
+        (base * thread_scale).round().clamp(48.0, 512.0) as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerformanceContractTier {
+    BelowTarget,
+    ApproachingTarget,
+    ShipTarget,
+    StretchTarget,
+}
+
+impl PerformanceContractTier {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BelowTarget => "below",
+            Self::ApproachingTarget => "approaching",
+            Self::ShipTarget => "ship",
+            Self::StretchTarget => "stretch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PerformanceContractTarget {
+    ship_fps_min: f32,
+    ship_tick_min: f32,
+    stretch_fps_min: f32,
+    stretch_tick_min: f32,
+    ship_stddev_ms_max: f32,
+    ship_jitter_ms_max: f32,
+    stretch_stddev_ms_max: f32,
+    stretch_jitter_ms_max: f32,
+    lag_frame_budget: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PerformanceContractEvaluation {
+    scenario: PerformanceContractScenario,
+    tier: PerformanceContractTier,
+    stable: bool,
+    live_balls: usize,
+    fps_ema: f32,
+    fps_avg: f32,
+    tick_hz: f32,
+    frame_stddev_ms: f32,
+    jitter_ms: f32,
+    lag_frames: u64,
+}
+
+impl PerformanceContractEvaluation {
+    fn compact_summary(&self) -> String {
+        format!(
+            "contract={} {} stable={} balls={} fps={:.1}/{:.1} tick={:.0}Hz stddev={:.2}ms jitter={:.2}ms lag={}",
+            self.scenario.label(),
+            self.tier.label(),
+            if self.stable { "yes" } else { "no" },
+            self.live_balls,
+            self.fps_ema,
+            self.fps_avg,
+            self.tick_hz,
+            self.frame_stddev_ms,
+            self.jitter_ms,
+            self.lag_frames,
+        )
+    }
+
+    fn detail_lines(&self) -> [String; 3] {
+        let target = performance_contract_target(self.scenario);
+        [
+            format!(
+                "perf contract | scenario={} ref_balls={} live_balls={} tier={} stable={}",
+                self.scenario.label(),
+                self.scenario.reference_balls(),
+                self.live_balls,
+                self.tier.label(),
+                self.stable
+            ),
+            format!(
+                "  current | fps ema={:.1} avg={:.1} tick={:.0}Hz stddev={:.2}ms jitter={:.2}ms lag_frames={}",
+                self.fps_ema,
+                self.fps_avg,
+                self.tick_hz,
+                self.frame_stddev_ms,
+                self.jitter_ms,
+                self.lag_frames
+            ),
+            format!(
+                "  target  | ship fps>={:.1} tick>={:.0}Hz stddev<={:.1}ms jitter<={:.1}ms | stretch fps>={:.1} tick>={:.0}Hz stddev<={:.1}ms jitter<={:.1}ms",
+                target.ship_fps_min,
+                target.ship_tick_min,
+                target.ship_stddev_ms_max,
+                target.ship_jitter_ms_max,
+                target.stretch_fps_min,
+                target.stretch_tick_min,
+                target.stretch_stddev_ms_max,
+                target.stretch_jitter_ms_max,
+            ),
+        ]
+    }
+}
+
 impl RuntimeBridgeTelemetry {
     fn new(bridge_path: RuntimeBridgePath) -> Self {
         Self {
@@ -209,6 +372,194 @@ impl RuntimeBridgeTelemetry {
     }
 }
 
+fn performance_contract_target(scenario: PerformanceContractScenario) -> PerformanceContractTarget {
+    match scenario {
+        PerformanceContractScenario::Showcase8k => PerformanceContractTarget {
+            ship_fps_min: 58.0,
+            ship_tick_min: 240.0,
+            stretch_fps_min: 60.0,
+            stretch_tick_min: 360.0,
+            ship_stddev_ms_max: 4.0,
+            ship_jitter_ms_max: 2.0,
+            stretch_stddev_ms_max: 2.5,
+            stretch_jitter_ms_max: 1.2,
+            lag_frame_budget: 2,
+        },
+        PerformanceContractScenario::Dense30k => PerformanceContractTarget {
+            ship_fps_min: 30.0,
+            ship_tick_min: 90.0,
+            stretch_fps_min: 45.0,
+            stretch_tick_min: 140.0,
+            ship_stddev_ms_max: 10.0,
+            ship_jitter_ms_max: 5.5,
+            stretch_stddev_ms_max: 6.0,
+            stretch_jitter_ms_max: 3.5,
+            lag_frame_budget: 3,
+        },
+        PerformanceContractScenario::Extreme60k => PerformanceContractTarget {
+            ship_fps_min: 15.0,
+            ship_tick_min: 60.0,
+            stretch_fps_min: 25.0,
+            stretch_tick_min: 90.0,
+            ship_stddev_ms_max: 16.0,
+            ship_jitter_ms_max: 8.0,
+            stretch_stddev_ms_max: 10.0,
+            stretch_jitter_ms_max: 5.5,
+            lag_frame_budget: 4,
+        },
+    }
+}
+
+fn choose_performance_contract_scenario(live_balls: usize) -> PerformanceContractScenario {
+    const SCENARIOS: [PerformanceContractScenario; 3] = [
+        PerformanceContractScenario::Showcase8k,
+        PerformanceContractScenario::Dense30k,
+        PerformanceContractScenario::Extreme60k,
+    ];
+    SCENARIOS
+        .into_iter()
+        .min_by_key(|scenario| live_balls.abs_diff(scenario.reference_balls()))
+        .unwrap_or(PerformanceContractScenario::Showcase8k)
+}
+
+fn evaluate_performance_contract_for_scenario(
+    scenario: PerformanceContractScenario,
+    live_balls: usize,
+    fps: FpsReport,
+    tick_hz: f32,
+    jitter_ms: f32,
+    lag_frames: u64,
+) -> PerformanceContractEvaluation {
+    let target = performance_contract_target(scenario);
+    let ship_stable = fps.frame_time_stddev_ms <= target.ship_stddev_ms_max
+        && jitter_ms <= target.ship_jitter_ms_max
+        && lag_frames <= target.lag_frame_budget;
+    let stretch_stable = fps.frame_time_stddev_ms <= target.stretch_stddev_ms_max
+        && jitter_ms <= target.stretch_jitter_ms_max
+        && lag_frames <= target.lag_frame_budget.saturating_sub(1).max(1);
+    let ship_ready =
+        fps.ema_fps >= target.ship_fps_min && tick_hz >= target.ship_tick_min && ship_stable;
+    let stretch_ready = fps.ema_fps >= target.stretch_fps_min
+        && tick_hz >= target.stretch_tick_min
+        && stretch_stable;
+    let approaching = fps.ema_fps >= target.ship_fps_min * 0.82
+        && tick_hz >= target.ship_tick_min * 0.75
+        && fps.frame_time_stddev_ms <= target.ship_stddev_ms_max * 1.35
+        && jitter_ms <= target.ship_jitter_ms_max * 1.35;
+    let tier = if stretch_ready {
+        PerformanceContractTier::StretchTarget
+    } else if ship_ready {
+        PerformanceContractTier::ShipTarget
+    } else if approaching {
+        PerformanceContractTier::ApproachingTarget
+    } else {
+        PerformanceContractTier::BelowTarget
+    };
+
+    PerformanceContractEvaluation {
+        scenario,
+        tier,
+        stable: ship_stable,
+        live_balls,
+        fps_ema: fps.ema_fps,
+        fps_avg: fps.avg_fps,
+        tick_hz,
+        frame_stddev_ms: fps.frame_time_stddev_ms,
+        jitter_ms,
+        lag_frames,
+    }
+}
+
+fn evaluate_performance_contract(
+    live_balls: usize,
+    fps: FpsReport,
+    tick_hz: f32,
+    jitter_ms: f32,
+    lag_frames: u64,
+) -> PerformanceContractEvaluation {
+    let scenario = choose_performance_contract_scenario(live_balls);
+    evaluate_performance_contract_for_scenario(
+        scenario, live_balls, fps, tick_hz, jitter_ms, lag_frames,
+    )
+}
+
+#[cfg(test)]
+mod performance_contract_tests {
+    use super::*;
+
+    #[test]
+    fn picks_nearest_performance_contract_scenario() {
+        assert_eq!(
+            choose_performance_contract_scenario(7_900),
+            PerformanceContractScenario::Showcase8k
+        );
+        assert_eq!(
+            choose_performance_contract_scenario(28_500),
+            PerformanceContractScenario::Dense30k
+        );
+        assert_eq!(
+            choose_performance_contract_scenario(58_000),
+            PerformanceContractScenario::Extreme60k
+        );
+    }
+
+    #[test]
+    fn marks_dense_30k_ship_target_when_metrics_clear_gate() {
+        let evaluation = evaluate_performance_contract(
+            30_200,
+            FpsReport {
+                instant_fps: 34.0,
+                ema_fps: 33.5,
+                avg_fps: 32.8,
+                frame_time_stddev_ms: 7.2,
+            },
+            108.0,
+            4.1,
+            2,
+        );
+        assert_eq!(evaluation.scenario, PerformanceContractScenario::Dense30k);
+        assert_eq!(evaluation.tier, PerformanceContractTier::ShipTarget);
+        assert!(evaluation.stable);
+    }
+
+    #[test]
+    fn parses_named_performance_contract_scenarios() {
+        assert_eq!(
+            PerformanceContractScenario::parse("8k"),
+            Some(PerformanceContractScenario::Showcase8k)
+        );
+        assert_eq!(
+            PerformanceContractScenario::parse("dense"),
+            Some(PerformanceContractScenario::Dense30k)
+        );
+        assert_eq!(
+            PerformanceContractScenario::parse("stress"),
+            Some(PerformanceContractScenario::Extreme60k)
+        );
+        assert_eq!(PerformanceContractScenario::parse("weird"), None);
+    }
+
+    #[test]
+    fn can_evaluate_against_explicit_scenario() {
+        let evaluation = evaluate_performance_contract_for_scenario(
+            PerformanceContractScenario::Extreme60k,
+            30_200,
+            FpsReport {
+                instant_fps: 21.0,
+                ema_fps: 20.0,
+                avg_fps: 19.5,
+                frame_time_stddev_ms: 9.0,
+            },
+            72.0,
+            4.5,
+            2,
+        );
+        assert_eq!(evaluation.scenario, PerformanceContractScenario::Extreme60k);
+        assert_eq!(evaluation.tier, PerformanceContractTier::ShipTarget);
+        assert!(evaluation.stable);
+    }
+}
+
 pub fn run_from_env() -> Result<(), Box<dyn Error>> {
     configure_parallel_runtime();
     if cfg!(debug_assertions) {
@@ -246,6 +597,22 @@ fn configure_parallel_runtime() {
             Err(err) => eprintln!("[mps] rayon global thread pool unchanged: {err}"),
         }
     });
+}
+
+fn prefer_vulkan_runtime_renderer() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            env::var("TILELINE_RENDERER")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase()),
+            Some(value) if value == "vulkan" || value == "vk"
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 fn gms_supported_on_platform(platform: RuntimePlatform, adapter_info: &wgpu::AdapterInfo) -> bool {
@@ -296,7 +663,7 @@ fn resolve_project_scheduler(
 
 struct AdapterBootstrap {
     instance: wgpu::Instance,
-    surface: wgpu::Surface<'static>,
+    surface: Option<wgpu::Surface<'static>>,
     adapter: wgpu::Adapter,
     bootstrap_note: String,
 }
@@ -306,12 +673,12 @@ fn request_adapter_with_platform_policy(
     platform: RuntimePlatform,
 ) -> Result<AdapterBootstrap, Box<dyn Error>> {
     let request_adapter = |instance: &wgpu::Instance,
-                           surface: &wgpu::Surface<'static>|
+                           surface: Option<&wgpu::Surface<'static>>|
      -> Result<wgpu::Adapter, String> {
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
-            compatible_surface: Some(surface),
+            compatible_surface: surface,
         }))
         .map_err(|err| format!("request_adapter failed: {err}"))
     };
@@ -322,11 +689,11 @@ fn request_adapter_with_platform_policy(
             ..Default::default()
         });
         let vk_surface = vk_instance.create_surface(Arc::clone(window))?;
-        match request_adapter(&vk_instance, &vk_surface) {
+        match request_adapter(&vk_instance, Some(&vk_surface)) {
             Ok(vk_adapter) => {
                 return Ok(AdapterBootstrap {
                     instance: vk_instance,
-                    surface: vk_surface,
+                    surface: Some(vk_surface),
                     adapter: vk_adapter,
                     bootstrap_note: "vulkan-first path active".to_string(),
                 });
@@ -334,7 +701,8 @@ fn request_adapter_with_platform_policy(
             Err(vk_err) => {
                 let fallback_instance = wgpu::Instance::default();
                 let fallback_surface = fallback_instance.create_surface(Arc::clone(window))?;
-                if let Ok(fallback_adapter) = request_adapter(&fallback_instance, &fallback_surface)
+                if let Ok(fallback_adapter) =
+                    request_adapter(&fallback_instance, Some(&fallback_surface))
                 {
                     let info = fallback_adapter.get_info();
                     return Err(build_vulkan_unavailable_message(
@@ -349,11 +717,23 @@ fn request_adapter_with_platform_policy(
     }
 
     let instance = wgpu::Instance::default();
+    if prefer_vulkan_runtime_renderer() {
+        let adapter = request_adapter(&instance, None)?;
+        return Ok(AdapterBootstrap {
+            instance,
+            surface: None,
+            adapter,
+            bootstrap_note:
+                "desktop adapter probe without wgpu surface (raw Vulkan renderer selected)"
+                    .to_string(),
+        });
+    }
+
     let surface = instance.create_surface(Arc::clone(window))?;
-    let adapter = request_adapter(&instance, &surface)?;
+    let adapter = request_adapter(&instance, Some(&surface))?;
     Ok(AdapterBootstrap {
         instance,
-        surface,
+        surface: Some(surface),
         adapter,
         bootstrap_note: "desktop default adapter path".to_string(),
     })
@@ -625,10 +1005,10 @@ struct TlAppRuntime {
     file_io_root: PathBuf,
     window: Arc<Window>,
     _instance: wgpu::Instance,
-    surface: wgpu::Surface<'static>,
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
+    config: Option<wgpu::SurfaceConfiguration>,
     size: PhysicalSize<u32>,
     world: PhysicsMpsRunner,
     /// Pending async physics step submitted before last GPU upload.
@@ -639,7 +1019,7 @@ struct TlAppRuntime {
     scene: BounceTankSceneController,
     draw_compiler: DrawPathCompiler,
     hud: TelemetryHudComposer,
-    renderer: WgpuSceneRenderer,
+    renderer: TlAppRenderer,
     camera: FreeCameraController,
     sprite_loader: Option<TlspriteWatchReloader>,
     sprite_cache: Option<TlspriteProgramCache>,
@@ -722,6 +1102,157 @@ struct TlAppRuntime {
     /// Current smoothed render scale maintained by Dynamo FSR (starts at 1.0 = native).
     fsr_dynamo_scale: f32,
     shutdown_prepared: bool,
+}
+
+enum TlAppRenderer {
+    Wgpu(WgpuSceneRenderer),
+    #[cfg(target_os = "linux")]
+    Vulkan(VulkanSceneRenderer),
+}
+
+impl TlAppRenderer {
+    fn backend_label(&self) -> &'static str {
+        match self {
+            Self::Wgpu(_) => "wgpu",
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(_) => "vulkan",
+        }
+    }
+
+    fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
+        match self {
+            Self::Wgpu(renderer) => renderer.resize(device, queue, width, height),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => {
+                if let Err(err) = renderer.resize(PhysicalSize::new(width, height)) {
+                    eprintln!("[vulkan renderer] resize failed: {err}");
+                }
+            }
+        }
+    }
+
+    fn set_camera_view(
+        &mut self,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        eye: [f32; 3],
+        target: [f32; 3],
+    ) {
+        match self {
+            Self::Wgpu(renderer) => renderer.set_camera_view(queue, width, height, eye, target),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.set_camera_view(width, height, eye, target),
+        }
+    }
+
+    fn set_ray_tracing_mode(&mut self, queue: &wgpu::Queue, mode: RayTracingMode) {
+        match self {
+            Self::Wgpu(renderer) => renderer.set_ray_tracing_mode(queue, mode),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.set_ray_tracing_mode(mode),
+        }
+    }
+
+    fn set_fsr_config(&mut self, queue: &wgpu::Queue, config: FsrConfig) {
+        match self {
+            Self::Wgpu(renderer) => renderer.set_fsr_config(queue, config),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.set_fsr_config(config),
+        }
+    }
+
+    fn set_msaa_sample_count(&mut self, device: &wgpu::Device, count: u32) {
+        match self {
+            Self::Wgpu(renderer) => renderer.set_msaa_sample_count(device, count),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.set_msaa_sample_count(count),
+        }
+    }
+
+    fn msaa_sample_count(&self) -> u32 {
+        match self {
+            Self::Wgpu(renderer) => renderer.msaa_sample_count(),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.msaa_sample_count(),
+        }
+    }
+
+    fn set_force_full_fbx_sphere(&mut self, force: bool) {
+        match self {
+            Self::Wgpu(renderer) => renderer.set_force_full_fbx_sphere(force),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.set_force_full_fbx_sphere(force),
+        }
+    }
+
+    fn bind_fbx_mesh_slot_from_path(
+        &mut self,
+        device: &wgpu::Device,
+        slot: u8,
+        path: &Path,
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(renderer) => renderer.bind_fbx_mesh_slot_from_path(device, slot, path),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.bind_fbx_mesh_slot_from_path(slot, path),
+        }
+    }
+
+    fn bind_builtin_sphere_mesh_slot(
+        &mut self,
+        device: &wgpu::Device,
+        slot: u8,
+        high_quality: bool,
+    ) {
+        match self {
+            Self::Wgpu(renderer) => {
+                renderer.bind_builtin_sphere_mesh_slot(device, slot, high_quality)
+            }
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.bind_builtin_sphere_mesh_slot(slot, high_quality),
+        }
+    }
+
+    fn ray_tracing_status(&self) -> crate::SceneRayTracingStatus {
+        match self {
+            Self::Wgpu(renderer) => renderer.ray_tracing_status(),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.ray_tracing_status(),
+        }
+    }
+
+    fn fsr_status(&self) -> FsrStatus {
+        match self {
+            Self::Wgpu(renderer) => renderer.fsr_status(),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.fsr_status(),
+        }
+    }
+
+    fn world_to_ndc(&self, world_pos: [f32; 3]) -> Option<[f32; 3]> {
+        match self {
+            Self::Wgpu(renderer) => renderer.world_to_ndc(world_pos),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.world_to_ndc(world_pos),
+        }
+    }
+
+    fn camera_eye(&self) -> [f32; 3] {
+        match self {
+            Self::Wgpu(renderer) => renderer.camera_eye(),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.camera_eye(),
+        }
+    }
+
+    fn world_radius_to_ndc_half_size(&self, world_radius: f32, clip_w: f32) -> f32 {
+        match self {
+            Self::Wgpu(renderer) => renderer.world_radius_to_ndc_half_size(world_radius, clip_w),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.world_radius_to_ndc_half_size(world_radius, clip_w),
+        }
+    }
 }
 
 struct FailSoftRuntime {
@@ -823,6 +1354,12 @@ fn merge_showcase_output(
 ) {
     merge_runtime_patch(&mut merged.patch, next.patch);
     merge_light_overrides(&mut merged.light_overrides, &next.light_overrides);
+    if next.performance_preset.is_some() {
+        merged.performance_preset = next.performance_preset;
+    }
+    if next.gfx_profile.is_some() {
+        merged.gfx_profile = next.gfx_profile;
+    }
     if next.rt_mode.is_some() {
         merged.rt_mode = next.rt_mode;
     }
@@ -1048,7 +1585,7 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
 }
 
 fn bind_renderer_meshes_from_tlsprite(
-    renderer: &mut WgpuSceneRenderer,
+    renderer: &mut TlAppRenderer,
     device: &wgpu::Device,
     sprite_path: &Path,
     program: &TlspriteProgram,
@@ -1322,16 +1859,16 @@ fn physics_safe_tick_ceiling_hz(
     Some(ceiling.clamp(24.0, hard_cap))
 }
 
-fn smooth_fps_limit_hint(
-    current_hint_hz: f32,
-    measured_hint_hz: f32,
-    mobile_path: bool,
-) -> f32 {
+fn smooth_fps_limit_hint(current_hint_hz: f32, measured_hint_hz: f32, mobile_path: bool) -> f32 {
     let current_hint_hz = current_hint_hz.max(24.0);
     let measured_hint_hz = measured_hint_hz.max(24.0);
     let ramp_up = measured_hint_hz > current_hint_hz;
     let alpha = if ramp_up {
-        if mobile_path { 0.05 } else { 0.06 }
+        if mobile_path {
+            0.05
+        } else {
+            0.06
+        }
     } else if mobile_path {
         0.16
     } else {

@@ -24,6 +24,8 @@
 //! - `tlsprite_editor_cli`: runtime-owned CLI entry for list-mode `.tlsprite` editing
 //! - `tlscript_showcase`: `.tlscript` showcase compile/evaluate bootstrap
 //! - `tlsprite_editor`: list-mode `.tlsprite` editor model + lavender Alpha theme
+//! - `vulkan_snapshot`: draw-frame -> raw Vulkan snapshot translation helpers
+//! - `vulkan_scene_renderer`: runtime adapter over `tl-core` raw Vulkan backend
 //! - `wgpu_scene_renderer`: backend implementation for draw-path + HUD sprite rendering
 //! - `wgpu_render_loop`: canonical `wgpu` submit/present integration hooks
 
@@ -55,6 +57,9 @@ mod tlsprite_editor;
 mod tlsprite_editor_cli;
 mod upscaler;
 mod versioning;
+#[cfg(target_os = "linux")]
+mod vulkan_scene_renderer;
+mod vulkan_snapshot;
 mod wgpu_render_loop;
 mod wgpu_scene_renderer;
 
@@ -142,9 +147,10 @@ pub use tlscript_parallel::{
     TlscriptParallelRuntimeMetrics, TlscriptWorkChunk,
 };
 pub use tlscript_showcase::{
-    compile_tlscript_showcase, TlscriptCoordinateSpace, TlscriptShowcaseCompileOutcome,
-    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
-    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
+    compile_tlscript_showcase, TlscriptCoordinateSpace, TlscriptGfxProfile,
+    TlscriptPerformancePreset, TlscriptShowcaseCompileOutcome, TlscriptShowcaseConfig,
+    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
+    TlscriptShowcaseProgram,
 };
 pub use tlsprite::{
     compile_tlsprite, compile_tlsprite_pack, compile_tlsprite_with_extra_roots, load_tlsprite_pack,
@@ -165,6 +171,12 @@ pub use versioning::{
     resolve_tileline_version_query, tileline_version_entries, TilelineVersionEntry, ENGINE_ID,
     ENGINE_VERSION,
 };
+#[cfg(target_os = "linux")]
+pub use vulkan_scene_renderer::{
+    VulkanSceneRenderer, VulkanSceneRendererConfig, VulkanSceneRendererError,
+    VulkanSceneRendererFrameResult,
+};
+pub use vulkan_snapshot::{build_vulkan_render_snapshot, VulkanSnapshotBuildStats};
 pub use wgpu_render_loop::{
     FrameExecutionTelemetry, PreAlphaFrameExecution, PreAlphaSystemsExecution,
     SecondaryHelperSubmitOutcome, WgpuRenderLoopCoordinator, WgpuRenderLoopMetrics,

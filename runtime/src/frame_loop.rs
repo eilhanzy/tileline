@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use tl_core::{
     AdaptiveBufferDecision, BridgeFrameId, BridgeFramePlan, BridgeMpsSubmission, GpuQueueLane,
-    MpsGmsBridge, MpsGmsBridgeConfig, MpsGmsBridgeMetrics,
+    GpuSubmissionHandle, GpuSubmissionWaiter, MpsGmsBridge, MpsGmsBridgeConfig,
+    MpsGmsBridgeMetrics,
 };
 
 /// Runtime orchestrator configuration.
@@ -211,9 +212,9 @@ impl FrameLoopRuntime {
     pub fn record_frame_submissions(
         &mut self,
         frame_id: BridgeFrameId,
-        primary_submission: Option<wgpu::SubmissionIndex>,
-        secondary_submission: Option<wgpu::SubmissionIndex>,
-        transfer_submission: Option<wgpu::SubmissionIndex>,
+        primary_submission: Option<GpuSubmissionHandle>,
+        secondary_submission: Option<GpuSubmissionHandle>,
+        transfer_submission: Option<GpuSubmissionHandle>,
     ) -> FrameSubmissionRecordResult {
         let mut result = FrameSubmissionRecordResult::default();
 
@@ -252,15 +253,15 @@ impl FrameLoopRuntime {
     /// Non-blocking present readiness probe (portable fence poll equivalent).
     pub fn try_reconcile_present_nonblocking(
         &mut self,
-        primary_device: &wgpu::Device,
-        secondary_device: Option<&wgpu::Device>,
-        transfer_device: Option<&wgpu::Device>,
+        primary_waiter: &dyn GpuSubmissionWaiter,
+        secondary_waiter: Option<&dyn GpuSubmissionWaiter>,
+        transfer_waiter: Option<&dyn GpuSubmissionWaiter>,
     ) -> Option<tl_core::ComposeBarrierState> {
         self.present_reconcile_calls = self.present_reconcile_calls.saturating_add(1);
         let state = self.bridge.try_reconcile_present_nonblocking(
-            primary_device,
-            secondary_device,
-            transfer_device,
+            primary_waiter,
+            secondary_waiter,
+            transfer_waiter,
         );
         if let Some(state) = state.as_ref() {
             if state.ready {
@@ -276,14 +277,14 @@ impl FrameLoopRuntime {
     /// Budgeted present reconcile (bounded wait, default bridge sync policy is 0.8ms).
     pub fn reconcile_present(
         &mut self,
-        primary_device: &wgpu::Device,
-        secondary_device: Option<&wgpu::Device>,
-        transfer_device: Option<&wgpu::Device>,
+        primary_waiter: &dyn GpuSubmissionWaiter,
+        secondary_waiter: Option<&dyn GpuSubmissionWaiter>,
+        transfer_waiter: Option<&dyn GpuSubmissionWaiter>,
     ) -> Option<tl_core::ComposeBarrierState> {
         self.present_reconcile_calls = self.present_reconcile_calls.saturating_add(1);
         let state =
             self.bridge
-                .reconcile_present(primary_device, secondary_device, transfer_device);
+                .reconcile_present(primary_waiter, secondary_waiter, transfer_waiter);
         if let Some(state) = state.as_ref() {
             if state.ready {
                 self.present_reconcile_ready = self.present_reconcile_ready.saturating_add(1);

@@ -57,6 +57,7 @@ pub struct DrawInstance3d {
     pub base_color_rgba: [f32; 4],
     pub material_params: [f32; 4], // roughness, metallic, emissive_strength, primitive_code
     pub emissive_rgb: [f32; 3],
+    pub texture_index: u32,
 }
 
 /// One 3D batch ready for backend draw encoding.
@@ -194,6 +195,7 @@ fn pack_draw_instance(instance: &SceneInstance3d) -> DrawInstance3d {
             primitive_code,
         ],
         emissive_rgb: emissive,
+        texture_index: instance.material.texture_slot as u32,
     }
 }
 

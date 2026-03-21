@@ -20,7 +20,9 @@ use tl_core::{
 
 use crate::scene::{BounceTankRuntimePatch, RayTracingMode, SceneLightOverride};
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 75] = [
+const SHOWCASE_BUILTIN_CALLS: [&str; 77] = [
+    "set_gfx_profile",
+    "set_perf_preset",
     "set_spawn_per_tick",
     "set_target_ball_count",
     "set_container_size",
@@ -103,6 +105,61 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 75] = [
 pub enum TlscriptCoordinateSpace {
     World,
     Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlscriptGfxProfile {
+    Low,
+    Med,
+    High,
+    Ultra,
+}
+
+impl TlscriptGfxProfile {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "med" | "medium" => Some(Self::Med),
+            "high" => Some(Self::High),
+            "ultra" => Some(Self::Ultra),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Med => "med",
+            Self::High => "high",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlscriptPerformancePreset {
+    Showcase8k,
+    Dense30k,
+    Extreme60k,
+}
+
+impl TlscriptPerformancePreset {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "8k" | "showcase" | "showcase8k" => Some(Self::Showcase8k),
+            "30k" | "dense" | "dense30k" => Some(Self::Dense30k),
+            "60k" | "extreme" | "extreme60k" | "stress" => Some(Self::Extreme60k),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Showcase8k => "8k",
+            Self::Dense30k => "30k",
+            Self::Extreme60k => "60k",
+        }
+    }
 }
 
 /// Showcase script compiler settings.
@@ -243,6 +300,8 @@ impl Default for TlscriptShowcaseControlInput {
 pub struct TlscriptShowcaseFrameOutput {
     pub patch: BounceTankRuntimePatch,
     pub light_overrides: Vec<SceneLightOverride>,
+    pub performance_preset: Option<TlscriptPerformancePreset>,
+    pub gfx_profile: Option<TlscriptGfxProfile>,
     pub ball_metallic: Option<f32>,
     pub ball_roughness: Option<f32>,
     pub rt_mode: Option<RayTracingMode>,
@@ -495,6 +554,8 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         TlscriptShowcaseFrameOutput {
             patch: state.patch,
             light_overrides: state.light_overrides_values(),
+            performance_preset: state.performance_preset,
+            gfx_profile: state.gfx_profile,
             ball_metallic: state.ball_metallic,
             ball_roughness: state.ball_roughness,
             rt_mode: state.rt_mode,
@@ -726,6 +787,8 @@ struct EvalState {
     vars: HashMap<String, DemoValue>,
     patch: BounceTankRuntimePatch,
     light_overrides: HashMap<u64, SceneLightOverride>,
+    performance_preset: Option<TlscriptPerformancePreset>,
+    gfx_profile: Option<TlscriptGfxProfile>,
     rt_mode: Option<RayTracingMode>,
     force_full_fbx_sphere: Option<bool>,
     camera_move_speed: Option<f32>,
@@ -754,6 +817,8 @@ impl EvalState {
             vars: HashMap::new(),
             patch: BounceTankRuntimePatch::default(),
             light_overrides: HashMap::new(),
+            performance_preset: None,
+            gfx_profile: None,
             rt_mode: None,
             force_full_fbx_sphere: None,
             camera_move_speed: None,
@@ -887,8 +952,83 @@ fn numeric_binary(left: DemoValue, right: DemoValue, f: impl FnOnce(f64, f64) ->
     }
 }
 
+fn apply_perf_preset_to_patch(state: &mut EvalState, preset: &str) {
+    let Some(preset_kind) = TlscriptPerformancePreset::parse(preset) else {
+        state.warn(format!(
+            "set_perf_preset expects '8k'|'30k'|'60k', got '{preset}'"
+        ));
+        return;
+    };
+    let (target_ball_count, spawn_per_tick, gfx_profile) = match preset_kind {
+        TlscriptPerformancePreset::Showcase8k => (8_000, 96, TlscriptGfxProfile::High),
+        TlscriptPerformancePreset::Dense30k => (30_000, 128, TlscriptGfxProfile::Med),
+        TlscriptPerformancePreset::Extreme60k => (60_000, 144, TlscriptGfxProfile::Low),
+    };
+    state.performance_preset = Some(preset_kind);
+    state.gfx_profile = Some(gfx_profile);
+    state.patch.target_ball_count = Some(target_ball_count);
+    state.patch.spawn_per_tick = Some(spawn_per_tick);
+}
+
+fn apply_gfx_profile_to_state(state: &mut EvalState, profile: &str) {
+    let Some(profile_kind) = TlscriptGfxProfile::parse(profile) else {
+        state.warn(format!(
+            "set_gfx_profile expects 'low'|'med'|'high'|'ultra', got '{profile}'"
+        ));
+        return;
+    };
+    state.gfx_profile = Some(profile_kind);
+}
+
+fn apply_profile_bool_to_state(state: &mut EvalState, profile: bool) {
+    state.gfx_profile = Some(if profile {
+        TlscriptGfxProfile::High
+    } else {
+        TlscriptGfxProfile::Low
+    });
+}
+
+fn apply_profile_numeric_to_state(state: &mut EvalState, numeric: i64) {
+    state.gfx_profile = Some(match numeric {
+        n if n <= 0 => TlscriptGfxProfile::Low,
+        1 => TlscriptGfxProfile::Med,
+        2 => TlscriptGfxProfile::High,
+        _ => TlscriptGfxProfile::Ultra,
+    });
+}
+
+fn apply_perf_preset_from_value(state: &mut EvalState, value: &DemoValue) {
+    match value {
+        DemoValue::Str(preset) => apply_perf_preset_to_patch(state, preset),
+        DemoValue::Int(value) => apply_perf_preset_to_patch(state, &value.to_string()),
+        DemoValue::Float(value) => {
+            apply_perf_preset_to_patch(state, &(value.round() as i64).to_string())
+        }
+        DemoValue::Bool(value) => {
+            apply_perf_preset_to_patch(state, if *value { "8k" } else { "30k" })
+        }
+    }
+}
+
+fn apply_gfx_profile_from_value(state: &mut EvalState, value: &DemoValue) {
+    match value {
+        DemoValue::Str(profile) => apply_gfx_profile_to_state(state, profile),
+        DemoValue::Int(value) => apply_profile_numeric_to_state(state, *value),
+        DemoValue::Float(value) => apply_profile_numeric_to_state(state, value.round() as i64),
+        DemoValue::Bool(value) => apply_profile_bool_to_state(state, *value),
+    }
+}
+
 fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalState) {
     match name {
+        "set_gfx_profile" => match args {
+            [value] => apply_gfx_profile_from_value(state, value),
+            _ => state.warn("set_gfx_profile expects 1 arg"),
+        },
+        "set_perf_preset" => match args {
+            [value] => apply_perf_preset_from_value(state, value),
+            _ => state.warn("set_perf_preset expects 1 arg"),
+        },
         "set_spawn_per_tick" => match args {
             [v] => state.patch.spawn_per_tick = Some(v.to_i64().max(0) as usize),
             _ => state.warn("set_spawn_per_tick expects 1 arg"),
@@ -1716,6 +1856,50 @@ mod tests {
         assert!((out.patch.scatter_strength.unwrap_or(0.0) - 0.16).abs() < 1e-6);
         assert!((out.patch.initial_speed_min.unwrap_or(0.0) - 0.35).abs() < 1e-6);
         assert!((out.patch.initial_speed_max.unwrap_or(0.0) - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn supports_performance_preset_builtin() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_perf_preset(\"30k\")\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.patch.target_ball_count, Some(30_000));
+        assert_eq!(out.patch.spawn_per_tick, Some(128));
+        assert_eq!(
+            out.performance_preset,
+            Some(TlscriptPerformancePreset::Dense30k)
+        );
+        assert_eq!(out.gfx_profile, Some(TlscriptGfxProfile::Med));
+    }
+
+    #[test]
+    fn supports_gfx_profile_builtin() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_gfx_profile(\"ultra\")\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.gfx_profile, Some(TlscriptGfxProfile::Ultra));
     }
 
     #[test]

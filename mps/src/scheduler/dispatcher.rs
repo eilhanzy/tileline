@@ -6,7 +6,9 @@
 
 use super::{TaskPayload, WasmTask};
 use crate::topology::{CpuClass, CpuTopology};
-use crate::worker::{spawn_worker, WorkerLaunchConfig, WorkerSignal};
+use crate::worker::{
+    normalize_worker_launch_for_host, spawn_worker, WorkerLaunchConfig, WorkerSignal,
+};
 use crossbeam::queue::{ArrayQueue, SegQueue};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -645,6 +647,7 @@ impl TaskDispatcher {
             if !config.enable_realtime_policy {
                 launch.realtime_priority = None;
             }
+            normalize_worker_launch_for_host(&mut launch);
 
             let handle = spawn_worker(launch, Arc::clone(&signal), {
                 let worker_queue = Arc::clone(&queue);

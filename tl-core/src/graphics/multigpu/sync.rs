@@ -18,7 +18,7 @@ use gms::{
     GpuAdapterProfile, MemoryTopology, MultiGpuSyncPlan, SharedBufferKey, SharedBufferLease,
     SharedBufferLockError,
 };
-use wgpu::{Device, PollError, PollStatus, SubmissionIndex};
+use wgpu::{Device, PollError, PollStatus};
 
 const APPLE_VENDOR_ID: u32 = 0x106B;
 
@@ -31,6 +31,64 @@ pub enum GpuQueueLane {
     Secondary,
     /// Transfer/copy queue (host-bridge uploads/readbacks), if the runtime separates it.
     Transfer,
+}
+
+/// Backend-neutral submission handle recorded against a queue lane.
+#[derive(Debug, Clone)]
+pub enum GpuSubmissionHandle {
+    Wgpu(wgpu::SubmissionIndex),
+    Serial(u64),
+}
+
+/// Portable result of polling or waiting on a GPU queue submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuSubmissionWaitStatus {
+    Ready,
+    Pending,
+    TimedOut,
+    Invalid,
+}
+
+/// Backend-neutral submission wait surface used by the synchronizer.
+pub trait GpuSubmissionWaiter {
+    fn wait_submission(
+        &self,
+        submission: &GpuSubmissionHandle,
+        timeout: Option<Duration>,
+    ) -> GpuSubmissionWaitStatus;
+}
+
+/// `wgpu` adapter that preserves the old queue-submission wait behavior behind a neutral trait.
+pub struct WgpuSubmissionWaiter<'a> {
+    device: &'a Device,
+}
+
+impl<'a> WgpuSubmissionWaiter<'a> {
+    pub fn new(device: &'a Device) -> Self {
+        Self { device }
+    }
+}
+
+impl GpuSubmissionWaiter for WgpuSubmissionWaiter<'_> {
+    fn wait_submission(
+        &self,
+        submission: &GpuSubmissionHandle,
+        timeout: Option<Duration>,
+    ) -> GpuSubmissionWaitStatus {
+        let GpuSubmissionHandle::Wgpu(submission) = submission else {
+            return GpuSubmissionWaitStatus::Invalid;
+        };
+        match self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission.clone()),
+            timeout,
+        }) {
+            Ok(status) if status.wait_finished() => GpuSubmissionWaitStatus::Ready,
+            Ok(PollStatus::Poll) => GpuSubmissionWaitStatus::Pending,
+            Ok(_) => GpuSubmissionWaitStatus::Pending,
+            Err(PollError::Timeout) => GpuSubmissionWaitStatus::TimedOut,
+            Err(PollError::WrongSubmissionIndex(_, _)) => GpuSubmissionWaitStatus::Invalid,
+        }
+    }
 }
 
 /// Backend sync style hint for the runtime.
@@ -181,9 +239,9 @@ struct TrackedFrame {
     require_primary: bool,
     require_secondary: bool,
     require_transfer: bool,
-    primary_submission: Option<SubmissionIndex>,
-    secondary_submission: Option<SubmissionIndex>,
-    transfer_submission: Option<SubmissionIndex>,
+    primary_submission: Option<GpuSubmissionHandle>,
+    secondary_submission: Option<GpuSubmissionHandle>,
+    transfer_submission: Option<GpuSubmissionHandle>,
 }
 
 impl TrackedFrame {
@@ -200,7 +258,7 @@ impl TrackedFrame {
         }
     }
 
-    fn submission_mut(&mut self, lane: GpuQueueLane) -> &mut Option<SubmissionIndex> {
+    fn submission_mut(&mut self, lane: GpuQueueLane) -> &mut Option<GpuSubmissionHandle> {
         match lane {
             GpuQueueLane::Primary => &mut self.primary_submission,
             GpuQueueLane::Secondary => &mut self.secondary_submission,
@@ -337,7 +395,7 @@ impl MultiGpuFrameSynchronizer {
         &mut self,
         frame_id: u64,
         lane: GpuQueueLane,
-        submission: SubmissionIndex,
+        submission: GpuSubmissionHandle,
     ) -> bool {
         if let Some(frame) = self
             .pending_frames
@@ -357,14 +415,14 @@ impl MultiGpuFrameSynchronizer {
     /// whether composition may proceed.
     pub fn try_reconcile_nonblocking(
         &mut self,
-        primary_device: &Device,
-        secondary_device: Option<&Device>,
-        transfer_device: Option<&Device>,
+        primary_waiter: &dyn GpuSubmissionWaiter,
+        secondary_waiter: Option<&dyn GpuSubmissionWaiter>,
+        transfer_waiter: Option<&dyn GpuSubmissionWaiter>,
     ) -> ComposeBarrierState {
         self.reconcile_impl(
-            primary_device,
-            secondary_device,
-            transfer_device,
+            primary_waiter,
+            secondary_waiter,
+            transfer_waiter,
             WaitMode::NonBlocking,
         )
     }
@@ -375,14 +433,14 @@ impl MultiGpuFrameSynchronizer {
     /// final composition/present. The wait is bounded so the CPU does not park for long.
     pub fn reconcile_for_present(
         &mut self,
-        primary_device: &Device,
-        secondary_device: Option<&Device>,
-        transfer_device: Option<&Device>,
+        primary_waiter: &dyn GpuSubmissionWaiter,
+        secondary_waiter: Option<&dyn GpuSubmissionWaiter>,
+        transfer_waiter: Option<&dyn GpuSubmissionWaiter>,
     ) -> ComposeBarrierState {
         self.reconcile_impl(
-            primary_device,
-            secondary_device,
-            transfer_device,
+            primary_waiter,
+            secondary_waiter,
+            transfer_waiter,
             WaitMode::Budgeted(self.config.compose_wait_budget),
         )
     }
@@ -472,9 +530,9 @@ impl MultiGpuFrameSynchronizer {
 
     fn reconcile_impl(
         &mut self,
-        primary_device: &Device,
-        secondary_device: Option<&Device>,
-        transfer_device: Option<&Device>,
+        primary_waiter: &dyn GpuSubmissionWaiter,
+        secondary_waiter: Option<&dyn GpuSubmissionWaiter>,
+        transfer_waiter: Option<&dyn GpuSubmissionWaiter>,
         wait_mode: WaitMode,
     ) -> ComposeBarrierState {
         let Some(frame) = self.pending_frames.front().cloned() else {
@@ -504,23 +562,21 @@ impl MultiGpuFrameSynchronizer {
         };
 
         let primary_ready = self.resolve_lane_readiness(
-            primary_device,
+            primary_waiter,
             frame.primary_submission,
             frame.require_primary,
             &mut remaining_wait_budget,
             &mut state,
         );
         let secondary_ready = self.resolve_lane_readiness(
-            secondary_device.unwrap_or(primary_device),
+            secondary_waiter.unwrap_or(primary_waiter),
             frame.secondary_submission,
             frame.require_secondary,
             &mut remaining_wait_budget,
             &mut state,
         );
         let transfer_ready = self.resolve_lane_readiness(
-            transfer_device
-                .or(secondary_device)
-                .unwrap_or(primary_device),
+            transfer_waiter.or(secondary_waiter).unwrap_or(primary_waiter),
             frame.transfer_submission,
             frame.require_transfer,
             &mut remaining_wait_budget,
@@ -540,8 +596,8 @@ impl MultiGpuFrameSynchronizer {
 
     fn resolve_lane_readiness(
         &mut self,
-        device: &Device,
-        submission: Option<SubmissionIndex>,
+        waiter: &dyn GpuSubmissionWaiter,
+        submission: Option<GpuSubmissionHandle>,
         required: bool,
         remaining_wait_budget: &mut Duration,
         state: &mut ComposeBarrierState,
@@ -557,15 +613,10 @@ impl MultiGpuFrameSynchronizer {
         // First perform a non-blocking targeted readiness check. This gives us a portable
         // fence-like probe without stalling the CPU.
         self.poll_calls = self.poll_calls.saturating_add(1);
-        match device.poll(wgpu::PollType::Wait {
-            submission_index: Some(submission.clone()),
-            timeout: Some(Duration::ZERO),
-        }) {
-            Ok(status) if status.wait_finished() => return true,
-            Ok(PollStatus::Poll) => {}
-            Ok(_) => {}
-            Err(PollError::Timeout) => {}
-            Err(PollError::WrongSubmissionIndex(_, _)) => {
+        match waiter.wait_submission(&submission, Some(Duration::ZERO)) {
+            GpuSubmissionWaitStatus::Ready => return true,
+            GpuSubmissionWaitStatus::Pending | GpuSubmissionWaitStatus::TimedOut => {}
+            GpuSubmissionWaitStatus::Invalid => {
                 self.invalid_submission_waits = self.invalid_submission_waits.saturating_add(1);
                 return false;
             }
@@ -578,17 +629,14 @@ impl MultiGpuFrameSynchronizer {
         let wait_start = Instant::now();
         self.wait_calls = self.wait_calls.saturating_add(1);
         state.waited = true;
-        match device.poll(wgpu::PollType::Wait {
-            submission_index: Some(submission),
-            timeout: Some(*remaining_wait_budget),
-        }) {
-            Ok(status) => {
+        match waiter.wait_submission(&submission, Some(*remaining_wait_budget)) {
+            GpuSubmissionWaitStatus::Ready => {
                 let waited = wait_start.elapsed();
                 state.wait_time = state.wait_time.saturating_add(waited);
                 *remaining_wait_budget = remaining_wait_budget.saturating_sub(waited);
-                status.wait_finished()
+                true
             }
-            Err(PollError::Timeout) => {
+            GpuSubmissionWaitStatus::TimedOut | GpuSubmissionWaitStatus::Pending => {
                 let waited = wait_start.elapsed();
                 state.wait_time = state.wait_time.saturating_add(waited);
                 *remaining_wait_budget = remaining_wait_budget.saturating_sub(waited);
@@ -596,7 +644,7 @@ impl MultiGpuFrameSynchronizer {
                 state.timed_out = true;
                 false
             }
-            Err(PollError::WrongSubmissionIndex(_, _)) => {
+            GpuSubmissionWaitStatus::Invalid => {
                 let waited = wait_start.elapsed();
                 state.wait_time = state.wait_time.saturating_add(waited);
                 *remaining_wait_budget = remaining_wait_budget.saturating_sub(waited);

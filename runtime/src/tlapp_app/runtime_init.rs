@@ -24,7 +24,7 @@ impl TlAppRuntime {
 
         let adapter_bootstrap = request_adapter_with_platform_policy(&window, platform)?;
         let instance = adapter_bootstrap.instance;
-        let surface = adapter_bootstrap.surface;
+        let mut surface = adapter_bootstrap.surface;
         let adapter = adapter_bootstrap.adapter;
         let adapter_info = adapter.get_info();
         eprintln!(
@@ -81,16 +81,40 @@ impl TlAppRuntime {
                 ..Default::default()
             }))?;
 
-        let mut config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .ok_or("surface is not compatible with selected adapter")?;
-        config.present_mode = match options.vsync {
+        let selected_present_mode = match options.vsync {
             VsyncMode::Auto => wgpu::PresentMode::AutoVsync,
             VsyncMode::On => wgpu::PresentMode::Fifo,
             VsyncMode::Off => wgpu::PresentMode::AutoNoVsync,
         };
-        let selected_present_mode = config.present_mode;
-        surface.configure(&device, &config);
+        let mut config = if let Some(surface) = surface.as_ref() {
+            let mut config = surface
+                .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+                .ok_or("surface is not compatible with selected adapter")?;
+            config.present_mode = selected_present_mode;
+            surface.configure(&device, &config);
+            Some(config)
+        } else {
+            None
+        };
+        let mut ensure_wgpu_surface = || -> Result<wgpu::TextureFormat, Box<dyn Error>> {
+            if surface.is_none() {
+                let new_surface = instance.create_surface(Arc::clone(&window))?;
+                let mut new_config = new_surface
+                    .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+                    .ok_or("surface is not compatible with selected adapter")?;
+                new_config.present_mode = selected_present_mode;
+                new_surface.configure(&device, &new_config);
+                let format = new_config.format;
+                surface = Some(new_surface);
+                config = Some(new_config);
+                Ok(format)
+            } else {
+                config
+                    .as_ref()
+                    .map(|config| config.format)
+                    .ok_or_else(|| "wgpu surface exists without config".into())
+            }
+        };
 
         let mut script_runtime = None;
         let mut joint_merged_sprite_program: Option<TlspriteProgram> = None;
@@ -487,22 +511,77 @@ impl TlAppRuntime {
             initial_speed_max: 1.25,
             ..BounceTankSceneConfig::default()
         });
-        let mut renderer = WgpuSceneRenderer::new(
-            &device,
-            &queue,
-            config.format,
-            size.width,
-            size.height,
-            adapter_info.backend,
-            options.msaa,
-        );
-        renderer.set_ray_tracing_mode(&queue, RayTracingMode::Auto);
         let fsr_config = FsrConfig {
             mode: options.fsr_mode,
             quality: options.fsr_quality,
             sharpness: options.fsr_sharpness,
             render_scale_override: options.fsr_scale_override,
         };
+        let mut renderer = if prefer_vulkan_runtime_renderer() {
+            #[cfg(target_os = "linux")]
+            {
+                let present_mode = match options.vsync {
+                    VsyncMode::Auto => tl_core::PresentModePreference::MailboxFirst,
+                    VsyncMode::On => tl_core::PresentModePreference::FifoOnly,
+                    VsyncMode::Off => tl_core::PresentModePreference::ImmediateFirst,
+                };
+                let vk_config = VulkanSceneRendererConfig {
+                    backend: tl_core::VulkanBackendConfig {
+                        present_mode,
+                        max_instances: 65_536,
+                        ..Default::default()
+                    },
+                    prefer_secondary_gpu: true,
+                };
+                match VulkanSceneRenderer::new(window.clone(), vk_config) {
+                    Ok(renderer) => {
+                        eprintln!("[renderer] using raw Vulkan runtime adapter");
+                        TlAppRenderer::Vulkan(renderer)
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[renderer] raw Vulkan runtime adapter failed ({}), falling back to wgpu",
+                            err
+                        );
+                        let format = ensure_wgpu_surface()?;
+                        TlAppRenderer::Wgpu(WgpuSceneRenderer::new(
+                            &device,
+                            &queue,
+                            format,
+                            size.width,
+                            size.height,
+                            adapter_info.backend,
+                            options.msaa,
+                        ))
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let format = ensure_wgpu_surface()?;
+                TlAppRenderer::Wgpu(WgpuSceneRenderer::new(
+                    &device,
+                    &queue,
+                    format,
+                    size.width,
+                    size.height,
+                    adapter_info.backend,
+                    options.msaa,
+                ))
+            }
+        } else {
+            let format = ensure_wgpu_surface()?;
+            TlAppRenderer::Wgpu(WgpuSceneRenderer::new(
+                &device,
+                &queue,
+                format,
+                size.width,
+                size.height,
+                adapter_info.backend,
+                options.msaa,
+            ))
+        };
+        renderer.set_ray_tracing_mode(&queue, RayTracingMode::Auto);
         renderer.set_fsr_config(&queue, fsr_config);
         // Always keep a deterministic high-quality FBX-equivalent mesh in slot 2 so script
         // `set_ball_mesh_slot(2)` stays stable even when tlsprite binding fails.

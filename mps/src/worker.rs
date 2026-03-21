@@ -8,6 +8,7 @@
 
 use crate::topology::CpuClass;
 use std::io;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -31,6 +32,12 @@ pub struct WorkerBootstrapReport {
     pub nice_applied: bool,
     /// `true` when a real-time policy was successfully applied.
     pub realtime_applied: bool,
+    /// Errno returned by the affinity syscall, if any.
+    pub affinity_error: Option<i32>,
+    /// Errno returned by the nice syscall, if any.
+    pub nice_error: Option<i32>,
+    /// Errno returned by the real-time scheduler syscall, if any.
+    pub realtime_error: Option<i32>,
     /// Last observed Linux errno-style failure code, if any.
     pub last_os_error: Option<i32>,
 }
@@ -192,16 +199,16 @@ where
     thread::Builder::new().name(thread_name).spawn(move || {
         let bootstrap = apply_worker_affinity_and_priority(&launch);
         #[cfg(target_os = "linux")]
-        if !bootstrap.affinity_applied
-            || (!bootstrap.realtime_applied && launch.realtime_priority.is_some())
-        {
+        if should_report_bootstrap_error(&launch, &bootstrap) {
             eprintln!(
-                "[mps worker] '{}' bootstrap affinity={} rt={} nice={} errno={:?}",
+                "[mps worker] '{}' bootstrap affinity={} rt={} nice={} affinity_errno={:?} rt_errno={:?} nice_errno={:?}",
                 launch.thread_name,
                 bootstrap.affinity_applied,
                 bootstrap.realtime_applied,
                 bootstrap.nice_applied,
-                bootstrap.last_os_error
+                bootstrap.affinity_error,
+                bootstrap.realtime_error,
+                bootstrap.nice_error,
             );
         }
         entry(launch, signal);
@@ -211,17 +218,125 @@ where
 /// Apply core affinity and thread priority for the current worker thread.
 pub fn apply_worker_affinity_and_priority(launch: &WorkerLaunchConfig) -> WorkerBootstrapReport {
     let mut report = WorkerBootstrapReport::default();
-    report.affinity_applied =
-        pin_current_thread_to_core(launch.logical_core_id, launch.strict_affinity)
-            .inspect_err(|errno| report.last_os_error = Some(*errno))
-            .is_ok();
-    report.realtime_applied = apply_linux_realtime_policy(launch)
-        .inspect_err(|errno| report.last_os_error = Some(*errno))
-        .is_ok();
-    report.nice_applied = set_current_thread_nice(launch.nice_value)
-        .inspect_err(|errno| report.last_os_error = Some(*errno))
-        .is_ok();
+    match pin_current_thread_to_core(launch.logical_core_id, launch.strict_affinity) {
+        Ok(()) => report.affinity_applied = true,
+        Err(errno) => {
+            report.affinity_error = Some(errno);
+            report.last_os_error = Some(errno);
+        }
+    }
+    match apply_linux_realtime_policy(launch) {
+        Ok(()) => report.realtime_applied = true,
+        Err(errno) => {
+            report.realtime_error = Some(errno);
+            report.last_os_error = Some(errno);
+        }
+    }
+    match set_current_thread_nice(launch.nice_value) {
+        Ok(()) => report.nice_applied = true,
+        Err(errno) => {
+            report.nice_error = Some(errno);
+            report.last_os_error = Some(errno);
+        }
+    }
     report
+}
+
+/// Normalize a worker launch request to what the current Linux host is likely
+/// allowed to grant without elevated privileges.
+pub fn normalize_worker_launch_for_host(launch: &mut WorkerLaunchConfig) {
+    #[cfg(target_os = "linux")]
+    {
+        if privileged_scheduler_uplift_available() {
+            return;
+        }
+
+        launch.realtime_priority = None;
+        launch.scheduling_policy = WorkerSchedulingPolicy::Other;
+        if launch.nice_value < 0 {
+            launch.nice_value = 0;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = launch;
+    }
+}
+
+/// Return whether the current process is likely allowed to request privileged
+/// scheduler uplift such as `SCHED_FIFO` or negative nice values.
+pub fn privileged_scheduler_uplift_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(detect_privileged_scheduler_uplift_available)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_privileged_scheduler_uplift_available() -> bool {
+    if let Ok(value) = std::env::var("TILELINE_MPS_PRIVILEGED_SCHED") {
+        let normalized = value.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "1" | "true" | "yes" | "on") {
+            return true;
+        }
+        if matches!(normalized.as_str(), "0" | "false" | "no" | "off") {
+            return false;
+        }
+    }
+
+    unsafe {
+        if libc::geteuid() == 0 {
+            return true;
+        }
+
+        let mut rt_limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_RTPRIO, &mut rt_limit) == 0 && rt_limit.rlim_cur > 0 {
+            return true;
+        }
+
+        let mut nice_limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NICE, &mut nice_limit) == 0 && nice_limit.rlim_cur > 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn should_report_bootstrap_error(
+    launch: &WorkerLaunchConfig,
+    bootstrap: &WorkerBootstrapReport,
+) -> bool {
+    if bootstrap.affinity_error.is_some() {
+        return true;
+    }
+
+    if let Some(errno) = bootstrap.realtime_error {
+        if !is_expected_permission_denial(errno, launch.realtime_priority.is_some()) {
+            return true;
+        }
+    }
+
+    if let Some(errno) = bootstrap.nice_error {
+        if !is_expected_permission_denial(errno, launch.nice_value < 0) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn is_expected_permission_denial(errno: i32, requested_uplift: bool) -> bool {
+    requested_uplift && matches!(errno, libc::EPERM | libc::EACCES)
 }
 
 #[cfg(target_os = "linux")]

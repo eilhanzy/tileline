@@ -4,8 +4,12 @@ version = "0.3.0"
 edition = "2021"
 
 [dependencies]
+ash = "0.38.0"
+ash-window = "0.13.0"
+bytemuck = "1.17.1"
 crossbeam.workspace = true
 wgpu.workspace = true
+winit.workspace = true
 mps = { path = "../mps" }
 gms = { path = "../gms" }
 mgs = { path = "../mgs" }

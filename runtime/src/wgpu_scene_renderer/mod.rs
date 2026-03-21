@@ -3595,6 +3595,7 @@ mod tests {
             base_color_rgba: [1.0, 1.0, 1.0, 1.0],
             material_params: [0.5, 0.0, 0.0, 0.0],
             emissive_rgb: [0.0, 0.0, 0.0],
+            texture_index: 0,
         }
     }
 }

@@ -55,6 +55,8 @@ pub struct SceneMaterial {
     pub roughness: f32,
     pub metallic: f32,
     pub emissive_rgb: [f32; 3],
+    /// Backend-neutral 3D texture indirection slot.
+    pub texture_slot: u16,
     pub shading: ShadingModel,
 }
 
@@ -65,6 +67,7 @@ impl Default for SceneMaterial {
             roughness: 0.6,
             metallic: 0.0,
             emissive_rgb: [0.0, 0.0, 0.0],
+            texture_slot: 0,
             shading: ShadingModel::LitPbr,
         }
     }
@@ -1202,6 +1205,7 @@ impl BounceTankSceneController {
                         roughness: ball.roughness,
                         metallic: ball.metallic,
                         emissive_rgb: [0.0, 0.0, 0.0],
+                        texture_slot: 0,
                         shading: ShadingModel::LitPbr,
                     },
                     casts_shadow: true,
@@ -2127,6 +2131,7 @@ impl BounceTankSceneController {
                 roughness: 0.04,
                 metallic: 0.0,
                 emissive_rgb: [0.05, 0.06, 0.08],
+                texture_slot: 0,
                 shading: ShadingModel::LitPbr,
             },
             casts_shadow: false,
@@ -2194,6 +2199,7 @@ impl BounceTankSceneController {
                     roughness: 0.06,
                     metallic: 0.0,
                     emissive_rgb: [0.05, 0.07, 0.10],
+                    texture_slot: 0,
                     shading: ShadingModel::LitPbr,
                 },
                 casts_shadow: false,
@@ -2335,6 +2341,7 @@ impl BounceTankSceneController {
                     roughness: 0.06,
                     metallic: 0.0,
                     emissive_rgb: [0.06, 0.09, 0.12],
+                    texture_slot: 0,
                     shading: ShadingModel::LitPbr,
                 },
                 casts_shadow: false,

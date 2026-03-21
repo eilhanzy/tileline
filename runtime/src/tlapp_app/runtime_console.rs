@@ -718,6 +718,7 @@ impl TlAppRuntime {
     }
 
     pub(super) fn console_status_line(&self) -> String {
+        let perf_contract = self.performance_contract_evaluation().compact_summary();
         let fsr = self.renderer.fsr_status();
         let rt = self.renderer.ray_tracing_status();
         let fps_cap = self
@@ -755,7 +756,7 @@ impl TlAppRuntime {
             .map(|w| w.path.display().to_string())
             .unwrap_or_else(|| "off".to_string());
         format!(
-            "pipeline={} bridge_path={} queued_plan_depth={} bridge_pump_published={} bridge_pump_drained={} physics_lag_frames={} bridge_fallback={} fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={}",
+            "pipeline={} bridge_path={} queued_plan_depth={} bridge_pump_published={} bridge_pump_drained={} physics_lag_frames={} bridge_fallback={} fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={} {}",
             self.pipeline_mode.as_str(),
             self.runtime_bridge_telemetry.bridge_path.as_str(),
             self.runtime_bridge_telemetry.queued_plan_depth,
@@ -781,8 +782,37 @@ impl TlAppRuntime {
             tailf_state,
             watch_state,
             self.console.script_vars.len(),
-            self.console.script_statements.len()
+            self.console.script_statements.len(),
+            perf_contract,
         )
+    }
+
+    pub(super) fn performance_contract_evaluation(&self) -> PerformanceContractEvaluation {
+        evaluate_performance_contract(
+            self.scene.live_ball_count(),
+            self.fps_tracker.snapshot(),
+            self.tick_hz,
+            self.frame_time_jitter_ema_ms,
+            self.runtime_bridge_telemetry.physics_lag_frames,
+        )
+    }
+
+    pub(super) fn performance_contract_evaluation_for(
+        &self,
+        scenario: Option<PerformanceContractScenario>,
+    ) -> PerformanceContractEvaluation {
+        let live_balls = self.scene.live_ball_count();
+        let fps = self.fps_tracker.snapshot();
+        let tick_hz = self.tick_hz;
+        let jitter_ms = self.frame_time_jitter_ema_ms;
+        let lag_frames = self.runtime_bridge_telemetry.physics_lag_frames;
+        if let Some(scenario) = scenario {
+            evaluate_performance_contract_for_scenario(
+                scenario, live_balls, fps, tick_hz, jitter_ms, lag_frames,
+            )
+        } else {
+            evaluate_performance_contract(live_balls, fps, tick_hz, jitter_ms, lag_frames)
+        }
     }
 
     pub(super) fn console_title_suffix(&self) -> String {
@@ -863,6 +893,8 @@ impl TlAppRuntime {
     }
 
     pub(super) fn sanitize_console_overlay_output(output: &mut TlscriptShowcaseFrameOutput) {
+        output.performance_preset = None;
+        output.gfx_profile = None;
         output.camera_translate_delta = None;
         output.camera_rotate_delta_deg = None;
         output.camera_move_axis = None;
@@ -977,6 +1009,9 @@ impl TlAppRuntime {
                             "sim.reset",
                             "scene.reload | script.reload | sprite.reload",
                             "perf.snapshot",
+                            "perf.contract [8k|30k|60k]",
+                            "perf.report [8k|30k|60k]",
+                            "perf.preset <8k|30k|60k>",
                             "phys.gravity <x y z>",
                             "phys.substeps <auto|n>",
                         ]),
@@ -1128,8 +1163,9 @@ impl TlAppRuntime {
                 let fsr = self.renderer.fsr_status();
                 let rt = self.renderer.ray_tracing_status();
                 let gravity = self.world.borrow().gravity();
+                let perf_contract = self.performance_contract_evaluation();
                 self.console_feedback(format!(
-                    "perf snapshot | pipeline={} bridge_path={} q={} +{} -{} lag={} fallback={} totals[published={} drained={} popped={}] | fps inst={:.1} ema={:.1} avg={:.1} stddev={:.2}ms | frame_ema={:.2}ms jitter_ema={:.2}ms | fill={:.2}/{:.2} | balls={} draw_limit={:?} | substeps={}/{} manual={:?} | grav=[{:.2},{:.2},{:.2}] | rt={:?}/{} dyn={} | fsr={:?}/{:?} scale={:.2} sharp={:.2}",
+                    "perf snapshot | pipeline={} bridge_path={} q={} +{} -{} lag={} fallback={} totals[published={} drained={} popped={}] | fps inst={:.1} ema={:.1} avg={:.1} stddev={:.2}ms | frame_ema={:.2}ms jitter_ema={:.2}ms | fill={:.2}/{:.2} | balls={} target={} draw_limit={:?} | substeps={}/{} manual={:?} | grav=[{:.2},{:.2},{:.2}] | rt={:?}/{} dyn={} | fsr={:?}/{:?} scale={:.2} sharp={:.2} | {}",
                     self.pipeline_mode.as_str(),
                     self.runtime_bridge_telemetry.bridge_path.as_str(),
                     self.runtime_bridge_telemetry.queued_plan_depth,
@@ -1149,6 +1185,7 @@ impl TlAppRuntime {
                     self.last_framebuffer_fill_ratio,
                     self.framebuffer_fill_ema,
                     self.scene.live_ball_count(),
+                    self.scene.config().target_ball_count,
                     self.adaptive_ball_render_limit,
                     self.last_substeps,
                     self.max_substeps,
@@ -1162,8 +1199,127 @@ impl TlAppRuntime {
                     fsr.requested_mode,
                     if fsr.active { "on" } else { "off" },
                     fsr.render_scale,
-                    fsr.sharpness
+                    fsr.sharpness,
+                    perf_contract.compact_summary()
                 ));
+            }
+            "perf.contract" => {
+                let requested_scenario = match parts.next() {
+                    Some(raw) => match PerformanceContractScenario::parse(raw) {
+                        Some(scenario) => Some(scenario),
+                        None => {
+                            self.console_feedback("usage: perf.contract [8k|30k|60k]");
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => None,
+                };
+                for line in self
+                    .performance_contract_evaluation_for(requested_scenario)
+                    .detail_lines()
+                {
+                    self.console_feedback(line);
+                }
+            }
+            "perf.report" => {
+                let requested_scenario = match parts.next() {
+                    Some(raw) => match PerformanceContractScenario::parse(raw) {
+                        Some(scenario) => Some(scenario),
+                        None => {
+                            self.console_feedback("usage: perf.report [8k|30k|60k]");
+                            return RuntimeCommand::Consumed;
+                        }
+                    },
+                    None => None,
+                };
+                let evaluation = self.performance_contract_evaluation_for(requested_scenario);
+                let fps = self.fps_tracker.snapshot();
+                let config = self.scene.config();
+                let fps_cap = self
+                    .frame_cap_interval
+                    .map(|interval| format!("{:.0}", 1.0 / interval.as_secs_f32().max(1e-6)))
+                    .unwrap_or_else(|| "off".to_string());
+                let substeps = self
+                    .manual_max_substeps
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| format!("auto:{}", self.max_substeps));
+                let render_distance = self
+                    .render_distance
+                    .map(|value| format!("{value:.1}"))
+                    .unwrap_or_else(|| "off".to_string());
+                let rt_status = self.renderer.ray_tracing_status();
+                self.console_feedback(format!(
+                    "perf report | scenario={} tier={} stable={} live={} target={} spawn_per_tick={} tick_profile={:?} substeps={} fps_cap={} vsync={:?}",
+                    evaluation.scenario.label(),
+                    evaluation.tier.label(),
+                    evaluation.stable,
+                    evaluation.live_balls,
+                    config.target_ball_count,
+                    config.spawn_per_tick,
+                    self.tick_profile,
+                    substeps,
+                    fps_cap,
+                    self.present_mode,
+                ));
+                self.console_feedback(format!(
+                    "  timing | fps inst={:.1} ema={:.1} avg={:.1} tick={:.0}Hz stddev={:.2}ms jitter={:.2}ms lag={} phys_us={}",
+                    fps.instant_fps,
+                    fps.ema_fps,
+                    fps.avg_fps,
+                    self.tick_hz,
+                    fps.frame_time_stddev_ms,
+                    self.frame_time_jitter_ema_ms,
+                    self.runtime_bridge_telemetry.physics_lag_frames,
+                    self.world.borrow().last_step_timings.total_us(),
+                ));
+                self.console_feedback(format!(
+                    "  render | backend={} scheduler={} pipeline={} render_distance={} adaptive_distance={} distance_blur={:?} fsr={:?}/{:?} scale={:.2} sharpness={:.2} rt={:?}/{} dyn={} adapter={}",
+                    self.renderer.backend_label(),
+                    scheduler_path_label(self.scheduler_path),
+                    self.pipeline_mode.as_str(),
+                    render_distance,
+                    self.adaptive_distance_enabled,
+                    self.distance_blur_mode,
+                    self.fsr_config.mode,
+                    self.fsr_config.quality,
+                    self.fsr_dynamo_scale,
+                    self.fsr_config.sharpness,
+                    self.rt_mode,
+                    rt_status.active,
+                    rt_status.rt_dynamic_count,
+                    self.adapter_name,
+                ));
+                for line in evaluation.detail_lines() {
+                    self.console_feedback(line);
+                }
+            }
+            "perf.preset" => {
+                let Some(raw) = parts.next() else {
+                    self.console_feedback("usage: perf.preset <8k|30k|60k>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(scenario) = PerformanceContractScenario::parse(raw) else {
+                    self.console_feedback("usage: perf.preset <8k|30k|60k>");
+                    return RuntimeCommand::Consumed;
+                };
+                match self.apply_performance_contract_preset(scenario) {
+                    Ok(note) => {
+                        self.console_feedback(note);
+                        let target = performance_contract_target(scenario);
+                        self.console_feedback(format!(
+                            "  preset target | ship fps>={:.1} tick>={:.0}Hz stddev<={:.1}ms jitter<={:.1}ms | stretch fps>={:.1} tick>={:.0}Hz stddev<={:.1}ms jitter<={:.1}ms",
+                            target.ship_fps_min,
+                            target.ship_tick_min,
+                            target.ship_stddev_ms_max,
+                            target.ship_jitter_ms_max,
+                            target.stretch_fps_min,
+                            target.stretch_tick_min,
+                            target.stretch_stddev_ms_max,
+                            target.stretch_jitter_ms_max,
+                        ));
+                    }
+                    Err(err) => self.console_feedback(err),
+                }
             }
             "phys.gravity" => {
                 let Some(x_raw) = parts.next() else {

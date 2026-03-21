@@ -26,7 +26,7 @@ use nps::DecodedPacketEvent;
 use paradoxpe::PhysicsWorld;
 use tl_core::{
     AdaptiveBufferDecision, AdaptiveFrameTelemetry, BridgeFrameId, BridgeFramePlan,
-    ComposeBarrierState, MpsGmsBridgeConfig,
+    ComposeBarrierState, GpuSubmissionHandle, MpsGmsBridgeConfig, WgpuSubmissionWaiter,
 };
 use tokio::net::UdpSocket;
 
@@ -462,9 +462,12 @@ impl WgpuRenderLoopCoordinator {
         frame_id: BridgeFrameId,
         submission: wgpu::SubmissionIndex,
     ) -> bool {
-        let result =
-            self.frame_loop
-                .record_frame_submissions(frame_id, Some(submission), None, None);
+        let result = self.frame_loop.record_frame_submissions(
+            frame_id,
+            Some(GpuSubmissionHandle::Wgpu(submission)),
+            None,
+            None,
+        );
         if result.primary_recorded {
             self.primary_submit_records = self.primary_submit_records.saturating_add(1);
             if let Some(state) = self.active_frames.get_mut(&frame_id) {
@@ -480,9 +483,12 @@ impl WgpuRenderLoopCoordinator {
         frame_id: BridgeFrameId,
         submission: wgpu::SubmissionIndex,
     ) -> bool {
-        let result =
-            self.frame_loop
-                .record_frame_submissions(frame_id, None, None, Some(submission));
+        let result = self.frame_loop.record_frame_submissions(
+            frame_id,
+            None,
+            None,
+            Some(GpuSubmissionHandle::Wgpu(submission)),
+        );
         if result.transfer_recorded {
             self.transfer_submit_records = self.transfer_submit_records.saturating_add(1);
             if let Some(state) = self.active_frames.get_mut(&frame_id) {
@@ -508,7 +514,7 @@ impl WgpuRenderLoopCoordinator {
             record = self.frame_loop.record_frame_submissions(
                 frame_id,
                 None,
-                Some(submission_index),
+                Some(GpuSubmissionHandle::Wgpu(submission_index)),
                 None,
             );
         }
@@ -537,14 +543,20 @@ impl WgpuRenderLoopCoordinator {
         transfer_device: Option<&wgpu::Device>,
     ) -> Option<ComposeBarrierState> {
         self.present_reconcile_calls = self.present_reconcile_calls.saturating_add(1);
-        let secondary_device = self
+        let primary_waiter = WgpuSubmissionWaiter::new(primary_device);
+        let secondary_waiter = self
             .multi_gpu_executor
             .as_ref()
-            .map(|e| e.secondary_device());
+            .map(|e| WgpuSubmissionWaiter::new(e.secondary_device()));
+        let transfer_waiter = transfer_device.map(WgpuSubmissionWaiter::new);
         let state = self.frame_loop.try_reconcile_present_nonblocking(
-            primary_device,
-            secondary_device,
-            transfer_device,
+            &primary_waiter,
+            secondary_waiter
+                .as_ref()
+                .map(|waiter| waiter as &dyn tl_core::GpuSubmissionWaiter),
+            transfer_waiter
+                .as_ref()
+                .map(|waiter| waiter as &dyn tl_core::GpuSubmissionWaiter),
         );
         self.accumulate_present_reconcile_counters(state.as_ref());
         state
@@ -557,13 +569,21 @@ impl WgpuRenderLoopCoordinator {
         transfer_device: Option<&wgpu::Device>,
     ) -> Option<ComposeBarrierState> {
         self.present_reconcile_calls = self.present_reconcile_calls.saturating_add(1);
-        let secondary_device = self
+        let primary_waiter = WgpuSubmissionWaiter::new(primary_device);
+        let secondary_waiter = self
             .multi_gpu_executor
             .as_ref()
-            .map(|e| e.secondary_device());
-        let state =
-            self.frame_loop
-                .reconcile_present(primary_device, secondary_device, transfer_device);
+            .map(|e| WgpuSubmissionWaiter::new(e.secondary_device()));
+        let transfer_waiter = transfer_device.map(WgpuSubmissionWaiter::new);
+        let state = self.frame_loop.reconcile_present(
+            &primary_waiter,
+            secondary_waiter
+                .as_ref()
+                .map(|waiter| waiter as &dyn tl_core::GpuSubmissionWaiter),
+            transfer_waiter
+                .as_ref()
+                .map(|waiter| waiter as &dyn tl_core::GpuSubmissionWaiter),
+        );
         self.accumulate_present_reconcile_counters(state.as_ref());
         if let Some(state_value) = state.as_ref() {
             if let Some(frame_id) = state_value.frame_id {

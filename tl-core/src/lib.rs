@@ -3,11 +3,12 @@
 //! `tl-core` is the integration boundary between:
 //! - `mps` (CPU scheduling / WASM execution)
 //! - `gms` (GPU discovery, planning, and multi-GPU heuristics)
-//! - runtime/render-loop code that records real `wgpu` submissions and present synchronization
+//! - runtime/render-loop code that records explicit GPU submissions and present synchronization
 //!
 //! The crate exposes:
 //! - [`core::bridge`] for MPS<->GMS frame planning
 //! - [`graphics::multigpu::sync`] for portable explicit multi-GPU synchronization and UMA hooks
+//! - [`graphics::vulkan_backend`] for the Linux-first raw Vulkan backend skeleton
 //! - [`tlscript`] for the in-memory, zero-copy `.tlscript` frontend lexer/token layer
 
 /// Canonical module id used by runtime version commands.
@@ -30,8 +31,18 @@ pub use core::mgs_bridge::{
 };
 pub use gms::{AdaptiveBufferDecision, AdaptiveFrameTelemetry};
 pub use graphics::multigpu::sync::{
-    ComposeBarrierState, GpuQueueLane, MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer,
-    MultiGpuSyncSnapshot, SharedPlacementPolicy, SyncBackendHint,
+    ComposeBarrierState, GpuQueueLane, GpuSubmissionHandle, GpuSubmissionWaitStatus,
+    GpuSubmissionWaiter, MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer,
+    MultiGpuSyncSnapshot, SharedPlacementPolicy, SyncBackendHint, WgpuSubmissionWaiter,
+};
+pub use graphics::vulkan_backend::{
+    FrameInstanceTransform, FrameLightRecord, FrameMaterialRecord, FrameSubmissionTelemetry,
+    FrameTextureRecord,
+    LinuxWindowSystemIntegration, PresentModePreference, RenderStateSnapshot, VulkanBackend,
+    VulkanBackendConfig, VulkanBackendError, VulkanDeviceExtensionSupport,
+    VulkanFrameExecutionTelemetry, VulkanMultiGpuCapabilities, VulkanMultiGpuConfig,
+    VulkanMultiGpuFramePlan, VulkanNativeMultiGpuSupport, VulkanPhysicalDeviceProfile,
+    VulkanQueueSelection, VulkanSnapshotSlotState,
 };
 pub use tlscript::{
     annotate_typed_ir_with_parallel_hooks, lower_to_typed_ir, lower_to_typed_ir_with_config,

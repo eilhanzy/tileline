@@ -487,6 +487,8 @@ fn empty_frame_output() -> TlscriptShowcaseFrameOutput {
     TlscriptShowcaseFrameOutput {
         patch: BounceTankRuntimePatch::default(),
         light_overrides: Vec::new(),
+        performance_preset: None,
+        gfx_profile: None,
         ball_metallic: None,
         ball_roughness: None,
         rt_mode: None,
@@ -515,6 +517,12 @@ fn merge_frame_output(
 ) {
     merge_patch(&mut merged.patch, next.patch);
     merge_light_overrides(&mut merged.light_overrides, &next.light_overrides);
+    if next.performance_preset.is_some() {
+        merged.performance_preset = next.performance_preset;
+    }
+    if next.gfx_profile.is_some() {
+        merged.gfx_profile = next.gfx_profile;
+    }
     if next.rt_mode.is_some() {
         merged.rt_mode = next.rt_mode;
     }

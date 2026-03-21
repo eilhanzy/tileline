@@ -335,4 +335,51 @@ impl TlAppRuntime {
             self.tick_profile
         ))
     }
+
+    pub(super) fn apply_performance_contract_preset(
+        &mut self,
+        scenario: PerformanceContractScenario,
+    ) -> Result<String, String> {
+        let mobile_path =
+            matches!(self.platform, RuntimePlatform::Android) || self.mgs_is_mobile_hardware;
+        let gfx_profile = scenario.recommended_gfx_profile(mobile_path);
+        let spawn_per_tick =
+            scenario.recommended_spawn_per_tick(self.mps_logical_threads, mobile_path);
+        let target_ball_count = scenario.reference_balls();
+
+        let gfx_note = self.apply_gfx_profile(gfx_profile)?;
+        {
+            let mut world = self.world.borrow_mut();
+            let _ = self.scene.apply_runtime_patch(
+                &mut *world,
+                BounceTankRuntimePatch {
+                    target_ball_count: Some(target_ball_count),
+                    spawn_per_tick: Some(spawn_per_tick),
+                    ..BounceTankRuntimePatch::default()
+                },
+            );
+        }
+
+        self.manual_max_substeps = None;
+        self.tick_retune_timer = 0.0;
+        self.distance_retune_timer = 0.0;
+        self.adaptive_load_pressure_ema = 0.0;
+        self.adaptive_ball_render_limit = None;
+        self.adaptive_live_ball_budget = None;
+        self.adaptive_low_poly_override = false;
+        self.reset_simulation_state();
+        self.world
+            .borrow_mut()
+            .set_timestep(1.0 / self.tick_hz.max(1.0), self.max_substeps);
+        self.sync_console_quick_fields_from_runtime();
+
+        Ok(format!(
+            "perf preset {} applied: target_balls={} spawn_per_tick={} gfx={} auto_substeps=on reset=yes | {}",
+            scenario.label(),
+            target_ball_count,
+            spawn_per_tick,
+            gfx_profile,
+            gfx_note
+        ))
+    }
 }

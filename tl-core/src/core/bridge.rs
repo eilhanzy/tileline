@@ -22,8 +22,8 @@ use gms::{
 use mps::{CorePreference, MpsScheduler, NativeTask, SchedulerMetrics, TaskPriority};
 
 use crate::graphics::multigpu::sync::{
-    ComposeBarrierState, GpuQueueLane, MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer,
-    MultiGpuSyncSnapshot,
+    ComposeBarrierState, GpuQueueLane, GpuSubmissionHandle, GpuSubmissionWaiter,
+    MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer, MultiGpuSyncSnapshot,
 };
 
 /// Bridge-local unique identifier for a submitted CPU->GPU pipeline task.
@@ -545,7 +545,7 @@ impl MpsGmsBridge {
         &mut self,
         frame_id: BridgeFrameId,
         lane: GpuQueueLane,
-        submission: wgpu::SubmissionIndex,
+        submission: GpuSubmissionHandle,
     ) -> bool {
         self.sync
             .as_mut()
@@ -556,24 +556,24 @@ impl MpsGmsBridge {
     /// Non-blocking compose reconcile (portable fence poll equivalent).
     pub fn try_reconcile_present_nonblocking(
         &mut self,
-        primary_device: &wgpu::Device,
-        secondary_device: Option<&wgpu::Device>,
-        transfer_device: Option<&wgpu::Device>,
+        primary_waiter: &dyn GpuSubmissionWaiter,
+        secondary_waiter: Option<&dyn GpuSubmissionWaiter>,
+        transfer_waiter: Option<&dyn GpuSubmissionWaiter>,
     ) -> Option<ComposeBarrierState> {
         self.sync.as_mut().map(|sync| {
-            sync.try_reconcile_nonblocking(primary_device, secondary_device, transfer_device)
+            sync.try_reconcile_nonblocking(primary_waiter, secondary_waiter, transfer_waiter)
         })
     }
 
     /// Budgeted compose reconcile (bounded fence wait equivalent, default 0.8ms).
     pub fn reconcile_present(
         &mut self,
-        primary_device: &wgpu::Device,
-        secondary_device: Option<&wgpu::Device>,
-        transfer_device: Option<&wgpu::Device>,
+        primary_waiter: &dyn GpuSubmissionWaiter,
+        secondary_waiter: Option<&dyn GpuSubmissionWaiter>,
+        transfer_waiter: Option<&dyn GpuSubmissionWaiter>,
     ) -> Option<ComposeBarrierState> {
         self.sync.as_mut().map(|sync| {
-            sync.reconcile_for_present(primary_device, secondary_device, transfer_device)
+            sync.reconcile_for_present(primary_waiter, secondary_waiter, transfer_waiter)
         })
     }
 
