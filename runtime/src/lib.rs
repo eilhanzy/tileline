@@ -15,6 +15,7 @@
 //! - `scene_workload`: scene->GMS workload synthesis helpers
 //! - `draw_path`: scene payload -> deterministic backend draw batches
 //! - `telemetry_hud`: telemetry -> HUD sprite overlay composition
+//! - `tile_world_2d`: chunked side-view tile world storage + visibility telemetry
 //! - `tlapp_app`: canonical TLApp runtime entry moved from examples into core runtime
 //! - `tlpfile`: project manifest that unifies `.tlscript` / `.tlsprite` / `.tljoint`
 //! - `tlpfile_gui`: general-purpose GUI shell driven by `.tlpfile`
@@ -46,6 +47,7 @@ mod scene_dispatch;
 mod scene_workload;
 mod scheduler_path;
 mod telemetry_hud;
+mod tile_world_2d;
 mod tlapp_app;
 mod tljoint;
 mod tlpfile;
@@ -108,9 +110,10 @@ pub use runtime_bridge::{
 pub use scene::{
     apply_scene_light_overrides, clamp_scene_lights_for_camera, BounceTankPatchMetrics,
     BounceTankRuntimePatch, BounceTankSceneConfig, BounceTankSceneController,
-    BounceTankTickMetrics, RayTracingMode, RenderSyncMode, SceneFrameInstances, SceneInstance3d,
-    SceneLight, SceneLightKind, SceneLightOverride, SceneMaterial, ScenePrimitive3d,
-    SceneTransform3d, ShadingModel, SpriteInstance, SpriteKind, TickRatePolicy, MAX_SCENE_LIGHTS,
+    BounceTankTickMetrics, RayTracingMode, RenderSyncMode, RuntimeSceneMode, SceneFrameInstances,
+    SceneInstance3d, SceneLight, SceneLightKind, SceneLightOverride, SceneMaterial,
+    ScenePrimitive3d, SceneTransform3d, SceneView2d, ShadingModel, SpriteInstance, SpriteKind,
+    TickRatePolicy, MAX_SCENE_LIGHTS,
 };
 pub use scene_dispatch::{
     submit_scene_estimate_to_bridge, SceneDispatchBridgeConfig, SceneDispatchLaneSummary,
@@ -125,6 +128,11 @@ pub use scheduler_path::{
 };
 pub use telemetry_hud::{
     TelemetryHudComposer, TelemetryHudConfig, TelemetryHudMetrics, TelemetryHudSample,
+};
+pub use tile_world_2d::{
+    ChunkedTileWorld2d, TileChunkCoord2d, TileCoord2d, TileMutation2d, TileView2d,
+    TileVisibleInstance2d, TileVisibleSet2d, TileWorld2dConfig, TileWorldFrameTelemetry,
+    TILE_ID_EMPTY,
 };
 pub use tlapp_app::run_from_env as run_tlapp_from_env;
 #[cfg(target_os = "android")]
@@ -150,7 +158,7 @@ pub use tlscript_showcase::{
     compile_tlscript_showcase, TlscriptCoordinateSpace, TlscriptGfxProfile,
     TlscriptPerformancePreset, TlscriptShowcaseCompileOutcome, TlscriptShowcaseConfig,
     TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
-    TlscriptShowcaseProgram,
+    TlscriptShowcaseProgram, TlscriptTileFill, TlscriptTileLookup,
 };
 pub use tlsprite::{
     compile_tlsprite, compile_tlsprite_pack, compile_tlsprite_with_extra_roots, load_tlsprite_pack,

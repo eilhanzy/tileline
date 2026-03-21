@@ -36,17 +36,19 @@ use crate::{
     clamp_scene_lights_for_camera, compile_tljoint_scene_from_path,
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, resolve_tileline_version_query,
     tileline_version_entries, BounceTankRuntimePatch, BounceTankSceneConfig,
-    BounceTankSceneController, BounceTankTickMetrics, DrawPathCompiler, FsrConfig, FsrDynamoConfig,
-    FsrMode, FsrQualityPreset, FsrStatus, GraphicsSchedulerPath, RayTracingMode, RenderSyncMode,
-    RuntimeBridgeConfig, RuntimeBridgeMetrics, RuntimeBridgeOrchestrator, RuntimeBridgePath,
-    RuntimeBridgeTick, RuntimeFramePlan, RuntimePlatform, SceneFrameInstances, ScenePrimitive3d,
-    SpriteInstance, SpriteKind, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy,
-    TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
+    BounceTankSceneController, BounceTankTickMetrics, ChunkedTileWorld2d, DrawPathCompiler,
+    FsrConfig, FsrDynamoConfig, FsrMode, FsrQualityPreset, FsrStatus, GraphicsSchedulerPath,
+    RayTracingMode, RenderSyncMode, RuntimeBridgeConfig, RuntimeBridgeMetrics,
+    RuntimeBridgeOrchestrator, RuntimeBridgePath, RuntimeBridgeTick, RuntimeFramePlan,
+    RuntimePlatform, RuntimeSceneMode, SceneFrameInstances, ScenePrimitive3d, SpriteInstance,
+    SpriteKind, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy, TileCoord2d,
+    TileMutation2d, TileView2d, TileWorld2dConfig, TileWorldFrameTelemetry, TljointDiagnosticLevel,
+    TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
     TlscriptPerformancePreset, TlscriptShowcaseConfig, TlscriptShowcaseControlInput,
     TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
-    TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader,
-    VulkanSceneRenderer, VulkanSceneRendererConfig, WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION,
-    MAX_SCENE_LIGHTS,
+    TlscriptTileLookup, TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache,
+    TlspriteWatchReloader, VulkanSceneRenderer, VulkanSceneRendererConfig, WgpuSceneRenderer,
+    ENGINE_ID, ENGINE_VERSION, MAX_SCENE_LIGHTS,
 };
 use gms::safe_default_required_limits_for_adapter;
 use mgs::MobileGpuProfile;
@@ -100,6 +102,8 @@ const CONSOLE_HELP_COMMANDS: &[&str] = &[
     "version [module|all]",
     "status | gfx.status",
     "sim.status | sim.pause | sim.resume | sim.step <n> | sim.reset",
+    "scene.mode <3d|2d>",
+    "tile.status | tile.set <x y id> | tile.dig <x y> | tile.fill <x0 y0 x1 y1 id>",
     "scene.reload | sprite.reload | script.reload",
     "perf.snapshot",
     "perf.contract [8k|30k|60k]",
@@ -800,6 +804,49 @@ fn parse_console_usize_in_range(
     Ok(parsed)
 }
 
+fn parse_console_i32_in_range(value: &str, label: &str, min: i32, max: i32) -> Result<i32, String> {
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| format!("invalid {label}: {value}"))?;
+    if parsed < min || parsed > max {
+        return Err(format!("{label} must be in [{min}..{max}]"));
+    }
+    Ok(parsed)
+}
+
+fn parse_console_u16_in_range(value: &str, label: &str, min: u16, max: u16) -> Result<u16, String> {
+    let parsed = value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid {label}: {value}"))?;
+    if parsed < min || parsed > max {
+        return Err(format!("{label} must be in [{min}..{max}]"));
+    }
+    Ok(parsed)
+}
+
+fn build_default_side_view_tile_world(scene: BounceTankSceneConfig) -> ChunkedTileWorld2d {
+    let mut world = ChunkedTileWorld2d::new(TileWorld2dConfig::default());
+    let half_width = scene.container_half_extents[0].max(8.0).round() as i32;
+    let half_height = scene.container_half_extents[1].max(6.0).round() as i32;
+    let min = TileCoord2d::new(-half_width, -half_height);
+    let max = TileCoord2d::new(half_width, half_height);
+
+    // Base container shell for early side-view sandboxes.
+    let _ = world.fill_rect(min, TileCoord2d::new(max.x, min.y + 1), 2); // floor
+    let _ = world.fill_rect(min, TileCoord2d::new(min.x + 1, max.y), 1); // left wall
+    let _ = world.fill_rect(TileCoord2d::new(max.x - 1, min.y), max, 1); // right wall
+    let _ = world.fill_rect(TileCoord2d::new(min.x, max.y - 1), max, 1); // ceiling
+
+    // Light platform strip so camera motion immediately shows chunk streaming and layering.
+    let platform_y = min.y + ((max.y - min.y) / 3).max(2);
+    let _ = world.fill_rect(
+        TileCoord2d::new(min.x / 2, platform_y),
+        TileCoord2d::new(max.x / 2, platform_y),
+        3,
+    );
+    world
+}
+
 fn bootstrap_uncapped_fps_hint(logical_threads: usize) -> f32 {
     // Start from a conservative-but-fast target and let runtime sampling retune to hardware limit.
     (170.0 + logical_threads as f32 * 7.5).clamp(170.0, 420.0)
@@ -1017,6 +1064,8 @@ struct TlAppRuntime {
     /// Metrics from the most recent physics_tick() call (1-frame pipeline lag).
     last_tick: BounceTankTickMetrics,
     scene: BounceTankSceneController,
+    tile_world_2d: ChunkedTileWorld2d,
+    tile_world_frame: TileWorldFrameTelemetry,
     draw_compiler: DrawPathCompiler,
     hud: TelemetryHudComposer,
     renderer: TlAppRenderer,
@@ -1331,14 +1380,23 @@ impl<'src> ScriptRuntime<'src> {
         &self,
         input: TlscriptShowcaseFrameInput,
         controls: TlscriptShowcaseControlInput,
+        tile_lookup: Option<&dyn TlscriptTileLookup>,
     ) -> TlscriptShowcaseFrameOutput {
         match self {
-            Self::Single(program) => program.evaluate_frame_with_controls(input, controls),
-            Self::Joint(bundle) => bundle.evaluate_frame(input, controls),
+            Self::Single(program) => {
+                program.evaluate_frame_with_controls_and_tile_lookup(input, controls, tile_lookup)
+            }
+            Self::Joint(bundle) => {
+                bundle.evaluate_frame_with_tile_lookup(input, controls, tile_lookup)
+            }
             Self::MultiScripts(programs) => {
                 let mut merged = empty_showcase_output();
                 for (index, program) in programs.iter().enumerate() {
-                    let output = program.evaluate_frame_with_controls(input, controls);
+                    let output = program.evaluate_frame_with_controls_and_tile_lookup(
+                        input,
+                        controls,
+                        tile_lookup,
+                    );
                     merge_showcase_output(&mut merged, output, index);
                 }
                 merged
@@ -1354,6 +1412,12 @@ fn merge_showcase_output(
 ) {
     merge_runtime_patch(&mut merged.patch, next.patch);
     merge_light_overrides(&mut merged.light_overrides, &next.light_overrides);
+    if !next.tile_mutations.is_empty() {
+        merged.tile_mutations.append(&mut next.tile_mutations);
+    }
+    if !next.tile_fills.is_empty() {
+        merged.tile_fills.append(&mut next.tile_fills);
+    }
     if next.performance_preset.is_some() {
         merged.performance_preset = next.performance_preset;
     }

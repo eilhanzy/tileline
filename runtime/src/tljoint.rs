@@ -21,6 +21,7 @@ use crate::scene::BounceTankRuntimePatch;
 use crate::tlscript_showcase::{
     compile_tlscript_showcase, TlscriptShowcaseConfig, TlscriptShowcaseControlInput,
     TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
+    TlscriptTileLookup,
 };
 use crate::tlsprite::{compile_tlsprite, TlspriteDiagnosticLevel, TlspriteProgram};
 
@@ -93,9 +94,20 @@ impl TljointSceneBundle {
         input: TlscriptShowcaseFrameInput,
         controls: TlscriptShowcaseControlInput,
     ) -> TlscriptShowcaseFrameOutput {
+        self.evaluate_frame_with_tile_lookup(input, controls, None)
+    }
+
+    /// Evaluate all scene scripts with optional runtime tile query callback.
+    pub fn evaluate_frame_with_tile_lookup(
+        &self,
+        input: TlscriptShowcaseFrameInput,
+        controls: TlscriptShowcaseControlInput,
+        tile_lookup: Option<&dyn TlscriptTileLookup>,
+    ) -> TlscriptShowcaseFrameOutput {
         let mut merged = empty_frame_output();
         for (index, script) in self.scripts.iter().enumerate() {
-            let out = script.evaluate_frame_with_controls(input, controls);
+            let out =
+                script.evaluate_frame_with_controls_and_tile_lookup(input, controls, tile_lookup);
             merge_frame_output(&mut merged, out, index);
         }
         merged
@@ -487,6 +499,8 @@ fn empty_frame_output() -> TlscriptShowcaseFrameOutput {
     TlscriptShowcaseFrameOutput {
         patch: BounceTankRuntimePatch::default(),
         light_overrides: Vec::new(),
+        tile_mutations: Vec::new(),
+        tile_fills: Vec::new(),
         performance_preset: None,
         gfx_profile: None,
         ball_metallic: None,
@@ -517,6 +531,12 @@ fn merge_frame_output(
 ) {
     merge_patch(&mut merged.patch, next.patch);
     merge_light_overrides(&mut merged.light_overrides, &next.light_overrides);
+    if !next.tile_mutations.is_empty() {
+        merged.tile_mutations.append(&mut next.tile_mutations);
+    }
+    if !next.tile_fills.is_empty() {
+        merged.tile_fills.append(&mut next.tile_fills);
+    }
     if next.performance_preset.is_some() {
         merged.performance_preset = next.performance_preset;
     }

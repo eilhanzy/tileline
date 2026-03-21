@@ -11,16 +11,18 @@
 use std::collections::HashMap;
 
 use tl_core::{
-    annotate_typed_ir_with_parallel_hooks, lower_to_typed_ir, BinaryOp, Block, DecoratorKind, Expr,
-    ExprKind, FunctionDef, Item, Lexer, Module, ParallelDispatchDecision, ParallelDispatchPlanner,
+    annotate_typed_ir_with_parallel_hooks, lower_to_typed_ir_with_config, BinaryOp, Block,
+    DecoratorKind, Expr, ExprKind, ExternalCallReturnHint, FunctionDef, Item, Lexer,
+    LoweringExternalSignature, Module, ParallelDispatchDecision, ParallelDispatchPlanner,
     ParallelDispatchPlannerConfig, ParallelExecutionPolicy, ParallelHookAnalyzer,
-    ParallelHookOutcome, ParallelScheduleHint, Parser, SemanticAnalyzer, SemanticOutcome, Stmt,
-    TypedIrModule, UnaryOp,
+    ParallelHookOutcome, ParallelScheduleHint, Parser, SemanticAnalyzer, SemanticOutcome,
+    SemanticType, Stmt, TypedIrLoweringConfig, TypedIrModule, UnaryOp,
 };
 
 use crate::scene::{BounceTankRuntimePatch, RayTracingMode, SceneLightOverride};
+use crate::tile_world_2d::{TileCoord2d, TileMutation2d, TILE_ID_EMPTY};
 
-const SHOWCASE_BUILTIN_CALLS: [&str; 77] = [
+const SHOWCASE_BUILTIN_CALLS: &[&str] = &[
     "set_gfx_profile",
     "set_perf_preset",
     "set_spawn_per_tick",
@@ -98,7 +100,59 @@ const SHOWCASE_BUILTIN_CALLS: [&str; 77] = [
     "set_coordinate_space",
     "move_camera",
     "rotate_camera",
+    "tile_set",
+    "tile_place",
+    "tile_dig",
+    "tile_fill",
+    "tile_get",
 ];
+
+const MAX_TILE_MUTATIONS_PER_FRAME: usize = 8_192;
+const MAX_TILE_FILLS_PER_FRAME: usize = 128;
+const TILE_GET_BUILTIN_NAME: &str = "tile_get";
+
+/// Runtime tile query surface used by `.tlscript` built-ins (for example `tile_get`).
+///
+/// This allows script evaluation to read canonical runtime tile world state without direct engine
+/// coupling in the evaluator core.
+pub trait TlscriptTileLookup {
+    fn tile_get(&self, x: i32, y: i32) -> u16;
+}
+
+impl<F> TlscriptTileLookup for F
+where
+    F: Fn(i32, i32) -> u16,
+{
+    fn tile_get(&self, x: i32, y: i32) -> u16 {
+        self(x, y)
+    }
+}
+
+/// Bounded tile-rect write emitted by `.tlscript` (`tile_fill`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlscriptTileFill {
+    pub min: TileCoord2d,
+    pub max: TileCoord2d,
+    pub tile_id: u16,
+}
+
+impl TlscriptTileFill {
+    fn normalized(self) -> Self {
+        Self {
+            min: TileCoord2d::new(self.min.x.min(self.max.x), self.min.y.min(self.max.y)),
+            max: TileCoord2d::new(self.min.x.max(self.max.x), self.min.y.max(self.max.y)),
+            tile_id: self.tile_id,
+        }
+    }
+
+    fn contains(&self, x: i32, y: i32) -> bool {
+        let normalized = self.normalized();
+        x >= normalized.min.x
+            && x <= normalized.max.x
+            && y >= normalized.min.y
+            && y <= normalized.max.y
+    }
+}
 
 /// Coordinate-space hint propagated from `.tlscript` to runtime camera controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +354,8 @@ impl Default for TlscriptShowcaseControlInput {
 pub struct TlscriptShowcaseFrameOutput {
     pub patch: BounceTankRuntimePatch,
     pub light_overrides: Vec<SceneLightOverride>,
+    pub tile_mutations: Vec<TileMutation2d>,
+    pub tile_fills: Vec<TlscriptTileFill>,
     pub performance_preset: Option<TlscriptPerformancePreset>,
     pub gfx_profile: Option<TlscriptGfxProfile>,
     pub ball_metallic: Option<f32>,
@@ -372,7 +428,17 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         input: TlscriptShowcaseFrameInput,
         controls: TlscriptShowcaseControlInput,
     ) -> TlscriptShowcaseFrameOutput {
-        let mut state = EvalState::new(self.max_eval_steps, self.max_loop_iterations);
+        self.evaluate_frame_with_controls_and_tile_lookup(input, controls, None)
+    }
+
+    /// Evaluate one script frame with optional runtime tile query callback.
+    pub fn evaluate_frame_with_controls_and_tile_lookup(
+        &self,
+        input: TlscriptShowcaseFrameInput,
+        controls: TlscriptShowcaseControlInput,
+        tile_lookup: Option<&dyn TlscriptTileLookup>,
+    ) -> TlscriptShowcaseFrameOutput {
+        let mut state = EvalState::new(self.max_eval_steps, self.max_loop_iterations, tile_lookup);
         state.vars.insert(
             "frame".to_string(),
             DemoValue::Int(input.frame_index as i64),
@@ -554,6 +620,8 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         TlscriptShowcaseFrameOutput {
             patch: state.patch,
             light_overrides: state.light_overrides_values(),
+            tile_mutations: state.tile_mutations_values(),
+            tile_fills: state.tile_fills_values(),
             performance_preset: state.performance_preset,
             gfx_profile: state.gfx_profile,
             ball_metallic: state.ball_metallic,
@@ -577,7 +645,7 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         }
     }
 
-    fn exec_block(&self, block: &Block<'src>, state: &mut EvalState) {
+    fn exec_block(&self, block: &Block<'src>, state: &mut EvalState<'_>) {
         for stmt in &block.statements {
             if !state.step() {
                 state.warn("evaluation step budget exhausted; frame script aborted early");
@@ -591,7 +659,7 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         }
     }
 
-    fn exec_stmt(&self, stmt: &Stmt<'src>, state: &mut EvalState) {
+    fn exec_stmt(&self, stmt: &Stmt<'src>, state: &mut EvalState<'_>) {
         match stmt {
             Stmt::Let(s) => {
                 let value = self.eval_expr(&s.value, state);
@@ -690,7 +758,7 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         }
     }
 
-    fn eval_expr(&self, expr: &Expr<'src>, state: &mut EvalState) -> DemoValue {
+    fn eval_expr(&self, expr: &Expr<'src>, state: &mut EvalState<'_>) -> DemoValue {
         if !state.step() {
             state.aborted_early = true;
             return DemoValue::Int(0);
@@ -755,13 +823,12 @@ impl<'src> TlscriptShowcaseProgram<'src> {
                     .iter()
                     .map(|arg| self.eval_expr(arg, state))
                     .collect::<Vec<_>>();
-                apply_builtin_patch_call(name, &values, state);
-                DemoValue::Int(0)
+                apply_builtin_patch_call(name, &values, state)
             }
         }
     }
 
-    fn eval_range_args(&self, args: &[Expr<'src>], state: &mut EvalState) -> (i64, i64, i64) {
+    fn eval_range_args(&self, args: &[Expr<'src>], state: &mut EvalState<'_>) -> (i64, i64, i64) {
         match args.len() {
             1 => (0, self.eval_expr(&args[0], state).to_i64(), 1),
             2 => (
@@ -782,11 +849,12 @@ impl<'src> TlscriptShowcaseProgram<'src> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct EvalState {
+struct EvalState<'lookup> {
     vars: HashMap<String, DemoValue>,
     patch: BounceTankRuntimePatch,
     light_overrides: HashMap<u64, SceneLightOverride>,
+    tile_mutations: Vec<TileMutation2d>,
+    tile_fills: Vec<TlscriptTileFill>,
     performance_preset: Option<TlscriptPerformancePreset>,
     gfx_profile: Option<TlscriptGfxProfile>,
     rt_mode: Option<RayTracingMode>,
@@ -809,14 +877,21 @@ struct EvalState {
     max_steps: usize,
     max_loop_iterations: usize,
     aborted_early: bool,
+    tile_lookup: Option<&'lookup dyn TlscriptTileLookup>,
 }
 
-impl EvalState {
-    fn new(max_steps: usize, max_loop_iterations: usize) -> Self {
+impl<'lookup> EvalState<'lookup> {
+    fn new(
+        max_steps: usize,
+        max_loop_iterations: usize,
+        tile_lookup: Option<&'lookup dyn TlscriptTileLookup>,
+    ) -> Self {
         Self {
             vars: HashMap::new(),
             patch: BounceTankRuntimePatch::default(),
             light_overrides: HashMap::new(),
+            tile_mutations: Vec::new(),
+            tile_fills: Vec::new(),
             performance_preset: None,
             gfx_profile: None,
             rt_mode: None,
@@ -839,6 +914,7 @@ impl EvalState {
             max_steps: max_steps.max(1),
             max_loop_iterations: max_loop_iterations.max(1),
             aborted_early: false,
+            tile_lookup,
         }
     }
 
@@ -867,6 +943,51 @@ impl EvalState {
         let mut out = self.light_overrides.values().cloned().collect::<Vec<_>>();
         out.sort_by_key(|entry| entry.id);
         out
+    }
+
+    fn tile_mutations_values(&self) -> Vec<TileMutation2d> {
+        self.tile_mutations.clone()
+    }
+
+    fn tile_fills_values(&self) -> Vec<TlscriptTileFill> {
+        self.tile_fills.clone()
+    }
+
+    fn push_tile_mutation(&mut self, mutation: TileMutation2d) {
+        if self.tile_mutations.len() >= MAX_TILE_MUTATIONS_PER_FRAME {
+            self.warn(format!(
+                "tile mutation dropped; max per frame reached ({MAX_TILE_MUTATIONS_PER_FRAME})"
+            ));
+            return;
+        }
+        self.tile_mutations.push(mutation);
+    }
+
+    fn push_tile_fill(&mut self, fill: TlscriptTileFill) {
+        if self.tile_fills.len() >= MAX_TILE_FILLS_PER_FRAME {
+            self.warn(format!(
+                "tile fill dropped; max per frame reached ({MAX_TILE_FILLS_PER_FRAME})"
+            ));
+            return;
+        }
+        self.tile_fills.push(fill.normalized());
+    }
+
+    fn resolve_tile_value_for_script(&self, x: i32, y: i32) -> u16 {
+        for fill in self.tile_fills.iter().rev() {
+            if fill.contains(x, y) {
+                return fill.tile_id;
+            }
+        }
+        for mutation in self.tile_mutations.iter().rev() {
+            if mutation.coord.x == x && mutation.coord.y == y {
+                return mutation.tile_id;
+            }
+        }
+        if let Some(lookup) = self.tile_lookup {
+            return lookup.tile_get(x, y);
+        }
+        TILE_ID_EMPTY
     }
 }
 
@@ -911,7 +1032,7 @@ fn eval_binary(
     op: BinaryOp,
     left: DemoValue,
     right: DemoValue,
-    state: &mut EvalState,
+    state: &mut EvalState<'_>,
 ) -> DemoValue {
     match op {
         BinaryOp::Add => numeric_binary(left, right, |a, b| a + b),
@@ -952,7 +1073,7 @@ fn numeric_binary(left: DemoValue, right: DemoValue, f: impl FnOnce(f64, f64) ->
     }
 }
 
-fn apply_perf_preset_to_patch(state: &mut EvalState, preset: &str) {
+fn apply_perf_preset_to_patch(state: &mut EvalState<'_>, preset: &str) {
     let Some(preset_kind) = TlscriptPerformancePreset::parse(preset) else {
         state.warn(format!(
             "set_perf_preset expects '8k'|'30k'|'60k', got '{preset}'"
@@ -970,7 +1091,7 @@ fn apply_perf_preset_to_patch(state: &mut EvalState, preset: &str) {
     state.patch.spawn_per_tick = Some(spawn_per_tick);
 }
 
-fn apply_gfx_profile_to_state(state: &mut EvalState, profile: &str) {
+fn apply_gfx_profile_to_state(state: &mut EvalState<'_>, profile: &str) {
     let Some(profile_kind) = TlscriptGfxProfile::parse(profile) else {
         state.warn(format!(
             "set_gfx_profile expects 'low'|'med'|'high'|'ultra', got '{profile}'"
@@ -980,7 +1101,7 @@ fn apply_gfx_profile_to_state(state: &mut EvalState, profile: &str) {
     state.gfx_profile = Some(profile_kind);
 }
 
-fn apply_profile_bool_to_state(state: &mut EvalState, profile: bool) {
+fn apply_profile_bool_to_state(state: &mut EvalState<'_>, profile: bool) {
     state.gfx_profile = Some(if profile {
         TlscriptGfxProfile::High
     } else {
@@ -988,7 +1109,7 @@ fn apply_profile_bool_to_state(state: &mut EvalState, profile: bool) {
     });
 }
 
-fn apply_profile_numeric_to_state(state: &mut EvalState, numeric: i64) {
+fn apply_profile_numeric_to_state(state: &mut EvalState<'_>, numeric: i64) {
     state.gfx_profile = Some(match numeric {
         n if n <= 0 => TlscriptGfxProfile::Low,
         1 => TlscriptGfxProfile::Med,
@@ -997,7 +1118,7 @@ fn apply_profile_numeric_to_state(state: &mut EvalState, numeric: i64) {
     });
 }
 
-fn apply_perf_preset_from_value(state: &mut EvalState, value: &DemoValue) {
+fn apply_perf_preset_from_value(state: &mut EvalState<'_>, value: &DemoValue) {
     match value {
         DemoValue::Str(preset) => apply_perf_preset_to_patch(state, preset),
         DemoValue::Int(value) => apply_perf_preset_to_patch(state, &value.to_string()),
@@ -1010,7 +1131,7 @@ fn apply_perf_preset_from_value(state: &mut EvalState, value: &DemoValue) {
     }
 }
 
-fn apply_gfx_profile_from_value(state: &mut EvalState, value: &DemoValue) {
+fn apply_gfx_profile_from_value(state: &mut EvalState<'_>, value: &DemoValue) {
     match value {
         DemoValue::Str(profile) => apply_gfx_profile_to_state(state, profile),
         DemoValue::Int(value) => apply_profile_numeric_to_state(state, *value),
@@ -1019,7 +1140,11 @@ fn apply_gfx_profile_from_value(state: &mut EvalState, value: &DemoValue) {
     }
 }
 
-fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalState) {
+fn apply_builtin_patch_call(
+    name: &str,
+    args: &[DemoValue],
+    state: &mut EvalState<'_>,
+) -> DemoValue {
     match name {
         "set_gfx_profile" => match args {
             [value] => apply_gfx_profile_from_value(state, value),
@@ -1512,8 +1637,43 @@ fn apply_builtin_patch_call(name: &str, args: &[DemoValue], state: &mut EvalStat
             [] => state.camera_reset_pose = true,
             _ => state.warn("reset_camera_pose expects 0 args"),
         },
+        "tile_set" | "tile_place" => match args {
+            [x, y, tile_id] => {
+                let coord = TileCoord2d::new(x.to_i64() as i32, y.to_i64() as i32);
+                let tile_id = tile_id.to_i64().clamp(0, i64::from(u16::MAX)) as u16;
+                state.push_tile_mutation(TileMutation2d::place(coord, tile_id));
+            }
+            _ => state.warn(format!("{name} expects 3 args (x, y, tile_id)")),
+        },
+        "tile_dig" => match args {
+            [x, y] => {
+                let coord = TileCoord2d::new(x.to_i64() as i32, y.to_i64() as i32);
+                state.push_tile_mutation(TileMutation2d::dig(coord));
+            }
+            _ => state.warn("tile_dig expects 2 args (x, y)"),
+        },
+        "tile_fill" => match args {
+            [x0, y0, x1, y1, tile_id] => {
+                let fill = TlscriptTileFill {
+                    min: TileCoord2d::new(x0.to_i64() as i32, y0.to_i64() as i32),
+                    max: TileCoord2d::new(x1.to_i64() as i32, y1.to_i64() as i32),
+                    tile_id: tile_id.to_i64().clamp(0, i64::from(u16::MAX)) as u16,
+                };
+                state.push_tile_fill(fill);
+            }
+            _ => state.warn("tile_fill expects 5 args (x0, y0, x1, y1, tile_id)"),
+        },
+        "tile_get" => match args {
+            [x, y] => {
+                let value =
+                    state.resolve_tile_value_for_script(x.to_i64() as i32, y.to_i64() as i32);
+                return DemoValue::Int(value as i64);
+            }
+            _ => state.warn("tile_get expects 2 args (x, y)"),
+        },
         _ => state.warn(format!("unknown showcase builtin '{name}'")),
     }
+    DemoValue::Int(0)
 }
 
 /// Compile a `.tlscript` source string into a showcase program.
@@ -1545,6 +1705,20 @@ pub fn compile_tlscript_showcase<'src>(
     );
     semantic_config.external_call_allowlist.sort();
     semantic_config.external_call_allowlist.dedup();
+    semantic_config
+        .external_call_return_hints
+        .push(ExternalCallReturnHint {
+            name: TILE_GET_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
+    semantic_config.external_call_return_hints.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| semantic_type_rank(a.result).cmp(&semantic_type_rank(b.result)))
+    });
+    semantic_config
+        .external_call_return_hints
+        .dedup_by(|left, right| left.name == right.name);
 
     let semantic_outcome: SemanticOutcome<'src> =
         SemanticAnalyzer::new(semantic_config).analyze_soft(&module);
@@ -1624,17 +1798,36 @@ pub fn compile_tlscript_showcase<'src>(
         ));
     }
 
-    let mut typed_ir = match lower_to_typed_ir(&module, &semantic_outcome.report) {
-        Ok(ir) => ir,
-        Err(err) => {
-            errors.push(format!("typed IR lowering error: {err:?}"));
-            return TlscriptShowcaseCompileOutcome {
-                program: None,
-                errors,
-                warnings,
-            };
-        }
-    };
+    let mut lowering_config = TypedIrLoweringConfig::default();
+    lowering_config
+        .external_function_signatures
+        .push(LoweringExternalSignature {
+            name: TILE_GET_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
+    lowering_config
+        .external_function_signatures
+        .sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| semantic_type_rank(a.result).cmp(&semantic_type_rank(b.result)))
+        });
+    lowering_config
+        .external_function_signatures
+        .dedup_by(|left, right| left.name == right.name);
+
+    let mut typed_ir =
+        match lower_to_typed_ir_with_config(&module, &semantic_outcome.report, lowering_config) {
+            Ok(ir) => ir,
+            Err(err) => {
+                errors.push(format!("typed IR lowering error: {err:?}"));
+                return TlscriptShowcaseCompileOutcome {
+                    program: None,
+                    errors,
+                    warnings,
+                };
+            }
+        };
     annotate_typed_ir_with_parallel_hooks(&mut typed_ir, &hooks);
     let entry_ir_index = typed_ir
         .functions
@@ -1664,6 +1857,17 @@ fn has_export_decorator(func: &FunctionDef<'_>) -> bool {
     func.decorators
         .iter()
         .any(|dec| matches!(dec.kind, DecoratorKind::Export))
+}
+
+fn semantic_type_rank(ty: SemanticType) -> u8 {
+    match ty {
+        SemanticType::Int => 0,
+        SemanticType::Float => 1,
+        SemanticType::Bool => 2,
+        SemanticType::Handle => 3,
+        SemanticType::Str => 4,
+        SemanticType::Unit => 5,
+    }
 }
 
 #[cfg(test)]
@@ -1951,6 +2155,105 @@ mod tests {
             key_f_down: false,
         });
         assert_eq!(out.patch.virtual_barrier_enabled, Some(false));
+    }
+
+    #[test]
+    fn supports_tile_builtins_with_query_feedback() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    tile_fill(-2, -1, 2, 1, 3)\n",
+            "    tile_set(1, 2, 5)\n",
+            "    tile_dig(0, 0)\n",
+            "    tile_place(4, 4, 9)\n",
+            "    let probe: int = tile_get(1, 2)\n",
+            "    if probe == 5:\n",
+            "        set_spawn_per_tick(111)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.patch.spawn_per_tick, Some(111));
+        assert_eq!(out.tile_fills.len(), 1);
+        assert_eq!(out.tile_fills[0].tile_id, 3);
+        assert_eq!(out.tile_mutations.len(), 3);
+        assert_eq!(
+            out.tile_mutations[0],
+            TileMutation2d::place(TileCoord2d::new(1, 2), 5)
+        );
+        assert_eq!(
+            out.tile_mutations[1],
+            TileMutation2d::dig(TileCoord2d::new(0, 0))
+        );
+        assert_eq!(
+            out.tile_mutations[2],
+            TileMutation2d::place(TileCoord2d::new(4, 4), 9)
+        );
+    }
+
+    #[test]
+    fn tile_get_reads_runtime_lookup_when_no_local_override() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    let probe: int = tile_get(9, 4)\n",
+            "    if probe == 7:\n",
+            "        set_spawn_per_tick(77)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let lookup = |x: i32, y: i32| {
+            if x == 9 && y == 4 {
+                7
+            } else {
+                TILE_ID_EMPTY
+            }
+        };
+        let out = program.evaluate_frame_with_controls_and_tile_lookup(
+            TlscriptShowcaseFrameInput {
+                frame_index: 0,
+                live_balls: 0,
+                spawned_this_tick: 0,
+                key_f_down: false,
+            },
+            TlscriptShowcaseControlInput::default(),
+            Some(&lookup),
+        );
+        assert_eq!(out.patch.spawn_per_tick, Some(77));
+    }
+
+    #[test]
+    fn tile_get_prefers_local_mutations_over_runtime_lookup() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    tile_set(1, 1, 5)\n",
+            "    let probe: int = tile_get(1, 1)\n",
+            "    if probe == 5:\n",
+            "        set_target_ball_count(123)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let lookup = |_x: i32, _y: i32| 2_u16;
+        let out = program.evaluate_frame_with_controls_and_tile_lookup(
+            TlscriptShowcaseFrameInput {
+                frame_index: 0,
+                live_balls: 0,
+                spawned_this_tick: 0,
+                key_f_down: false,
+            },
+            TlscriptShowcaseControlInput::default(),
+            Some(&lookup),
+        );
+        assert_eq!(out.patch.target_ball_count, Some(123));
     }
 
     #[test]

@@ -220,6 +220,7 @@ impl TlAppRuntime {
             }
         }
 
+        let tile_lookup = |x: i32, y: i32| self.tile_world_2d.tile(TileCoord2d::new(x, y));
         let mut frame_eval = self.script_runtime.evaluate_frame(
             TlscriptShowcaseFrameInput {
                 frame_index: self.script_frame_index,
@@ -228,6 +229,7 @@ impl TlAppRuntime {
                 key_f_down: self.script_key_f_keyboard || self.gamepad.action_f_down(),
             },
             script_camera_input,
+            Some(&tile_lookup),
         );
         if !self.console.script_statements.is_empty() {
             merge_showcase_output(
@@ -292,6 +294,31 @@ impl TlAppRuntime {
         if let Some(mode) = frame_eval.rt_mode {
             self.rt_mode = mode;
             self.renderer.set_ray_tracing_mode(&self.queue, mode);
+        }
+        if !frame_eval.tile_fills.is_empty() || !frame_eval.tile_mutations.is_empty() {
+            let mut changed_tiles = 0usize;
+            for fill in &frame_eval.tile_fills {
+                changed_tiles = changed_tiles.saturating_add(self.tile_world_2d.fill_rect(
+                    fill.min,
+                    fill.max,
+                    fill.tile_id,
+                ));
+            }
+            for mutation in &frame_eval.tile_mutations {
+                if self.tile_world_2d.apply_mutation(*mutation) {
+                    changed_tiles = changed_tiles.saturating_add(1);
+                }
+            }
+            if changed_tiles > 0 && self.script_frame_index % 120 == 0 {
+                println!(
+                    "tlapp tile | changed={} fills={} mutations={} rev={}",
+                    changed_tiles,
+                    frame_eval.tile_fills.len(),
+                    frame_eval.tile_mutations.len(),
+                    self.tile_world_2d.world_revision()
+                );
+            }
+            self.tile_world_frame = self.tile_world_2d.telemetry_snapshot();
         }
 
         let live_balls = self.scene.live_ball_count();
@@ -636,6 +663,8 @@ impl TlAppRuntime {
                 self.adaptive_ball_render_limit,
             )
         };
+        self.append_visible_tile_world_sprites(&mut frame);
+        let tile_frame = self.tile_world_frame;
         let unknown_light_overrides =
             apply_scene_light_overrides(&mut frame, frame_eval.light_overrides.as_slice());
         // Apply global ball material overrides from tlscript.
@@ -1011,12 +1040,18 @@ impl TlAppRuntime {
         let render_backend_label = self.renderer.backend_label();
         let performance_contract = self.performance_contract_evaluation();
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Balls {} (draw {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | Phys {}µs (int {}µs bp {}µs np {}µs sv {}µs sl {}µs) | contract {}:{} | {:?} {} {} {:?}{}{}{}{}{}{}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Scene {} | Balls {} (draw {}) | Tiles {} (vis {} cull {} chunks {} dirty {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | Phys {}µs (int {}µs bp {}µs np {}µs sv {}µs sl {}µs) | contract {}:{} | {:?} {} {} {:?}{}{}{}{}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
             self.tick_hz,
+            draw.mode.as_str(),
             tick.live_balls,
             visible_ball_count,
+            tile_frame.emitted_tiles,
+            tile_frame.visible_tiles,
+            tile_frame.culled_tiles,
+            tile_frame.visible_chunks,
+            tile_frame.dirty_chunks,
             upload.light_count,
             self.rt_mode,
             if rt_status.active { "on" } else { "off" },
@@ -1071,13 +1106,19 @@ impl TlAppRuntime {
                 self.runtime_bridge_telemetry.physics_lag_frames,
             );
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | balls: {:>5} | draw: {:>5} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | contract: {}:{} stable={} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | phys_workers: {} | phys_queue: {} | phys_inflight: {} | phys_frame: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | render_backend: {} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {} | pipeline: {} | bridge_path: {} | queued_plan_depth: {} | bridge_pump_published: {} | bridge_pump_drained: {} | physics_lag_frames: {} | bridge_fallback: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | scene_mode: {} | balls: {:>5} | draw: {:>5} | tiles_draw: {:>5} | tiles_vis: {:>5} | tiles_culled: {:>5} | tile_chunks: {:>4} | tile_dirty: {:>4} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | contract: {}:{} stable={} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | phys_workers: {} | phys_queue: {} | phys_inflight: {} | phys_frame: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | render_backend: {} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {} | pipeline: {} | bridge_path: {} | queued_plan_depth: {} | bridge_pump_published: {} | bridge_pump_drained: {} | physics_lag_frames: {} | bridge_fallback: {}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
                 report.frame_time_stddev_ms,
+                draw.mode.as_str(),
                 tick.live_balls,
                 visible_ball_count,
+                tile_frame.emitted_tiles,
+                tile_frame.visible_tiles,
+                tile_frame.culled_tiles,
+                tile_frame.visible_chunks,
+                tile_frame.dirty_chunks,
                 upload.light_count,
                 substeps,
                 step_timings.total_us(),

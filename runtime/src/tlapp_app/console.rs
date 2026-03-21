@@ -207,6 +207,8 @@ pub fn empty_showcase_output() -> TlscriptShowcaseFrameOutput {
     TlscriptShowcaseFrameOutput {
         patch: BounceTankRuntimePatch::default(),
         light_overrides: Vec::new(),
+        tile_mutations: Vec::new(),
+        tile_fills: Vec::new(),
         performance_preset: None,
         gfx_profile: None,
         ball_metallic: None,

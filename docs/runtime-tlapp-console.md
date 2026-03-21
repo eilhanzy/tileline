@@ -56,6 +56,11 @@ Mouse usage:
 - `sim.resume`
 - `sim.step <n>`
 - `sim.reset`
+- `scene.mode <3d|2d>`
+- `tile.status`
+- `tile.set <x y id>`
+- `tile.dig <x y>`
+- `tile.fill <x0 y0 x1 y1 id>`
 - `scene.reload`
 - `script.reload`
 - `sprite.reload`
@@ -155,6 +160,20 @@ gfx.render_distance 72
 sim.pause
 sim.step 3
 perf.snapshot
+```
+
+```text
+scene.mode 2d
+tile.set 0 -6 4
+tile.fill -10 -8 10 -8 2
+tile.dig 0 -8
+tile.status
+```
+
+```text
+script.call tile_fill(-20,-10,20,-10,2)
+script.call tile_set(0,-9,4)
+script.call tile_dig(0,-10)
 ```
 
 ```text

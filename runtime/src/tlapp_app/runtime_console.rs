@@ -756,7 +756,13 @@ impl TlAppRuntime {
             .map(|w| w.path.display().to_string())
             .unwrap_or_else(|| "off".to_string());
         format!(
-            "pipeline={} bridge_path={} queued_plan_depth={} bridge_pump_published={} bridge_pump_drained={} physics_lag_frames={} bridge_fallback={} fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={} {}",
+            "scene_mode={} tile[chunks={} dirty={} vis={} draw={} cull={}] pipeline={} bridge_path={} queued_plan_depth={} bridge_pump_published={} bridge_pump_drained={} physics_lag_frames={} bridge_fallback={} fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={} {}",
+            self.scene_mode().as_str(),
+            self.tile_world_frame.loaded_chunks,
+            self.tile_world_frame.dirty_chunks,
+            self.tile_world_frame.visible_chunks,
+            self.tile_world_frame.emitted_tiles,
+            self.tile_world_frame.culled_tiles,
             self.pipeline_mode.as_str(),
             self.runtime_bridge_telemetry.bridge_path.as_str(),
             self.runtime_bridge_telemetry.queued_plan_depth,
@@ -872,7 +878,8 @@ impl TlAppRuntime {
         let Some(program) = compile.program else {
             return Err("script statement produced no runnable program".to_string());
         };
-        let mut output = program.evaluate_frame_with_controls(
+        let tile_lookup = |x: i32, y: i32| self.tile_world_2d.tile(TileCoord2d::new(x, y));
+        let mut output = program.evaluate_frame_with_controls_and_tile_lookup(
             TlscriptShowcaseFrameInput {
                 frame_index: self.script_frame_index,
                 live_balls: self.scene.live_ball_count(),
@@ -880,6 +887,7 @@ impl TlAppRuntime {
                 key_f_down: self.script_key_f_keyboard || self.gamepad.action_f_down(),
             },
             TlscriptShowcaseControlInput::default(),
+            Some(&tile_lookup),
         );
         if !compile.warnings.is_empty() {
             output.warnings.extend(
@@ -1007,6 +1015,11 @@ impl TlAppRuntime {
                             "sim.resume",
                             "sim.step <n>",
                             "sim.reset",
+                            "scene.mode <3d|2d>",
+                            "tile.status",
+                            "tile.set <x y id>",
+                            "tile.dig <x y>",
+                            "tile.fill <x0 y0 x1 y1 id>",
                             "scene.reload | script.reload | sprite.reload",
                             "perf.snapshot",
                             "perf.contract [8k|30k|60k]",
@@ -1072,7 +1085,8 @@ impl TlAppRuntime {
             }
             "sim.status" => {
                 self.console_feedback(format!(
-                    "sim paused={} step_budget={} tick_hz={:.1} max_substeps={} manual_substeps={:?}",
+                    "sim mode={} paused={} step_budget={} tick_hz={:.1} max_substeps={} manual_substeps={:?}",
+                    self.scene_mode().as_str(),
                     self.simulation_paused,
                     self.simulation_step_budget,
                     self.tick_hz,
@@ -1110,6 +1124,184 @@ impl TlAppRuntime {
             "sim.reset" => {
                 self.reset_simulation_state();
                 self.console_feedback("simulation reset (world + scene)");
+            }
+            "scene.mode" => {
+                let Some(raw_mode) = parts.next() else {
+                    self.console_feedback("usage: scene.mode <3d|2d>");
+                    return RuntimeCommand::Consumed;
+                };
+                match RuntimeSceneMode::from_str(raw_mode) {
+                    Some(mode) => {
+                        self.set_scene_mode(mode);
+                        self.console_feedback(format!("scene mode set to '{}'", mode.as_str()));
+                    }
+                    None => self.console_feedback("invalid scene mode (expected: 3d|2d)"),
+                }
+            }
+            "tile.status" => {
+                let t = self.tile_world_frame;
+                self.console_feedback(format!(
+                    "tile world | chunks={} dirty={} visible_chunks={} visible_tiles={} emitted_tiles={} culled_tiles={} world_rev={} mutations={}",
+                    t.loaded_chunks,
+                    t.dirty_chunks,
+                    t.visible_chunks,
+                    t.visible_tiles,
+                    t.emitted_tiles,
+                    t.culled_tiles,
+                    t.world_revision,
+                    t.mutation_count
+                ));
+            }
+            "tile.set" => {
+                let Some(raw_x) = parts.next() else {
+                    self.console_feedback("usage: tile.set <x y id>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(raw_y) = parts.next() else {
+                    self.console_feedback("usage: tile.set <x y id>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(raw_id) = parts.next() else {
+                    self.console_feedback("usage: tile.set <x y id>");
+                    return RuntimeCommand::Consumed;
+                };
+                let x = match parse_console_i32_in_range(raw_x, "tile.set.x", -262_144, 262_144) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let y = match parse_console_i32_in_range(raw_y, "tile.set.y", -262_144, 262_144) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let tile_id = match parse_console_u16_in_range(raw_id, "tile.set.id", 1, u16::MAX) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let coord = TileCoord2d::new(x, y);
+                let before = self.tile_world_2d.tile(coord);
+                let changed = self.tile_world_2d.set_tile(coord, tile_id);
+                self.tile_world_frame = self.tile_world_2d.telemetry_snapshot();
+                self.console_feedback(format!(
+                    "tile.set ({x},{y}) {} -> {}{}",
+                    before,
+                    tile_id,
+                    if changed { "" } else { " (unchanged)" }
+                ));
+            }
+            "tile.dig" => {
+                let Some(raw_x) = parts.next() else {
+                    self.console_feedback("usage: tile.dig <x y>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(raw_y) = parts.next() else {
+                    self.console_feedback("usage: tile.dig <x y>");
+                    return RuntimeCommand::Consumed;
+                };
+                let x = match parse_console_i32_in_range(raw_x, "tile.dig.x", -262_144, 262_144) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let y = match parse_console_i32_in_range(raw_y, "tile.dig.y", -262_144, 262_144) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let coord = TileCoord2d::new(x, y);
+                let before = self.tile_world_2d.tile(coord);
+                let changed = self
+                    .tile_world_2d
+                    .apply_mutation(TileMutation2d::dig(coord));
+                self.tile_world_frame = self.tile_world_2d.telemetry_snapshot();
+                self.console_feedback(format!(
+                    "tile.dig ({x},{y}) {} -> 0{}",
+                    before,
+                    if changed { "" } else { " (unchanged)" }
+                ));
+            }
+            "tile.fill" => {
+                let Some(raw_x0) = parts.next() else {
+                    self.console_feedback("usage: tile.fill <x0 y0 x1 y1 id>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(raw_y0) = parts.next() else {
+                    self.console_feedback("usage: tile.fill <x0 y0 x1 y1 id>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(raw_x1) = parts.next() else {
+                    self.console_feedback("usage: tile.fill <x0 y0 x1 y1 id>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(raw_y1) = parts.next() else {
+                    self.console_feedback("usage: tile.fill <x0 y0 x1 y1 id>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(raw_id) = parts.next() else {
+                    self.console_feedback("usage: tile.fill <x0 y0 x1 y1 id>");
+                    return RuntimeCommand::Consumed;
+                };
+                let x0 = match parse_console_i32_in_range(raw_x0, "tile.fill.x0", -262_144, 262_144)
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let y0 = match parse_console_i32_in_range(raw_y0, "tile.fill.y0", -262_144, 262_144)
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let x1 = match parse_console_i32_in_range(raw_x1, "tile.fill.x1", -262_144, 262_144)
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let y1 = match parse_console_i32_in_range(raw_y1, "tile.fill.y1", -262_144, 262_144)
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let tile_id = match parse_console_u16_in_range(raw_id, "tile.fill.id", 0, u16::MAX)
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                let changed = self.tile_world_2d.fill_rect(
+                    TileCoord2d::new(x0, y0),
+                    TileCoord2d::new(x1, y1),
+                    tile_id,
+                );
+                self.tile_world_frame = self.tile_world_2d.telemetry_snapshot();
+                self.console_feedback(format!(
+                    "tile.fill [{x0},{y0}]..[{x1},{y1}] id={tile_id} changed={changed}"
+                ));
             }
             "scene.reload" => {
                 let mut notes = Vec::new();

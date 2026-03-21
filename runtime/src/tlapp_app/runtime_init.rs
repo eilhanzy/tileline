@@ -511,6 +511,8 @@ impl TlAppRuntime {
             initial_speed_max: 1.25,
             ..BounceTankSceneConfig::default()
         });
+        let tile_world_2d = build_default_side_view_tile_world(scene.config());
+        let tile_world_frame = tile_world_2d.telemetry_snapshot();
         let fsr_config = FsrConfig {
             mode: options.fsr_mode,
             quality: options.fsr_quality,
@@ -713,6 +715,8 @@ impl TlAppRuntime {
                 fully_spawned: false,
             },
             scene,
+            tile_world_2d,
+            tile_world_frame,
             draw_compiler,
             hud,
             renderer,

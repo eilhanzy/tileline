@@ -1,6 +1,67 @@
 use super::*;
 
 impl TlAppRuntime {
+    pub(super) fn set_scene_mode(&mut self, mode: RuntimeSceneMode) {
+        self.scene.set_scene_mode(mode);
+    }
+
+    pub(super) fn scene_mode(&self) -> RuntimeSceneMode {
+        self.scene.scene_mode()
+    }
+
+    pub(super) fn reset_tile_world_to_default(&mut self) {
+        self.tile_world_2d = build_default_side_view_tile_world(self.scene.config());
+        self.tile_world_frame = self.tile_world_2d.telemetry_snapshot();
+    }
+
+    pub(super) fn append_visible_tile_world_sprites(&mut self, frame: &mut SceneFrameInstances) {
+        if !frame.mode.is_2d() {
+            self.tile_world_frame = self.tile_world_2d.telemetry_snapshot();
+            return;
+        }
+        let Some(view) = frame.view_2d else {
+            self.tile_world_frame = self.tile_world_2d.telemetry_snapshot();
+            return;
+        };
+
+        let visible = self.tile_world_2d.collect_visible_tiles(
+            TileView2d {
+                center: view.center,
+                half_size: view.half_size,
+                zoom: view.zoom,
+            },
+            None,
+        );
+        self.tile_world_frame = visible.telemetry;
+
+        let zoom = view.zoom.max(0.05);
+        let half_x = (view.half_size[0].abs().max(0.5) / zoom).max(0.5);
+        let half_y = (view.half_size[1].abs().max(0.5) / zoom).max(0.5);
+        let tile_size_ndc = [1.0 / half_x, 1.0 / half_y];
+
+        frame.sprites.reserve(visible.tiles.len());
+        for tile in visible.tiles {
+            let world_x = tile.coord.x as f32 + 0.5;
+            let world_y = tile.coord.y as f32 + 0.5;
+            let ndc_x = (world_x - view.center[0]) / half_x;
+            let ndc_y = (world_y - view.center[1]) / half_y;
+            if ndc_x.abs() > 1.2 || ndc_y.abs() > 1.2 {
+                continue;
+            }
+
+            frame.sprites.push(SpriteInstance {
+                sprite_id: tile_sprite_id(tile.coord, tile.tile_id),
+                kind: SpriteKind::Terrain,
+                position: [ndc_x, ndc_y, 0.30],
+                size: tile_size_ndc,
+                rotation_rad: 0.0,
+                color_rgba: tile_color_rgba(tile.tile_id),
+                texture_slot: tile.tile_id,
+                layer: tile.layer,
+            });
+        }
+    }
+
     pub(super) fn prepare_for_exit(&mut self) {
         if self.shutdown_prepared {
             return;
@@ -44,6 +105,7 @@ impl TlAppRuntime {
         let container_mesh_slot = self.scene.container_mesh_slot();
         self.world.replace(PhysicsWorld::new(world_config));
         self.scene = BounceTankSceneController::new(scene_config);
+        self.reset_tile_world_to_default();
         if let Some(program) = sprite_program {
             self.scene.set_sprite_program(program);
         }
@@ -382,4 +444,23 @@ impl TlAppRuntime {
             gfx_note
         ))
     }
+}
+
+fn tile_sprite_id(coord: TileCoord2d, tile_id: u16) -> u64 {
+    let x = coord.x as i64 as u64;
+    let y = coord.y as i64 as u64;
+    ((x & 0xFFFF_FFFF) << 32) | (y & 0xFFFF_FFFF) ^ ((tile_id as u64) << 48)
+}
+
+fn tile_color_rgba(tile_id: u16) -> [f32; 4] {
+    let t = tile_id as f32;
+    let base = ((tile_id as u32)
+        .wrapping_mul(1103515245)
+        .wrapping_add(12345)
+        & 0xFF) as f32
+        / 255.0;
+    let r = (0.30 + 0.52 * (base * 1.37 + t * 0.03).sin().abs()).clamp(0.0, 1.0);
+    let g = (0.34 + 0.50 * (base * 1.11 + t * 0.05 + 0.7).sin().abs()).clamp(0.0, 1.0);
+    let b = (0.28 + 0.46 * (base * 0.91 + t * 0.07 + 1.3).sin().abs()).clamp(0.0, 1.0);
+    [r, g, b, 0.95]
 }

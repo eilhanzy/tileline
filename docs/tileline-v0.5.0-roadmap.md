@@ -39,11 +39,13 @@ features**, not on inventing entirely new subsystems.
 - an optimized forward + hybrid RT render path that is stable in the runtime
 - a first-class orthographic / side-view 2D runtime path
 - a chunked tile-world foundation suitable for Terraria-like digging/building scenes
+- runtime-backed `.tlscript` tile query/write semantics for 2D scenes
 - a usable effects layer on top of the current shader/light stack
 - first-class texture support in the runtime scene/material path
 - a first-class SPIR-V shader path for the raw Vulkan backend
 - a more aggressively parallel ParadoxPE execution model
 - a flat-2D ParadoxPE mode for side-view terrain/body collision
+- a runtime MAS path (`runtime/src/mas.rs`) aligned with MPS scheduling ownership
 - a stricter MPS-driven runtime execution path with fewer serial bottlenecks
 - a Linux-first raw Vulkan backend inside `tl-core`
 - no shipping runtime dependence on `Bevy` scheduling/tasks
@@ -69,12 +71,14 @@ These are intentionally out of scope for `v0.5.0`:
 - lights, shaders, textures, and effects all work together in the same scene path
 - one canonical side-view 2D scene path works in runtime without example-only hacks
 - chunked tile worlds can render, scroll, and mutate locally through dig/place updates
+- `.tlscript` tile reads/writes resolve against canonical runtime tile state (not example-local stubs)
 - ParadoxPE flat-2D mode exists and is the canonical 2D terrain/body collision path
 - 2D camera, animation, and VFX can coexist on the same runtime scene path
 - SPIR-V is a supported, documented shader/runtime artifact path for Vulkan scene rendering
 - the Vulkan backend migration path inside `tl-core` is real and no longer speculative
 - ParadoxPE no longer depends on coarse serial stepping in its main hot path
 - MPS is the primary CPU execution path for physics/runtime jobs
+- MAS is integrated as a runtime-owned audio path without destabilizing physics/render pacing
 - no `Bevy App/System/bevy_tasks` dependence exists in shipping runtime execution
 - no `rayon` dependence remains in shipping hot paths for physics/runtime scheduling
 - no `wgpu`-backed render path remains in shipping runtime execution
@@ -455,6 +459,23 @@ Validation rules:
 - 2D scene frame pacing remains diagnosable from telemetry
 - the 2D path works through runtime content loading, not only through bespoke examples
 
+### F6. 2D Script-Runtime Bridge Hardening
+
+Target work:
+
+- make `tile_get` resolve against canonical runtime chunked tile state when no local override exists
+- keep same-frame `tile_set`/`tile_fill`/`tile_dig` overlays deterministic before runtime apply
+- ensure `single` / `multi-script` / `.tljoint` evaluation paths share one tile lookup contract
+- align `script.call` console evaluation with runtime scene script evaluation semantics
+- keep script-side tile operations bounded and telemetry-visible
+
+Acceptance gates:
+
+- `tile_get` returns live runtime tile value without requiring example-only glue
+- local same-frame script mutations still override `tile_get` deterministically
+- `.tljoint` and multi-script compositions do not drift from single-script behavior
+- 2D script-heavy scenes remain diagnosable from telemetry and do not regress pacing unexpectedly
+
 ## Milestones
 
 ### Milestone 1: 2D Foundation First
@@ -465,11 +486,13 @@ Target contents:
 - initial 2D runtime rendering path (orthographic camera + tile/sprite layer composition)
 - chunked tile-world scene representation and local mutation loop (dig/place)
 - 2D authoring flow anchored in `.tlsprite` + `.tlscript` + `.tljoint`
+- script/runtime bridge baseline (`F6`) for canonical tile query/write semantics
 
 Exit criteria:
 
 - one canonical 2D side-view scene path supports tiles + sprites + overlays
 - chunked tile dig/place path is functional without full-world rebuild behavior
+- `.tlscript` tile operations are runtime-backed and deterministic across script composition modes
 
 ### Milestone 2: Render + Effects + Texture Consolidation
 
@@ -492,6 +515,7 @@ Exit criteria:
 Target contents:
 
 - stronger MPS dispatch ownership in runtime
+- MAS (`runtime/src/mas.rs`) promoted as Multi Audio Synthesizer runtime path with MPS-aligned scheduling
 - ParadoxPE phase refactor and lower serial world-step fraction
 - `rayon` hot-path exit
 - `Bevy` runtime-path exit
@@ -502,6 +526,7 @@ Target contents:
 Exit criteria:
 
 - `v0.5.0` can be shipped without depending on generic schedulers or `wgpu` in shipping runtime
+- MAS runtime path remains stable under the same workload validation gates
 
 ## Validation Gates
 
