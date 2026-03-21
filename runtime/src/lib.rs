@@ -75,7 +75,7 @@ pub use frame_loop::{
 };
 pub use mas::{
     AudioBufferBlock, MasConfig, MasCoreAffinity, MasMetrics, MasPriority, MasSubmission,
-    MultiAudioScheduler,
+    MasWavError, MultiAudioScheduler, WavClip, WavPlaybackCursor, WavPlaybackParams,
 };
 pub use mgs_frame_loop::{
     MgsFrameLoopRuntime, MgsFrameLoopRuntimeConfig, MgsFrameLoopRuntimeMetrics,
@@ -110,10 +110,10 @@ pub use runtime_bridge::{
 pub use scene::{
     apply_scene_light_overrides, clamp_scene_lights_for_camera, BounceTankPatchMetrics,
     BounceTankRuntimePatch, BounceTankSceneConfig, BounceTankSceneController,
-    BounceTankTickMetrics, RayTracingMode, RenderSyncMode, RuntimeSceneMode, SceneFrameInstances,
-    SceneInstance3d, SceneLight, SceneLightKind, SceneLightOverride, SceneMaterial,
-    ScenePrimitive3d, SceneTransform3d, SceneView2d, ShadingModel, SpriteInstance, SpriteKind,
-    TickRatePolicy, MAX_SCENE_LIGHTS,
+    BounceTankTickMetrics, RayTracingMode, RenderSyncMode, RuntimeSceneMode, SceneAudioTrack,
+    SceneFrameInstances, SceneInstance3d, SceneLight, SceneLightKind, SceneLightOverride,
+    SceneMaterial, ScenePrimitive3d, SceneTransform3d, SceneView2d, ShadingModel, SpriteInstance,
+    SpriteKind, TickRatePolicy, MAX_SCENE_LIGHTS,
 };
 pub use scene_dispatch::{
     submit_scene_estimate_to_bridge, SceneDispatchBridgeConfig, SceneDispatchLaneSummary,

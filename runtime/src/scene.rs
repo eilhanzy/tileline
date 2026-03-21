@@ -134,6 +134,19 @@ pub struct SpriteInstance {
     pub layer: i16,
 }
 
+/// One scene-owned audio track descriptor (runtime-controlled, renderer-independent).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneAudioTrack {
+    pub track_id: u64,
+    pub enabled: bool,
+    /// Relative or absolute `.wav` asset path.
+    pub wav_path: String,
+    pub gain: f32,
+    pub pitch_semitones: f32,
+    pub tempo: f32,
+    pub looped: bool,
+}
+
 /// Runtime scene light kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SceneLightKind {
@@ -284,13 +297,68 @@ impl RayTracingMode {
     }
 }
 
+/// Canonical runtime scene mode.
+///
+/// `Spatial3d` keeps current showcase behavior. `SideView2d` is the first-class 2D mode used by
+/// side-view sandbox scenes (Terraria-like foundation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeSceneMode {
+    #[default]
+    Spatial3d,
+    SideView2d,
+}
+
+impl RuntimeSceneMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spatial3d => "3d",
+            Self::SideView2d => "2d-side",
+        }
+    }
+
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "3d" | "spatial3d" | "spatial" => Some(Self::Spatial3d),
+            "2d" | "side2d" | "side-view-2d" | "sideview2d" => Some(Self::SideView2d),
+            _ => None,
+        }
+    }
+
+    pub fn is_2d(self) -> bool {
+        matches!(self, Self::SideView2d)
+    }
+}
+
+/// Optional 2D view hint emitted by runtime scene controllers.
+///
+/// This is a renderer-facing hint only; camera ownership remains in runtime app flow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneView2d {
+    pub center: [f32; 2],
+    pub half_size: [f32; 2],
+    pub zoom: f32,
+}
+
+impl Default for SceneView2d {
+    fn default() -> Self {
+        Self {
+            center: [0.0, 0.0],
+            half_size: [12.0, 8.0],
+            zoom: 1.0,
+        }
+    }
+}
+
 /// Runtime scene batch for one render frame.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SceneFrameInstances {
+    pub mode: RuntimeSceneMode,
+    pub view_2d: Option<SceneView2d>,
     pub opaque_3d: Vec<SceneInstance3d>,
     pub transparent_3d: Vec<SceneInstance3d>,
     pub sprites: Vec<SpriteInstance>,
     pub lights: Vec<SceneLight>,
+    pub audio_tracks: Vec<SceneAudioTrack>,
 }
 
 /// Apply `.tlscript` light overrides onto frame lights.
@@ -436,6 +504,7 @@ impl TickRatePolicy {
 /// Configuration for the bounce showcase scene.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BounceTankSceneConfig {
+    pub scene_mode: RuntimeSceneMode,
     pub target_ball_count: usize,
     pub spawn_per_tick: usize,
     pub container_half_extents: [f32; 3],
@@ -469,12 +538,16 @@ pub struct BounceTankSceneConfig {
     pub scatter_interval_ticks: u64,
     pub scatter_strength: f32,
     pub virtual_barrier_enabled: bool,
+    pub audio_enabled: bool,
+    pub audio_pitch_semitones: f32,
+    pub audio_tempo: f32,
     pub seed: u64,
 }
 
 impl Default for BounceTankSceneConfig {
     fn default() -> Self {
         Self {
+            scene_mode: RuntimeSceneMode::Spatial3d,
             target_ball_count: 12_000,
             spawn_per_tick: 120,
             container_half_extents: [24.0, 16.0, 24.0],
@@ -508,6 +581,10 @@ impl Default for BounceTankSceneConfig {
             scatter_interval_ticks: 420,
             scatter_strength: 0.16,
             virtual_barrier_enabled: true,
+            // Demo defaults to silent; scenes can opt-in with runtime/script controls.
+            audio_enabled: false,
+            audio_pitch_semitones: 0.0,
+            audio_tempo: 1.0,
             seed: 0x5EED_C0DE_u64,
         }
     }
@@ -559,6 +636,9 @@ pub struct BounceTankRuntimePatch {
     pub scatter_interval_ticks: Option<u64>,
     pub scatter_strength: Option<f32>,
     pub virtual_barrier_enabled: Option<bool>,
+    pub audio_enabled: Option<bool>,
+    pub audio_pitch_semitones: Option<f32>,
+    pub audio_tempo: Option<f32>,
     pub speculative_sweep_enabled: Option<bool>,
     pub speculative_sweep_max_distance: Option<f32>,
     pub speculative_contacts_enabled: Option<bool>,
@@ -611,6 +691,9 @@ pub struct BounceTankSceneController {
     levitation_velocities: Vec<[f32; 3]>,
     levitation_reaction_cells: HashMap<LevitationCellKey, Vec<usize>>,
     levitation_lateral_phase: f32,
+    scene_audio_wav_path: Option<String>,
+    scene_audio_gain: f32,
+    scene_audio_looped: bool,
 }
 
 impl BounceTankSceneController {
@@ -631,11 +714,27 @@ impl BounceTankSceneController {
             levitation_velocities: Vec::new(),
             levitation_reaction_cells: HashMap::new(),
             levitation_lateral_phase: 0.0,
+            scene_audio_wav_path: None,
+            scene_audio_gain: 1.0,
+            scene_audio_looped: true,
         }
     }
 
     pub fn config(&self) -> BounceTankSceneConfig {
         self.config
+    }
+
+    /// Active runtime scene mode.
+    pub fn scene_mode(&self) -> RuntimeSceneMode {
+        self.config.scene_mode
+    }
+
+    /// Switch between canonical 3D and side-view 2D runtime scene modes.
+    ///
+    /// This is a lightweight runtime switch for Milestone 1 skeleton wiring. Scene content and
+    /// renderer-specific behavior are still refined by follow-up 2D workstreams.
+    pub fn set_scene_mode(&mut self, mode: RuntimeSceneMode) {
+        self.config.scene_mode = mode;
     }
 
     pub fn live_ball_count(&self) -> usize {
@@ -685,6 +784,72 @@ impl BounceTankSceneController {
     /// Active mesh override slot for the container, if any.
     pub fn container_mesh_slot(&self) -> Option<u8> {
         self.container_mesh_slot
+    }
+
+    /// Set or clear the scene-level `.wav` path.
+    pub fn set_scene_audio_wav_path(&mut self, wav_path: Option<String>) {
+        self.scene_audio_wav_path = wav_path.and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+    }
+
+    pub fn set_scene_audio_gain(&mut self, gain: f32) {
+        self.scene_audio_gain = gain.clamp(0.0, 4.0);
+    }
+
+    pub fn set_scene_audio_looped(&mut self, looped: bool) {
+        self.scene_audio_looped = looped;
+    }
+
+    /// Current scene audio descriptor, if a `.wav` path is configured.
+    pub fn scene_audio_track(&self) -> Option<SceneAudioTrack> {
+        let Some(wav_path) = &self.scene_audio_wav_path else {
+            return None;
+        };
+        Some(SceneAudioTrack {
+            track_id: 1,
+            enabled: self.config.audio_enabled,
+            wav_path: wav_path.clone(),
+            gain: self.scene_audio_gain,
+            pitch_semitones: self.config.audio_pitch_semitones,
+            tempo: self.config.audio_tempo,
+            looped: self.scene_audio_looped,
+        })
+    }
+
+    pub fn set_scene_audio_track_enabled(&mut self, world: &mut PhysicsWorld, enabled: bool) {
+        let _ = self.apply_runtime_patch(
+            world,
+            BounceTankRuntimePatch {
+                audio_enabled: Some(enabled),
+                ..BounceTankRuntimePatch::default()
+            },
+        );
+    }
+
+    pub fn set_scene_audio_pitch_semitones(&mut self, world: &mut PhysicsWorld, pitch: f32) {
+        let _ = self.apply_runtime_patch(
+            world,
+            BounceTankRuntimePatch {
+                audio_pitch_semitones: Some(pitch),
+                ..BounceTankRuntimePatch::default()
+            },
+        );
+    }
+
+    pub fn set_scene_audio_tempo(&mut self, world: &mut PhysicsWorld, tempo: f32) {
+        let _ = self.apply_runtime_patch(
+            world,
+            BounceTankRuntimePatch {
+                audio_tempo: Some(tempo),
+                ..BounceTankRuntimePatch::default()
+            },
+        );
     }
 
     /// Apply a bounded runtime patch and propagate dynamic damping changes to existing bodies.
@@ -955,6 +1120,26 @@ impl BounceTankSceneController {
                 updated = true;
             }
         }
+        if let Some(enabled) = patch.audio_enabled {
+            if self.config.audio_enabled != enabled {
+                self.config.audio_enabled = enabled;
+                updated = true;
+            }
+        }
+        if let Some(pitch) = patch.audio_pitch_semitones {
+            let clamped = pitch.clamp(-24.0, 24.0);
+            if (self.config.audio_pitch_semitones - clamped).abs() > f32::EPSILON {
+                self.config.audio_pitch_semitones = clamped;
+                updated = true;
+            }
+        }
+        if let Some(tempo) = patch.audio_tempo {
+            let clamped = tempo.clamp(0.25, 4.0);
+            if (self.config.audio_tempo - clamped).abs() > f32::EPSILON {
+                self.config.audio_tempo = clamped;
+                updated = true;
+            }
+        }
         if patch.speculative_sweep_enabled.is_some()
             || patch.speculative_sweep_max_distance.is_some()
         {
@@ -1074,6 +1259,9 @@ impl BounceTankSceneController {
         let spawned = self.spawn_batch(world);
         let scattered = self.maybe_scatter_burst(world);
         let _ = self.apply_levitation_field(world);
+        if self.config.scene_mode.is_2d() {
+            let _ = self.enforce_side_view_flat_plane(world);
+        }
         let _ = self.clamp_ball_velocity_for_collision_safety(world);
         BounceTankTickMetrics {
             spawned_this_tick: spawned,
@@ -1096,6 +1284,9 @@ impl BounceTankSceneController {
             // dynamic balls do not remain visibly outside the container.
             self.recycle_hard_escaped_balls(world)
         };
+        if self.config.scene_mode.is_2d() {
+            let _ = self.enforce_side_view_flat_plane(world);
+        }
         if recycled > 0 {
             // Interpolation uses stored snapshots captured inside `world.step(...)`.
             // If we corrected positions after the step, push one fresh snapshot so render doesn't
@@ -1147,7 +1338,20 @@ impl BounceTankSceneController {
         interpolation_alpha: Option<f32>,
         ball_render_limit: Option<usize>,
     ) -> SceneFrameInstances {
-        let mut frame = SceneFrameInstances::default();
+        let mut frame = SceneFrameInstances {
+            mode: self.config.scene_mode,
+            ..SceneFrameInstances::default()
+        };
+        if self.config.scene_mode.is_2d() {
+            frame.view_2d = Some(SceneView2d {
+                center: [0.0, 0.0],
+                half_size: [
+                    self.config.container_half_extents[0].max(0.5),
+                    self.config.container_half_extents[1].max(0.5),
+                ],
+                zoom: 1.0,
+            });
+        }
         if self.container_mesh_slot.is_some() {
             self.append_container_wall_instances(&mut frame.transparent_3d);
         } else {
@@ -1192,11 +1396,16 @@ impl BounceTankSceneController {
                 };
                 let (position, rotation) = pose?;
                 let q = rotation.quaternion();
+                let render_z = if self.config.scene_mode.is_2d() {
+                    0.0
+                } else {
+                    position.z
+                };
                 Some(SceneInstance3d {
                     instance_id: ball.body.raw() as u64,
                     primitive,
                     transform: SceneTransform3d {
-                        translation: [position.x, position.y, position.z],
+                        translation: [position.x, position.y, render_z],
                         rotation_xyzw: [q.i, q.j, q.k, q.w],
                         scale: [ball.radius * 2.0, ball.radius * 2.0, ball.radius * 2.0],
                     },
@@ -1234,6 +1443,9 @@ impl BounceTankSceneController {
                 &mut frame.sprites,
             );
             program.emit_lights(&mut frame.lights);
+        }
+        if let Some(track) = self.scene_audio_track() {
+            frame.audio_tracks.push(track);
         }
 
         // Built-in fallback overlay (spawn progress bar), kept renderer-agnostic.
@@ -1422,6 +1634,7 @@ impl BounceTankSceneController {
         let to_spawn = remaining.min(staged_spawn_cap.max(1));
         let mut spawned = 0usize;
 
+        let side_view_2d = self.config.scene_mode.is_2d();
         let hx = self.config.container_half_extents[0].max(0.5);
         let hy = self.config.container_half_extents[1].max(0.5);
         let hz = self.config.container_half_extents[2].max(0.5);
@@ -1439,7 +1652,11 @@ impl BounceTankSceneController {
                 self.rand01(),
             );
             let spawn_x = self.rand_range(-(hx - radius) * 0.86, (hx - radius) * 0.86);
-            let spawn_z = self.rand_range(-(hz - radius) * 0.86, (hz - radius) * 0.86);
+            let spawn_z = if side_view_2d {
+                0.0
+            } else {
+                self.rand_range(-(hz - radius) * 0.86, (hz - radius) * 0.86)
+            };
             let spawn_y = self.rand_range(hy * 0.45, hy * 0.88).min(hy - radius);
             let mass = (radius * radius * radius * 14.0).max(0.1);
 
@@ -1449,22 +1666,33 @@ impl BounceTankSceneController {
                     .initial_speed_max
                     .max(self.config.initial_speed_min.max(0.0)),
             );
-            let theta = self.rand01() * TAU;
-            let vz = self.rand_range(-1.0, 1.0);
-            let xy = (1.0 - vz * vz).sqrt();
-            // Keep launch velocity bounded to configured speed range; avoid speed^2 blow-up.
-            let mut launch_dir = Vector3::new(
-                xy * theta.cos(),
-                -self.rand_range(0.15, 0.55),
-                xy * theta.sin(),
-            );
+            let mut launch_dir = if side_view_2d {
+                Vector3::new(
+                    self.rand_range(-1.0, 1.0),
+                    -self.rand_range(0.15, 0.55),
+                    0.0,
+                )
+            } else {
+                let theta = self.rand01() * TAU;
+                let vz = self.rand_range(-1.0, 1.0);
+                let xy = (1.0 - vz * vz).sqrt();
+                // Keep launch velocity bounded to configured speed range; avoid speed^2 blow-up.
+                Vector3::new(
+                    xy * theta.cos(),
+                    -self.rand_range(0.15, 0.55),
+                    xy * theta.sin(),
+                )
+            };
             let launch_len = launch_dir.norm();
             if launch_len > 1e-6 {
                 launch_dir /= launch_len;
             } else {
                 launch_dir = Vector3::new(0.0, -1.0, 0.0);
             }
-            let velocity = launch_dir * speed;
+            let mut velocity = launch_dir * speed;
+            if side_view_2d {
+                velocity.z = 0.0;
+            }
 
             let body = world.spawn_body(BodyDesc {
                 kind: BodyKind::Dynamic,
@@ -1514,6 +1742,7 @@ impl BounceTankSceneController {
     /// Apply an occasional high-energy burst so the showcase naturally "splashes" without
     /// per-frame randomness overhead.
     fn maybe_scatter_burst(&mut self, world: &mut PhysicsWorld) -> usize {
+        let side_view_2d = self.config.scene_mode.is_2d();
         let strength = self.config.scatter_strength.clamp(0.0, 1.0);
         if strength <= 0.01 {
             return 0;
@@ -1552,14 +1781,23 @@ impl BounceTankSceneController {
 
         // Cycle bursts across six axis-aligned face directions so contact pressure reaches all
         // container sides over time instead of continuously biasing toward diagonal corner piles.
-        let face_dirs = [
-            [1.0_f32, 0.0, 0.0],
-            [-1.0_f32, 0.0, 0.0],
-            [0.0_f32, 0.0, 1.0],
-            [0.0_f32, 0.0, -1.0],
-            [0.0_f32, 1.0, 0.0],
-            [0.0_f32, -1.0, 0.0],
-        ];
+        let face_dirs = if side_view_2d {
+            &[
+                [1.0_f32, 0.0, 0.0],
+                [-1.0_f32, 0.0, 0.0],
+                [0.0_f32, 1.0, 0.0],
+                [0.0_f32, -1.0, 0.0],
+            ][..]
+        } else {
+            &[
+                [1.0_f32, 0.0, 0.0],
+                [-1.0_f32, 0.0, 0.0],
+                [0.0_f32, 0.0, 1.0],
+                [0.0_f32, 0.0, -1.0],
+                [0.0_f32, 1.0, 0.0],
+                [0.0_f32, -1.0, 0.0],
+            ][..]
+        };
         let face = face_dirs[(self.scatter_face_cursor as usize) % face_dirs.len()];
         self.scatter_face_cursor = self.scatter_face_cursor.wrapping_add(1);
         let face_dir = Vector3::new(face[0], face[1], face[2]);
@@ -1581,10 +1819,12 @@ impl BounceTankSceneController {
             } else {
                 dir.x += self.rand_range(-0.12, 0.12);
             }
-            if face_dir.z.abs() < 0.5 {
-                dir.z += self.rand_range(-lateral_jitter, lateral_jitter);
-            } else {
-                dir.z += self.rand_range(-0.12, 0.12);
+            if !side_view_2d {
+                if face_dir.z.abs() < 0.5 {
+                    dir.z += self.rand_range(-lateral_jitter, lateral_jitter);
+                } else {
+                    dir.z += self.rand_range(-0.12, 0.12);
+                }
             }
             if face_dir.y.abs() < 0.5 {
                 dir.y += self.rand_range(0.05, 0.28 + 0.25 * strength);
@@ -1599,7 +1839,10 @@ impl BounceTankSceneController {
                 continue;
             }
             let speed = self.rand_range(burst_min, burst_max);
-            let velocity = (dir / len2.sqrt()) * speed;
+            let mut velocity = (dir / len2.sqrt()) * speed;
+            if side_view_2d {
+                velocity.z = 0.0;
+            }
             if world.set_velocity(ball.body, velocity) {
                 scattered = scattered.saturating_add(1);
             }
@@ -1617,6 +1860,7 @@ impl BounceTankSceneController {
     /// The lateral path adds deterministic X/Z glide plus side-wall steering so balls also move
     /// and rebound across horizontal axes during the showcase.
     fn apply_levitation_field(&mut self, world: &mut PhysicsWorld) -> usize {
+        let side_view_2d = self.config.scene_mode.is_2d();
         let vertical_enabled = self.config.levitation_strength > 1e-5;
         let lateral_strength = self.config.levitation_lateral_strength.max(0.0);
         let lateral_damping = self.config.levitation_lateral_damping.max(0.0);
@@ -1786,7 +2030,7 @@ impl BounceTankSceneController {
                     if pos[0].abs() > side_wall_band_x {
                         accel_x += -pos[0].signum() * lateral_wall_push;
                     }
-                    if pos[2].abs() > side_wall_band_z {
+                    if !side_view_2d && pos[2].abs() > side_wall_band_z {
                         accel_z += -pos[2].signum() * lateral_wall_push;
                     }
                 }
@@ -1803,6 +2047,9 @@ impl BounceTankSceneController {
                 velocity[0] = next_vx;
                 velocity[2] = next_vz;
             }
+            if side_view_2d {
+                velocity[2] = 0.0;
+            }
 
             if world.set_velocity(
                 self.levitation_body_handles[i],
@@ -1812,6 +2059,36 @@ impl BounceTankSceneController {
             }
         }
         adjusted
+    }
+
+    /// Keep dynamic bodies on a strict Z=0 plane for canonical side-view 2D mode.
+    fn enforce_side_view_flat_plane(&mut self, world: &mut PhysicsWorld) -> usize {
+        if !self.config.scene_mode.is_2d() {
+            return 0;
+        }
+        let mut corrected = 0usize;
+        for ball in &self.balls {
+            let Some(body) = world.body(ball.body) else {
+                continue;
+            };
+            let mut position = body.position;
+            let mut velocity = body.linear_velocity;
+            let mut changed = false;
+            if position.z.abs() > 1e-5 {
+                position.z = 0.0;
+                changed = true;
+            }
+            if velocity.z.abs() > 1e-5 {
+                velocity.z = 0.0;
+                changed = true;
+            }
+            if changed {
+                let _ = world.set_position(ball.body, position);
+                let _ = world.set_velocity(ball.body, velocity);
+                corrected = corrected.saturating_add(1);
+            }
+        }
+        corrected
     }
 
     /// Clamps rare escaped balls back inside the prism instead of deleting them.
@@ -2537,9 +2814,90 @@ mod tests {
         assert!(scene.live_ball_count() <= 256);
 
         let frame = scene.build_frame_instances(&world, Some(0.5));
+        assert_eq!(frame.mode, RuntimeSceneMode::Spatial3d);
+        assert!(frame.view_2d.is_none());
         assert!(!frame.transparent_3d.is_empty());
         assert!(!frame.sprites.is_empty());
         assert!(!frame.opaque_3d.is_empty());
+    }
+
+    #[test]
+    fn side_view_mode_emits_2d_view_hint() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            scene_mode: RuntimeSceneMode::SideView2d,
+            target_ball_count: 32,
+            spawn_per_tick: 32,
+            ..BounceTankSceneConfig::default()
+        });
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+        let frame = scene.build_frame_instances(&world, Some(1.0));
+        assert_eq!(frame.mode, RuntimeSceneMode::SideView2d);
+        let view = frame.view_2d.expect("2D mode should emit view hint");
+        assert!(view.half_size[0] > 0.0);
+        assert!(view.half_size[1] > 0.0);
+    }
+
+    #[test]
+    fn side_view_mode_keeps_dynamic_balls_on_flat_z_plane() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            scene_mode: RuntimeSceneMode::SideView2d,
+            target_ball_count: 160,
+            spawn_per_tick: 80,
+            scatter_interval_ticks: 1,
+            scatter_strength: 0.9,
+            levitation_lateral_strength: 2.0,
+            levitation_lateral_wall_push: 1.1,
+            ..BounceTankSceneConfig::default()
+        });
+
+        for _ in 0..6 {
+            let _ = scene.physics_tick(&mut world);
+            let _ = world.step(world.config().fixed_dt);
+            let _ = scene.reconcile_after_step(&mut world);
+        }
+
+        for ball in &scene.balls {
+            let body = world.body(ball.body).expect("dynamic body should be alive");
+            assert!(
+                body.position.z.abs() <= 1e-4,
+                "z position drifted in side-view mode: {}",
+                body.position.z
+            );
+            assert!(
+                body.linear_velocity.z.abs() <= 1e-4,
+                "z velocity drifted in side-view mode: {}",
+                body.linear_velocity.z
+            );
+        }
+    }
+
+    #[test]
+    fn scene_audio_descriptor_is_emitted_when_wav_path_is_set() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig::default());
+        scene.set_scene_audio_wav_path(Some("assets/audio/theme.wav".to_string()));
+        scene.set_scene_audio_track_enabled(&mut world, true);
+        scene.set_scene_audio_pitch_semitones(&mut world, -2.0);
+        scene.set_scene_audio_tempo(&mut world, 1.1);
+        let frame = scene.build_frame_instances(&world, Some(1.0));
+        assert_eq!(frame.audio_tracks.len(), 1);
+        let track = &frame.audio_tracks[0];
+        assert_eq!(track.wav_path, "assets/audio/theme.wav");
+        assert!(track.enabled);
+        assert!((track.pitch_semitones + 2.0).abs() < 1e-6);
+        assert!((track.tempo - 1.1).abs() < 1e-6);
     }
 
     #[test]
@@ -2571,6 +2929,9 @@ mod tests {
                 friction_static_boost: Some(1.28),
                 friction_kinetic_scale: Some(0.84),
                 restitution_velocity_threshold: Some(0.25),
+                audio_enabled: Some(true),
+                audio_pitch_semitones: Some(3.5),
+                audio_tempo: Some(1.2),
                 ..BounceTankRuntimePatch::default()
             },
         );
@@ -2584,6 +2945,9 @@ mod tests {
         assert!((cfg.friction_static_boost - 1.28).abs() < 1e-6);
         assert!((cfg.friction_kinetic_scale - 0.84).abs() < 1e-6);
         assert!((cfg.restitution_velocity_threshold - 0.25).abs() < 1e-6);
+        assert!(cfg.audio_enabled);
+        assert!((cfg.audio_pitch_semitones - 3.5).abs() < 1e-6);
+        assert!((cfg.audio_tempo - 1.2).abs() < 1e-6);
         assert!(world.gravity().y < -9.9);
         assert!(world.solver().config().hard_position_projection_strength > 1.0);
         assert!((world.solver().config().friction_transition_speed - 1.65).abs() < 1e-6);

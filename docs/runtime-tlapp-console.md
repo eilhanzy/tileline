@@ -177,6 +177,13 @@ script.call tile_dig(0,-10)
 ```
 
 ```text
+script.call set_audio_wav("assets/audio/theme.wav")
+script.call set_audio_enabled(true)
+script.call set_audio_pitch(-2.0)
+script.call set_audio_tempo(1.10)
+```
+
+```text
 file.exists docs/runtime-tlapp-console.md
 file.head docs/runtime-tlapp-console.md 12
 file.tail runtime/src/tlapp_app.rs 20
@@ -202,5 +209,6 @@ script.list
 
 - CLI script overlay strips transient camera-delta commands from persistence to avoid accidental
   continuous drift.
+- Demo scripts keep audio disabled by default; `set_audio_*` calls enable scene-side audio state.
 - Any statement compile/eval warnings are reported in the console output (`[tlapp console] ...`).
 - Unknown variables in `$var` expansion are fail-soft errors for that command, not hard panics.

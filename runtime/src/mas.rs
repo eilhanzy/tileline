@@ -7,6 +7,7 @@
 //! - soft-fail accounting for panics in user mix callbacks
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +73,194 @@ impl AudioBufferBlock {
         self.samples.len() / channels
     }
 }
+
+/// Decoded interleaved PCM clip loaded from a `.wav` asset.
+#[derive(Debug, Clone)]
+pub struct WavClip {
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub samples: Vec<f32>,
+}
+
+impl WavClip {
+    /// Decode a `.wav` file into normalized interleaved `f32` PCM samples.
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, MasWavError> {
+        let mut reader =
+            hound::WavReader::open(path.as_ref()).map_err(|err| MasWavError::Decode {
+                reason: err.to_string(),
+            })?;
+        let spec = reader.spec();
+        let channels = spec.channels.max(1);
+        let sample_rate_hz = spec.sample_rate.max(8_000);
+        let mut samples = Vec::new();
+
+        match spec.sample_format {
+            hound::SampleFormat::Float => {
+                for sample in reader.samples::<f32>() {
+                    let value = sample.map_err(|err| MasWavError::Decode {
+                        reason: err.to_string(),
+                    })?;
+                    samples.push(value.clamp(-1.0, 1.0));
+                }
+            }
+            hound::SampleFormat::Int => {
+                let bits = spec.bits_per_sample.clamp(1, 32);
+                let scale = ((1_i64 << (bits - 1)) as f32).max(1.0);
+                for sample in reader.samples::<i32>() {
+                    let value = sample.map_err(|err| MasWavError::Decode {
+                        reason: err.to_string(),
+                    })?;
+                    samples.push((value as f32 / scale).clamp(-1.0, 1.0));
+                }
+            }
+        }
+
+        let channels_usize = channels as usize;
+        if channels_usize > 0 {
+            let aligned = (samples.len() / channels_usize) * channels_usize;
+            samples.truncate(aligned);
+        }
+
+        Ok(Self {
+            sample_rate_hz,
+            channels,
+            samples,
+        })
+    }
+
+    #[inline]
+    pub fn frame_count(&self) -> usize {
+        let channels = self.channels.max(1) as usize;
+        self.samples.len() / channels
+    }
+
+    /// Mix this clip into one output block with tempo/pitch controls.
+    ///
+    /// First-pass behavior uses a coupled playback-rate model:
+    /// `effective_rate = pitch_ratio * tempo * src_hz/out_hz`.
+    pub fn mix_into_block(
+        &self,
+        cursor: &mut WavPlaybackCursor,
+        params: WavPlaybackParams,
+        out: &mut AudioBufferBlock,
+    ) {
+        let src_frames = self.frame_count();
+        let dst_frames = out.frame_count();
+        if src_frames == 0 || dst_frames == 0 {
+            return;
+        }
+        let src_hz = self.sample_rate_hz.max(1) as f64;
+        let dst_hz = out.sample_rate_hz.max(1) as f64;
+        let pitch_ratio = 2.0_f64.powf((params.pitch_semitones as f64) / 12.0);
+        let tempo = params.tempo.clamp(0.25, 4.0) as f64;
+        let rate = (pitch_ratio * tempo * (src_hz / dst_hz)).max(1e-6);
+        let gain = params.gain.clamp(0.0, 4.0);
+        let dst_channels = out.channels.max(1) as usize;
+        let src_channels = self.channels.max(1) as usize;
+        let max_frame = src_frames.saturating_sub(1) as f64;
+        let src_frames_f64 = src_frames as f64;
+
+        for frame_index in 0..dst_frames {
+            let mut src_frame = cursor.frame_position;
+            if params.looped {
+                src_frame = wrap_frame(src_frame, src_frames_f64);
+            } else if src_frame > max_frame {
+                break;
+            }
+
+            let src_floor = src_frame.floor();
+            let next_floor = if src_floor + 1.0 <= max_frame {
+                src_floor + 1.0
+            } else if params.looped {
+                0.0
+            } else {
+                max_frame
+            };
+            let alpha = (src_frame - src_floor) as f32;
+            let src0 = src_floor as usize;
+            let src1 = next_floor as usize;
+
+            for out_channel in 0..dst_channels {
+                let src_channel = if src_channels == 1 {
+                    0
+                } else {
+                    out_channel.min(src_channels - 1)
+                };
+                let sample0 = self.sample_at(src0, src_channel);
+                let sample1 = self.sample_at(src1, src_channel);
+                let mixed = sample0 + (sample1 - sample0) * alpha;
+                let dst_index = frame_index * dst_channels + out_channel;
+                out.samples[dst_index] += mixed * gain;
+            }
+
+            cursor.frame_position += rate;
+            if params.looped {
+                cursor.frame_position = wrap_frame(cursor.frame_position, src_frames_f64);
+            }
+        }
+    }
+
+    #[inline]
+    fn sample_at(&self, frame_index: usize, channel: usize) -> f32 {
+        let channels = self.channels.max(1) as usize;
+        let index = frame_index
+            .saturating_mul(channels)
+            .saturating_add(channel.min(channels.saturating_sub(1)));
+        self.samples.get(index).copied().unwrap_or(0.0)
+    }
+}
+
+#[inline]
+fn wrap_frame(frame: f64, frame_count: f64) -> f64 {
+    if frame_count <= 0.0 {
+        return 0.0;
+    }
+    frame.rem_euclid(frame_count)
+}
+
+/// Playback cursor for one streamed `.wav` clip.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WavPlaybackCursor {
+    pub frame_position: f64,
+}
+
+/// Runtime playback controls for a `.wav` scene track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WavPlaybackParams {
+    pub gain: f32,
+    /// Semitone shift relative to source pitch. `+12.0` means one octave up.
+    pub pitch_semitones: f32,
+    /// Playback tempo scalar (`1.0` default).
+    pub tempo: f32,
+    pub looped: bool,
+}
+
+impl Default for WavPlaybackParams {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            pitch_semitones: 0.0,
+            tempo: 1.0,
+            looped: true,
+        }
+    }
+}
+
+/// `.wav` decode/mix error for MAS-facing audio content APIs.
+#[derive(Debug, Clone)]
+pub enum MasWavError {
+    Decode { reason: String },
+}
+
+impl std::fmt::Display for MasWavError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode { reason } => write!(f, "wav decode error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for MasWavError {}
 
 /// MAS configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -264,6 +453,7 @@ fn map_affinity(affinity: MasCoreAffinity) -> CorePreference {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn submits_and_drains_audio_block() {
@@ -292,5 +482,50 @@ mod tests {
             .samples
             .iter()
             .all(|sample| (*sample - 0.25).abs() <= f32::EPSILON));
+    }
+
+    #[test]
+    fn loads_wav_clip_and_mixes_with_pitch_and_tempo() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("tileline-mas-test-{nonce}.wav"));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create wav");
+        for i in 0..512 {
+            let t = i as f32 / 512.0;
+            let s = (t * std::f32::consts::TAU * 3.0).sin();
+            let q = (s * i16::MAX as f32) as i16;
+            writer.write_sample(q).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+
+        let clip = WavClip::load_from_path(&path).expect("decode wav");
+        assert_eq!(clip.channels, 1);
+        assert!(clip.frame_count() >= 512);
+
+        let mut cursor = WavPlaybackCursor::default();
+        let mut block = AudioBufferBlock::silent(1, 48_000, 2, 256);
+        clip.mix_into_block(
+            &mut cursor,
+            WavPlaybackParams {
+                gain: 0.5,
+                pitch_semitones: 4.0,
+                tempo: 1.25,
+                looped: true,
+            },
+            &mut block,
+        );
+        assert!(cursor.frame_position > 0.0);
+        assert_eq!(block.channels, 2);
+        assert!(block.samples.iter().any(|s| s.abs() > 1e-4));
+
+        let _ = std::fs::remove_file(path);
     }
 }

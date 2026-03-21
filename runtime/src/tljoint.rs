@@ -501,6 +501,10 @@ fn empty_frame_output() -> TlscriptShowcaseFrameOutput {
         light_overrides: Vec::new(),
         tile_mutations: Vec::new(),
         tile_fills: Vec::new(),
+        audio_wav_path: None,
+        audio_enabled: None,
+        audio_pitch_semitones: None,
+        audio_tempo: None,
         performance_preset: None,
         gfx_profile: None,
         ball_metallic: None,
@@ -536,6 +540,18 @@ fn merge_frame_output(
     }
     if !next.tile_fills.is_empty() {
         merged.tile_fills.append(&mut next.tile_fills);
+    }
+    if next.audio_wav_path.is_some() {
+        merged.audio_wav_path = next.audio_wav_path.take();
+    }
+    if next.audio_enabled.is_some() {
+        merged.audio_enabled = next.audio_enabled;
+    }
+    if next.audio_pitch_semitones.is_some() {
+        merged.audio_pitch_semitones = next.audio_pitch_semitones;
+    }
+    if next.audio_tempo.is_some() {
+        merged.audio_tempo = next.audio_tempo;
     }
     if next.performance_preset.is_some() {
         merged.performance_preset = next.performance_preset;
@@ -743,6 +759,15 @@ fn merge_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRuntimePatc
     }
     if patch.virtual_barrier_enabled.is_some() {
         target.virtual_barrier_enabled = patch.virtual_barrier_enabled;
+    }
+    if patch.audio_enabled.is_some() {
+        target.audio_enabled = patch.audio_enabled;
+    }
+    if patch.audio_pitch_semitones.is_some() {
+        target.audio_pitch_semitones = patch.audio_pitch_semitones;
+    }
+    if patch.audio_tempo.is_some() {
+        target.audio_tempo = patch.audio_tempo;
     }
     if patch.speculative_sweep_enabled.is_some() {
         target.speculative_sweep_enabled = patch.speculative_sweep_enabled;

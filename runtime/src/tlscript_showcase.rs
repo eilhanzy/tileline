@@ -97,6 +97,10 @@ const SHOWCASE_BUILTIN_CALLS: &[&str] = &[
     "set_camera_sprint",
     "set_camera_look_active",
     "reset_camera_pose",
+    "set_audio_enabled",
+    "set_audio_pitch",
+    "set_audio_tempo",
+    "set_audio_wav",
     "set_coordinate_space",
     "move_camera",
     "rotate_camera",
@@ -356,6 +360,10 @@ pub struct TlscriptShowcaseFrameOutput {
     pub light_overrides: Vec<SceneLightOverride>,
     pub tile_mutations: Vec<TileMutation2d>,
     pub tile_fills: Vec<TlscriptTileFill>,
+    pub audio_wav_path: Option<String>,
+    pub audio_enabled: Option<bool>,
+    pub audio_pitch_semitones: Option<f32>,
+    pub audio_tempo: Option<f32>,
     pub performance_preset: Option<TlscriptPerformancePreset>,
     pub gfx_profile: Option<TlscriptGfxProfile>,
     pub ball_metallic: Option<f32>,
@@ -622,6 +630,10 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             light_overrides: state.light_overrides_values(),
             tile_mutations: state.tile_mutations_values(),
             tile_fills: state.tile_fills_values(),
+            audio_wav_path: state.audio_wav_path.clone(),
+            audio_enabled: state.audio_enabled,
+            audio_pitch_semitones: state.audio_pitch_semitones,
+            audio_tempo: state.audio_tempo,
             performance_preset: state.performance_preset,
             gfx_profile: state.gfx_profile,
             ball_metallic: state.ball_metallic,
@@ -855,6 +867,10 @@ struct EvalState<'lookup> {
     light_overrides: HashMap<u64, SceneLightOverride>,
     tile_mutations: Vec<TileMutation2d>,
     tile_fills: Vec<TlscriptTileFill>,
+    audio_wav_path: Option<String>,
+    audio_enabled: Option<bool>,
+    audio_pitch_semitones: Option<f32>,
+    audio_tempo: Option<f32>,
     performance_preset: Option<TlscriptPerformancePreset>,
     gfx_profile: Option<TlscriptGfxProfile>,
     rt_mode: Option<RayTracingMode>,
@@ -892,6 +908,10 @@ impl<'lookup> EvalState<'lookup> {
             light_overrides: HashMap::new(),
             tile_mutations: Vec::new(),
             tile_fills: Vec::new(),
+            audio_wav_path: None,
+            audio_enabled: None,
+            audio_pitch_semitones: None,
+            audio_tempo: None,
             performance_preset: None,
             gfx_profile: None,
             rt_mode: None,
@@ -1637,6 +1657,45 @@ fn apply_builtin_patch_call(
             [] => state.camera_reset_pose = true,
             _ => state.warn("reset_camera_pose expects 0 args"),
         },
+        "set_audio_enabled" => match args {
+            [v] => {
+                let enabled = v.to_bool();
+                state.audio_enabled = Some(enabled);
+                state.patch.audio_enabled = Some(enabled);
+            }
+            _ => state.warn("set_audio_enabled expects 1 arg"),
+        },
+        "set_audio_pitch" => match args {
+            [v] => {
+                let pitch = (v.to_f64() as f32).clamp(-24.0, 24.0);
+                state.audio_pitch_semitones = Some(pitch);
+                state.patch.audio_pitch_semitones = Some(pitch);
+            }
+            _ => state.warn("set_audio_pitch expects 1 arg"),
+        },
+        "set_audio_tempo" => match args {
+            [v] => {
+                let tempo = (v.to_f64() as f32).clamp(0.25, 4.0);
+                state.audio_tempo = Some(tempo);
+                state.patch.audio_tempo = Some(tempo);
+            }
+            _ => state.warn("set_audio_tempo expects 1 arg"),
+        },
+        "set_audio_wav" => match args {
+            [DemoValue::Str(path)] => {
+                let trimmed = path.trim();
+                if trimmed.is_empty() {
+                    state.audio_wav_path = None;
+                } else {
+                    state.audio_wav_path = Some(trimmed.to_string());
+                }
+            }
+            [value] => state.warn(format!(
+                "set_audio_wav expects string path, got numeric/bool value '{}' (ignored)",
+                value.to_i64()
+            )),
+            _ => state.warn("set_audio_wav expects 1 arg (path string)"),
+        },
         "tile_set" | "tile_place" => match args {
             [x, y, tile_id] => {
                 let coord = TileCoord2d::new(x.to_i64() as i32, y.to_i64() as i32);
@@ -2254,6 +2313,37 @@ mod tests {
             Some(&lookup),
         );
         assert_eq!(out.patch.target_ball_count, Some(123));
+    }
+
+    #[test]
+    fn supports_scene_audio_builtins() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_audio_wav(\"assets/audio/sideview_theme.wav\")\n",
+            "    set_audio_enabled(true)\n",
+            "    set_audio_pitch(3.5)\n",
+            "    set_audio_tempo(1.15)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(
+            out.audio_wav_path.as_deref(),
+            Some("assets/audio/sideview_theme.wav")
+        );
+        assert_eq!(out.audio_enabled, Some(true));
+        assert!((out.audio_pitch_semitones.unwrap_or(0.0) - 3.5).abs() < 1e-6);
+        assert!((out.audio_tempo.unwrap_or(0.0) - 1.15).abs() < 1e-6);
+        assert_eq!(out.patch.audio_enabled, Some(true));
+        assert!((out.patch.audio_pitch_semitones.unwrap_or(0.0) - 3.5).abs() < 1e-6);
+        assert!((out.patch.audio_tempo.unwrap_or(0.0) - 1.15).abs() < 1e-6);
     }
 
     #[test]

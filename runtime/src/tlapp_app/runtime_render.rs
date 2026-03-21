@@ -250,6 +250,26 @@ impl TlAppRuntime {
         if let Some(profile) = frame_eval.gfx_profile {
             let _ = self.apply_gfx_profile(profile.as_str());
         }
+        if let Some(wav_path) = frame_eval.audio_wav_path.take() {
+            self.scene.set_scene_audio_wav_path(Some(wav_path));
+        }
+        if frame_eval.audio_enabled.is_some()
+            || frame_eval.audio_pitch_semitones.is_some()
+            || frame_eval.audio_tempo.is_some()
+        {
+            let mut world = self.world.borrow_mut();
+            if let Some(enabled) = frame_eval.audio_enabled {
+                self.scene
+                    .set_scene_audio_track_enabled(&mut world, enabled);
+            }
+            if let Some(pitch) = frame_eval.audio_pitch_semitones {
+                self.scene
+                    .set_scene_audio_pitch_semitones(&mut world, pitch);
+            }
+            if let Some(tempo) = frame_eval.audio_tempo {
+                self.scene.set_scene_audio_tempo(&mut world, tempo);
+            }
+        }
 
         if let Some(speed) = frame_eval.camera_move_speed {
             self.camera.set_move_speed(speed);

@@ -1418,6 +1418,18 @@ fn merge_showcase_output(
     if !next.tile_fills.is_empty() {
         merged.tile_fills.append(&mut next.tile_fills);
     }
+    if next.audio_wav_path.is_some() {
+        merged.audio_wav_path = next.audio_wav_path.take();
+    }
+    if next.audio_enabled.is_some() {
+        merged.audio_enabled = next.audio_enabled;
+    }
+    if next.audio_pitch_semitones.is_some() {
+        merged.audio_pitch_semitones = next.audio_pitch_semitones;
+    }
+    if next.audio_tempo.is_some() {
+        merged.audio_tempo = next.audio_tempo;
+    }
     if next.performance_preset.is_some() {
         merged.performance_preset = next.performance_preset;
     }
@@ -1624,6 +1636,15 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
     }
     if patch.virtual_barrier_enabled.is_some() {
         target.virtual_barrier_enabled = patch.virtual_barrier_enabled;
+    }
+    if patch.audio_enabled.is_some() {
+        target.audio_enabled = patch.audio_enabled;
+    }
+    if patch.audio_pitch_semitones.is_some() {
+        target.audio_pitch_semitones = patch.audio_pitch_semitones;
+    }
+    if patch.audio_tempo.is_some() {
+        target.audio_tempo = patch.audio_tempo;
     }
     if patch.speculative_sweep_enabled.is_some() {
         target.speculative_sweep_enabled = patch.speculative_sweep_enabled;

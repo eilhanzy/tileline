@@ -45,6 +45,9 @@ def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_dow
         set_light_softness(200, 0.30)
         set_light_glow_enabled(200, false)
         set_light_follow_camera(200, true)
+        set_audio_enabled(false)
+        set_audio_pitch(0.0)
+        set_audio_tempo(1.0)
 
     set_camera_move_speed(18.0)
     set_camera_look_sensitivity(0.0018)
