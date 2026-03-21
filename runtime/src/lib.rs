@@ -156,9 +156,9 @@ pub use tlscript_parallel::{
 };
 pub use tlscript_showcase::{
     compile_tlscript_showcase, TlscriptCoordinateSpace, TlscriptGfxProfile,
-    TlscriptPerformancePreset, TlscriptShowcaseCompileOutcome, TlscriptShowcaseConfig,
-    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
-    TlscriptShowcaseProgram, TlscriptTileFill, TlscriptTileLookup,
+    TlscriptOverlayTileLookup, TlscriptPerformancePreset, TlscriptShowcaseCompileOutcome,
+    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
+    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlscriptTileFill, TlscriptTileLookup,
 };
 pub use tlsprite::{
     compile_tlsprite, compile_tlsprite_pack, compile_tlsprite_with_extra_roots, load_tlsprite_pack,

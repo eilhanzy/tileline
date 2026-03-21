@@ -12,3 +12,15 @@ tljoint_scene = main
 [scene.mobile_safe]
 tljoint = bounce_showcase_mobile_safe.tljoint
 tljoint_scene = main
+
+[scene.sideview_static]
+tljoint = sideview_static_map.tljoint
+tljoint_scene = main
+
+[scene.sideview_chunk_mutation]
+tljoint = sideview_chunk_mutation.tljoint
+tljoint_scene = main
+
+[scene.sideview_stress]
+tljoint = sideview_stress_map.tljoint
+tljoint_scene = main

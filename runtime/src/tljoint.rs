@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 
 use crate::scene::BounceTankRuntimePatch;
 use crate::tlscript_showcase::{
-    compile_tlscript_showcase, TlscriptShowcaseConfig, TlscriptShowcaseControlInput,
-    TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
-    TlscriptTileLookup,
+    compile_tlscript_showcase, TlscriptOverlayTileLookup, TlscriptShowcaseConfig,
+    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
+    TlscriptShowcaseProgram, TlscriptTileLookup,
 };
 use crate::tlsprite::{compile_tlsprite, TlspriteDiagnosticLevel, TlspriteProgram};
 
@@ -106,8 +106,16 @@ impl TljointSceneBundle {
     ) -> TlscriptShowcaseFrameOutput {
         let mut merged = empty_frame_output();
         for (index, script) in self.scripts.iter().enumerate() {
-            let out =
-                script.evaluate_frame_with_controls_and_tile_lookup(input, controls, tile_lookup);
+            let overlay_lookup = TlscriptOverlayTileLookup::new(
+                tile_lookup,
+                &merged.tile_mutations,
+                &merged.tile_fills,
+            );
+            let out = script.evaluate_frame_with_controls_and_tile_lookup(
+                input,
+                controls,
+                Some(&overlay_lookup),
+            );
             merge_frame_output(&mut merged, out, index);
         }
         merged
@@ -918,5 +926,49 @@ mod tests {
         );
         assert_eq!(frame.patch.spawn_per_tick, Some(64));
         assert_eq!(frame.patch.target_ball_count, Some(1024));
+    }
+
+    #[test]
+    fn tile_get_in_later_script_observes_prior_script_mutations() {
+        let script_a_source = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    tile_set(7, 4, 11)\n",
+        );
+        let script_b_source = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    let probe: int = tile_get(7, 4)\n",
+            "    if probe == 11:\n",
+            "        set_spawn_per_tick(333)\n",
+        );
+        let script_a =
+            compile_tlscript_showcase(script_a_source, TlscriptShowcaseConfig::default())
+                .program
+                .expect("script a");
+        let script_b =
+            compile_tlscript_showcase(script_b_source, TlscriptShowcaseConfig::default())
+                .program
+                .expect("script b");
+        let bundle = TljointSceneBundle {
+            manifest_path: PathBuf::from("inline.tljoint"),
+            scene_name: "main".to_string(),
+            script_paths: vec![PathBuf::from("a.tlscript"), PathBuf::from("b.tlscript")],
+            sprite_paths: Vec::new(),
+            scripts: vec![script_a, script_b],
+            merged_sprite_program: None,
+        };
+        let runtime_lookup = |_x: i32, _y: i32| 2_u16;
+        let frame = bundle.evaluate_frame_with_tile_lookup(
+            TlscriptShowcaseFrameInput {
+                frame_index: 0,
+                live_balls: 0,
+                spawned_this_tick: 0,
+                key_f_down: false,
+            },
+            TlscriptShowcaseControlInput::default(),
+            Some(&runtime_lookup),
+        );
+        assert_eq!(frame.patch.spawn_per_tick, Some(333));
     }
 }

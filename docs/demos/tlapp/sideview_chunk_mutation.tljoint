@@ -1,0 +1,5 @@
+tljoint_v1
+
+[scene.main]
+tlscripts = sideview_chunk_mutation.tlscript
+tlsprites = bounce_hud.tlsprite

@@ -1,0 +1,31 @@
+@export
+@parallel(domain="bodies", read="transform,aabb", write="velocity", chunk=96, schedule="performance")
+@deterministic
+def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):
+    set_scene_mode("2d")
+    set_side_view_plane_z(0.0)
+    if frame < 240:
+        set_side_view_center(-24.0, -4.0)
+    elif frame < 480:
+        set_side_view_center(0.0, -4.0)
+    else:
+        set_side_view_center(24.0, -4.0)
+    set_side_view_zoom(0.85)
+    set_spawn_profile_2d(4200, 96, 0.35, 1.35)
+    set_gravity(0.0, -12.4, 0.0)
+    set_scatter_strength(0.10)
+    if frame == 0:
+        tile_fill(-192, -40, 192, -38, 2)
+        tile_fill(-192, -38, -188, 72, 1)
+        tile_fill(188, -38, 192, 72, 1)
+        tile_fill(-160, -20, 160, -19, 3)
+        tile_fill(-120, -4, 120, -3, 4)
+        tile_fill(-80, 12, 80, 13, 5)
+    if frame < 360:
+        tile_dig(-32, -19)
+        tile_dig(0, -19)
+        tile_dig(32, -19)
+    elif frame < 720:
+        tile_place(-32, -19, 6)
+        tile_place(0, -19, 6)
+        tile_place(32, -19, 6)

@@ -19,7 +19,7 @@ use tl_core::{
     SemanticType, Stmt, TypedIrLoweringConfig, TypedIrModule, UnaryOp,
 };
 
-use crate::scene::{BounceTankRuntimePatch, RayTracingMode, SceneLightOverride};
+use crate::scene::{BounceTankRuntimePatch, RayTracingMode, RuntimeSceneMode, SceneLightOverride};
 use crate::tile_world_2d::{TileCoord2d, TileMutation2d, TILE_ID_EMPTY};
 
 const SHOWCASE_BUILTIN_CALLS: &[&str] = &[
@@ -27,9 +27,14 @@ const SHOWCASE_BUILTIN_CALLS: &[&str] = &[
     "set_perf_preset",
     "set_spawn_per_tick",
     "set_target_ball_count",
+    "set_scene_mode",
     "set_container_size",
     "set_container_shape",
     "set_container_half_extents",
+    "set_side_view_plane_z",
+    "set_side_view_center",
+    "set_side_view_zoom",
+    "set_side_view_camera",
     "set_wall_thickness",
     "set_container_mesh_scale",
     "set_linear_damping",
@@ -71,6 +76,7 @@ const SHOWCASE_BUILTIN_CALLS: &[&str] = &[
     "set_initial_speed",
     "set_initial_speed_min",
     "set_initial_speed_max",
+    "set_spawn_profile_2d",
     "set_ball_mesh_slot",
     "set_container_mesh_slot",
     "set_fbx_full_render",
@@ -129,6 +135,54 @@ where
 {
     fn tile_get(&self, x: i32, y: i32) -> u16 {
         self(x, y)
+    }
+}
+
+/// Runtime tile lookup adapter that layers same-frame overlays over a canonical runtime lookup.
+///
+/// Resolution order is deterministic and shared across single-script, multi-script, `.tljoint`,
+/// and console script-call evaluation:
+/// 1) latest `tile_set` / `tile_place` / `tile_dig` mutation
+/// 2) latest `tile_fill` rectangle
+/// 3) runtime tile lookup callback
+/// 4) `TILE_ID_EMPTY`
+#[derive(Clone, Copy)]
+pub struct TlscriptOverlayTileLookup<'lookup> {
+    pub base_lookup: Option<&'lookup dyn TlscriptTileLookup>,
+    pub overlay_mutations: &'lookup [TileMutation2d],
+    pub overlay_fills: &'lookup [TlscriptTileFill],
+}
+
+impl<'lookup> TlscriptOverlayTileLookup<'lookup> {
+    pub fn new(
+        base_lookup: Option<&'lookup dyn TlscriptTileLookup>,
+        overlay_mutations: &'lookup [TileMutation2d],
+        overlay_fills: &'lookup [TlscriptTileFill],
+    ) -> Self {
+        Self {
+            base_lookup,
+            overlay_mutations,
+            overlay_fills,
+        }
+    }
+}
+
+impl TlscriptTileLookup for TlscriptOverlayTileLookup<'_> {
+    fn tile_get(&self, x: i32, y: i32) -> u16 {
+        for mutation in self.overlay_mutations.iter().rev() {
+            if mutation.coord.x == x && mutation.coord.y == y {
+                return mutation.tile_id;
+            }
+        }
+        for fill in self.overlay_fills.iter().rev() {
+            if fill.contains(x, y) {
+                return fill.tile_id;
+            }
+        }
+        if let Some(lookup) = self.base_lookup {
+            return lookup.tile_get(x, y);
+        }
+        TILE_ID_EMPTY
     }
 }
 
@@ -994,20 +1048,8 @@ impl<'lookup> EvalState<'lookup> {
     }
 
     fn resolve_tile_value_for_script(&self, x: i32, y: i32) -> u16 {
-        for fill in self.tile_fills.iter().rev() {
-            if fill.contains(x, y) {
-                return fill.tile_id;
-            }
-        }
-        for mutation in self.tile_mutations.iter().rev() {
-            if mutation.coord.x == x && mutation.coord.y == y {
-                return mutation.tile_id;
-            }
-        }
-        if let Some(lookup) = self.tile_lookup {
-            return lookup.tile_get(x, y);
-        }
-        TILE_ID_EMPTY
+        TlscriptOverlayTileLookup::new(self.tile_lookup, &self.tile_mutations, &self.tile_fills)
+            .tile_get(x, y)
     }
 }
 
@@ -1182,6 +1224,33 @@ fn apply_builtin_patch_call(
             [v] => state.patch.target_ball_count = Some(v.to_i64().max(0) as usize),
             _ => state.warn("set_target_ball_count expects 1 arg"),
         },
+        "set_scene_mode" => match args {
+            [DemoValue::Str(mode)] => {
+                let normalized = mode.trim().to_ascii_lowercase();
+                state.patch.scene_mode = match normalized.as_str() {
+                    "2d" | "side2d" | "side_view_2d" | "side-view-2d" => {
+                        Some(RuntimeSceneMode::SideView2d)
+                    }
+                    "3d" | "spatial3d" | "spatial_3d" | "spatial-3d" => {
+                        Some(RuntimeSceneMode::Spatial3d)
+                    }
+                    _ => {
+                        state.warn(format!(
+                            "set_scene_mode expects '2d'|'3d', got '{mode}'"
+                        ));
+                        None
+                    }
+                };
+            }
+            [mode] => {
+                state.patch.scene_mode = Some(if mode.to_bool() {
+                    RuntimeSceneMode::SideView2d
+                } else {
+                    RuntimeSceneMode::Spatial3d
+                });
+            }
+            _ => state.warn("set_scene_mode expects 1 arg"),
+        },
         "set_container_size" => match args {
             [x, y, z] => {
                 let sx = (x.to_f64() as f32).max(0.0);
@@ -1207,6 +1276,27 @@ fn apply_builtin_patch_call(
                     Some([x.to_f64() as f32, y.to_f64() as f32, z.to_f64() as f32]);
             }
             _ => state.warn("set_container_half_extents expects 3 args"),
+        },
+        "set_side_view_plane_z" => match args {
+            [z] => state.patch.side_view_plane_z = Some(z.to_f64() as f32),
+            _ => state.warn("set_side_view_plane_z expects 1 arg"),
+        },
+        "set_side_view_center" => match args {
+            [x, y] => {
+                state.patch.side_view_center = Some([x.to_f64() as f32, y.to_f64() as f32]);
+            }
+            _ => state.warn("set_side_view_center expects 2 args"),
+        },
+        "set_side_view_zoom" => match args {
+            [zoom] => state.patch.side_view_zoom = Some(zoom.to_f64() as f32),
+            _ => state.warn("set_side_view_zoom expects 1 arg"),
+        },
+        "set_side_view_camera" => match args {
+            [x, y, zoom] => {
+                state.patch.side_view_center = Some([x.to_f64() as f32, y.to_f64() as f32]);
+                state.patch.side_view_zoom = Some(zoom.to_f64() as f32);
+            }
+            _ => state.warn("set_side_view_camera expects 3 args (center_x, center_y, zoom)"),
         },
         "set_wall_thickness" => match args {
             [v] => state.patch.wall_thickness = Some(v.to_f64() as f32),
@@ -1438,6 +1528,18 @@ fn apply_builtin_patch_call(
         "set_initial_speed_max" => match args {
             [v] => state.patch.initial_speed_max = Some(v.to_f64() as f32),
             _ => state.warn("set_initial_speed_max expects 1 arg"),
+        },
+        "set_spawn_profile_2d" => match args {
+            [target_balls, spawn_per_tick, speed_min, speed_max] => {
+                state.patch.scene_mode = Some(RuntimeSceneMode::SideView2d);
+                state.patch.target_ball_count = Some(target_balls.to_i64().max(0) as usize);
+                state.patch.spawn_per_tick = Some(spawn_per_tick.to_i64().max(0) as usize);
+                state.patch.initial_speed_min = Some(speed_min.to_f64() as f32);
+                state.patch.initial_speed_max = Some(speed_max.to_f64() as f32);
+            }
+            _ => state.warn(
+                "set_spawn_profile_2d expects 4 args (target_balls, spawn_per_tick, speed_min, speed_max)",
+            ),
         },
         "set_ball_mesh_slot" => match args {
             [v] => state.patch.ball_mesh_slot = Some(v.to_i64().clamp(0, 255) as u8),
@@ -2029,6 +2131,72 @@ mod tests {
     }
 
     #[test]
+    fn supports_side_view_plane_z_builtin() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_side_view_plane_z(7.75)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.patch.side_view_plane_z, Some(7.75));
+    }
+
+    #[test]
+    fn supports_side_view_camera_and_scene_mode_builtins() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_scene_mode(\"2d\")\n",
+            "    set_side_view_center(12.0, -4.0)\n",
+            "    set_side_view_zoom(1.6)\n",
+            "    set_side_view_camera(8.0, 3.0, 0.85)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.patch.scene_mode, Some(RuntimeSceneMode::SideView2d));
+        assert_eq!(out.patch.side_view_center, Some([8.0, 3.0]));
+        assert_eq!(out.patch.side_view_zoom, Some(0.85));
+    }
+
+    #[test]
+    fn supports_spawn_profile_2d_builtin() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_spawn_profile_2d(2400, 96, 0.25, 1.40)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.patch.scene_mode, Some(RuntimeSceneMode::SideView2d));
+        assert_eq!(out.patch.target_ball_count, Some(2400));
+        assert_eq!(out.patch.spawn_per_tick, Some(96));
+        assert_eq!(out.patch.initial_speed_min, Some(0.25));
+        assert_eq!(out.patch.initial_speed_max, Some(1.40));
+    }
+
+    #[test]
     fn supports_script_driven_camera_input_controls() {
         let src = concat!(
             "@export\n",
@@ -2316,6 +2484,50 @@ mod tests {
     }
 
     #[test]
+    fn tile_get_prefers_mutation_over_fill_for_same_coord() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    tile_fill(0, 0, 4, 4, 3)\n",
+            "    tile_set(2, 2, 8)\n",
+            "    let probe: int = tile_get(2, 2)\n",
+            "    if probe == 8:\n",
+            "        set_spawn_per_tick(222)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let lookup = |_x: i32, _y: i32| 1_u16;
+        let out = program.evaluate_frame_with_controls_and_tile_lookup(
+            TlscriptShowcaseFrameInput {
+                frame_index: 0,
+                live_balls: 0,
+                spawned_this_tick: 0,
+                key_f_down: false,
+            },
+            TlscriptShowcaseControlInput::default(),
+            Some(&lookup),
+        );
+        assert_eq!(out.patch.spawn_per_tick, Some(222));
+    }
+
+    #[test]
+    fn overlay_tile_lookup_uses_deterministic_precedence() {
+        let base = |x: i32, y: i32| if x == 9 && y == 9 { 7 } else { TILE_ID_EMPTY };
+        let fills = vec![TlscriptTileFill {
+            min: TileCoord2d::new(1, 1),
+            max: TileCoord2d::new(3, 3),
+            tile_id: 4,
+        }];
+        let mutations = vec![TileMutation2d::place(TileCoord2d::new(2, 2), 9)];
+        let lookup = TlscriptOverlayTileLookup::new(Some(&base), &mutations, &fills);
+        assert_eq!(lookup.tile_get(2, 2), 9);
+        assert_eq!(lookup.tile_get(3, 3), 4);
+        assert_eq!(lookup.tile_get(9, 9), 7);
+        assert_eq!(lookup.tile_get(99, 99), TILE_ID_EMPTY);
+    }
+
+    #[test]
     fn supports_scene_audio_builtins() {
         let src = concat!(
             "@export\n",
@@ -2492,6 +2704,39 @@ mod tests {
         assert!(
             outcome.errors.is_empty(),
             "tlapp mobile-safe script should compile cleanly: {:?}",
+            outcome.errors
+        );
+    }
+
+    #[test]
+    fn tlapp_sideview_static_script_compiles() {
+        let src = include_str!("../../docs/demos/tlapp/sideview_static_map.tlscript");
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(
+            outcome.errors.is_empty(),
+            "tlapp sideview static script should compile cleanly: {:?}",
+            outcome.errors
+        );
+    }
+
+    #[test]
+    fn tlapp_sideview_chunk_mutation_script_compiles() {
+        let src = include_str!("../../docs/demos/tlapp/sideview_chunk_mutation.tlscript");
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(
+            outcome.errors.is_empty(),
+            "tlapp sideview chunk mutation script should compile cleanly: {:?}",
+            outcome.errors
+        );
+    }
+
+    #[test]
+    fn tlapp_sideview_stress_script_compiles() {
+        let src = include_str!("../../docs/demos/tlapp/sideview_stress_map.tlscript");
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(
+            outcome.errors.is_empty(),
+            "tlapp sideview stress script should compile cleanly: {:?}",
             outcome.errors
         );
     }

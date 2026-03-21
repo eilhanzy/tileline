@@ -1,0 +1,5 @@
+tljoint_v1
+
+[scene.main]
+tlscripts = sideview_static_map.tlscript
+tlsprites = bounce_hud.tlsprite

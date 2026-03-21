@@ -44,11 +44,11 @@ use crate::{
     SpriteKind, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy, TileCoord2d,
     TileMutation2d, TileView2d, TileWorld2dConfig, TileWorldFrameTelemetry, TljointDiagnosticLevel,
     TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
-    TlscriptPerformancePreset, TlscriptShowcaseConfig, TlscriptShowcaseControlInput,
-    TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
-    TlscriptTileLookup, TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache,
-    TlspriteWatchReloader, VulkanSceneRenderer, VulkanSceneRendererConfig, WgpuSceneRenderer,
-    ENGINE_ID, ENGINE_VERSION, MAX_SCENE_LIGHTS,
+    TlscriptOverlayTileLookup, TlscriptPerformancePreset, TlscriptShowcaseConfig,
+    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
+    TlscriptShowcaseProgram, TlscriptTileLookup, TlspriteHotReloadEvent, TlspriteProgram,
+    TlspriteProgramCache, TlspriteWatchReloader, VulkanSceneRenderer, VulkanSceneRendererConfig,
+    WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION, MAX_SCENE_LIGHTS,
 };
 use gms::safe_default_required_limits_for_adapter;
 use mgs::MobileGpuProfile;
@@ -561,6 +561,48 @@ mod performance_contract_tests {
         assert_eq!(evaluation.scenario, PerformanceContractScenario::Extreme60k);
         assert_eq!(evaluation.tier, PerformanceContractTier::ShipTarget);
         assert!(evaluation.stable);
+    }
+}
+
+#[cfg(test)]
+mod script_runtime_tile_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn multi_script_runtime_uses_overlay_tile_lookup_contract() {
+        let script_a_source = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    tile_set(3, 2, 14)\n",
+        );
+        let script_b_source = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    let probe: int = tile_get(3, 2)\n",
+            "    if probe == 14:\n",
+            "        set_spawn_per_tick(271)\n",
+        );
+        let script_a =
+            compile_tlscript_showcase(script_a_source, TlscriptShowcaseConfig::default())
+                .program
+                .expect("script a");
+        let script_b =
+            compile_tlscript_showcase(script_b_source, TlscriptShowcaseConfig::default())
+                .program
+                .expect("script b");
+        let runtime = ScriptRuntime::MultiScripts(vec![script_a, script_b]);
+        let runtime_lookup = |_x: i32, _y: i32| 5_u16;
+        let out = runtime.evaluate_frame(
+            TlscriptShowcaseFrameInput {
+                frame_index: 0,
+                live_balls: 0,
+                spawned_this_tick: 0,
+                key_f_down: false,
+            },
+            TlscriptShowcaseControlInput::default(),
+            Some(&runtime_lookup),
+        );
+        assert_eq!(out.patch.spawn_per_tick, Some(271));
     }
 }
 
@@ -1392,10 +1434,15 @@ impl<'src> ScriptRuntime<'src> {
             Self::MultiScripts(programs) => {
                 let mut merged = empty_showcase_output();
                 for (index, program) in programs.iter().enumerate() {
+                    let overlay_lookup = TlscriptOverlayTileLookup::new(
+                        tile_lookup,
+                        &merged.tile_mutations,
+                        &merged.tile_fills,
+                    );
                     let output = program.evaluate_frame_with_controls_and_tile_lookup(
                         input,
                         controls,
-                        tile_lookup,
+                        Some(&overlay_lookup),
                     );
                     merge_showcase_output(&mut merged, output, index);
                 }

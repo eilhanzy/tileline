@@ -869,6 +869,7 @@ impl TlAppRuntime {
     pub(super) fn evaluate_console_statement(
         &self,
         statement: &str,
+        tile_lookup: Option<&dyn TlscriptTileLookup>,
     ) -> Result<TlscriptShowcaseFrameOutput, String> {
         let source = format!("@export\ndef showcase_tick():\n    {statement}\n");
         let compile = compile_tlscript_showcase(&source, TlscriptShowcaseConfig::default());
@@ -878,17 +879,31 @@ impl TlAppRuntime {
         let Some(program) = compile.program else {
             return Err("script statement produced no runnable program".to_string());
         };
-        let tile_lookup = |x: i32, y: i32| self.tile_world_2d.tile(TileCoord2d::new(x, y));
-        let mut output = program.evaluate_frame_with_controls_and_tile_lookup(
-            TlscriptShowcaseFrameInput {
-                frame_index: self.script_frame_index,
-                live_balls: self.scene.live_ball_count(),
-                spawned_this_tick: self.script_last_spawned,
-                key_f_down: self.script_key_f_keyboard || self.gamepad.action_f_down(),
-            },
-            TlscriptShowcaseControlInput::default(),
-            Some(&tile_lookup),
-        );
+        let mut output = if let Some(tile_lookup) = tile_lookup {
+            program.evaluate_frame_with_controls_and_tile_lookup(
+                TlscriptShowcaseFrameInput {
+                    frame_index: self.script_frame_index,
+                    live_balls: self.scene.live_ball_count(),
+                    spawned_this_tick: self.script_last_spawned,
+                    key_f_down: self.script_key_f_keyboard || self.gamepad.action_f_down(),
+                },
+                TlscriptShowcaseControlInput::default(),
+                Some(tile_lookup),
+            )
+        } else {
+            let runtime_tile_lookup =
+                |x: i32, y: i32| self.tile_world_2d.tile(TileCoord2d::new(x, y));
+            program.evaluate_frame_with_controls_and_tile_lookup(
+                TlscriptShowcaseFrameInput {
+                    frame_index: self.script_frame_index,
+                    live_balls: self.scene.live_ball_count(),
+                    spawned_this_tick: self.script_last_spawned,
+                    key_f_down: self.script_key_f_keyboard || self.gamepad.action_f_down(),
+                },
+                TlscriptShowcaseControlInput::default(),
+                Some(&runtime_tile_lookup),
+            )
+        };
         if !compile.warnings.is_empty() {
             output.warnings.extend(
                 compile
@@ -939,6 +954,7 @@ impl TlAppRuntime {
 
     pub(super) fn rebuild_console_script_overlay(&mut self) -> Result<Vec<String>, String> {
         let mut rebuilt = empty_showcase_output();
+        let runtime_tile_lookup = |x: i32, y: i32| self.tile_world_2d.tile(TileCoord2d::new(x, y));
         let mut notes = Vec::new();
         for (index, statement_template) in self.console.script_statements.iter().enumerate() {
             let expanded = self
@@ -946,8 +962,13 @@ impl TlAppRuntime {
                 .map_err(|err| {
                     format!("statement[{index}] '{statement_template}' variable error: {err}")
                 })?;
+            let overlay_lookup = TlscriptOverlayTileLookup::new(
+                Some(&runtime_tile_lookup),
+                &rebuilt.tile_mutations,
+                &rebuilt.tile_fills,
+            );
             let mut output = self
-                .evaluate_console_statement(&expanded)
+                .evaluate_console_statement(&expanded, Some(&overlay_lookup))
                 .map_err(|err| format!("statement[{index}] '{expanded}' failed: {err}"))?;
             if !output.warnings.is_empty() {
                 notes.push(format!(

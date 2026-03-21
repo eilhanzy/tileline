@@ -13,7 +13,7 @@ use std::f32::consts::TAU;
 use nalgebra::Vector3;
 use paradoxpe::{
     Aabb, BodyDesc, BodyHandle, BodyKind, ColliderDesc, ColliderMaterial, ColliderShape,
-    PhysicsWorld,
+    PhysicsSimulationMode, PhysicsWorld,
 };
 use rayon::prelude::*;
 
@@ -505,6 +505,12 @@ impl TickRatePolicy {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BounceTankSceneConfig {
     pub scene_mode: RuntimeSceneMode,
+    /// Z depth plane used while side-view 2D mode is active.
+    pub side_view_plane_z: f32,
+    /// Side-view 2D camera center in world tile-space units.
+    pub side_view_center: [f32; 2],
+    /// Side-view 2D camera zoom (>1 = zoom in, <1 = zoom out).
+    pub side_view_zoom: f32,
     pub target_ball_count: usize,
     pub spawn_per_tick: usize,
     pub container_half_extents: [f32; 3],
@@ -548,6 +554,9 @@ impl Default for BounceTankSceneConfig {
     fn default() -> Self {
         Self {
             scene_mode: RuntimeSceneMode::Spatial3d,
+            side_view_plane_z: 0.0,
+            side_view_center: [0.0, 0.0],
+            side_view_zoom: 1.0,
             target_ball_count: 12_000,
             spawn_per_tick: 120,
             container_half_extents: [24.0, 16.0, 24.0],
@@ -603,9 +612,13 @@ pub struct BounceTankTickMetrics {
 /// Runtime-safe patch set for `.tlscript` or gameplay controllers.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BounceTankRuntimePatch {
+    pub scene_mode: Option<RuntimeSceneMode>,
     pub target_ball_count: Option<usize>,
     pub spawn_per_tick: Option<usize>,
     pub container_half_extents: Option<[f32; 3]>,
+    pub side_view_plane_z: Option<f32>,
+    pub side_view_center: Option<[f32; 2]>,
+    pub side_view_zoom: Option<f32>,
     pub wall_thickness: Option<f32>,
     pub container_mesh_scale: Option<[f32; 3]>,
     pub linear_damping: Option<f32>,
@@ -737,6 +750,24 @@ impl BounceTankSceneController {
         self.config.scene_mode = mode;
     }
 
+    /// Set side-view 2D Z depth plane.
+    pub fn set_side_view_plane_z(&mut self, plane_z: f32) {
+        self.config.side_view_plane_z = plane_z.clamp(-512.0, 512.0);
+    }
+
+    /// Set side-view 2D camera center (world tile-space units).
+    pub fn set_side_view_center(&mut self, center_x: f32, center_y: f32) {
+        self.config.side_view_center = [
+            center_x.clamp(-1_000_000.0, 1_000_000.0),
+            center_y.clamp(-1_000_000.0, 1_000_000.0),
+        ];
+    }
+
+    /// Set side-view 2D camera zoom.
+    pub fn set_side_view_zoom(&mut self, zoom: f32) {
+        self.config.side_view_zoom = zoom.clamp(0.05, 20.0);
+    }
+
     pub fn live_ball_count(&self) -> usize {
         self.balls.len()
     }
@@ -866,6 +897,12 @@ impl BounceTankSceneController {
         let mut refresh_solver_friction = false;
         let mut refresh_solver_restitution = false;
 
+        if let Some(scene_mode) = patch.scene_mode {
+            if self.config.scene_mode != scene_mode {
+                self.config.scene_mode = scene_mode;
+                updated = true;
+            }
+        }
         if let Some(target) = patch.target_ball_count {
             let clamped = target.clamp(1, 200_000);
             if self.config.target_ball_count != clamped {
@@ -890,6 +927,31 @@ impl BounceTankSceneController {
             if self.config.container_half_extents != clamped {
                 self.config.container_half_extents = clamped;
                 rebuild_barriers = true;
+                updated = true;
+            }
+        }
+        if let Some(plane_z) = patch.side_view_plane_z {
+            let clamped = plane_z.clamp(-512.0, 512.0);
+            if (self.config.side_view_plane_z - clamped).abs() > f32::EPSILON {
+                self.config.side_view_plane_z = clamped;
+                world.set_flat_2d_plane_z(clamped);
+                updated = true;
+            }
+        }
+        if let Some(center) = patch.side_view_center {
+            let clamped = [
+                center[0].clamp(-1_000_000.0, 1_000_000.0),
+                center[1].clamp(-1_000_000.0, 1_000_000.0),
+            ];
+            if self.config.side_view_center != clamped {
+                self.config.side_view_center = clamped;
+                updated = true;
+            }
+        }
+        if let Some(zoom) = patch.side_view_zoom {
+            let clamped = zoom.clamp(0.05, 20.0);
+            if (self.config.side_view_zoom - clamped).abs() > f32::EPSILON {
+                self.config.side_view_zoom = clamped;
                 updated = true;
             }
         }
@@ -1250,6 +1312,7 @@ impl BounceTankSceneController {
 
     /// Ensure static physics walls exist and then spawn a progressive ball batch.
     pub fn physics_tick(&mut self, world: &mut PhysicsWorld) -> BounceTankTickMetrics {
+        self.sync_world_simulation_mode(world);
         self.ensure_container_walls(world);
         self.ensure_container_edge_barriers(world);
         self.cull_missing(world);
@@ -1277,6 +1340,7 @@ impl BounceTankSceneController {
     /// Call this right after `world.step(...)` to avoid one-frame visual pops where a high-energy
     /// body tunnels outside the prism before the next `physics_tick`.
     pub fn reconcile_after_step(&mut self, world: &mut PhysicsWorld) -> usize {
+        self.sync_world_simulation_mode(world);
         let recycled = if self.virtual_barrier_enabled() {
             self.recycle_escaped_balls(world)
         } else {
@@ -1344,12 +1408,12 @@ impl BounceTankSceneController {
         };
         if self.config.scene_mode.is_2d() {
             frame.view_2d = Some(SceneView2d {
-                center: [0.0, 0.0],
+                center: self.config.side_view_center,
                 half_size: [
                     self.config.container_half_extents[0].max(0.5),
                     self.config.container_half_extents[1].max(0.5),
                 ],
-                zoom: 1.0,
+                zoom: self.config.side_view_zoom.clamp(0.05, 20.0),
             });
         }
         if self.container_mesh_slot.is_some() {
@@ -1397,7 +1461,7 @@ impl BounceTankSceneController {
                 let (position, rotation) = pose?;
                 let q = rotation.quaternion();
                 let render_z = if self.config.scene_mode.is_2d() {
-                    0.0
+                    self.config.side_view_plane_z
                 } else {
                     position.z
                 };
@@ -1635,6 +1699,7 @@ impl BounceTankSceneController {
         let mut spawned = 0usize;
 
         let side_view_2d = self.config.scene_mode.is_2d();
+        let side_view_plane_z = self.config.side_view_plane_z;
         let hx = self.config.container_half_extents[0].max(0.5);
         let hy = self.config.container_half_extents[1].max(0.5);
         let hz = self.config.container_half_extents[2].max(0.5);
@@ -1653,7 +1718,7 @@ impl BounceTankSceneController {
             );
             let spawn_x = self.rand_range(-(hx - radius) * 0.86, (hx - radius) * 0.86);
             let spawn_z = if side_view_2d {
-                0.0
+                side_view_plane_z
             } else {
                 self.rand_range(-(hz - radius) * 0.86, (hz - radius) * 0.86)
             };
@@ -2066,6 +2131,7 @@ impl BounceTankSceneController {
         if !self.config.scene_mode.is_2d() {
             return 0;
         }
+        let side_view_plane_z = self.config.side_view_plane_z;
         let mut corrected = 0usize;
         for ball in &self.balls {
             let Some(body) = world.body(ball.body) else {
@@ -2074,8 +2140,8 @@ impl BounceTankSceneController {
             let mut position = body.position;
             let mut velocity = body.linear_velocity;
             let mut changed = false;
-            if position.z.abs() > 1e-5 {
-                position.z = 0.0;
+            if (position.z - side_view_plane_z).abs() > 1e-5 {
+                position.z = side_view_plane_z;
                 changed = true;
             }
             if velocity.z.abs() > 1e-5 {
@@ -2089,6 +2155,19 @@ impl BounceTankSceneController {
             }
         }
         corrected
+    }
+
+    #[inline]
+    fn sync_world_simulation_mode(&self, world: &mut PhysicsWorld) {
+        world.set_flat_2d_plane_z(self.config.side_view_plane_z);
+        let target_mode = if self.config.scene_mode.is_2d() {
+            PhysicsSimulationMode::Flat2d
+        } else {
+            PhysicsSimulationMode::Spatial3d
+        };
+        if world.simulation_mode() != target_mode {
+            world.set_simulation_mode(target_mode);
+        }
     }
 
     /// Clamps rare escaped balls back inside the prism instead of deleting them.
@@ -2391,11 +2470,16 @@ impl BounceTankSceneController {
     }
 
     fn container_visual_instance(&self) -> SceneInstance3d {
+        let center_z = if self.config.scene_mode.is_2d() {
+            self.config.side_view_plane_z
+        } else {
+            0.0
+        };
         SceneInstance3d {
             instance_id: u64::MAX - 1,
             primitive: ScenePrimitive3d::Box,
             transform: SceneTransform3d {
-                translation: [0.0, 0.0, 0.0],
+                translation: [0.0, 0.0, center_z],
                 rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 scale: [
                     self.config.container_half_extents[0] * 2.0,
@@ -2420,6 +2504,11 @@ impl BounceTankSceneController {
     fn append_container_wall_instances(&self, out: &mut Vec<SceneInstance3d>) {
         let Some(slot) = self.container_mesh_slot else {
             return;
+        };
+        let plane_z = if self.config.scene_mode.is_2d() {
+            self.config.side_view_plane_z
+        } else {
+            0.0
         };
         let hx = self.config.container_half_extents[0].max(0.5);
         let hy = self.config.container_half_extents[1].max(0.5);
@@ -2457,7 +2546,8 @@ impl BounceTankSceneController {
                 [(hx + t) * 2.0, (hy + t) * 2.0, t],
             ),
         ];
-        for (index, (translation, scale)) in faces.into_iter().enumerate() {
+        for (index, (mut translation, scale)) in faces.into_iter().enumerate() {
+            translation[2] += plane_z;
             let shaped_scale = [
                 scale[0] * mesh_scale[0],
                 scale[1] * mesh_scale[1],
@@ -2487,6 +2577,11 @@ impl BounceTankSceneController {
 
     /// Adds 12 thin edge prisms so the tank silhouette remains readable from every camera angle.
     fn append_container_edge_instances(&self, out: &mut Vec<SceneInstance3d>) {
+        let plane_z = if self.config.scene_mode.is_2d() {
+            self.config.side_view_plane_z
+        } else {
+            0.0
+        };
         let hx = self.config.container_half_extents[0] * 2.0;
         let hy = self.config.container_half_extents[1] * 2.0;
         let hz = self.config.container_half_extents[2] * 2.0;
@@ -2600,11 +2695,12 @@ impl BounceTankSceneController {
         ];
 
         let mut edge_index: u64 = 0;
-        for (translation, scale) in x_edges
+        for (mut translation, scale) in x_edges
             .into_iter()
             .chain(y_edges.into_iter())
             .chain(z_edges.into_iter())
         {
+            translation[2] += plane_z;
             out.push(SceneInstance3d {
                 instance_id: (u64::MAX - 20).saturating_sub(edge_index),
                 primitive,
@@ -2844,12 +2940,14 @@ mod tests {
 
     #[test]
     fn side_view_mode_keeps_dynamic_balls_on_flat_z_plane() {
+        let side_view_plane_z = 2.5;
         let mut world = PhysicsWorld::new(PhysicsWorldConfig {
             fixed_dt: 1.0 / 120.0,
             ..PhysicsWorldConfig::default()
         });
         let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
             scene_mode: RuntimeSceneMode::SideView2d,
+            side_view_plane_z,
             target_ball_count: 160,
             spawn_per_tick: 80,
             scatter_interval_ticks: 1,
@@ -2864,11 +2962,13 @@ mod tests {
             let _ = world.step(world.config().fixed_dt);
             let _ = scene.reconcile_after_step(&mut world);
         }
+        assert_eq!(world.simulation_mode(), PhysicsSimulationMode::Flat2d);
+        assert!((world.flat_2d_plane_z() - side_view_plane_z).abs() < 1e-6);
 
         for ball in &scene.balls {
             let body = world.body(ball.body).expect("dynamic body should be alive");
             assert!(
-                body.position.z.abs() <= 1e-4,
+                (body.position.z - side_view_plane_z).abs() <= 1e-4,
                 "z position drifted in side-view mode: {}",
                 body.position.z
             );
@@ -2878,6 +2978,83 @@ mod tests {
                 body.linear_velocity.z
             );
         }
+    }
+
+    #[test]
+    fn side_view_mode_frame_instances_follow_side_view_plane_z() {
+        let side_view_plane_z = 3.25;
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig {
+            scene_mode: RuntimeSceneMode::SideView2d,
+            side_view_plane_z,
+            target_ball_count: 96,
+            spawn_per_tick: 96,
+            ..BounceTankSceneConfig::default()
+        });
+        scene.container_mesh_slot = Some(7);
+
+        let _ = scene.physics_tick(&mut world);
+        let _ = world.step(world.config().fixed_dt);
+        let frame = scene.build_frame_instances(&world, Some(1.0));
+
+        let ball_instances = frame
+            .opaque_3d
+            .iter()
+            .filter(|instance| matches!(instance.primitive, ScenePrimitive3d::Sphere))
+            .collect::<Vec<_>>();
+        assert!(
+            !ball_instances.is_empty(),
+            "side-view frame should include sphere ball instances"
+        );
+        for instance in ball_instances {
+            assert!(
+                (instance.transform.translation[2] - side_view_plane_z).abs() <= 1e-5,
+                "ball instance z did not follow side-view plane"
+            );
+        }
+
+        let wall_instances = frame
+            .transparent_3d
+            .iter()
+            .filter(|instance| matches!(instance.primitive, ScenePrimitive3d::Mesh { slot: 7 }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wall_instances.len(),
+            6,
+            "mesh-backed rectangular wall set should emit six faces"
+        );
+        assert!(wall_instances.iter().any(|instance| {
+            (instance.transform.translation[2] - side_view_plane_z).abs() > 0.1
+        }));
+    }
+
+    #[test]
+    fn runtime_patch_can_set_side_view_mode_and_camera() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            fixed_dt: 1.0 / 120.0,
+            ..PhysicsWorldConfig::default()
+        });
+        let mut scene = BounceTankSceneController::new(BounceTankSceneConfig::default());
+        let metrics = scene.apply_runtime_patch(
+            &mut world,
+            BounceTankRuntimePatch {
+                scene_mode: Some(RuntimeSceneMode::SideView2d),
+                side_view_center: Some([6.5, -2.0]),
+                side_view_zoom: Some(1.35),
+                side_view_plane_z: Some(4.0),
+                ..BounceTankRuntimePatch::default()
+            },
+        );
+        assert!(metrics.config_updated);
+        let frame = scene.build_frame_instances(&world, Some(1.0));
+        assert_eq!(frame.mode, RuntimeSceneMode::SideView2d);
+        let view = frame.view_2d.expect("side-view mode should emit 2D view");
+        assert_eq!(view.center, [6.5, -2.0]);
+        assert!((view.zoom - 1.35).abs() <= 1e-6);
+        assert!((scene.config().side_view_plane_z - 4.0).abs() <= 1e-6);
     }
 
     #[test]
