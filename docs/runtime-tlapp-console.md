@@ -140,6 +140,13 @@ These commands update live runtime state (no restart required).
 scene script evaluation. This means runtime CLI statements can override gameplay-script values
 without editing source files.
 
+Useful script-side runtime queries and controls:
+
+- `contact_any()`, `contact_pairs()`, `contact_manifolds()`
+- aliases: `touch_any()`, `touch_pairs()`, `touch_manifolds()`
+- `set_render_distance(v)`, `set_adaptive_distance(mode)`, `set_distance_blur(mode)`,
+  `set_msaa(samples)`
+
 ## Examples
 
 ```text
@@ -203,6 +210,14 @@ script.call set_gravity(0.0, $gravity_y, 0.0)
 script.call set_spawn_per_tick(96)
 script.call set_bounce(0.82, 0.78)
 script.list
+```
+
+```text
+script.call set_render_distance(72)
+script.call set_adaptive_distance("auto")
+script.call set_distance_blur("on")
+script.call set_msaa(2)
+script.exec if contact_any(): set_spawn_per_tick(contact_pairs())
 ```
 
 ## Notes

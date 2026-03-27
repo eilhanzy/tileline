@@ -8,9 +8,9 @@
 
 use crate::topology::CpuClass;
 use std::io;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 

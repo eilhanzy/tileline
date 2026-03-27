@@ -210,6 +210,7 @@ impl TlAppRuntime {
                         bind_renderer_meshes_from_tlsprite(
                             &mut self.renderer,
                             &self.device,
+                            &self.queue,
                             sprite_loader.path(),
                             &program,
                         );
@@ -220,6 +221,15 @@ impl TlAppRuntime {
             }
         }
 
+        let contact_snapshot = {
+            let world = self.world.borrow();
+            let broadphase = world.broadphase().stats();
+            let narrowphase = world.narrowphase().stats();
+            TlscriptShowcaseContactSnapshot {
+                contact_pairs: broadphase.candidate_pairs,
+                contact_manifolds: narrowphase.manifolds,
+            }
+        };
         let tile_lookup = |x: i32, y: i32| self.tile_world_2d.tile(TileCoord2d::new(x, y));
         let mut frame_eval = self.script_runtime.evaluate_frame(
             TlscriptShowcaseFrameInput {
@@ -230,6 +240,7 @@ impl TlAppRuntime {
             },
             script_camera_input,
             Some(&tile_lookup),
+            contact_snapshot,
         );
         if !self.console.script_statements.is_empty() {
             merge_showcase_output(
@@ -237,6 +248,37 @@ impl TlAppRuntime {
                 self.console.script_overlay.clone(),
                 CONSOLE_SCRIPT_INDEX,
             );
+        }
+        if let Some(distance_override) = frame_eval.render_distance {
+            self.render_distance = distance_override;
+            if let Some(value) = distance_override {
+                self.render_distance_min = (value * 0.72).clamp(28.0, value);
+                self.render_distance_max = (value * 1.55).clamp(value, value.max(220.0));
+                self.console.quick_render_distance = format!("{value:.1}");
+            } else {
+                self.console.quick_render_distance = "off".to_string();
+            }
+        }
+        if let Some(mode) = frame_eval.adaptive_distance_mode {
+            self.adaptive_distance_enabled = mode.resolve(true);
+        }
+        if let Some(mode) = frame_eval.distance_blur_mode {
+            self.distance_blur_mode = match mode {
+                TlscriptToggleMode::Auto => ToggleAuto::Auto,
+                TlscriptToggleMode::On => ToggleAuto::On,
+                TlscriptToggleMode::Off => ToggleAuto::Off,
+            };
+            self.distance_blur_enabled = mode.resolve(false);
+        }
+        if let Some(samples) = frame_eval.msaa_samples {
+            if self.renderer.msaa_sample_count() != samples {
+                self.renderer.set_msaa_sample_count(&self.device, samples);
+            }
+            self.console.quick_msaa = if samples > 1 {
+                samples.to_string()
+            } else {
+                "off".to_string()
+            };
         }
 
         if let Some(preset) = frame_eval.performance_preset {

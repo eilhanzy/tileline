@@ -6,12 +6,17 @@
 - `sideview_chunk_mutation.tlscript`: medium chunked map with dig/place mutation loop
 - `sideview_stress_map.tlscript`: stress side-view map script for heavy tile/actor visibility
 - `bounce_hud.tlsprite`: HUD sprites + FBX mesh slot bindings
+- `sphere.fbx`: high-quality sphere mesh used by bounce scenes
+- `cube-prism.fbx`: prism mesh used for container wall bindings
 - `main.tljoint`: primary scene manifest binding script/sprite groups
 - `bounce_showcase_mobile_safe.tljoint`: mobile-safe scene manifest
 - `sideview_static_map.tljoint`: static side-view 2D validation scene
 - `sideview_chunk_mutation.tljoint`: chunk mutation (dig/place) side-view 2D validation scene
 - `sideview_stress_map.tljoint`: stress side-view 2D validation scene
 - `tlapp_project.tlpfile`: project-level manifest that unifies scene bindings for GUI/tools
+
+`.tlpfile` scene separation is explicit: use `default_dimension = 3d|2d` in `[project]`
+and `dimension = 3d|2d` per `[scene.*]`.
 
 Run with:
 
@@ -90,4 +95,14 @@ Open project GUI from `.tlpfile`:
 ```bash
 cargo run -p runtime --bin tlproject_gui -- \
   --project docs/demos/tlapp/tlapp_project.tlpfile
+```
+
+Build numbered `.pak` shards directly from this project root:
+
+```bash
+./scripts/build_tlpfile_pak.sh \
+  --project docs/demos/tlapp/tlapp_project.tlpfile \
+  --out-dir dist/pak \
+  --base-name tlapp-assets \
+  --max-shard-gb 5
 ```

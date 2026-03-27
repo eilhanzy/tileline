@@ -10,7 +10,7 @@ use mps::{
     DispatcherDoubleBufferedTransforms, DispatcherTransformSample, DoubleBufferedTransformStorage,
     TransformSample,
 };
-use nalgebra::Vector3;
+use nalgebra::{UnitQuaternion, Vector3};
 use rayon::prelude::*;
 
 use crate::abi::ParadoxScriptHostAbi;
@@ -118,8 +118,24 @@ impl FixedStepClock {
 }
 
 /// World configuration for the ParadoxPE foundation runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhysicsSimulationMode {
+    #[default]
+    Spatial3d,
+    Flat2d,
+}
+
+impl PhysicsSimulationMode {
+    #[inline]
+    pub const fn is_flat_2d(self) -> bool {
+        matches!(self, Self::Flat2d)
+    }
+}
+
+/// World configuration for the ParadoxPE foundation runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicsWorldConfig {
+    pub simulation_mode: PhysicsSimulationMode,
     pub gravity: Vector3<f32>,
     pub fixed_dt: f32,
     pub max_substeps: u32,
@@ -134,6 +150,7 @@ pub struct PhysicsWorldConfig {
 impl Default for PhysicsWorldConfig {
     fn default() -> Self {
         Self {
+            simulation_mode: PhysicsSimulationMode::Spatial3d,
             gravity: Vector3::new(0.0, -9.81, 0.0),
             fixed_dt: 1.0 / 120.0,
             max_substeps: 8,
@@ -188,6 +205,7 @@ pub struct PhysicsStepExecutionPlan {
 
 pub struct PhysicsWorld {
     config: PhysicsWorldConfig,
+    flat_2d_plane_z: f32,
     clock: FixedStepClock,
     bodies: BodyRegistry,
     broadphase: BroadphasePipeline,
@@ -209,7 +227,10 @@ pub struct PhysicsWorld {
 }
 
 impl PhysicsWorld {
-    pub fn new(config: PhysicsWorldConfig) -> Self {
+    pub fn new(mut config: PhysicsWorldConfig) -> Self {
+        if config.simulation_mode.is_flat_2d() {
+            config.gravity = flatten_xy_vector(config.gravity);
+        }
         let mut broadphase = BroadphasePipeline::new(config.broadphase.clone());
         broadphase.sync_for_body_count(0);
         let mut narrowphase = NarrowphasePipeline::new(config.narrowphase.clone());
@@ -220,6 +241,7 @@ impl PhysicsWorld {
         Self {
             clock: FixedStepClock::new(config.fixed_dt, config.max_substeps),
             config,
+            flat_2d_plane_z: 0.0,
             bodies: BodyRegistry::new(),
             broadphase,
             narrowphase,
@@ -258,9 +280,51 @@ impl PhysicsWorld {
         self.config.gravity
     }
 
+    /// Current simulation mode (`Spatial3d` or `Flat2d`).
+    pub fn simulation_mode(&self) -> PhysicsSimulationMode {
+        self.config.simulation_mode
+    }
+
+    /// Current Z plane used by flat-2D simulation mode.
+    pub fn flat_2d_plane_z(&self) -> f32 {
+        self.flat_2d_plane_z
+    }
+
+    /// Set the Z depth plane for flat-2D simulation.
+    ///
+    /// This keeps XY simulation semantics while allowing runtime scene coordinates to anchor the
+    /// 2D world on a deterministic Z slice in 3D space.
+    pub fn set_flat_2d_plane_z(&mut self, plane_z: f32) {
+        if (self.flat_2d_plane_z - plane_z).abs() <= f32::EPSILON {
+            return;
+        }
+        self.flat_2d_plane_z = plane_z;
+        if self.config.simulation_mode.is_flat_2d() {
+            let _ = self.enforce_flat_2d_constraints();
+        }
+    }
+
+    /// Switch simulation mode at runtime.
+    ///
+    /// `Flat2d` keeps world state on XY plane (Z locked) and preserves only Z-axis rotation.
+    pub fn set_simulation_mode(&mut self, mode: PhysicsSimulationMode) {
+        if self.config.simulation_mode == mode {
+            return;
+        }
+        self.config.simulation_mode = mode;
+        if mode.is_flat_2d() {
+            self.config.gravity = flatten_xy_vector(self.config.gravity);
+            let _ = self.enforce_flat_2d_constraints();
+        }
+    }
+
     /// Update gravity at runtime without rebuilding the world.
     pub fn set_gravity(&mut self, gravity: Vector3<f32>) {
-        self.config.gravity = gravity;
+        self.config.gravity = if self.config.simulation_mode.is_flat_2d() {
+            flatten_xy_vector(gravity)
+        } else {
+            gravity
+        };
     }
 
     /// Update fixed-step scheduler parameters at runtime.
@@ -396,6 +460,16 @@ impl PhysicsWorld {
     }
 
     pub fn spawn_body(&mut self, desc: BodyDesc) -> BodyHandle {
+        let desc = if self.config.simulation_mode.is_flat_2d() {
+            BodyDesc {
+                position: flatten_position_to_plane(desc.position, self.flat_2d_plane_z),
+                rotation: flatten_to_z_axis_rotation(desc.rotation),
+                linear_velocity: flatten_xy_vector(desc.linear_velocity),
+                ..desc
+            }
+        } else {
+            desc
+        };
         let handle = self.bodies.spawn(desc);
         self.sync_hot_loop_buffers();
         handle
@@ -573,15 +647,30 @@ impl PhysicsWorld {
     }
 
     pub fn apply_force(&mut self, body: BodyHandle, force: Vector3<f32>) -> bool {
+        let force = if self.config.simulation_mode.is_flat_2d() {
+            flatten_xy_vector(force)
+        } else {
+            force
+        };
         self.bodies.apply_force(body, force)
     }
 
     pub fn set_velocity(&mut self, body: BodyHandle, velocity: Vector3<f32>) -> bool {
+        let velocity = if self.config.simulation_mode.is_flat_2d() {
+            flatten_xy_vector(velocity)
+        } else {
+            velocity
+        };
         self.bodies.set_velocity(body, velocity)
     }
 
     /// Move one body to a world-space position and rebuild its broadphase bounds.
     pub fn set_position(&mut self, body: BodyHandle, position: Vector3<f32>) -> bool {
+        let position = if self.config.simulation_mode.is_flat_2d() {
+            flatten_position_to_plane(position, self.flat_2d_plane_z)
+        } else {
+            position
+        };
         self.bodies.set_position(body, position)
     }
 
@@ -748,35 +837,44 @@ impl PhysicsWorld {
         self.broadphase.rebuild_pairs_parallel(bodies);
         timings.broadphase_us += duration_us(t.elapsed());
 
-        let t = Instant::now();
-        let candidate_pairs = self.broadphase.candidate_pairs();
-        let colliders = &self.colliders;
-        let manifolds = self
-            .narrowphase
-            .rebuild_manifolds(bodies, candidate_pairs, |body| {
-                primary_shape_for_body(colliders, bodies, body)
-            });
-        timings.narrowphase_us += duration_us(t.elapsed());
-
-        let t = Instant::now();
-        self.solver
-            .solve(&mut self.bodies, manifolds, plan.fixed_dt);
-        self.joint_solver
-            .solve(&mut self.bodies, &self.active_joints, plan.fixed_dt);
-        Self::rebuild_contacts_from_manifolds(&mut self.contacts, manifolds);
-        timings.solver_us += duration_us(t.elapsed());
-
         let is_last = step_index + 1 == plan.substeps;
         let on_stride = plan.substeps as usize > plan.sleep_update_stride
             && step_index as usize % plan.sleep_update_stride == 0;
-        if is_last || on_stride {
+
+        {
             let t = Instant::now();
-            self.sleep_manager.update(
-                &mut self.bodies,
-                manifolds,
-                &self.active_joints,
-                plan.fixed_dt,
-            );
+            let candidate_pairs = self.broadphase.candidate_pairs();
+            let colliders = &self.colliders;
+            let manifolds = self
+                .narrowphase
+                .rebuild_manifolds(bodies, candidate_pairs, |body| {
+                    primary_shape_for_body(colliders, bodies, body)
+                });
+            timings.narrowphase_us += duration_us(t.elapsed());
+
+            let t = Instant::now();
+            self.solver
+                .solve(&mut self.bodies, manifolds, plan.fixed_dt);
+            self.joint_solver
+                .solve(&mut self.bodies, &self.active_joints, plan.fixed_dt);
+            Self::rebuild_contacts_from_manifolds(&mut self.contacts, manifolds);
+            timings.solver_us += duration_us(t.elapsed());
+
+            if is_last || on_stride {
+                let t = Instant::now();
+                self.sleep_manager.update(
+                    &mut self.bodies,
+                    manifolds,
+                    &self.active_joints,
+                    plan.fixed_dt,
+                );
+                timings.sleep_us += duration_us(t.elapsed());
+            }
+        }
+
+        if self.config.simulation_mode.is_flat_2d() {
+            let t = Instant::now();
+            let _ = self.enforce_flat_2d_constraints();
             timings.sleep_us += duration_us(t.elapsed());
         }
     }
@@ -870,9 +968,24 @@ impl PhysicsWorld {
             let Some(dense) = self.bodies.dense_index_of(frame.handle) else {
                 continue;
             };
-            self.bodies.positions[dense] = frame.position;
-            self.bodies.rotations[dense] = frame.rotation;
-            self.bodies.linear_velocities[dense] = frame.linear_velocity;
+            let position = if self.config.simulation_mode.is_flat_2d() {
+                flatten_position_to_plane(frame.position, self.flat_2d_plane_z)
+            } else {
+                frame.position
+            };
+            let rotation = if self.config.simulation_mode.is_flat_2d() {
+                flatten_to_z_axis_rotation(frame.rotation)
+            } else {
+                frame.rotation
+            };
+            let linear_velocity = if self.config.simulation_mode.is_flat_2d() {
+                flatten_xy_vector(frame.linear_velocity)
+            } else {
+                frame.linear_velocity
+            };
+            self.bodies.positions[dense] = position;
+            self.bodies.rotations[dense] = rotation;
+            self.bodies.linear_velocities[dense] = linear_velocity;
             self.bodies.awake[dense] = frame.awake;
             self.bodies.recompute_world_aabb_for_dense(dense);
             restored += 1;
@@ -892,6 +1005,41 @@ impl PhysicsWorld {
         alpha: f32,
     ) -> Option<crate::snapshot::InterpolatedBodyPose> {
         self.interpolation.interpolate_body(body, alpha)
+    }
+
+    /// Enforce XY-plane constraints for `Flat2d` mode.
+    ///
+    /// This keeps runtime, script, and physics transforms coherent when side-view 2D mode is
+    /// enabled and prevents solver drift from leaking bodies away from Z=0.
+    fn enforce_flat_2d_constraints(&mut self) -> usize {
+        if !self.config.simulation_mode.is_flat_2d() {
+            return 0;
+        }
+        let mut corrected = 0usize;
+        for dense in 0..self.bodies.len() {
+            let mut changed = false;
+
+            if (self.bodies.positions[dense].z - self.flat_2d_plane_z).abs() > 1e-6 {
+                self.bodies.positions[dense].z = self.flat_2d_plane_z;
+                changed = true;
+            }
+            if self.bodies.linear_velocities[dense].z.abs() > 1e-6 {
+                self.bodies.linear_velocities[dense].z = 0.0;
+                changed = true;
+            }
+
+            let flattened = flatten_to_z_axis_rotation(self.bodies.rotations[dense]);
+            if self.bodies.rotations[dense].angle_to(&flattened) > 1e-6 {
+                self.bodies.rotations[dense] = flattened;
+                changed = true;
+            }
+
+            if changed {
+                self.bodies.recompute_world_aabb_for_dense(dense);
+                corrected = corrected.saturating_add(1);
+            }
+        }
+        corrected
     }
 
     fn rebuild_contacts_from_manifolds(
@@ -1058,6 +1206,24 @@ fn primary_shape_for_body(
         record.desc.material,
         record.desc.user_tag,
     ))
+}
+
+#[inline]
+fn flatten_xy_vector(mut value: Vector3<f32>) -> Vector3<f32> {
+    value.z = 0.0;
+    value
+}
+
+#[inline]
+fn flatten_position_to_plane(mut value: Vector3<f32>, plane_z: f32) -> Vector3<f32> {
+    value.z = plane_z;
+    value
+}
+
+#[inline]
+fn flatten_to_z_axis_rotation(rotation: UnitQuaternion<f32>) -> UnitQuaternion<f32> {
+    let (_, _, yaw) = rotation.euler_angles();
+    UnitQuaternion::from_axis_angle(&Vector3::z_axis(), yaw)
 }
 
 fn duration_us(d: Duration) -> u64 {
@@ -1258,6 +1424,84 @@ mod tests {
         assert_eq!(world.config().max_substeps, 24);
         assert!((world.fixed_step_clock().fixed_dt() - (1.0 / 480.0)).abs() < 1e-6);
         assert_eq!(world.fixed_step_clock().max_substeps(), 24);
+    }
+
+    #[test]
+    fn flat_2d_mode_flattens_spawn_and_runtime_updates() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            simulation_mode: PhysicsSimulationMode::Flat2d,
+            gravity: Vector3::new(0.0, -9.81, 3.0),
+            ..PhysicsWorldConfig::default()
+        });
+        assert_eq!(world.gravity().z, 0.0);
+
+        let body = world.spawn_body(BodyDesc {
+            position: Vector3::new(1.0, 2.0, 6.0),
+            linear_velocity: Vector3::new(0.5, -0.3, 4.0),
+            rotation: UnitQuaternion::from_euler_angles(0.6, -0.4, 0.3),
+            ..BodyDesc::default()
+        });
+        let snapshot = world.body(body).expect("body");
+        assert!(snapshot.position.z.abs() <= 1e-6);
+        assert!(snapshot.linear_velocity.z.abs() <= 1e-6);
+        let (roll, pitch, _) = snapshot.rotation.euler_angles();
+        assert!(roll.abs() <= 1e-5);
+        assert!(pitch.abs() <= 1e-5);
+
+        assert!(world.set_position(body, Vector3::new(3.0, 4.0, -9.0)));
+        assert!(world.set_velocity(body, Vector3::new(0.0, 1.0, -7.0)));
+        let updated = world.body(body).expect("body");
+        assert!(updated.position.z.abs() <= 1e-6);
+        assert!(updated.linear_velocity.z.abs() <= 1e-6);
+    }
+
+    #[test]
+    fn enabling_flat_2d_mode_runtime_flattens_existing_bodies() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig::default());
+        let body = world.spawn_body(BodyDesc {
+            position: Vector3::new(0.0, 0.0, 3.0),
+            linear_velocity: Vector3::new(0.0, 0.0, 2.0),
+            rotation: UnitQuaternion::from_euler_angles(0.25, 0.15, -0.4),
+            ..BodyDesc::default()
+        });
+
+        world.set_simulation_mode(PhysicsSimulationMode::Flat2d);
+        assert_eq!(world.simulation_mode(), PhysicsSimulationMode::Flat2d);
+
+        let flattened = world.body(body).expect("body");
+        assert!(flattened.position.z.abs() <= 1e-6);
+        assert!(flattened.linear_velocity.z.abs() <= 1e-6);
+        let (roll, pitch, _) = flattened.rotation.euler_angles();
+        assert!(roll.abs() <= 1e-5);
+        assert!(pitch.abs() <= 1e-5);
+
+        let _ = world.step(1.0 / 60.0);
+        let after_step = world.body(body).expect("body");
+        assert!(after_step.position.z.abs() <= 1e-6);
+        assert!(after_step.linear_velocity.z.abs() <= 1e-6);
+    }
+
+    #[test]
+    fn flat_2d_plane_z_can_be_configured() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            simulation_mode: PhysicsSimulationMode::Flat2d,
+            ..PhysicsWorldConfig::default()
+        });
+        world.set_flat_2d_plane_z(2.75);
+        assert!((world.flat_2d_plane_z() - 2.75).abs() < 1e-6);
+
+        let body = world.spawn_body(BodyDesc {
+            position: Vector3::new(0.0, 0.0, -5.0),
+            linear_velocity: Vector3::new(0.0, 1.0, 9.0),
+            ..BodyDesc::default()
+        });
+        let snapshot = world.body(body).expect("body");
+        assert!((snapshot.position.z - 2.75).abs() < 1e-6);
+        assert!(snapshot.linear_velocity.z.abs() <= 1e-6);
+
+        world.set_flat_2d_plane_z(-1.25);
+        let shifted = world.body(body).expect("body");
+        assert!((shifted.position.z + 1.25).abs() < 1e-6);
     }
 
     #[test]

@@ -32,14 +32,13 @@ pub use core::mgs_bridge::{
 pub use gms::{AdaptiveBufferDecision, AdaptiveFrameTelemetry};
 pub use graphics::multigpu::sync::{
     ComposeBarrierState, GpuQueueLane, GpuSubmissionHandle, GpuSubmissionWaitStatus,
-    GpuSubmissionWaiter, MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer,
-    MultiGpuSyncSnapshot, SharedPlacementPolicy, SyncBackendHint, WgpuSubmissionWaiter,
+    GpuSubmissionWaiter, MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer, MultiGpuSyncSnapshot,
+    SharedPlacementPolicy, SyncBackendHint, WgpuSubmissionWaiter,
 };
 pub use graphics::vulkan_backend::{
     FrameInstanceTransform, FrameLightRecord, FrameMaterialRecord, FrameSubmissionTelemetry,
-    FrameTextureRecord,
-    LinuxWindowSystemIntegration, PresentModePreference, RenderStateSnapshot, VulkanBackend,
-    VulkanBackendConfig, VulkanBackendError, VulkanDeviceExtensionSupport,
+    FrameTextureRecord, LinuxWindowSystemIntegration, PresentModePreference, RenderStateSnapshot,
+    VulkanBackend, VulkanBackendConfig, VulkanBackendError, VulkanDeviceExtensionSupport,
     VulkanFrameExecutionTelemetry, VulkanMultiGpuCapabilities, VulkanMultiGpuConfig,
     VulkanMultiGpuFramePlan, VulkanNativeMultiGpuSupport, VulkanPhysicalDeviceProfile,
     VulkanQueueSelection, VulkanSnapshotSlotState,

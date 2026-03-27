@@ -200,7 +200,7 @@ For pre-alpha integration freeze, prefer:
 
 ## Platform Notes
 
-### NVIDIA / AMD / Apple GPU Unit Counts
+### NVIDIA / AMD Unit Counts
 
 GMS uses a layered detection strategy for SM/CU/CoreCluster counts:
 
@@ -212,11 +212,6 @@ GMS uses a layered detection strategy for SM/CU/CoreCluster counts:
 3. `wgpu`-limits-based heuristic fallback
 
 The benchmark and planner diagnostics show the active source (`native`, `table`, or `heuristic`).
-
-### Apple Silicon (Metal / UMA)
-
-UMA-specific tuning and adaptive buffer controls are implemented in `gms` and wired into
-`tl-core`/`runtime` for stability recovery and encoder-window management.
 
 ## Current `.tlscript` Status
 
@@ -267,6 +262,11 @@ Cross-target toolchain doctor/setup:
 
 Release notes:
 
+- `docs/releases/v0.4.5.md`
+- `docs/releases/v0.4.5-github.md`
+- `docs/releases/v0.4.5.1.md`
+- `docs/releases/v0.4.5.1-github.md`
+- `docs/releases/v0.3.0.md`
 - `docs/releases/v0.2.0.md`
 - `docs/releases/v0.1.0.md`
 - `CHANGELOG.md`

@@ -576,7 +576,9 @@ impl MultiGpuFrameSynchronizer {
             &mut state,
         );
         let transfer_ready = self.resolve_lane_readiness(
-            transfer_waiter.or(secondary_waiter).unwrap_or(primary_waiter),
+            transfer_waiter
+                .or(secondary_waiter)
+                .unwrap_or(primary_waiter),
             frame.transfer_submission,
             frame.require_transfer,
             &mut remaining_wait_budget,

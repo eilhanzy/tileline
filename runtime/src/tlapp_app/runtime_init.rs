@@ -3,13 +3,44 @@ use super::*;
 impl TlAppRuntime {
     pub(super) fn new(
         event_loop: &ActiveEventLoop,
-        options: CliOptions,
+        mut options: CliOptions,
         platform: RuntimePlatform,
     ) -> Result<Self, Box<dyn Error>> {
         let file_io_root = env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from("."));
+        let mut pak_mount_root: Option<PathBuf> = None;
+        if let Some(requested_pak_path) = options.pak_path.clone() {
+            let resolved_pak_path = resolve_path_from_root(&file_io_root, &requested_pak_path);
+            let canonical_pak_path = resolved_pak_path.canonicalize().map_err(|err| {
+                format!(
+                    "failed to resolve pak '{}': {err}",
+                    requested_pak_path.display()
+                )
+            })?;
+            let mount_root = allocate_pak_mount_root(&file_io_root)?;
+            let unpack_report =
+                unpack_pak(&canonical_pak_path, &mount_root).map_err(|err| -> Box<dyn Error> {
+                    let _ = fs::remove_dir_all(&mount_root);
+                    format!(
+                        "failed to mount pak '{}' into '{}': {err}",
+                        canonical_pak_path.display(),
+                        mount_root.display()
+                    )
+                    .into()
+                })?;
+            options.pak_path = Some(canonical_pak_path.clone());
+            remap_cli_paths_from_pak_mount(&mut options, &mount_root);
+            eprintln!(
+                "[pak] mounted '{}' -> '{}' files={} bytes={}",
+                canonical_pak_path.display(),
+                mount_root.display(),
+                unpack_report.file_count,
+                unpack_report.total_payload_bytes
+            );
+            pak_mount_root = Some(mount_root);
+        }
         let window = Arc::new(
             event_loop.create_window(
                 WindowAttributes::default()
@@ -120,6 +151,7 @@ impl TlAppRuntime {
         let mut joint_merged_sprite_program: Option<TlspriteProgram> = None;
         let mut bundle_sprite_root: Option<PathBuf> = None;
         let mut project_scheduler_manifest: Option<TlpfileGraphicsScheduler> = None;
+        let mut project_scene_dimension_manifest: Option<TlpfileSceneDimension> = None;
         if let Some(project_path) = &options.project_path {
             let project_compile = compile_tlpfile_scene_from_path(
                 project_path,
@@ -154,6 +186,7 @@ impl TlAppRuntime {
             })?;
 
             project_scheduler_manifest = Some(bundle.scheduler);
+            project_scene_dimension_manifest = Some(bundle.scene_dimension);
 
             if bundle.scene_name == "main" {
                 let main_joint_ok = bundle
@@ -176,6 +209,7 @@ impl TlAppRuntime {
             let script_count = bundle.scripts.len();
             let sprite_count = bundle.sprite_count();
             let scheduler_name = bundle.scheduler.as_str();
+            let scene_dimension = bundle.scene_dimension.as_str();
             let joint_label = bundle
                 .selected_joint_path
                 .as_ref()
@@ -188,9 +222,10 @@ impl TlAppRuntime {
             joint_merged_sprite_program = bundle.merged_sprite_program.clone();
             script_runtime = Some(ScriptRuntime::MultiScripts(bundle.scripts));
             eprintln!(
-                "[tlpfile] project='{}' scene='{}' scheduler={} scripts={} sprites={} joint={}",
+                "[tlpfile] project='{}' scene='{}' mode={} scheduler={} scripts={} sprites={} joint={}",
                 project_path.display(),
                 scene_name,
+                scene_dimension,
                 scheduler_name,
                 script_count,
                 sprite_count,
@@ -491,6 +526,9 @@ impl TlAppRuntime {
             },
             ..PhysicsWorldConfig::default()
         });
+        let initial_scene_mode = project_scene_dimension_manifest
+            .map(scene_mode_from_tlpfile_dimension)
+            .unwrap_or(RuntimeSceneMode::Spatial3d);
         let scene = BounceTankSceneController::new(BounceTankSceneConfig {
             target_ball_count: 8_000,
             // Script can still tune this, but runtime starts from a progressive default.
@@ -509,6 +547,7 @@ impl TlAppRuntime {
             linear_damping: 0.012,
             initial_speed_min: 0.35,
             initial_speed_max: 1.25,
+            scene_mode: initial_scene_mode,
             ..BounceTankSceneConfig::default()
         });
         let tile_world_2d = build_default_side_view_tile_world(scene.config());
@@ -645,7 +684,13 @@ impl TlAppRuntime {
             force_full_fbx_from_sprite = program.requires_full_fbx_render();
             scene.set_sprite_program(program.clone());
             if let Some(root_hint) = bundle_sprite_root.as_deref() {
-                bind_renderer_meshes_from_tlsprite(&mut renderer, &device, root_hint, &program);
+                bind_renderer_meshes_from_tlsprite(
+                    &mut renderer,
+                    &device,
+                    &queue,
+                    root_hint,
+                    &program,
+                );
             }
             (None, None)
         } else {
@@ -674,6 +719,7 @@ impl TlAppRuntime {
                 bind_renderer_meshes_from_tlsprite(
                     &mut renderer,
                     &device,
+                    &queue,
                     sprite_loader.path(),
                     &program,
                 );
@@ -698,6 +744,7 @@ impl TlAppRuntime {
         let mut runtime = Self {
             cli_options: options.clone(),
             file_io_root,
+            pak_mount_root,
             window,
             _instance: instance,
             surface,
@@ -801,4 +848,88 @@ impl TlAppRuntime {
         runtime.sync_console_quick_fields_from_runtime();
         Ok(runtime)
     }
+}
+
+fn resolve_path_from_root(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn allocate_pak_mount_root(file_io_root: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let base_dir = file_io_root.join(".tileline").join("pak_mounts");
+    fs::create_dir_all(&base_dir).map_err(|err| {
+        format!(
+            "failed to create pak mount directory '{}': {err}",
+            base_dir.display()
+        )
+    })?;
+
+    let pid = std::process::id();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    for attempt in 0..64u32 {
+        let candidate = base_dir.join(format!("tlapp-{pid}-{stamp}-{attempt}"));
+        if candidate.exists() {
+            continue;
+        }
+        fs::create_dir_all(&candidate).map_err(|err| {
+            format!(
+                "failed to create pak mount root '{}': {err}",
+                candidate.display()
+            )
+        })?;
+        return Ok(candidate);
+    }
+
+    Err(format!(
+        "failed to allocate unique pak mount root under '{}'",
+        base_dir.display()
+    )
+    .into())
+}
+
+fn remap_cli_paths_from_pak_mount(options: &mut CliOptions, mount_root: &Path) {
+    let mut remapped = Vec::new();
+    if remap_optional_relative_path(&mut options.project_path, mount_root) {
+        remapped.push("project");
+    }
+    if remap_optional_relative_path(&mut options.joint_path, mount_root) {
+        remapped.push("joint");
+    }
+    if remap_relative_path(&mut options.script_path, mount_root) {
+        remapped.push("script");
+    }
+    if remap_relative_path(&mut options.sprite_path, mount_root) {
+        remapped.push("sprite");
+    }
+    if !remapped.is_empty() {
+        eprintln!(
+            "[pak] resolved runtime content from mounted archive: {}",
+            remapped.join(", ")
+        );
+    }
+}
+
+fn remap_optional_relative_path(path: &mut Option<PathBuf>, mount_root: &Path) -> bool {
+    let Some(inner) = path.as_mut() else {
+        return false;
+    };
+    remap_relative_path(inner, mount_root)
+}
+
+fn remap_relative_path(path: &mut PathBuf, mount_root: &Path) -> bool {
+    if path.is_absolute() {
+        return false;
+    }
+    let candidate = mount_root.join(path.as_path());
+    if !candidate.exists() {
+        return false;
+    }
+    *path = candidate;
+    true
 }

@@ -1,6 +1,7 @@
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use winit::dpi::PhysicalSize;
@@ -29,6 +30,8 @@ pub struct CliOptions {
     pub joint_scene: String,
     pub script_path: PathBuf,
     pub sprite_path: PathBuf,
+    pub ini_path: Option<PathBuf>,
+    pub pak_path: Option<PathBuf>,
 }
 
 impl Default for CliOptions {
@@ -54,121 +57,47 @@ impl Default for CliOptions {
             joint_scene: "main".to_string(),
             script_path: PathBuf::from("docs/demos/tlapp/bounce_showcase.tlscript"),
             sprite_path: PathBuf::from("docs/demos/tlapp/bounce_hud.tlsprite"),
+            ini_path: None,
+            pak_path: None,
         }
     }
 }
 
 impl CliOptions {
     pub fn parse_from_env() -> Result<Self, Box<dyn Error>> {
-        let mut options = Self::default();
-        let mut args = env::args().skip(1);
-        let mut pipeline_explicit = false;
+        let args = env::args().skip(1).collect::<Vec<_>>();
+        if args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+        {
+            print_usage();
+            std::process::exit(0);
+        }
+        if args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-V" | "--version"))
+        {
+            print_version_overview();
+            std::process::exit(0);
+        }
 
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    print_usage();
-                    std::process::exit(0);
-                }
-                "-V" | "--version" => {
-                    print_version_overview();
-                    std::process::exit(0);
-                }
-                "--resolution" => {
-                    let value = next_arg(&mut args, "--resolution")?;
-                    options.resolution = parse_resolution(&value)?;
-                }
-                "--vsync" => {
-                    let value = next_arg(&mut args, "--vsync")?;
-                    options.vsync = VsyncMode::parse(&value)?;
-                }
-                "--fps-cap" => {
-                    let value = next_arg(&mut args, "--fps-cap")?;
-                    options.fps_cap = parse_fps_cap(&value)?;
-                }
-                "--pipeline" => {
-                    let value = next_arg(&mut args, "--pipeline")?;
-                    options.pipeline_mode = PipelineMode::parse(&value)?;
-                    pipeline_explicit = true;
-                }
-                "--tick-profile" => {
-                    let value = next_arg(&mut args, "--tick-profile")?;
-                    options.tick_profile = TickProfile::parse(&value)?;
-                }
-                "--tick-cap" => {
-                    let value = next_arg(&mut args, "--tick-cap")?;
-                    options.tick_cap = parse_tick_cap(&value)?;
-                }
-                "--render-distance" => {
-                    let value = next_arg(&mut args, "--render-distance")?;
-                    options.render_distance = parse_render_distance(&value)?;
-                }
-                "--adaptive-distance" => {
-                    let value = next_arg(&mut args, "--adaptive-distance")?;
-                    options.adaptive_distance = ToggleAuto::parse(&value, "--adaptive-distance")?;
-                }
-                "--distance-blur" => {
-                    let value = next_arg(&mut args, "--distance-blur")?;
-                    options.distance_blur = ToggleAuto::parse(&value, "--distance-blur")?;
-                }
-                "--msaa" => {
-                    let value = next_arg(&mut args, "--msaa")?;
-                    options.msaa = parse_msaa(&value)?;
-                }
-                "--fsr" => {
-                    let value = next_arg(&mut args, "--fsr")?;
-                    options.fsr_mode =
-                        FsrMode::parse(&value).ok_or_else(|| -> Box<dyn Error> {
-                            "invalid --fsr value (expected off|auto|on|fsr1)".into()
-                        })?;
-                }
-                "--fsr-quality" => {
-                    let value = next_arg(&mut args, "--fsr-quality")?;
-                    options.fsr_quality = FsrQualityPreset::parse(&value).ok_or_else(
-                        || -> Box<dyn Error> {
-                            "invalid --fsr-quality value (expected native|ultra|quality|balanced|performance)"
-                                .into()
-                        },
-                    )?;
-                }
-                "--fsr-sharpness" => {
-                    let value = next_arg(&mut args, "--fsr-sharpness")?;
-                    options.fsr_sharpness = parse_fsr_sharpness(&value)?;
-                }
-                "--fsr-scale" => {
-                    let value = next_arg(&mut args, "--fsr-scale")?;
-                    options.fsr_scale_override = parse_fsr_scale(&value)?;
-                }
-                "--fps-report" => {
-                    let value = next_arg(&mut args, "--fps-report")?;
-                    options.fps_report_interval = parse_seconds_arg(&value, "--fps-report")?;
-                }
-                "--project" => {
-                    let value = next_arg(&mut args, "--project")?;
-                    options.project_path = Some(PathBuf::from(value));
-                }
-                "--joint" => {
-                    let value = next_arg(&mut args, "--joint")?;
-                    options.joint_path = Some(PathBuf::from(value));
-                }
-                "--scene" => {
-                    let value = next_arg(&mut args, "--scene")?;
-                    options.joint_scene = value.trim().to_string();
-                }
-                "--script" => {
-                    let value = next_arg(&mut args, "--script")?;
-                    options.script_path = PathBuf::from(value);
-                }
-                "--sprite" => {
-                    let value = next_arg(&mut args, "--sprite")?;
-                    options.sprite_path = PathBuf::from(value);
-                }
-                other => {
-                    return Err(format!("unknown argument: {other} (use --help)").into());
-                }
+        let mut options = Self::default();
+        let explicit_ini_path = scan_ini_path_from_args(&args)?;
+        let ini_path = explicit_ini_path
+            .clone()
+            .or_else(|| env::var("TILELINE_INI").ok().map(PathBuf::from));
+        if let Some(ini_path) = ini_path {
+            let warnings = apply_ini_overrides(&mut options, &ini_path)?;
+            options.ini_path = Some(ini_path);
+            for warning in warnings {
+                eprintln!("[tlapp ini] {warning}");
             }
         }
 
+        // Precedence: CLI > env > ini > defaults.
+        // Apply env overrides after INI, then parse CLI for final authority.
+        apply_env_overrides(&mut options)?;
+        let pipeline_explicit = parse_cli_overrides(&args, &mut options)?;
         if !pipeline_explicit {
             if let Ok(value) = env::var("TILELINE_PIPELINE") {
                 options.pipeline_mode = PipelineMode::parse(&value).map_err(|_| {
@@ -404,6 +333,331 @@ pub fn parse_fsr_scale(value: &str) -> Result<Option<f32>, Box<dyn Error>> {
     Ok(Some(parsed))
 }
 
+fn scan_ini_path_from_args(args: &[String]) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ini" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("missing value for --ini".into());
+                };
+                return Ok(Some(PathBuf::from(value)));
+            }
+            "-h" | "--help" | "-V" | "--version" => {
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn apply_env_overrides(options: &mut CliOptions) -> Result<(), Box<dyn Error>> {
+    if let Ok(value) = env::var("TILELINE_RESOLUTION") {
+        options.resolution = parse_resolution(&value)?;
+    }
+    if let Ok(value) = env::var("TILELINE_VSYNC") {
+        options.vsync = VsyncMode::parse(&value)?;
+    }
+    if let Ok(value) = env::var("TILELINE_FPS_CAP") {
+        options.fps_cap = parse_fps_cap(&value)?;
+    }
+    if let Ok(value) = env::var("TILELINE_TICK_PROFILE") {
+        options.tick_profile = TickProfile::parse(&value)?;
+    }
+    if let Ok(value) = env::var("TILELINE_TICK_CAP") {
+        options.tick_cap = parse_tick_cap(&value)?;
+    }
+    if let Ok(value) = env::var("TILELINE_RENDER_DISTANCE") {
+        options.render_distance = parse_render_distance(&value)?;
+    }
+    if let Ok(value) = env::var("TILELINE_ADAPTIVE_DISTANCE") {
+        options.adaptive_distance = ToggleAuto::parse(&value, "TILELINE_ADAPTIVE_DISTANCE")?;
+    }
+    if let Ok(value) = env::var("TILELINE_DISTANCE_BLUR") {
+        options.distance_blur = ToggleAuto::parse(&value, "TILELINE_DISTANCE_BLUR")?;
+    }
+    if let Ok(value) = env::var("TILELINE_MSAA") {
+        options.msaa = parse_msaa(&value)?;
+    }
+    if let Ok(value) = env::var("TILELINE_FSR_MODE") {
+        options.fsr_mode = FsrMode::parse(&value).ok_or_else(|| -> Box<dyn Error> {
+            "invalid TILELINE_FSR_MODE value (expected off|auto|on|fsr1)".into()
+        })?;
+    }
+    if let Ok(value) = env::var("TILELINE_FSR_QUALITY") {
+        options.fsr_quality =
+            FsrQualityPreset::parse(&value).ok_or_else(|| -> Box<dyn Error> {
+                "invalid TILELINE_FSR_QUALITY value (expected native|ultra|quality|balanced|performance)"
+                    .into()
+            })?;
+    }
+    if let Ok(value) = env::var("TILELINE_FSR_SHARPNESS") {
+        options.fsr_sharpness = parse_fsr_sharpness(&value)?;
+    }
+    if let Ok(value) = env::var("TILELINE_FSR_SCALE") {
+        options.fsr_scale_override = parse_fsr_scale(&value)?;
+    }
+    if let Ok(value) = env::var("TILELINE_FPS_REPORT") {
+        options.fps_report_interval = parse_seconds_arg(&value, "TILELINE_FPS_REPORT")?;
+    }
+    if let Ok(value) = env::var("TILELINE_PROJECT") {
+        options.project_path = Some(PathBuf::from(value));
+    }
+    if let Ok(value) = env::var("TILELINE_JOINT") {
+        options.joint_path = Some(PathBuf::from(value));
+    }
+    if let Ok(value) = env::var("TILELINE_SCENE") {
+        options.joint_scene = value.trim().to_string();
+    }
+    if let Ok(value) = env::var("TILELINE_SCRIPT") {
+        options.script_path = PathBuf::from(value);
+    }
+    if let Ok(value) = env::var("TILELINE_SPRITE") {
+        options.sprite_path = PathBuf::from(value);
+    }
+    if let Ok(value) = env::var("TILELINE_PAK") {
+        options.pak_path = Some(PathBuf::from(value));
+    }
+    Ok(())
+}
+
+fn parse_cli_overrides(args: &[String], options: &mut CliOptions) -> Result<bool, Box<dyn Error>> {
+    let mut iter = args.iter().cloned();
+    let mut pipeline_explicit = false;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" | "-V" | "--version" => {}
+            "--ini" => {
+                let value = next_arg(&mut iter, "--ini")?;
+                options.ini_path = Some(PathBuf::from(value));
+            }
+            "--pak" => {
+                let value = next_arg(&mut iter, "--pak")?;
+                options.pak_path = Some(PathBuf::from(value));
+            }
+            "--resolution" => {
+                let value = next_arg(&mut iter, "--resolution")?;
+                options.resolution = parse_resolution(&value)?;
+            }
+            "--vsync" => {
+                let value = next_arg(&mut iter, "--vsync")?;
+                options.vsync = VsyncMode::parse(&value)?;
+            }
+            "--fps-cap" => {
+                let value = next_arg(&mut iter, "--fps-cap")?;
+                options.fps_cap = parse_fps_cap(&value)?;
+            }
+            "--pipeline" => {
+                let value = next_arg(&mut iter, "--pipeline")?;
+                options.pipeline_mode = PipelineMode::parse(&value)?;
+                pipeline_explicit = true;
+            }
+            "--tick-profile" => {
+                let value = next_arg(&mut iter, "--tick-profile")?;
+                options.tick_profile = TickProfile::parse(&value)?;
+            }
+            "--tick-cap" => {
+                let value = next_arg(&mut iter, "--tick-cap")?;
+                options.tick_cap = parse_tick_cap(&value)?;
+            }
+            "--render-distance" => {
+                let value = next_arg(&mut iter, "--render-distance")?;
+                options.render_distance = parse_render_distance(&value)?;
+            }
+            "--adaptive-distance" => {
+                let value = next_arg(&mut iter, "--adaptive-distance")?;
+                options.adaptive_distance = ToggleAuto::parse(&value, "--adaptive-distance")?;
+            }
+            "--distance-blur" => {
+                let value = next_arg(&mut iter, "--distance-blur")?;
+                options.distance_blur = ToggleAuto::parse(&value, "--distance-blur")?;
+            }
+            "--msaa" => {
+                let value = next_arg(&mut iter, "--msaa")?;
+                options.msaa = parse_msaa(&value)?;
+            }
+            "--fsr" => {
+                let value = next_arg(&mut iter, "--fsr")?;
+                options.fsr_mode = FsrMode::parse(&value).ok_or_else(|| -> Box<dyn Error> {
+                    "invalid --fsr value (expected off|auto|on|fsr1)".into()
+                })?;
+            }
+            "--fsr-quality" => {
+                let value = next_arg(&mut iter, "--fsr-quality")?;
+                options.fsr_quality = FsrQualityPreset::parse(&value).ok_or_else(
+                    || -> Box<dyn Error> {
+                        "invalid --fsr-quality value (expected native|ultra|quality|balanced|performance)"
+                            .into()
+                    },
+                )?;
+            }
+            "--fsr-sharpness" => {
+                let value = next_arg(&mut iter, "--fsr-sharpness")?;
+                options.fsr_sharpness = parse_fsr_sharpness(&value)?;
+            }
+            "--fsr-scale" => {
+                let value = next_arg(&mut iter, "--fsr-scale")?;
+                options.fsr_scale_override = parse_fsr_scale(&value)?;
+            }
+            "--fps-report" => {
+                let value = next_arg(&mut iter, "--fps-report")?;
+                options.fps_report_interval = parse_seconds_arg(&value, "--fps-report")?;
+            }
+            "--project" => {
+                let value = next_arg(&mut iter, "--project")?;
+                options.project_path = Some(PathBuf::from(value));
+            }
+            "--joint" => {
+                let value = next_arg(&mut iter, "--joint")?;
+                options.joint_path = Some(PathBuf::from(value));
+            }
+            "--scene" => {
+                let value = next_arg(&mut iter, "--scene")?;
+                options.joint_scene = value.trim().to_string();
+            }
+            "--script" => {
+                let value = next_arg(&mut iter, "--script")?;
+                options.script_path = PathBuf::from(value);
+            }
+            "--sprite" => {
+                let value = next_arg(&mut iter, "--sprite")?;
+                options.sprite_path = PathBuf::from(value);
+            }
+            other => {
+                return Err(format!("unknown argument: {other} (use --help)").into());
+            }
+        }
+    }
+
+    Ok(pipeline_explicit)
+}
+
+fn apply_ini_overrides(
+    options: &mut CliOptions,
+    ini_path: &Path,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let source = fs::read_to_string(ini_path).map_err(|err| {
+        format!(
+            "failed to read ini '{}': {err}",
+            ini_path.as_os_str().to_string_lossy()
+        )
+    })?;
+    let mut warnings = Vec::new();
+    for (line_no, key, value) in parse_ini_lines(&source, &mut warnings) {
+        let normalized = key.to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "resolution" => options.resolution = parse_resolution(&value)?,
+            "vsync" => options.vsync = VsyncMode::parse(&value)?,
+            "fps_cap" => options.fps_cap = parse_fps_cap(&value)?,
+            "pipeline" => options.pipeline_mode = PipelineMode::parse(&value)?,
+            "tick_profile" => options.tick_profile = TickProfile::parse(&value)?,
+            "tick_cap" => options.tick_cap = parse_tick_cap(&value)?,
+            "render_distance" => options.render_distance = parse_render_distance(&value)?,
+            "adaptive_distance" => {
+                options.adaptive_distance = ToggleAuto::parse(&value, "adaptive_distance")?
+            }
+            "distance_blur" => options.distance_blur = ToggleAuto::parse(&value, "distance_blur")?,
+            "msaa" => options.msaa = parse_msaa(&value)?,
+            "fsr" | "fsr_mode" => {
+                options.fsr_mode =
+                    FsrMode::parse(&value).ok_or_else(|| -> Box<dyn Error> {
+                        "invalid fsr value in ini (expected off|auto|on|fsr1)".into()
+                    })?
+            }
+            "fsr_quality" => {
+                options.fsr_quality = FsrQualityPreset::parse(&value).ok_or_else(
+                    || -> Box<dyn Error> {
+                        "invalid fsr_quality value in ini (expected native|ultra|quality|balanced|performance)"
+                            .into()
+                    },
+                )?
+            }
+            "fsr_sharpness" => options.fsr_sharpness = parse_fsr_sharpness(&value)?,
+            "fsr_scale" => options.fsr_scale_override = parse_fsr_scale(&value)?,
+            "fps_report" => options.fps_report_interval = parse_seconds_arg(&value, "fps_report")?,
+            "project" | "project_path" => options.project_path = Some(PathBuf::from(value)),
+            "joint" | "joint_path" => options.joint_path = Some(PathBuf::from(value)),
+            "scene" | "joint_scene" => options.joint_scene = value.trim().to_string(),
+            "script" | "script_path" => options.script_path = PathBuf::from(value),
+            "sprite" | "sprite_path" => options.sprite_path = PathBuf::from(value),
+            "pak" | "pak_path" => options.pak_path = Some(PathBuf::from(value)),
+            "ini" | "ini_path" => warnings.push(format!(
+                "{}:{}: '{}' key is ignored (ini recursion is not supported)",
+                ini_path.display(),
+                line_no,
+                key
+            )),
+            _ => warnings.push(format!(
+                "{}:{}: unknown ini key '{}', ignoring",
+                ini_path.display(),
+                line_no,
+                key
+            )),
+        }
+    }
+    Ok(warnings)
+}
+
+fn parse_ini_lines(source: &str, warnings: &mut Vec<String>) -> Vec<(usize, String, String)> {
+    let mut parsed = Vec::new();
+    for (index, raw_line) in source.lines().enumerate() {
+        let line_no = index + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = trimmed.split_once('=') else {
+            warnings.push(format!("line {}: invalid ini entry '{trimmed}'", line_no));
+            continue;
+        };
+        let key = raw_key.trim();
+        if key.is_empty() {
+            warnings.push(format!("line {}: empty ini key", line_no));
+            continue;
+        }
+        let value = strip_ini_inline_comment(raw_value.trim());
+        if value.is_empty() {
+            warnings.push(format!("line {}: empty value for key '{key}'", line_no));
+            continue;
+        }
+        let key = key
+            .strip_prefix("tlapp_")
+            .or_else(|| key.strip_prefix("runtime_"))
+            .unwrap_or(key)
+            .to_string();
+        parsed.push((line_no, key, value));
+    }
+    parsed
+}
+
+fn strip_ini_inline_comment(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_quote = false;
+    for ch in raw.chars() {
+        match ch {
+            '"' => {
+                in_quote = !in_quote;
+                out.push(ch);
+            }
+            '#' | ';' if !in_quote => break,
+            _ => out.push(ch),
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn print_usage() {
     println!("Tileline TLApp Runtime Demo");
     println!("Usage: cargo run -p runtime --bin tlapp -- [options]");
@@ -425,6 +679,8 @@ fn print_usage() {
     println!("  --fsr-sharpness <0..1>    FSR sharpen amount (default: 0.35)");
     println!("  --fsr-scale <0.5..1|auto> Render scale override for FSR mode");
     println!("  --fps-report <sec>        CLI FPS report cadence (default: 1.0)");
+    println!("  --ini <path>              Startup config (.ini) file");
+    println!("  --pak <path>              Asset package (.pak) to mount before scene load");
     println!("  --project <path>          .tlpfile manifest (GMS required for TLApp runtime)");
     println!("  --joint <path>            .tljoint manifest path (overrides --script/--sprite)");
     println!("  --scene <name>            Scene id inside .tlpfile/.tljoint (default: main)");
@@ -459,6 +715,11 @@ fn print_version_overview() {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::{apply_ini_overrides, scan_ini_path_from_args, CliOptions};
+
     fn make_adapter_info(
         name: &str,
         backend: wgpu::Backend,
@@ -543,5 +804,64 @@ mod tests {
         assert!(message.contains("Vulkan unavailable on Android"));
         assert!(message.contains("FallbackGPU"));
         assert!(message.contains("backend=Gl"));
+    }
+
+    #[test]
+    fn scan_ini_path_from_args_detects_flag() {
+        let args = vec![
+            "--vsync".to_string(),
+            "off".to_string(),
+            "--ini".to_string(),
+            "config/tlapp.ini".to_string(),
+        ];
+        let ini = scan_ini_path_from_args(&args).expect("scan should succeed");
+        assert_eq!(ini.as_deref(), Some(Path::new("config/tlapp.ini")));
+    }
+
+    #[test]
+    fn ini_overrides_apply_paths_and_graphics_fields() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("tileline-cli-ini-{}-{stamp}", std::process::id(),));
+        fs::create_dir_all(&temp_dir).expect("temp dir should be creatable");
+        let ini_path = temp_dir.join("tlapp.ini");
+        fs::write(
+            &ini_path,
+            r#"
+                [tlapp]
+                resolution = 1920x1080
+                vsync = off
+                fps_cap = off
+                fsr = on
+                fsr_quality = balanced
+                fsr_sharpness = 0.55
+                fsr_scale = 0.75
+                script = assets/gameplay.tlscript
+                sprite = assets/hud.tlsprite
+                pak = assets/base.pak
+            "#,
+        )
+        .expect("ini should be writable");
+
+        let mut options = CliOptions::default();
+        let warnings = apply_ini_overrides(&mut options, &ini_path).expect("ini should parse");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(options.resolution.width, 1920);
+        assert_eq!(options.resolution.height, 1080);
+        assert!(options.fps_cap.is_none());
+        assert_eq!(options.fsr_sharpness, 0.55);
+        assert_eq!(options.fsr_scale_override, Some(0.75));
+        assert_eq!(options.script_path, Path::new("assets/gameplay.tlscript"));
+        assert_eq!(options.sprite_path, Path::new("assets/hud.tlsprite"));
+        assert_eq!(
+            options.pak_path.as_deref(),
+            Some(Path::new("assets/base.pak"))
+        );
+
+        let _ = fs::remove_file(&ini_path);
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

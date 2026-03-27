@@ -57,6 +57,13 @@ The frame path:
 - `set_light_color(id, r, g, b)`
 - `set_light_softness(id, v)`
 - `set_rt_mode(mode)` (`off|auto|on`)
+- `set_render_distance(v)` (`v <= 0` => `off`)
+- `set_adaptive_distance(mode)` (`auto|on|off` or bool/int)
+- `set_distance_blur(mode)` (`auto|on|off` or bool/int)
+- `set_msaa(samples)` (`off|1|2|4`)
+- `contact_any()` / `touch_any()`
+- `contact_pairs()` / `touch_pairs()`
+- `contact_manifolds()` / `touch_manifolds()`
 - `tile_set(x, y, tile_id)` / `tile_place(x, y, tile_id)`
 - `tile_dig(x, y)`
 - `tile_fill(x0, y0, x1, y1, tile_id)`
@@ -72,6 +79,17 @@ Tile query resolution order is deterministic:
 3. runtime tile-world lookup
 4. empty tile (`0`)
 
+Global contact variables are auto-injected each frame from the latest completed physics step:
+
+- `contact_any`, `contact_pairs`, `contact_manifolds`
+- aliases: `touch_any`, `touch_pairs`, `touch_manifolds`
+
+Source mapping:
+
+- `contact_pairs = broadphase.candidate_pairs`
+- `contact_manifolds = narrowphase.manifolds`
+- `contact_any = (contact_manifolds > 0)`
+
 ## Light Merge Rule
 
 Final frame lights are merged deterministically:
@@ -80,3 +98,14 @@ Final frame lights are merged deterministically:
 2. `.tlscript` applies id-based partial overrides.
 3. Unknown `light_id` emits soft warning (no hard fail).
 4. Renderer clamps to `MAX_LIGHTS` with deterministic priority.
+
+## Runtime Merge Precedence
+
+For frame-level script controls, precedence is deterministic:
+
+1. CLI script overlay
+2. Scene `.tlscript` (single / multi / `.tljoint`)
+3. Existing runtime state
+
+This applies to the new effect controls (`render_distance`, `adaptive_distance`, `distance_blur`,
+`msaa`) as well.

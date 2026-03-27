@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use nalgebra::{Matrix4, Quaternion, Translation3, UnitQuaternion, Vector3};
 
 use crate::scene::{
-    SceneFrameInstances, SceneInstance3d, SceneLight, ScenePrimitive3d, ShadingModel,
-    SpriteInstance, SpriteKind,
+    RuntimeSceneMode, SceneFrameInstances, SceneInstance3d, SceneLight, ScenePrimitive3d,
+    SceneView2d, ShadingModel, SpriteInstance, SpriteKind,
 };
 
 /// Batched draw lane.
@@ -83,6 +83,8 @@ pub struct DrawFrameStats {
 /// Render-ready frame payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeDrawFrame {
+    pub mode: RuntimeSceneMode,
+    pub view_2d: Option<SceneView2d>,
     pub opaque_batches: Vec<DrawBatch3d>,
     pub transparent_batches: Vec<DrawBatch3d>,
     pub sprites: Vec<SpriteInstance>,
@@ -166,6 +168,8 @@ impl DrawPathCompiler {
         lights.sort_by_key(|light| (light.layer, light.id));
 
         RuntimeDrawFrame {
+            mode: frame.mode,
+            view_2d: frame.view_2d,
             opaque_batches,
             transparent_batches,
             sprites: std::mem::take(&mut self.sprite_scratch),
@@ -234,7 +238,7 @@ fn sprite_kind_sort_rank(kind: SpriteKind) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::{SceneMaterial, SceneTransform3d, SpriteKind};
+    use crate::scene::{RuntimeSceneMode, SceneMaterial, SceneTransform3d, SpriteKind};
 
     #[test]
     fn compile_groups_instances_into_deterministic_batches() {
@@ -286,6 +290,8 @@ mod tests {
 
         let mut compiler = DrawPathCompiler::new();
         let out = compiler.compile(&frame);
+        assert_eq!(out.mode, RuntimeSceneMode::Spatial3d);
+        assert!(out.view_2d.is_none());
         assert_eq!(out.stats.opaque_batches, 1);
         assert_eq!(out.stats.transparent_batches, 1);
         assert_eq!(out.opaque_batches[0].instances[0].instance_id, 5);

@@ -5,6 +5,32 @@ This document defines the 2D scope moved from `v0.5.0` into `v0.4.5`.
 `v0.4.5` is now the release line for first-class side-view 2D engine foundations.
 `v0.5.0` continues with render optimization + independence work on top of this baseline.
 
+## Patch Track: v0.4.5.1 (Strict Gate)
+
+`v0.4.5.1` is a patch-stability release on top of this track with two runtime/script deliveries:
+
+- global 2D/3D contact query surface in `.tlscript`:
+  - built-ins: `contact_any`, `contact_pairs`, `contact_manifolds`
+  - aliases: `touch_any`, `touch_pairs`, `touch_manifolds`
+  - frame vars auto-injected from latest completed physics step
+- scripted effect control without adding a new render pass:
+  - `set_render_distance(v)`
+  - `set_adaptive_distance(mode)`
+  - `set_distance_blur(mode)`
+  - `set_msaa(samples)`
+
+Merge precedence lock for patch behavior:
+
+1. CLI script overlay
+2. scene script (`.tlscript` / multi-script / `.tljoint`)
+3. existing runtime state
+
+Strict gate for `v0.4.5.1`:
+
+- unit + integration tests for touch/effect script surface
+- benchmark comparison vs `v0.4.5` baseline (FPS/p95/tick jitter)
+- 20 minute soak (script reload + scene reload) without panic/segfault/leak trend
+
 ## Release Goals
 
 `v0.4.5` should deliver all of the following:

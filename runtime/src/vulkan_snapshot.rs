@@ -117,16 +117,18 @@ fn append_batch_instances(
     stats: &mut VulkanSnapshotBuildStats,
 ) {
     for instance in &batch.instances {
-        let texture_index = *texture_map.entry(instance.texture_index).or_insert_with(|| {
-            let next_index = texture_scratch.len() as u32;
-            texture_scratch.push(FrameTextureRecord {
-                texture_slot: instance.texture_index,
-                sampler_code: 0,
-                flags: 0,
-                _padding: 0,
+        let texture_index = *texture_map
+            .entry(instance.texture_index)
+            .or_insert_with(|| {
+                let next_index = texture_scratch.len() as u32;
+                texture_scratch.push(FrameTextureRecord {
+                    texture_slot: instance.texture_index,
+                    sampler_code: 0,
+                    flags: 0,
+                    _padding: 0,
+                });
+                next_index
             });
-            next_index
-        });
         let material_key = instance_material_key(batch, instance);
         let material_index = *material_map.entry(material_key).or_insert_with(|| {
             let next_index = material_scratch.len() as u32;
@@ -157,7 +159,10 @@ fn append_batch_instances(
     }
 }
 
-fn instance_material_key(batch: &DrawBatch3d, instance: &crate::draw_path::DrawInstance3d) -> MaterialDedupKey {
+fn instance_material_key(
+    batch: &DrawBatch3d,
+    instance: &crate::draw_path::DrawInstance3d,
+) -> MaterialDedupKey {
     let flags = if batch.key.shading_code == 1 {
         MATERIAL_FLAG_UNLIT
     } else {
@@ -233,10 +238,13 @@ fn pack_light(light: &SceneLight) -> FrameLightRecord {
 mod tests {
     use super::*;
     use crate::draw_path::{DrawBatch3d, DrawBatchKey, DrawInstance3d};
+    use crate::scene::RuntimeSceneMode;
 
     #[test]
     fn build_snapshot_preserves_order_and_flags() {
         let draw = RuntimeDrawFrame {
+            mode: RuntimeSceneMode::Spatial3d,
+            view_2d: None,
             opaque_batches: vec![DrawBatch3d {
                 lane: DrawLane::Opaque,
                 key: DrawBatchKey {
@@ -320,6 +328,8 @@ mod tests {
     #[test]
     fn keeps_distinct_material_records_for_distinct_texture_slots() {
         let draw = RuntimeDrawFrame {
+            mode: RuntimeSceneMode::Spatial3d,
+            view_2d: None,
             opaque_batches: vec![DrawBatch3d {
                 lane: DrawLane::Opaque,
                 key: DrawBatchKey {

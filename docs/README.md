@@ -13,7 +13,8 @@ in `src/` crates (not benchmark-only code).
 - `tileline-alpha-plan.md`: Alpha A1 scope for `.tlsprite` list editor, MAS scaffold, and theme baseline
 - `tileline-pre-beta-fsr-plan.md`: pre-beta milestones with FSR 1.0, adaptive quality, and full input accessibility
 - `tileline-beta-roadmap.md`: phased beta roadmap, integration milestones, and deferred scope
-- `tileline-v0.5.0-roadmap.md`: v0.5.0 roadmap for 2D-first execution, render optimization, effects/textures, ParadoxPE + MPS revision, and Rayon/Bevy/WGPU independence
+- `tileline-v0.4.5-roadmap.md`: v0.4.5 roadmap for first-class 2D side-view foundation (chunked tile world + dig/place + flat-2D ParadoxPE)
+- `tileline-v0.5.0-roadmap.md`: v0.5.0 roadmap for render optimization, effects/textures, ParadoxPE + MPS revision, and Rayon/Bevy/WGPU independence
 - `tileline-v0.3.0-foundation.md`: v0.3.0 foundation scope for runtime FSR policy and decentralized NPS topology
 - `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
 - `nps-runtime-plan.md`: canonical NPS channel, tick, snapshot, and transport runtime plan
@@ -38,7 +39,11 @@ in `src/` crates (not benchmark-only code).
 - `runtime-tlscript-showcase.md`: `.tlscript` showcase compile/evaluate bootstrap for scene control
 - `mgs-scene-workload.md`: runtime/mobile scene density to MGS bridge hint and tile planning mapping
 - `mgs-orangepi5-validation.md`: repeatable Orange Pi 5 validation runner and pass gates for MGS
-- `releases/v0.3.0.md`: current release notes with runtime version commands and CLI file tooling
+- `releases/v0.4.5.1.md`: current release notes for 2D `.png/.svg` sprite texture support
+- `releases/v0.4.5.1-github.md`: GitHub-ready release summary for `v0.4.5.1`
+- `releases/v0.4.5.md`: 2D foundation consolidation release notes
+- `releases/v0.4.5-github.md`: GitHub-ready release summary for `v0.4.5`
+- `releases/v0.3.0.md`: runtime version command + console file tooling release notes
 - `releases/v0.3.0-github.md`: GitHub-ready release summary for `v0.3.0`
 - `releases/v0.2.1.md`: stabilization release notes for collision robustness
 - `releases/v0.1.0.md`: first pre-alpha release notes and binary packaging flow

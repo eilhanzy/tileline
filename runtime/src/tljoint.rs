@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use crate::scene::BounceTankRuntimePatch;
 use crate::tlscript_showcase::{
     compile_tlscript_showcase, TlscriptOverlayTileLookup, TlscriptShowcaseConfig,
-    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
-    TlscriptShowcaseProgram, TlscriptTileLookup,
+    TlscriptShowcaseContactSnapshot, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
+    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlscriptTileLookup,
 };
 use crate::tlsprite::{compile_tlsprite, TlspriteDiagnosticLevel, TlspriteProgram};
 
@@ -94,7 +94,12 @@ impl TljointSceneBundle {
         input: TlscriptShowcaseFrameInput,
         controls: TlscriptShowcaseControlInput,
     ) -> TlscriptShowcaseFrameOutput {
-        self.evaluate_frame_with_tile_lookup(input, controls, None)
+        self.evaluate_frame_with_tile_lookup_and_contacts(
+            input,
+            controls,
+            None,
+            TlscriptShowcaseContactSnapshot::default(),
+        )
     }
 
     /// Evaluate all scene scripts with optional runtime tile query callback.
@@ -104,6 +109,22 @@ impl TljointSceneBundle {
         controls: TlscriptShowcaseControlInput,
         tile_lookup: Option<&dyn TlscriptTileLookup>,
     ) -> TlscriptShowcaseFrameOutput {
+        self.evaluate_frame_with_tile_lookup_and_contacts(
+            input,
+            controls,
+            tile_lookup,
+            TlscriptShowcaseContactSnapshot::default(),
+        )
+    }
+
+    /// Evaluate all scene scripts with optional runtime tile query callback and contact snapshot.
+    pub fn evaluate_frame_with_tile_lookup_and_contacts(
+        &self,
+        input: TlscriptShowcaseFrameInput,
+        controls: TlscriptShowcaseControlInput,
+        tile_lookup: Option<&dyn TlscriptTileLookup>,
+        contact_snapshot: TlscriptShowcaseContactSnapshot,
+    ) -> TlscriptShowcaseFrameOutput {
         let mut merged = empty_frame_output();
         for (index, script) in self.scripts.iter().enumerate() {
             let overlay_lookup = TlscriptOverlayTileLookup::new(
@@ -111,10 +132,11 @@ impl TljointSceneBundle {
                 &merged.tile_mutations,
                 &merged.tile_fills,
             );
-            let out = script.evaluate_frame_with_controls_and_tile_lookup(
+            let out = script.evaluate_frame_with_controls_and_tile_lookup_and_contacts(
                 input,
                 controls,
                 Some(&overlay_lookup),
+                contact_snapshot,
             );
             merge_frame_output(&mut merged, out, index);
         }
@@ -518,6 +540,10 @@ fn empty_frame_output() -> TlscriptShowcaseFrameOutput {
         ball_metallic: None,
         ball_roughness: None,
         rt_mode: None,
+        render_distance: None,
+        adaptive_distance_mode: None,
+        distance_blur_mode: None,
+        msaa_samples: None,
         force_full_fbx_sphere: None,
         camera_move_speed: None,
         camera_look_sensitivity: None,
@@ -569,6 +595,18 @@ fn merge_frame_output(
     }
     if next.rt_mode.is_some() {
         merged.rt_mode = next.rt_mode;
+    }
+    if next.render_distance.is_some() {
+        merged.render_distance = next.render_distance;
+    }
+    if next.adaptive_distance_mode.is_some() {
+        merged.adaptive_distance_mode = next.adaptive_distance_mode;
+    }
+    if next.distance_blur_mode.is_some() {
+        merged.distance_blur_mode = next.distance_blur_mode;
+    }
+    if next.msaa_samples.is_some() {
+        merged.msaa_samples = next.msaa_samples;
     }
     if next.force_full_fbx_sphere.is_some() {
         merged.force_full_fbx_sphere = next.force_full_fbx_sphere;

@@ -3,24 +3,30 @@ tlpfile_v1
 [project]
 name = TLApp Showcase Project
 scheduler = auto
+default_dimension = 3d
 default_scene = main
 
 [scene.main]
+dimension = 3d
 tljoint = main.tljoint
 tljoint_scene = main
 
 [scene.mobile_safe]
+dimension = 3d
 tljoint = bounce_showcase_mobile_safe.tljoint
 tljoint_scene = main
 
 [scene.sideview_static]
+dimension = 2d
 tljoint = sideview_static_map.tljoint
 tljoint_scene = main
 
 [scene.sideview_chunk_mutation]
+dimension = 2d
 tljoint = sideview_chunk_mutation.tljoint
 tljoint_scene = main
 
 [scene.sideview_stress]
+dimension = 2d
 tljoint = sideview_stress_map.tljoint
 tljoint_scene = main

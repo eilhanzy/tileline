@@ -879,8 +879,17 @@ impl TlAppRuntime {
         let Some(program) = compile.program else {
             return Err("script statement produced no runnable program".to_string());
         };
+        let contact_snapshot = {
+            let world = self.world.borrow();
+            let broadphase = world.broadphase().stats();
+            let narrowphase = world.narrowphase().stats();
+            TlscriptShowcaseContactSnapshot {
+                contact_pairs: broadphase.candidate_pairs,
+                contact_manifolds: narrowphase.manifolds,
+            }
+        };
         let mut output = if let Some(tile_lookup) = tile_lookup {
-            program.evaluate_frame_with_controls_and_tile_lookup(
+            program.evaluate_frame_with_controls_and_tile_lookup_and_contacts(
                 TlscriptShowcaseFrameInput {
                     frame_index: self.script_frame_index,
                     live_balls: self.scene.live_ball_count(),
@@ -889,11 +898,12 @@ impl TlAppRuntime {
                 },
                 TlscriptShowcaseControlInput::default(),
                 Some(tile_lookup),
+                contact_snapshot,
             )
         } else {
             let runtime_tile_lookup =
                 |x: i32, y: i32| self.tile_world_2d.tile(TileCoord2d::new(x, y));
-            program.evaluate_frame_with_controls_and_tile_lookup(
+            program.evaluate_frame_with_controls_and_tile_lookup_and_contacts(
                 TlscriptShowcaseFrameInput {
                     frame_index: self.script_frame_index,
                     live_balls: self.scene.live_ball_count(),
@@ -902,6 +912,7 @@ impl TlAppRuntime {
                 },
                 TlscriptShowcaseControlInput::default(),
                 Some(&runtime_tile_lookup),
+                contact_snapshot,
             )
         };
         if !compile.warnings.is_empty() {

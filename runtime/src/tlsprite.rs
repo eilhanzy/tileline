@@ -15,7 +15,7 @@
 //! size = 0.40, 0.035
 //! rotation_rad = 0.0
 //! color = 0.10, 0.84, 0.62, 0.92
-//! fbx = docs/demos/sphere.fbx
+//! fbx = docs/demos/tlapp/sphere.fbx
 //! scale_axis = x
 //! scale_source = spawn_progress
 //! scale_min = 0.02
@@ -33,9 +33,11 @@ use std::{
 };
 
 use fbx::Property as FbxProperty;
+use image::{imageops::FilterType, ImageReader};
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
+use resvg::{tiny_skia, usvg};
 
 use crate::scene::{SceneLight, SceneLightKind, SpriteInstance, SpriteKind};
 
@@ -117,6 +119,8 @@ pub struct TlspriteSpriteDef {
     pub sprite: SpriteInstance,
     /// Original FBX path from source (if any). Used by runtime policy hooks.
     pub fbx_source: Option<String>,
+    /// Optional sprite texture source (`.png`/`.svg`) from source text.
+    pub texture_source: Option<String>,
     dynamic_scale: Option<TlspriteDynamicScale>,
 }
 
@@ -168,6 +172,26 @@ impl TlspriteProgram {
                 continue;
             };
             let slot = sprite.sprite.texture_slot.min(u8::MAX as u16) as u8;
+            if out.iter().any(|(existing_slot, _)| *existing_slot == slot) {
+                continue;
+            }
+            out.push((slot, path));
+        }
+        out
+    }
+
+    /// Returns unique texture bindings inferred from sprite sections.
+    ///
+    /// Convention:
+    /// - `texture_slot` is used as atlas slot id.
+    /// - first declaration for a slot wins (deterministic by section order).
+    pub fn sprite_texture_bindings(&self) -> Vec<(u16, &str)> {
+        let mut out = Vec::new();
+        for sprite in &self.sprites {
+            let Some(path) = sprite.texture_source.as_deref() else {
+                continue;
+            };
+            let slot = sprite.sprite.texture_slot;
             if out.iter().any(|(existing_slot, _)| *existing_slot == slot) {
                 continue;
             }
@@ -1029,6 +1053,7 @@ fn decode_tlsprite_pack(bytes: &[u8]) -> Result<DecodedTlspritePack, String> {
                 layer,
             },
             fbx_source: None,
+            texture_source: None,
             dynamic_scale,
         });
     }
@@ -1258,6 +1283,7 @@ struct PendingEntry {
     sprite_id: Option<u64>,
     kind: Option<SpriteKind>,
     fbx: Option<String>,
+    texture: Option<String>,
     texture_slot: Option<u16>,
     layer: Option<i16>,
     position: Option<[f32; 3]>,
@@ -1294,6 +1320,7 @@ impl PendingEntry {
             sprite_id: None,
             kind: None,
             fbx: None,
+            texture: None,
             texture_slot: None,
             layer: None,
             position: None,
@@ -1354,6 +1381,18 @@ impl PendingEntry {
                     });
                 } else {
                     self.fbx = Some(raw.to_string());
+                }
+            }
+            "texture" | "sprite_texture" => {
+                let raw = value.trim();
+                if raw.is_empty() {
+                    diagnostics.push(TlspriteDiagnostic {
+                        level: TlspriteDiagnosticLevel::Warning,
+                        line,
+                        message: "key 'texture' is empty and will be ignored".to_string(),
+                    });
+                } else {
+                    self.texture = Some(raw.to_string());
                 }
             }
             "texture_slot" => {
@@ -1492,15 +1531,35 @@ impl PendingEntry {
                 }
             }
         });
+        let texture_hints = self.texture.as_deref().and_then(|raw_path| {
+            match infer_sprite_hints_from_texture_path(raw_path, extra_roots) {
+                Ok(hints) => Some(hints),
+                Err(err) => {
+                    diagnostics.push(TlspriteDiagnostic {
+                        level: TlspriteDiagnosticLevel::Warning,
+                        line: self.line_started,
+                        message: format!(
+                            "section '{}' failed to parse texture '{}': {err}; using sprite defaults",
+                            self.name, raw_path
+                        ),
+                    });
+                    None
+                }
+            }
+        });
 
         let mut color = self.color.unwrap_or(defaults.color_rgba);
         for c in &mut color {
             *c = c.clamp(0.0, 1.0);
         }
         let mut size = self.size.unwrap_or_else(|| {
-            fbx_hints
-                .map(|h| h.suggested_size(defaults.size))
-                .unwrap_or(defaults.size)
+            if let Some(hints) = texture_hints {
+                hints.suggested_size(defaults.size)
+            } else {
+                fbx_hints
+                    .map(|h| h.suggested_size(defaults.size))
+                    .unwrap_or(defaults.size)
+            }
         });
         size[0] = size[0].max(0.001);
         size[1] = size[1].max(0.001);
@@ -1547,11 +1606,13 @@ impl PendingEntry {
                 color_rgba: color,
                 texture_slot: self
                     .texture_slot
+                    .or_else(|| texture_hints.map(|h| h.texture_slot))
                     .or_else(|| fbx_hints.map(|h| h.texture_slot))
                     .unwrap_or(defaults.texture_slot),
                 layer: self.layer.unwrap_or(defaults.layer),
             },
             fbx_source: self.fbx,
+            texture_source: self.texture,
             dynamic_scale,
         })
     }
@@ -1736,6 +1797,26 @@ struct FbxSpriteHints {
     texture_slot: u16,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TextureSpriteHints {
+    aspect: f32,
+    texture_slot: u16,
+}
+
+impl TextureSpriteHints {
+    fn suggested_size(self, base: [f32; 2]) -> [f32; 2] {
+        let aspect = self.aspect.clamp(0.25, 4.0);
+        let mut out = if aspect >= 1.0 {
+            [base[0] * aspect, base[1]]
+        } else {
+            [base[0], base[1] / aspect.max(1e-3)]
+        };
+        out[0] = out[0].clamp(0.001, 2.0);
+        out[1] = out[1].clamp(0.001, 2.0);
+        out
+    }
+}
+
 impl FbxSpriteHints {
     fn suggested_size(self, base: [f32; 2]) -> [f32; 2] {
         let aspect = self.aspect.clamp(0.25, 4.0);
@@ -1754,7 +1835,7 @@ fn infer_sprite_hints_from_fbx_path(
     raw_path: &str,
     extra_roots: &[PathBuf],
 ) -> Result<FbxSpriteHints, String> {
-    let path = resolve_fbx_path(raw_path, extra_roots)?;
+    let path = resolve_existing_asset_path(raw_path, extra_roots)?;
     let bytes =
         fs::read(&path).map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
     let file = fbx::File::read_from(Cursor::new(bytes))
@@ -1797,7 +1878,7 @@ fn infer_sprite_hints_from_fbx_path(
     })
 }
 
-fn resolve_fbx_path(raw_path: &str, extra_roots: &[PathBuf]) -> Result<PathBuf, String> {
+fn resolve_existing_asset_path(raw_path: &str, extra_roots: &[PathBuf]) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(raw_path);
     if candidate.is_absolute() {
         if candidate.exists() {
@@ -1824,6 +1905,121 @@ fn resolve_fbx_path(raw_path: &str, extra_roots: &[PathBuf]) -> Result<PathBuf, 
         }
     }
     Err(format!("path '{}' does not exist in known roots", raw_path))
+}
+
+fn infer_sprite_hints_from_texture_path(
+    raw_path: &str,
+    extra_roots: &[PathBuf],
+) -> Result<TextureSpriteHints, String> {
+    let path = resolve_existing_asset_path(raw_path, extra_roots)?;
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .ok_or_else(|| format!("texture '{}' has no extension", path.display()))?;
+
+    let (width, height) = match ext.as_str() {
+        "png" => {
+            let reader = ImageReader::open(&path)
+                .map_err(|err| format!("failed to open png '{}': {err}", path.display()))?
+                .with_guessed_format()
+                .map_err(|err| {
+                    format!("failed to detect image format '{}': {err}", path.display())
+                })?;
+            if !matches!(reader.format(), Some(image::ImageFormat::Png)) {
+                return Err(format!("texture '{}' is not a PNG file", path.display()));
+            }
+            reader.into_dimensions().map_err(|err| {
+                format!("failed to read png dimensions '{}': {err}", path.display())
+            })?
+        }
+        "svg" => {
+            let bytes = fs::read(&path)
+                .map_err(|err| format!("failed to read svg '{}': {err}", path.display()))?;
+            let options = usvg::Options::default();
+            let tree = usvg::Tree::from_data(&bytes, &options)
+                .map_err(|err| format!("failed to parse svg '{}': {err}", path.display()))?;
+            let size = tree.size();
+            (
+                size.width().round().max(1.0) as u32,
+                size.height().round().max(1.0) as u32,
+            )
+        }
+        other => {
+            return Err(format!(
+                "texture '{}' has unsupported extension '{}'; expected .png or .svg",
+                path.display(),
+                other
+            ));
+        }
+    };
+
+    let width = width.max(1);
+    let height = height.max(1);
+    let aspect = (width as f32 / height as f32).clamp(0.25, 4.0);
+    let texture_slot = infer_texture_slot_from_path(&path);
+    Ok(TextureSpriteHints {
+        aspect,
+        texture_slot,
+    })
+}
+
+fn infer_texture_slot_from_path(path: &Path) -> u16 {
+    // Reserve [64..127] for external image atlas uploads.
+    const IMAGE_SLOT_BASE: u16 = 64;
+    const IMAGE_SLOT_COUNT: u16 = 64;
+    let mut hasher = DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    IMAGE_SLOT_BASE + (hasher.finish() % IMAGE_SLOT_COUNT as u64) as u16
+}
+
+/// Decode a sprite texture source (`.png` or `.svg`) into RGBA8 pixels.
+pub fn decode_sprite_texture_to_rgba(
+    path: &Path,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Vec<u8>, String> {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .ok_or_else(|| format!("texture '{}' has no extension", path.display()))?;
+
+    let width = target_width.max(1);
+    let height = target_height.max(1);
+    match ext.as_str() {
+        "png" => {
+            let image = ImageReader::open(path)
+                .map_err(|err| format!("failed to open png '{}': {err}", path.display()))?
+                .with_guessed_format()
+                .map_err(|err| {
+                    format!("failed to detect image format '{}': {err}", path.display())
+                })?
+                .decode()
+                .map_err(|err| format!("failed to decode png '{}': {err}", path.display()))?;
+            let resized = image.resize_exact(width, height, FilterType::Lanczos3);
+            Ok(resized.to_rgba8().into_raw())
+        }
+        "svg" => {
+            let bytes = fs::read(path)
+                .map_err(|err| format!("failed to read svg '{}': {err}", path.display()))?;
+            let options = usvg::Options::default();
+            let tree = usvg::Tree::from_data(&bytes, &options)
+                .map_err(|err| format!("failed to parse svg '{}': {err}", path.display()))?;
+            let mut pixmap = tiny_skia::Pixmap::new(width, height)
+                .ok_or_else(|| format!("failed to allocate svg raster target {width}x{height}"))?;
+            let size = tree.size();
+            let sx = width as f32 / size.width().max(1e-6);
+            let sy = height as f32 / size.height().max(1e-6);
+            let transform = tiny_skia::Transform::from_scale(sx, sy);
+            resvg::render(&tree, transform, &mut pixmap.as_mut());
+            Ok(pixmap.take())
+        }
+        other => Err(format!(
+            "unsupported sprite texture extension '{}'; expected .png or .svg",
+            other
+        )),
+    }
 }
 
 fn first_fbx_mesh_vertices(file: &fbx::File) -> Option<&[f64]> {
@@ -2025,6 +2221,7 @@ fn parse_f32_components(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ImageFormat, Rgba, RgbaImage};
     use std::{
         fs,
         path::PathBuf,
@@ -2119,7 +2316,7 @@ mod tests {
     #[test]
     fn fbx_key_infers_sprite_hints_when_available() {
         let fbx_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../docs/demos/sphere.fbx")
+            .join("../docs/demos/tlapp/sphere.fbx")
             .canonicalize()
             .expect("sphere.fbx should exist");
         let src = format!(
@@ -2162,17 +2359,52 @@ mod tests {
             "[a]\n",
             "sprite_id = 10\n",
             "texture_slot = 4\n",
-            "fbx = docs/demos/sphere.fbx\n",
+            "fbx = docs/demos/tlapp/sphere.fbx\n",
             "[b]\n",
             "sprite_id = 11\n",
             "texture_slot = 4\n",
-            "fbx = docs/demos/other.fbx\n",
+            "fbx = docs/demos/tlapp/other.fbx\n",
         );
         let out = compile_tlsprite(src);
         let program = out.program.expect("program");
         let bindings = program.mesh_fbx_bindings();
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].0, 4);
+    }
+
+    #[test]
+    fn texture_png_key_infers_external_slot_and_aspect() {
+        let png_path = temp_asset_path("sprite", "png");
+        let image = RgbaImage::from_pixel(64, 32, Rgba([240, 200, 180, 255]));
+        image
+            .save_with_format(&png_path, ImageFormat::Png)
+            .expect("write png");
+        let src = format!(
+            "tlsprite_v1\n[ui.icon]\nsprite_id = 200\ntexture = {}\n",
+            png_path.display()
+        );
+
+        let out = compile_tlsprite(&src);
+        assert!(out.program.is_some());
+        assert!(out
+            .diagnostics
+            .iter()
+            .all(|d| d.level != TlspriteDiagnosticLevel::Error));
+        let program = out.program.expect("program");
+        let sprite = &program.sprites()[0];
+        assert!(sprite.texture_source.is_some());
+        assert!((64..128).contains(&sprite.sprite.texture_slot));
+        assert!(sprite.sprite.size[0] > sprite.sprite.size[1]);
+
+        let bindings = program.sprite_texture_bindings();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].0, sprite.sprite.texture_slot);
+        assert_eq!(
+            bindings[0].1,
+            sprite.texture_source.as_deref().unwrap_or_default()
+        );
+
+        let _ = fs::remove_file(png_path);
     }
 
     #[test]
@@ -2420,6 +2652,19 @@ mod tests {
             "tileline_tlsprite_{tag}_{}_{}.tlsprite",
             std::process::id(),
             ts
+        ))
+    }
+
+    fn temp_asset_path(tag: &str, extension: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "tileline_tlsprite_{tag}_{}_{}.{}",
+            std::process::id(),
+            ts,
+            extension
         ))
     }
 }

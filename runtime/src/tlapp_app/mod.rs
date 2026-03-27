@@ -35,7 +35,7 @@ use crate::{
     app_runner, apply_scene_light_overrides, choose_scheduler_path_for_platform,
     clamp_scene_lights_for_camera, compile_tljoint_scene_from_path,
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, resolve_tileline_version_query,
-    tileline_version_entries, BounceTankRuntimePatch, BounceTankSceneConfig,
+    tileline_version_entries, unpack_pak, BounceTankRuntimePatch, BounceTankSceneConfig,
     BounceTankSceneController, BounceTankTickMetrics, ChunkedTileWorld2d, DrawPathCompiler,
     FsrConfig, FsrDynamoConfig, FsrMode, FsrQualityPreset, FsrStatus, GraphicsSchedulerPath,
     RayTracingMode, RenderSyncMode, RuntimeBridgeConfig, RuntimeBridgeMetrics,
@@ -43,12 +43,13 @@ use crate::{
     RuntimePlatform, RuntimeSceneMode, SceneFrameInstances, ScenePrimitive3d, SpriteInstance,
     SpriteKind, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy, TileCoord2d,
     TileMutation2d, TileView2d, TileWorld2dConfig, TileWorldFrameTelemetry, TljointDiagnosticLevel,
-    TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler,
+    TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlpfileSceneDimension,
     TlscriptOverlayTileLookup, TlscriptPerformancePreset, TlscriptShowcaseConfig,
-    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
-    TlscriptShowcaseProgram, TlscriptTileLookup, TlspriteHotReloadEvent, TlspriteProgram,
-    TlspriteProgramCache, TlspriteWatchReloader, VulkanSceneRenderer, VulkanSceneRendererConfig,
-    WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION, MAX_SCENE_LIGHTS,
+    TlscriptShowcaseContactSnapshot, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
+    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlscriptTileLookup, TlscriptToggleMode,
+    TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader,
+    VulkanSceneRenderer, VulkanSceneRendererConfig, WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION,
+    MAX_SCENE_LIGHTS,
 };
 use gms::safe_default_required_limits_for_adapter;
 use mgs::MobileGpuProfile;
@@ -601,6 +602,7 @@ mod script_runtime_tile_lookup_tests {
             },
             TlscriptShowcaseControlInput::default(),
             Some(&runtime_lookup),
+            TlscriptShowcaseContactSnapshot::default(),
         );
         assert_eq!(out.patch.spawn_per_tick, Some(271));
     }
@@ -704,6 +706,13 @@ fn resolve_project_scheduler(
                 reason: format!("manifest scheduler=auto -> {}", decision.reason),
             })
         }
+    }
+}
+
+fn scene_mode_from_tlpfile_dimension(dimension: TlpfileSceneDimension) -> RuntimeSceneMode {
+    match dimension {
+        TlpfileSceneDimension::TwoD => RuntimeSceneMode::SideView2d,
+        TlpfileSceneDimension::ThreeD => RuntimeSceneMode::Spatial3d,
     }
 }
 
@@ -1092,6 +1101,7 @@ impl ApplicationHandler for TlApp {
 struct TlAppRuntime {
     cli_options: CliOptions,
     file_io_root: PathBuf,
+    pak_mount_root: Option<PathBuf>,
     window: Arc<Window>,
     _instance: wgpu::Instance,
     surface: Option<wgpu::Surface<'static>>,
@@ -1290,6 +1300,19 @@ impl TlAppRenderer {
         }
     }
 
+    fn bind_sprite_texture_slot_from_path(
+        &mut self,
+        queue: &wgpu::Queue,
+        slot: u16,
+        path: &Path,
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(renderer) => renderer.bind_sprite_texture_slot_from_path(queue, slot, path),
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(renderer) => renderer.bind_sprite_texture_slot_from_path(slot, path),
+        }
+    }
+
     fn bind_builtin_sphere_mesh_slot(
         &mut self,
         device: &wgpu::Device,
@@ -1423,14 +1446,22 @@ impl<'src> ScriptRuntime<'src> {
         input: TlscriptShowcaseFrameInput,
         controls: TlscriptShowcaseControlInput,
         tile_lookup: Option<&dyn TlscriptTileLookup>,
+        contact_snapshot: TlscriptShowcaseContactSnapshot,
     ) -> TlscriptShowcaseFrameOutput {
         match self {
-            Self::Single(program) => {
-                program.evaluate_frame_with_controls_and_tile_lookup(input, controls, tile_lookup)
-            }
-            Self::Joint(bundle) => {
-                bundle.evaluate_frame_with_tile_lookup(input, controls, tile_lookup)
-            }
+            Self::Single(program) => program
+                .evaluate_frame_with_controls_and_tile_lookup_and_contacts(
+                    input,
+                    controls,
+                    tile_lookup,
+                    contact_snapshot,
+                ),
+            Self::Joint(bundle) => bundle.evaluate_frame_with_tile_lookup_and_contacts(
+                input,
+                controls,
+                tile_lookup,
+                contact_snapshot,
+            ),
             Self::MultiScripts(programs) => {
                 let mut merged = empty_showcase_output();
                 for (index, program) in programs.iter().enumerate() {
@@ -1439,10 +1470,11 @@ impl<'src> ScriptRuntime<'src> {
                         &merged.tile_mutations,
                         &merged.tile_fills,
                     );
-                    let output = program.evaluate_frame_with_controls_and_tile_lookup(
+                    let output = program.evaluate_frame_with_controls_and_tile_lookup_and_contacts(
                         input,
                         controls,
                         Some(&overlay_lookup),
+                        contact_snapshot,
                     );
                     merge_showcase_output(&mut merged, output, index);
                 }
@@ -1485,6 +1517,18 @@ fn merge_showcase_output(
     }
     if next.rt_mode.is_some() {
         merged.rt_mode = next.rt_mode;
+    }
+    if next.render_distance.is_some() {
+        merged.render_distance = next.render_distance;
+    }
+    if next.adaptive_distance_mode.is_some() {
+        merged.adaptive_distance_mode = next.adaptive_distance_mode;
+    }
+    if next.distance_blur_mode.is_some() {
+        merged.distance_blur_mode = next.distance_blur_mode;
+    }
+    if next.msaa_samples.is_some() {
+        merged.msaa_samples = next.msaa_samples;
     }
     if next.force_full_fbx_sphere.is_some() {
         merged.force_full_fbx_sphere = next.force_full_fbx_sphere;
@@ -1719,6 +1763,7 @@ fn merge_runtime_patch(target: &mut BounceTankRuntimePatch, patch: BounceTankRun
 fn bind_renderer_meshes_from_tlsprite(
     renderer: &mut TlAppRenderer,
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     sprite_path: &Path,
     program: &TlspriteProgram,
 ) {
@@ -1735,6 +1780,27 @@ fn bind_renderer_meshes_from_tlsprite(
             Err(err) => {
                 eprintln!(
                     "[tlapp fbx] failed slot {} for '{}': {}",
+                    slot,
+                    resolved.to_string_lossy(),
+                    err
+                );
+            }
+        }
+    }
+
+    for (slot, raw_path) in program.sprite_texture_bindings() {
+        let resolved = resolve_asset_path(sprite_path, raw_path);
+        match renderer.bind_sprite_texture_slot_from_path(queue, slot, resolved.as_path()) {
+            Ok(()) => {
+                println!(
+                    "[tlapp sprite] bound slot {} <- {}",
+                    slot,
+                    resolved.to_string_lossy()
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "[tlapp sprite] failed slot {} for '{}': {}",
                     slot,
                     resolved.to_string_lossy(),
                     err

@@ -68,3 +68,24 @@ Unpack:
 cargo run -p runtime --example pak_tool -- \
   unpack --pak dist/prebeta/tileline-assets-prebeta.pak --out dist/prebeta/unpacked-assets
 ```
+
+## `.tlpfile` Builder (5GB Numbered Shards)
+
+For project-first packaging, use:
+
+```bash
+./scripts/build_tlpfile_pak.sh \
+  --project docs/demos/tlapp/tlapp_project.tlpfile \
+  --out-dir dist/pak \
+  --base-name tlapp-assets \
+  --max-shard-gb 5
+```
+
+This builder enforces:
+
+- project root = directory that contains `.tlpfile`
+- manifest paths must stay inside project root (no absolute paths, no `../`)
+- numbered output shards:
+  - `tlapp-assets.part0001.pak`
+  - `tlapp-assets.part0002.pak`
+  - ...

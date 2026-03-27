@@ -16,6 +16,7 @@ use crate::draw_path::{DrawLane, RuntimeDrawFrame};
 use crate::scene::{
     RayTracingMode, SceneLight, SceneLightKind, SpriteInstance, SpriteKind, MAX_SCENE_LIGHTS,
 };
+use crate::tlsprite::decode_sprite_texture_to_rgba;
 use crate::upscaler::{resolve_fsr_status, FsrConfig, FsrStatus};
 
 const SPRITE_ATLAS_GRID_DIM: u32 = 16;
@@ -26,11 +27,12 @@ pub const DEFAULT_MSAA_SAMPLE_COUNT: u32 = 4;
 const MAX_SHADOW_LIGHTS: usize = 4;
 /// Resolution of each shadow map (square). 1024 gives good quality for a flashlight at scene scale.
 const SHADOW_MAP_SIZE: u32 = 1024;
-const DEFAULT_SPHERE_FBX_BYTES: &[u8] = include_bytes!("../../../docs/demos/sphere.fbx");
+const DEFAULT_SPHERE_FBX_BYTES: &[u8] = include_bytes!("../../../docs/demos/tlapp/sphere.fbx");
 // Hysteresis avoids rapid mesh-mode flapping when instance counts hover around thresholds.
 const SPHERE_LOD_ENABLE_THRESHOLD: usize = 2_500;
 const SPHERE_LOD_DISABLE_THRESHOLD: usize = 1_800;
 const RT_DYNAMIC_CAP: u32 = 16_384;
+const EXTERNAL_IMAGE_SLOT_BASE: u16 = 64;
 const TEXT_GLYPH_SLOT_BASE: u16 = 128;
 
 #[repr(C)]
@@ -264,7 +266,7 @@ pub struct WgpuSceneRenderer {
     fsr_sampler: wgpu::Sampler,
     fsr_bind_group: wgpu::BindGroup,
     fsr_uniform_buffer: wgpu::Buffer,
-    _sprite_atlas_texture: wgpu::Texture,
+    sprite_atlas_texture: wgpu::Texture,
     sprite_atlas_bind_group: wgpu::BindGroup,
     sprite_atlas_overlay_bind_group: wgpu::BindGroup,
     box_mesh: GpuMesh,
@@ -811,7 +813,7 @@ impl WgpuSceneRenderer {
             fsr_sampler,
             fsr_bind_group,
             fsr_uniform_buffer,
-            _sprite_atlas_texture: sprite_atlas_texture,
+            sprite_atlas_texture,
             sprite_atlas_bind_group,
             sprite_atlas_overlay_bind_group,
             box_mesh,
@@ -1043,6 +1045,70 @@ impl WgpuSceneRenderer {
             create_icosa_sphere_mesh(device)
         };
         self.custom_mesh_slots.insert(slot, mesh);
+    }
+
+    /// Bind a 2D sprite source (`.png` / `.svg`) into one atlas slot.
+    ///
+    /// Slots in `[64..127]` are reserved for external image textures.
+    pub fn bind_sprite_texture_slot_from_path(
+        &mut self,
+        queue: &wgpu::Queue,
+        slot: u16,
+        path: &Path,
+    ) -> Result<(), String> {
+        if slot >= TEXT_GLYPH_SLOT_BASE {
+            return Err(format!(
+                "slot {} is reserved for text glyph atlas lanes (>= {})",
+                slot, TEXT_GLYPH_SLOT_BASE
+            ));
+        }
+        let pixels =
+            decode_sprite_texture_to_rgba(path, SPRITE_ATLAS_TILE_SIZE, SPRITE_ATLAS_TILE_SIZE)?;
+        self.bind_sprite_texture_slot_from_rgba(queue, slot, &pixels)
+    }
+
+    /// Bind raw RGBA8 pixels into a sprite atlas slot.
+    pub fn bind_sprite_texture_slot_from_rgba(
+        &mut self,
+        queue: &wgpu::Queue,
+        slot: u16,
+        rgba_pixels: &[u8],
+    ) -> Result<(), String> {
+        let expected = (SPRITE_ATLAS_TILE_SIZE * SPRITE_ATLAS_TILE_SIZE * 4) as usize;
+        if rgba_pixels.len() != expected {
+            return Err(format!(
+                "invalid RGBA payload size for sprite atlas slot {}: got {}, expected {}",
+                slot,
+                rgba_pixels.len(),
+                expected
+            ));
+        }
+
+        let (origin_x, origin_y) = sprite_slot_origin_px(slot);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.sprite_atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: origin_x,
+                    y: origin_y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(SPRITE_ATLAS_TILE_SIZE * 4),
+                rows_per_image: Some(SPRITE_ATLAS_TILE_SIZE),
+            },
+            wgpu::Extent3d {
+                width: SPRITE_ATLAS_TILE_SIZE,
+                height: SPRITE_ATLAS_TILE_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
     }
 
     pub fn upload_draw_frame(
@@ -2314,7 +2380,7 @@ fn sprite_kind_atlas_row(kind: SpriteKind) -> u32 {
 fn sprite_kind_atlas_rect(kind: SpriteKind, texture_slot: u16) -> [f32; 4] {
     const ATLAS_COLS: u16 = SPRITE_ATLAS_GRID_DIM as u16;
     const INV_ATLAS: f32 = 1.0 / SPRITE_ATLAS_GRID_DIM as f32;
-    let (col, row) = if texture_slot >= TEXT_GLYPH_SLOT_BASE {
+    let (col, row) = if texture_slot >= EXTERNAL_IMAGE_SLOT_BASE {
         (
             texture_slot % ATLAS_COLS,
             (texture_slot / ATLAS_COLS).min(ATLAS_COLS - 1),
@@ -2931,6 +2997,15 @@ fn create_default_sprite_atlas_resources(
     (texture, bind_group_linear, bind_group_nearest)
 }
 
+#[inline]
+fn sprite_slot_origin_px(slot: u16) -> (u32, u32) {
+    let total_slots = (SPRITE_ATLAS_GRID_DIM * SPRITE_ATLAS_GRID_DIM) as u16;
+    let normalized = slot % total_slots.max(1);
+    let col = (normalized % SPRITE_ATLAS_GRID_DIM as u16) as u32;
+    let row = (normalized / SPRITE_ATLAS_GRID_DIM as u16) as u32;
+    (col * SPRITE_ATLAS_TILE_SIZE, row * SPRITE_ATLAS_TILE_SIZE)
+}
+
 fn build_default_sprite_atlas_pixels(width: u32, height: u32) -> Vec<u8> {
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     let tile = SPRITE_ATLAS_TILE_SIZE.max(1);
@@ -3414,11 +3489,13 @@ mod tests {
     use crate::draw_path::{
         DrawBatch3d, DrawBatchKey, DrawFrameStats, DrawInstance3d, RuntimeDrawFrame,
     };
-    use crate::scene::{SpriteInstance, SpriteKind};
+    use crate::scene::{RuntimeSceneMode, SpriteInstance, SpriteKind};
 
     #[test]
     fn upload_plan_preserves_range_counts() {
         let draw = RuntimeDrawFrame {
+            mode: RuntimeSceneMode::Spatial3d,
+            view_2d: None,
             opaque_batches: vec![DrawBatch3d {
                 lane: DrawLane::Opaque,
                 key: DrawBatchKey {
@@ -3461,6 +3538,8 @@ mod tests {
     #[test]
     fn upload_plan_encodes_sprite_kind_and_virtual_atlas_rect() {
         let draw = RuntimeDrawFrame {
+            mode: RuntimeSceneMode::Spatial3d,
+            view_2d: None,
             opaque_batches: Vec::new(),
             transparent_batches: Vec::new(),
             sprites: vec![SpriteInstance {
@@ -3494,6 +3573,27 @@ mod tests {
         assert!((sprite.atlas_rect[1] - 0.125).abs() < 1e-6); // row 2 / 16
         assert!((sprite.atlas_rect[2] - 0.4375).abs() < 1e-6);
         assert!((sprite.atlas_rect[3] - 0.1875).abs() < 1e-6);
+    }
+
+    #[test]
+    fn external_image_slots_use_absolute_atlas_rows() {
+        let rect = sprite_kind_atlas_rect(SpriteKind::Hud, EXTERNAL_IMAGE_SLOT_BASE);
+        // slot 64 => col 0, row 4 in a 16x16 atlas grid.
+        assert!((rect[0] - 0.0).abs() < 1e-6);
+        assert!((rect[1] - 0.25).abs() < 1e-6);
+        assert!((rect[2] - 0.0625).abs() < 1e-6);
+        assert!((rect[3] - 0.3125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sprite_slot_origin_px_maps_slot_to_expected_tile() {
+        let (x, y) = sprite_slot_origin_px(EXTERNAL_IMAGE_SLOT_BASE);
+        assert_eq!(x, 0);
+        assert_eq!(y, SPRITE_ATLAS_TILE_SIZE * 4);
+
+        let (x2, y2) = sprite_slot_origin_px(EXTERNAL_IMAGE_SLOT_BASE + 5);
+        assert_eq!(x2, SPRITE_ATLAS_TILE_SIZE * 5);
+        assert_eq!(y2, SPRITE_ATLAS_TILE_SIZE * 4);
     }
 
     #[test]

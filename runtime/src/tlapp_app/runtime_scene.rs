@@ -77,12 +77,24 @@ impl TlAppRuntime {
         self.keyboard_camera = CameraInputState::default();
         self.script_key_f_keyboard = false;
         self.script_key_g_keyboard = false;
+        self.sprite_loader = None;
+        self.sprite_cache = None;
         self.console_overlay_sprites.clear();
         self.frame_cap_interval = None;
         self.adaptive_pacer_enabled = false;
         self.queue.submit(std::iter::empty());
         if let Err(err) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
             eprintln!("[shutdown] device poll failed: {err}");
+        }
+        if let Some(pak_mount_root) = self.pak_mount_root.take() {
+            if let Err(err) = fs::remove_dir_all(&pak_mount_root) {
+                eprintln!(
+                    "[pak] failed to remove mount directory '{}': {err}",
+                    pak_mount_root.display()
+                );
+            } else {
+                eprintln!("[pak] unmounted '{}'", pak_mount_root.display());
+            }
         }
     }
 
@@ -154,6 +166,7 @@ impl TlAppRuntime {
                 bind_renderer_meshes_from_tlsprite(
                     &mut self.renderer,
                     &self.device,
+                    &self.queue,
                     root,
                     &program,
                 );
@@ -181,6 +194,7 @@ impl TlAppRuntime {
             bind_renderer_meshes_from_tlsprite(
                 &mut self.renderer,
                 &self.device,
+                &self.queue,
                 sprite_loader.path(),
                 &program,
             );
@@ -234,18 +248,24 @@ impl TlAppRuntime {
             let scene_name = bundle.scene_name.clone();
             let script_count = bundle.scripts.len();
             let sprite_count = bundle.sprite_count();
+            let scene_mode = scene_mode_from_tlpfile_dimension(bundle.scene_dimension);
             let merged_sprite_program = bundle.merged_sprite_program.clone();
             let sprite_root = bundle
                 .selected_joint_path
                 .clone()
                 .or_else(|| Some(bundle.project_path.clone()));
             self.script_runtime = ScriptRuntime::MultiScripts(bundle.scripts);
+            self.set_scene_mode(scene_mode);
             if include_bundle_sprite {
                 self.apply_bundle_sprite_program(merged_sprite_program, sprite_root.as_deref());
             }
             return Ok(format!(
-                "project reloaded scene='{}' scripts={} sprites={} warnings={}",
-                scene_name, script_count, sprite_count, warning_count
+                "project reloaded scene='{}' mode={} scripts={} sprites={} warnings={}",
+                scene_name,
+                scene_mode.as_str(),
+                script_count,
+                sprite_count,
+                warning_count
             ));
         }
 

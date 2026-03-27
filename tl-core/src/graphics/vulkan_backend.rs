@@ -1641,28 +1641,28 @@ unsafe fn create_frame_resources(
                 (snapshot_slot.material_capacity * size_of::<FrameMaterialRecord>())
                     as vk::DeviceSize,
             )];
-    let texture_buffer_info = [vk::DescriptorBufferInfo::default()
-        .buffer(snapshot_slot.mapped.buffer)
-        .offset(snapshot_slot.textures_offset as vk::DeviceSize)
-        .range(
-            (snapshot_slot.texture_capacity * size_of::<FrameTextureRecord>())
-                as vk::DeviceSize,
-        )];
-    let light_buffer_info = [vk::DescriptorBufferInfo::default()
-        .buffer(snapshot_slot.mapped.buffer)
-        .offset(snapshot_slot.lights_offset as vk::DeviceSize)
-        .range(
-            (snapshot_slot.light_capacity * size_of::<FrameLightRecord>()) as vk::DeviceSize,
-        )];
-    let texture_image_info = [vk::DescriptorImageInfo::default()
-        .sampler(scene_pipeline.texture_array.sampler)
-        .image_view(scene_pipeline.texture_array.image_view)
-        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-    let descriptor_writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+        let texture_buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(snapshot_slot.mapped.buffer)
+            .offset(snapshot_slot.textures_offset as vk::DeviceSize)
+            .range(
+                (snapshot_slot.texture_capacity * size_of::<FrameTextureRecord>())
+                    as vk::DeviceSize,
+            )];
+        let light_buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(snapshot_slot.mapped.buffer)
+            .offset(snapshot_slot.lights_offset as vk::DeviceSize)
+            .range(
+                (snapshot_slot.light_capacity * size_of::<FrameLightRecord>()) as vk::DeviceSize,
+            )];
+        let texture_image_info = [vk::DescriptorImageInfo::default()
+            .sampler(scene_pipeline.texture_array.sampler)
+            .image_view(scene_pipeline.texture_array.image_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let descriptor_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(&camera_buffer_info),
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
@@ -1674,17 +1674,17 @@ unsafe fn create_frame_resources(
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&light_buffer_info),
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(3)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&texture_buffer_info),
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(4)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&texture_image_info),
-    ];
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&texture_buffer_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&texture_image_info),
+        ];
         device.update_descriptor_sets(&descriptor_writes, &[]);
         frames.push(FrameResources {
             command_pool,
@@ -2153,8 +2153,7 @@ unsafe fn create_dummy_texture_array_resources(
             128, 196, 255, 255, 72, 120, 220, 255, 72, 120, 220, 255, 128, 196, 255, 255,
         ],
     ];
-    let mut staging_bytes =
-        Vec::with_capacity((TEX_WIDTH * TEX_HEIGHT * TEX_LAYERS * 4) as usize);
+    let mut staging_bytes = Vec::with_capacity((TEX_WIDTH * TEX_HEIGHT * TEX_LAYERS * 4) as usize);
     for layer in texels {
         staging_bytes.extend_from_slice(&layer);
     }
@@ -2208,8 +2207,8 @@ unsafe fn create_dummy_texture_array_resources(
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
     let command_buffer = device.allocate_command_buffers(&alloc_info)?[0];
-    let begin_info = vk::CommandBufferBeginInfo::default()
-        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     device.begin_command_buffer(command_buffer, &begin_info)?;
 
     let subresource_range = vk::ImageSubresourceRange::default()
@@ -2377,12 +2376,12 @@ unsafe fn record_frame_commands(
         &[frame.camera_descriptor_set],
         &[],
     );
-        let push_constants = DrawPushConstants {
-            material_count: snapshot_state.material_count,
-            light_count: snapshot_state.light_count,
-            texture_count: snapshot_state.texture_count,
-            _padding0: 0,
-        };
+    let push_constants = DrawPushConstants {
+        material_count: snapshot_state.material_count,
+        light_count: snapshot_state.light_count,
+        texture_count: snapshot_state.texture_count,
+        _padding0: 0,
+    };
     device.cmd_push_constants(
         command_buffer,
         scene_pipeline.pipeline_layout,

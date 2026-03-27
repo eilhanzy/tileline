@@ -223,7 +223,7 @@ mod tests {
             "size = 0.4, 0.2\n",
             "rotation_rad = 0.0\n",
             "color = 1.0, 1.0, 1.0, 1.0\n",
-            "fbx = docs/demos/sphere.fbx\n",
+            "fbx = docs/demos/tlapp/sphere.fbx\n",
         );
 
         let document = TlspriteListDocument::from_source(source);

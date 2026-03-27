@@ -9,9 +9,11 @@
 //! [project]
 //! name = TLApp Demo
 //! scheduler = auto
+//! default_dimension = 3d
 //! default_scene = main
 //!
 //! [scene.main]
+//! dimension = 3d
 //! tljoint = main.tljoint
 //! tljoint_scene = main
 //! tlscripts = bonus_rules.tlscript
@@ -65,6 +67,36 @@ impl TlpfileGraphicsScheduler {
     }
 }
 
+/// Scene-space dimension selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlpfileSceneDimension {
+    TwoD,
+    ThreeD,
+}
+
+impl Default for TlpfileSceneDimension {
+    fn default() -> Self {
+        Self::ThreeD
+    }
+}
+
+impl TlpfileSceneDimension {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "2d" | "side2d" | "side-view-2d" | "side_view_2d" | "sideview2d" => Some(Self::TwoD),
+            "3d" | "spatial3d" | "spatial_3d" | "spatial3" | "spatial" => Some(Self::ThreeD),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoD => "2d",
+            Self::ThreeD => "3d",
+        }
+    }
+}
+
 /// Diagnostic level for `.tlpfile` parsing/compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlpfileDiagnosticLevel {
@@ -84,6 +116,7 @@ pub struct TlpfileDiagnostic {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlpfileSceneBinding {
     pub scene: String,
+    pub dimension: TlpfileSceneDimension,
     pub tljoint: Option<String>,
     pub tljoint_scene: Option<String>,
     pub tlscripts: Vec<String>,
@@ -95,6 +128,7 @@ pub struct TlpfileSceneBinding {
 pub struct TlpfileProject {
     pub name: String,
     pub scheduler: TlpfileGraphicsScheduler,
+    pub default_dimension: TlpfileSceneDimension,
     pub default_scene: String,
     pub scenes: Vec<TlpfileSceneBinding>,
 }
@@ -126,6 +160,7 @@ pub struct TlpfileSceneBundle {
     pub project_path: PathBuf,
     pub project_name: String,
     pub scheduler: TlpfileGraphicsScheduler,
+    pub scene_dimension: TlpfileSceneDimension,
     pub scene_name: String,
     pub selected_joint_path: Option<PathBuf>,
     pub selected_joint_scene: Option<String>,
@@ -166,6 +201,7 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
     let mut saw_header = false;
     let mut project_name: Option<String> = None;
     let mut project_scheduler: Option<TlpfileGraphicsScheduler> = None;
+    let mut project_default_dimension: Option<TlpfileSceneDimension> = None;
     let mut project_default_scene: Option<String> = None;
     let mut current_scene: Option<TlpfileSceneBinding> = None;
     let mut in_project_section = false;
@@ -211,6 +247,7 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
                 }
                 current_scene = Some(TlpfileSceneBinding {
                     scene: name.to_string(),
+                    dimension: project_default_dimension.unwrap_or_default(),
                     ..TlpfileSceneBinding::default()
                 });
                 continue;
@@ -277,6 +314,25 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
                         });
                     }
                 }
+                "default_dimension" | "dimension" | "scene_mode" | "mode" => {
+                    if value.is_empty() {
+                        diagnostics.push(TlpfileDiagnostic {
+                            level: TlpfileDiagnosticLevel::Warning,
+                            line: line_no,
+                            message: "empty default_dimension ignored (expected 2d|3d)".to_string(),
+                        });
+                    } else if let Some(parsed) = TlpfileSceneDimension::parse(value) {
+                        project_default_dimension = Some(parsed);
+                    } else {
+                        diagnostics.push(TlpfileDiagnostic {
+                            level: TlpfileDiagnosticLevel::Error,
+                            line: line_no,
+                            message: format!(
+                                "invalid default_dimension '{value}' (expected 2d|3d)"
+                            ),
+                        });
+                    }
+                }
                 other => diagnostics.push(TlpfileDiagnostic {
                     level: TlpfileDiagnosticLevel::Warning,
                     line: line_no,
@@ -313,6 +369,23 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
             }
             "tlsprites" | "sprites" => {
                 push_csv(&mut scene.tlsprites, value, line_no, &mut diagnostics)
+            }
+            "dimension" | "scene_mode" | "mode" => {
+                if value.is_empty() {
+                    diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Warning,
+                        line: line_no,
+                        message: "empty scene dimension ignored (expected 2d|3d)".to_string(),
+                    });
+                } else if let Some(parsed) = TlpfileSceneDimension::parse(value) {
+                    scene.dimension = parsed;
+                } else {
+                    diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: format!("invalid scene dimension '{value}' (expected 2d|3d)"),
+                    });
+                }
             }
             other => diagnostics.push(TlpfileDiagnostic {
                 level: TlpfileDiagnosticLevel::Warning,
@@ -413,6 +486,7 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
         Some(TlpfileProject {
             name: project_name.unwrap_or_else(|| "Tileline Project".to_string()),
             scheduler: project_scheduler.unwrap_or_default(),
+            default_dimension: project_default_dimension.unwrap_or_default(),
             default_scene,
             scenes,
         })
@@ -476,6 +550,7 @@ pub fn compile_tlpfile_scene_from_path(
             diagnostics,
         };
     };
+    let scene_dimension = scene.dimension;
 
     let base_dir = project_path.parent().unwrap_or_else(|| Path::new("."));
     let mut joint_bundle: Option<TljointSceneBundle> = None;
@@ -642,6 +717,7 @@ pub fn compile_tlpfile_scene_from_path(
             project_path: project_path.to_path_buf(),
             project_name: project.name,
             scheduler: project.scheduler,
+            scene_dimension,
             scene_name: resolved_scene_name.to_string(),
             selected_joint_path,
             selected_joint_scene,
@@ -749,8 +825,10 @@ mod tests {
             "[project]\n",
             "name = Demo Project\n",
             "scheduler = gms\n",
+            "default_dimension = 3d\n",
             "default_scene = main\n",
             "[scene.main]\n",
+            "dimension = 2d\n",
             "tljoint = main.tljoint\n",
             "tljoint_scene = main\n",
             "tlscripts = extra.tlscript\n",
@@ -761,8 +839,10 @@ mod tests {
         let project = out.project.expect("project");
         assert_eq!(project.name, "Demo Project");
         assert_eq!(project.scheduler, TlpfileGraphicsScheduler::Gms);
+        assert_eq!(project.default_dimension, TlpfileSceneDimension::ThreeD);
         assert_eq!(project.default_scene, "main");
         assert_eq!(project.scenes.len(), 1);
+        assert_eq!(project.scenes[0].dimension, TlpfileSceneDimension::TwoD);
         assert_eq!(project.scenes[0].tljoint.as_deref(), Some("main.tljoint"));
     }
 
@@ -855,6 +935,81 @@ mod tests {
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
         let project = out.project.expect("project");
         assert_eq!(project.scheduler, TlpfileGraphicsScheduler::Auto);
+    }
+
+    #[test]
+    fn uses_project_default_dimension_for_scenes() {
+        let source = concat!(
+            "tlpfile_v1\n",
+            "[project]\n",
+            "name = Scene Mode Defaults\n",
+            "default_dimension = 2d\n",
+            "default_scene = demo\n",
+            "[scene.demo]\n",
+            "tlscript = demo.tlscript\n",
+        );
+        let out = parse_tlpfile(source);
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        let project = out.project.expect("project");
+        assert_eq!(project.default_dimension, TlpfileSceneDimension::TwoD);
+        assert_eq!(project.scenes[0].dimension, TlpfileSceneDimension::TwoD);
+    }
+
+    #[test]
+    fn compile_outcome_exposes_scene_dimension() {
+        let dir = unique_temp_dir("dimension");
+        let manifest = dir.join("demo.tlpfile");
+        let script = dir.join("demo.tlscript");
+        let sprite = dir.join("demo.tlsprite");
+
+        std::fs::write(
+            &manifest,
+            concat!(
+                "tlpfile_v1\n",
+                "[project]\n",
+                "name = Dimension Demo\n",
+                "default_scene = demo\n",
+                "[scene.demo]\n",
+                "dimension = 2d\n",
+                "tlscript = demo.tlscript\n",
+                "tlsprite = demo.tlsprite\n",
+            ),
+        )
+        .expect("write manifest");
+        std::fs::write(
+            &script,
+            concat!(
+                "@export\n",
+                "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, key_f_down: bool, input_move_x: float, input_move_y: float, input_move_z: float, input_look_dx: float, input_look_dy: float, input_sprint_down: bool, input_look_active: bool, input_reset_camera: bool):\n",
+                "    set_spawn_per_tick(42)\n",
+            ),
+        )
+        .expect("write script");
+        std::fs::write(
+            &sprite,
+            concat!(
+                "tlsprite_v1\n",
+                "[hud.demo]\n",
+                "sprite_id = 7\n",
+                "kind = hud\n",
+                "texture_slot = 0\n",
+                "layer = 100\n",
+                "position = 0.0, 0.0, 0.0\n",
+                "size = 0.2, 0.1\n",
+                "rotation_rad = 0.0\n",
+                "color = 1.0, 1.0, 1.0, 1.0\n",
+            ),
+        )
+        .expect("write sprite");
+
+        let out = compile_tlpfile_scene_from_path(
+            &manifest,
+            Some("demo"),
+            TlscriptShowcaseConfig::default(),
+        );
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        let bundle = out.bundle.expect("bundle");
+        assert_eq!(bundle.scene_dimension, TlpfileSceneDimension::TwoD);
     }
 
     #[test]

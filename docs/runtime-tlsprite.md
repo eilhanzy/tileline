@@ -19,6 +19,8 @@ tlsprite_v1
 sprite_id = 1
 kind = generic | hud | camera | terrain
 texture_slot = 0
+texture = path/to/sprite.png | path/to/sprite.svg
+sprite_texture = path/to/sprite.png | path/to/sprite.svg
 layer = 100
 position = x, y, z
 size = w, h
@@ -38,6 +40,26 @@ scale_max = 1.0
 
 `camera` and `terrain` kinds provide sensible defaults (position/size/layer/color) when fields are
 not specified, so minimal sections can be authored quickly.
+
+### Sprite Texture Sources (`.png` / `.svg`)
+
+Sprite entries can now provide runtime texture sources directly from `.tlsprite`:
+
+- `texture = ...` (canonical key)
+- `sprite_texture = ...` (alias)
+
+Behavior:
+
+- If `texture_slot` is omitted, runtime infers a deterministic atlas slot from the texture path.
+- Inferred image slots are reserved in `[64..127]` for external image uploads.
+- `.png` and `.svg` are supported; other extensions produce soft warnings.
+- For known image dimensions, default sprite aspect (`size`) is inferred from source ratio.
+
+Renderer binding flow:
+
+- `TlspriteProgram::sprite_texture_bindings()` emits unique `(slot, path)` pairs (first-win).
+- TLApp resolves each path and uploads decoded RGBA to atlas slots via runtime renderer APIs.
+- `.svg` sources are rasterized at atlas tile resolution before upload.
 
 ### Light Authoring (`entry_kind = light`)
 
@@ -177,6 +199,7 @@ Current `runtime::WgpuSceneRenderer` path consumes sprite kind metadata and appl
 - kind-aware virtual atlas rect selection (by `kind` + `texture_slot`)
 - camera-style shader treatment (lens/ring emphasis)
 - terrain-style shader treatment (banding/gradient emphasis)
+- external image slot mapping for `.png/.svg` textures (`texture_slot >= 64`)
 
 This keeps type behavior in `src/` runtime code rather than benchmark-only scripts.
 

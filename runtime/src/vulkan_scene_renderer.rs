@@ -22,9 +22,8 @@ use std::sync::Arc;
 use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3};
 use tl_core::{
     FrameInstanceTransform, FrameLightRecord, FrameMaterialRecord, FrameTextureRecord,
-    RenderStateSnapshot,
-    VulkanBackend, VulkanBackendConfig, VulkanBackendError, VulkanFrameExecutionTelemetry,
-    VulkanMultiGpuFramePlan,
+    RenderStateSnapshot, VulkanBackend, VulkanBackendConfig, VulkanBackendError,
+    VulkanFrameExecutionTelemetry, VulkanMultiGpuFramePlan,
 };
 use wgpu::Backend;
 use winit::window::Window;
@@ -257,6 +256,15 @@ impl VulkanSceneRenderer {
         Ok(())
     }
 
+    /// Placeholder sprite texture binding hook for the Vulkan migration path.
+    pub fn bind_sprite_texture_slot_from_path(
+        &mut self,
+        _slot: u16,
+        _path: &Path,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Placeholder built-in sphere slot binding hook for the Vulkan migration path.
     pub fn bind_builtin_sphere_mesh_slot(&mut self, _slot: u8, _high_quality: bool) {}
 
@@ -439,6 +447,7 @@ fn resolve_rt_status(mode: RayTracingMode, supports_ray_query: bool) -> SceneRay
 mod tests {
     use super::*;
     use crate::draw_path::{DrawBatch3d, DrawBatchKey, DrawFrameStats, DrawInstance3d, DrawLane};
+    use crate::scene::RuntimeSceneMode;
 
     fn sample_draw_frame(
         opaque_instances: usize,
@@ -485,6 +494,8 @@ mod tests {
             ],
         };
         RuntimeDrawFrame {
+            mode: RuntimeSceneMode::Spatial3d,
+            view_2d: None,
             opaque_batches: if opaque_instances > 0 {
                 vec![opaque_batch]
             } else {

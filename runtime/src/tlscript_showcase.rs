@@ -95,6 +95,10 @@ const SHOWCASE_BUILTIN_CALLS: &[&str] = &[
     "set_ball_metallic",
     "set_ball_roughness",
     "set_rt_mode",
+    "set_render_distance",
+    "set_adaptive_distance",
+    "set_distance_blur",
+    "set_msaa",
     "set_camera_move_speed",
     "set_camera_look_sensitivity",
     "set_camera_pose",
@@ -115,11 +119,23 @@ const SHOWCASE_BUILTIN_CALLS: &[&str] = &[
     "tile_dig",
     "tile_fill",
     "tile_get",
+    "contact_any",
+    "contact_pairs",
+    "contact_manifolds",
+    "touch_any",
+    "touch_pairs",
+    "touch_manifolds",
 ];
 
 const MAX_TILE_MUTATIONS_PER_FRAME: usize = 8_192;
 const MAX_TILE_FILLS_PER_FRAME: usize = 128;
 const TILE_GET_BUILTIN_NAME: &str = "tile_get";
+const CONTACT_ANY_BUILTIN_NAME: &str = "contact_any";
+const CONTACT_PAIRS_BUILTIN_NAME: &str = "contact_pairs";
+const CONTACT_MANIFOLDS_BUILTIN_NAME: &str = "contact_manifolds";
+const TOUCH_ANY_BUILTIN_NAME: &str = "touch_any";
+const TOUCH_PAIRS_BUILTIN_NAME: &str = "touch_pairs";
+const TOUCH_MANIFOLDS_BUILTIN_NAME: &str = "touch_manifolds";
 
 /// Runtime tile query surface used by `.tlscript` built-ins (for example `tile_get`).
 ///
@@ -321,6 +337,45 @@ pub struct TlscriptShowcaseFrameInput {
     pub key_f_down: bool,
 }
 
+/// Runtime-provided global contact counters for the latest completed physics step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TlscriptShowcaseContactSnapshot {
+    pub contact_pairs: usize,
+    pub contact_manifolds: usize,
+}
+
+impl TlscriptShowcaseContactSnapshot {
+    pub fn contact_any(self) -> bool {
+        self.contact_manifolds > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlscriptToggleMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl TlscriptToggleMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "on" | "true" | "1" => Some(Self::On),
+            "off" | "false" | "0" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn resolve(self, auto_default: bool) -> bool {
+        match self {
+            Self::Auto => auto_default,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
 /// Optional input-control snapshot for script-driven camera handling.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TlscriptShowcaseControlInput {
@@ -423,6 +478,10 @@ pub struct TlscriptShowcaseFrameOutput {
     pub ball_metallic: Option<f32>,
     pub ball_roughness: Option<f32>,
     pub rt_mode: Option<RayTracingMode>,
+    pub render_distance: Option<Option<f32>>,
+    pub adaptive_distance_mode: Option<TlscriptToggleMode>,
+    pub distance_blur_mode: Option<TlscriptToggleMode>,
+    pub msaa_samples: Option<u32>,
     pub force_full_fbx_sphere: Option<bool>,
     pub camera_move_speed: Option<f32>,
     pub camera_look_sensitivity: Option<f32>,
@@ -500,7 +559,25 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         controls: TlscriptShowcaseControlInput,
         tile_lookup: Option<&dyn TlscriptTileLookup>,
     ) -> TlscriptShowcaseFrameOutput {
+        self.evaluate_frame_with_controls_and_tile_lookup_and_contacts(
+            input,
+            controls,
+            tile_lookup,
+            TlscriptShowcaseContactSnapshot::default(),
+        )
+    }
+
+    /// Evaluate one script frame with optional runtime tile query and global-contact snapshot.
+    pub fn evaluate_frame_with_controls_and_tile_lookup_and_contacts(
+        &self,
+        input: TlscriptShowcaseFrameInput,
+        controls: TlscriptShowcaseControlInput,
+        tile_lookup: Option<&dyn TlscriptTileLookup>,
+        contact_snapshot: TlscriptShowcaseContactSnapshot,
+    ) -> TlscriptShowcaseFrameOutput {
         let mut state = EvalState::new(self.max_eval_steps, self.max_loop_iterations, tile_lookup);
+        state.contact_pairs = contact_snapshot.contact_pairs;
+        state.contact_manifolds = contact_snapshot.contact_manifolds;
         state.vars.insert(
             "frame".to_string(),
             DemoValue::Int(input.frame_index as i64),
@@ -670,6 +747,30 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             "pad_sprint_down".to_string(),
             DemoValue::Bool(controls.pad_sprint_down),
         );
+        state.vars.insert(
+            "contact_pairs".to_string(),
+            DemoValue::Int(contact_snapshot.contact_pairs as i64),
+        );
+        state.vars.insert(
+            "contact_manifolds".to_string(),
+            DemoValue::Int(contact_snapshot.contact_manifolds as i64),
+        );
+        state.vars.insert(
+            "contact_any".to_string(),
+            DemoValue::Bool(contact_snapshot.contact_any()),
+        );
+        state.vars.insert(
+            "touch_pairs".to_string(),
+            DemoValue::Int(contact_snapshot.contact_pairs as i64),
+        );
+        state.vars.insert(
+            "touch_manifolds".to_string(),
+            DemoValue::Int(contact_snapshot.contact_manifolds as i64),
+        );
+        state.vars.insert(
+            "touch_any".to_string(),
+            DemoValue::Bool(contact_snapshot.contact_any()),
+        );
 
         let Item::Function(entry_fn) = &self.module.items[self.entry_item_index];
         self.exec_block(&entry_fn.body, &mut state);
@@ -693,6 +794,10 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             ball_metallic: state.ball_metallic,
             ball_roughness: state.ball_roughness,
             rt_mode: state.rt_mode,
+            render_distance: state.render_distance,
+            adaptive_distance_mode: state.adaptive_distance_mode,
+            distance_blur_mode: state.distance_blur_mode,
+            msaa_samples: state.msaa_samples,
             force_full_fbx_sphere: state.force_full_fbx_sphere,
             camera_move_speed: state.camera_move_speed,
             camera_look_sensitivity: state.camera_look_sensitivity,
@@ -928,6 +1033,10 @@ struct EvalState<'lookup> {
     performance_preset: Option<TlscriptPerformancePreset>,
     gfx_profile: Option<TlscriptGfxProfile>,
     rt_mode: Option<RayTracingMode>,
+    render_distance: Option<Option<f32>>,
+    adaptive_distance_mode: Option<TlscriptToggleMode>,
+    distance_blur_mode: Option<TlscriptToggleMode>,
+    msaa_samples: Option<u32>,
     force_full_fbx_sphere: Option<bool>,
     camera_move_speed: Option<f32>,
     camera_look_sensitivity: Option<f32>,
@@ -942,6 +1051,8 @@ struct EvalState<'lookup> {
     camera_reset_pose: bool,
     ball_metallic: Option<f32>,
     ball_roughness: Option<f32>,
+    contact_pairs: usize,
+    contact_manifolds: usize,
     warnings: Vec<String>,
     steps: usize,
     max_steps: usize,
@@ -969,6 +1080,10 @@ impl<'lookup> EvalState<'lookup> {
             performance_preset: None,
             gfx_profile: None,
             rt_mode: None,
+            render_distance: None,
+            adaptive_distance_mode: None,
+            distance_blur_mode: None,
+            msaa_samples: None,
             force_full_fbx_sphere: None,
             camera_move_speed: None,
             camera_look_sensitivity: None,
@@ -983,6 +1098,8 @@ impl<'lookup> EvalState<'lookup> {
             camera_reset_pose: false,
             ball_metallic: None,
             ball_roughness: None,
+            contact_pairs: 0,
+            contact_manifolds: 0,
             warnings: Vec::new(),
             steps: 0,
             max_steps: max_steps.max(1),
@@ -1050,6 +1167,10 @@ impl<'lookup> EvalState<'lookup> {
     fn resolve_tile_value_for_script(&self, x: i32, y: i32) -> u16 {
         TlscriptOverlayTileLookup::new(self.tile_lookup, &self.tile_mutations, &self.tile_fills)
             .tile_get(x, y)
+    }
+
+    fn contact_any(&self) -> bool {
+        self.contact_manifolds > 0
     }
 }
 
@@ -1202,12 +1323,84 @@ fn apply_gfx_profile_from_value(state: &mut EvalState<'_>, value: &DemoValue) {
     }
 }
 
+fn parse_toggle_mode_from_value(
+    builtin_name: &str,
+    value: &DemoValue,
+    state: &mut EvalState<'_>,
+) -> Option<TlscriptToggleMode> {
+    match value {
+        DemoValue::Str(raw) => match TlscriptToggleMode::parse(raw) {
+            Some(mode) => Some(mode),
+            None => {
+                state.warn(format!(
+                    "{builtin_name} expects mode auto|on|off (or bool), got '{raw}'"
+                ));
+                None
+            }
+        },
+        DemoValue::Bool(enabled) => Some(if *enabled {
+            TlscriptToggleMode::On
+        } else {
+            TlscriptToggleMode::Off
+        }),
+        DemoValue::Int(numeric) => Some(if *numeric == 0 {
+            TlscriptToggleMode::Off
+        } else {
+            TlscriptToggleMode::On
+        }),
+        DemoValue::Float(numeric) => Some(if numeric.abs() <= f64::EPSILON {
+            TlscriptToggleMode::Off
+        } else {
+            TlscriptToggleMode::On
+        }),
+    }
+}
+
+fn parse_msaa_samples_from_value(value: &DemoValue) -> Option<u32> {
+    match value {
+        DemoValue::Str(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "1" => Some(1),
+            "2" => Some(2),
+            "4" => Some(4),
+            _ => None,
+        },
+        DemoValue::Bool(enabled) => Some(if *enabled { 4 } else { 1 }),
+        DemoValue::Int(numeric) => match *numeric {
+            n if n <= 1 => Some(1),
+            2 => Some(2),
+            4 => Some(4),
+            _ => None,
+        },
+        DemoValue::Float(numeric) => {
+            let rounded = numeric.round() as i64;
+            match rounded {
+                n if n <= 1 => Some(1),
+                2 => Some(2),
+                4 => Some(4),
+                _ => None,
+            }
+        }
+    }
+}
+
 fn apply_builtin_patch_call(
     name: &str,
     args: &[DemoValue],
     state: &mut EvalState<'_>,
 ) -> DemoValue {
     match name {
+        CONTACT_ANY_BUILTIN_NAME | TOUCH_ANY_BUILTIN_NAME => match args {
+            [] => return DemoValue::Bool(state.contact_any()),
+            _ => state.warn(format!("{name} expects 0 args")),
+        },
+        CONTACT_PAIRS_BUILTIN_NAME | TOUCH_PAIRS_BUILTIN_NAME => match args {
+            [] => return DemoValue::Int(state.contact_pairs as i64),
+            _ => state.warn(format!("{name} expects 0 args")),
+        },
+        CONTACT_MANIFOLDS_BUILTIN_NAME | TOUCH_MANIFOLDS_BUILTIN_NAME => match args {
+            [] => return DemoValue::Int(state.contact_manifolds as i64),
+            _ => state.warn(format!("{name} expects 0 args")),
+        },
         "set_gfx_profile" => match args {
             [value] => apply_gfx_profile_from_value(state, value),
             _ => state.warn("set_gfx_profile expects 1 arg"),
@@ -1673,6 +1866,54 @@ fn apply_builtin_patch_call(
             }
             _ => state.warn("set_rt_mode expects 1 arg"),
         },
+        "set_render_distance" => match args {
+            [DemoValue::Str(mode)] => {
+                let normalized = mode.trim().to_ascii_lowercase();
+                if normalized == "off" || normalized == "none" {
+                    state.render_distance = Some(None);
+                } else if let Ok(distance) = normalized.parse::<f32>() {
+                    if distance <= 0.0 {
+                        state.render_distance = Some(None);
+                    } else {
+                        state.render_distance = Some(Some(distance));
+                    }
+                } else {
+                    state.warn(format!(
+                        "set_render_distance expects number or off, got '{mode}'"
+                    ));
+                }
+            }
+            [value] => {
+                let distance = value.to_f64() as f32;
+                if distance <= 0.0 {
+                    state.render_distance = Some(None);
+                } else {
+                    state.render_distance = Some(Some(distance));
+                }
+            }
+            _ => state.warn("set_render_distance expects 1 arg"),
+        },
+        "set_adaptive_distance" => match args {
+            [value] => {
+                state.adaptive_distance_mode =
+                    parse_toggle_mode_from_value("set_adaptive_distance", value, state);
+            }
+            _ => state.warn("set_adaptive_distance expects 1 arg"),
+        },
+        "set_distance_blur" => match args {
+            [value] => {
+                state.distance_blur_mode =
+                    parse_toggle_mode_from_value("set_distance_blur", value, state);
+            }
+            _ => state.warn("set_distance_blur expects 1 arg"),
+        },
+        "set_msaa" => match args {
+            [value] => match parse_msaa_samples_from_value(value) {
+                Some(samples) => state.msaa_samples = Some(samples),
+                None => state.warn("set_msaa expects off|1|2|4 (or bool)"),
+            },
+            _ => state.warn("set_msaa expects 1 arg"),
+        },
         "set_camera_move_speed" => match args {
             [v] => state.camera_move_speed = Some(v.to_f64() as f32),
             _ => state.warn("set_camera_move_speed expects 1 arg"),
@@ -1872,6 +2113,42 @@ pub fn compile_tlscript_showcase<'src>(
             name: TILE_GET_BUILTIN_NAME.to_string(),
             result: SemanticType::Int,
         });
+    semantic_config
+        .external_call_return_hints
+        .push(ExternalCallReturnHint {
+            name: CONTACT_ANY_BUILTIN_NAME.to_string(),
+            result: SemanticType::Bool,
+        });
+    semantic_config
+        .external_call_return_hints
+        .push(ExternalCallReturnHint {
+            name: CONTACT_PAIRS_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
+    semantic_config
+        .external_call_return_hints
+        .push(ExternalCallReturnHint {
+            name: CONTACT_MANIFOLDS_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
+    semantic_config
+        .external_call_return_hints
+        .push(ExternalCallReturnHint {
+            name: TOUCH_ANY_BUILTIN_NAME.to_string(),
+            result: SemanticType::Bool,
+        });
+    semantic_config
+        .external_call_return_hints
+        .push(ExternalCallReturnHint {
+            name: TOUCH_PAIRS_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
+    semantic_config
+        .external_call_return_hints
+        .push(ExternalCallReturnHint {
+            name: TOUCH_MANIFOLDS_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
     semantic_config.external_call_return_hints.sort_by(|a, b| {
         a.name
             .cmp(&b.name)
@@ -1964,6 +2241,42 @@ pub fn compile_tlscript_showcase<'src>(
         .external_function_signatures
         .push(LoweringExternalSignature {
             name: TILE_GET_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
+    lowering_config
+        .external_function_signatures
+        .push(LoweringExternalSignature {
+            name: CONTACT_ANY_BUILTIN_NAME.to_string(),
+            result: SemanticType::Bool,
+        });
+    lowering_config
+        .external_function_signatures
+        .push(LoweringExternalSignature {
+            name: CONTACT_PAIRS_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
+    lowering_config
+        .external_function_signatures
+        .push(LoweringExternalSignature {
+            name: CONTACT_MANIFOLDS_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
+    lowering_config
+        .external_function_signatures
+        .push(LoweringExternalSignature {
+            name: TOUCH_ANY_BUILTIN_NAME.to_string(),
+            result: SemanticType::Bool,
+        });
+    lowering_config
+        .external_function_signatures
+        .push(LoweringExternalSignature {
+            name: TOUCH_PAIRS_BUILTIN_NAME.to_string(),
+            result: SemanticType::Int,
+        });
+    lowering_config
+        .external_function_signatures
+        .push(LoweringExternalSignature {
+            name: TOUCH_MANIFOLDS_BUILTIN_NAME.to_string(),
             result: SemanticType::Int,
         });
     lowering_config
@@ -2580,6 +2893,107 @@ mod tests {
         assert_eq!(out.patch.speculative_contacts_enabled, Some(true));
         assert!((out.patch.speculative_contact_distance.unwrap_or(0.0) - 0.07).abs() < 1e-6);
         assert!((out.patch.speculative_max_prediction_distance.unwrap_or(0.0) - 1.65).abs() < 1e-6);
+    }
+
+    #[test]
+    fn supports_contact_touch_query_builtins_and_frame_vars() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int, contact_any: bool, touch_manifolds: int):\n",
+            "    let pairs: int = contact_pairs()\n",
+            "    let manifolds: int = touch_manifolds\n",
+            "    if contact_any:\n",
+            "        set_spawn_per_tick(pairs + manifolds)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame_with_controls_and_tile_lookup_and_contacts(
+            TlscriptShowcaseFrameInput {
+                frame_index: 0,
+                live_balls: 0,
+                spawned_this_tick: 0,
+                key_f_down: false,
+            },
+            TlscriptShowcaseControlInput::default(),
+            None,
+            TlscriptShowcaseContactSnapshot {
+                contact_pairs: 28,
+                contact_manifolds: 7,
+            },
+        );
+        assert_eq!(out.patch.spawn_per_tick, Some(35));
+    }
+
+    #[test]
+    fn supports_scripted_effect_controls() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_render_distance(72.5)\n",
+            "    set_adaptive_distance(\"off\")\n",
+            "    set_distance_blur(true)\n",
+            "    set_msaa(2)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out.render_distance, Some(Some(72.5)));
+        assert_eq!(out.adaptive_distance_mode, Some(TlscriptToggleMode::Off));
+        assert_eq!(out.distance_blur_mode, Some(TlscriptToggleMode::On));
+        assert_eq!(out.msaa_samples, Some(2));
+
+        let src_off = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_render_distance(0)\n",
+            "    set_distance_blur(\"auto\")\n",
+            "    set_msaa(\"off\")\n",
+        );
+        let outcome_off = compile_tlscript_showcase(src_off, Default::default());
+        assert!(outcome_off.errors.is_empty(), "{:?}", outcome_off.errors);
+        let program_off = outcome_off.program.as_ref().expect("program");
+        let out_off = program_off.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 1,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert_eq!(out_off.render_distance, Some(None));
+        assert_eq!(out_off.distance_blur_mode, Some(TlscriptToggleMode::Auto));
+        assert_eq!(out_off.msaa_samples, Some(1));
+    }
+
+    #[test]
+    fn effect_mode_parse_errors_emit_soft_warnings() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    set_adaptive_distance(\"unknown\")\n",
+            "    set_msaa(3)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame(TlscriptShowcaseFrameInput {
+            frame_index: 0,
+            live_balls: 0,
+            spawned_this_tick: 0,
+            key_f_down: false,
+        });
+        assert!(out.adaptive_distance_mode.is_none());
+        assert!(out.msaa_samples.is_none());
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w.contains("set_adaptive_distance")));
+        assert!(out.warnings.iter().any(|w| w.contains("set_msaa")));
     }
 
     #[test]

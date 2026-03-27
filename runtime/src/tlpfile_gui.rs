@@ -508,8 +508,9 @@ impl UiModel {
         });
         if let Some(bundle) = &outcome.bundle {
             self.status = format!(
-                "scene '{}' compiled | scheduler={} scripts={} sprites={} warnings={warnings}",
+                "scene '{}' compiled | mode={} scheduler={} scripts={} sprites={} warnings={warnings}",
                 bundle.scene_name,
+                bundle.scene_dimension.as_str(),
                 bundle.scheduler.as_str(),
                 bundle.scripts.len(),
                 bundle.sprite_count(),
@@ -1095,6 +1096,7 @@ impl GuiRuntime {
             (
                 project.name.clone(),
                 project.default_scene.clone(),
+                project.default_dimension,
                 project.scheduler,
                 project
                     .scenes
@@ -1204,7 +1206,7 @@ impl GuiRuntime {
                 .default_width(320.0)
                 .show(ctx, |ui| {
                 ui.heading("Scenes");
-                if let Some((_, _, _, scene_names)) = project_meta.as_ref() {
+                if let Some((_, _, _, _, scene_names)) = project_meta.as_ref() {
                     egui::ScrollArea::vertical()
                         .max_height(160.0)
                         .show(ui, |ui| {
@@ -1314,9 +1316,12 @@ impl GuiRuntime {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Scene Summary");
-            if let Some((project_name, default_scene, scheduler, _)) = project_meta.as_ref() {
+            if let Some((project_name, default_scene, default_dimension, scheduler, _)) =
+                project_meta.as_ref()
+            {
                 ui.label(format!("Project: {}", project_name));
                 ui.label(format!("Default scene: {}", default_scene));
+                ui.label(format!("Default mode: {}", default_dimension.as_str()));
                 ui.label(format!("Active scene: {}", self.model.selected_scene));
                 ui.label(format!("Scheduler: {}", scheduler.as_str()));
             } else {

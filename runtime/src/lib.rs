@@ -145,7 +145,7 @@ pub use tljoint::{
 pub use tlpfile::{
     compile_tlpfile_scene_from_path, load_tlpfile, parse_tlpfile, TlpfileDiagnostic,
     TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlpfileParseOutcome, TlpfileProject,
-    TlpfileSceneBinding, TlpfileSceneBundle, TlpfileSceneCompileOutcome,
+    TlpfileSceneBinding, TlpfileSceneBundle, TlpfileSceneCompileOutcome, TlpfileSceneDimension,
 };
 pub use tlpfile_gui::run_from_env as run_tlproject_gui_from_env;
 #[cfg(target_os = "android")]
@@ -157,8 +157,9 @@ pub use tlscript_parallel::{
 pub use tlscript_showcase::{
     compile_tlscript_showcase, TlscriptCoordinateSpace, TlscriptGfxProfile,
     TlscriptOverlayTileLookup, TlscriptPerformancePreset, TlscriptShowcaseCompileOutcome,
-    TlscriptShowcaseConfig, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
-    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlscriptTileFill, TlscriptTileLookup,
+    TlscriptShowcaseConfig, TlscriptShowcaseContactSnapshot, TlscriptShowcaseControlInput,
+    TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
+    TlscriptTileFill, TlscriptTileLookup, TlscriptToggleMode,
 };
 pub use tlsprite::{
     compile_tlsprite, compile_tlsprite_pack, compile_tlsprite_with_extra_roots, load_tlsprite_pack,
