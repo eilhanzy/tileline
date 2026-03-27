@@ -18,6 +18,7 @@ pub mod broadphase;
 pub mod handle;
 pub mod joint;
 pub mod narrowphase;
+pub mod parallel;
 pub mod sleep;
 pub mod snapshot;
 pub mod solver;

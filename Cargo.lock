@@ -3985,7 +3985,6 @@ dependencies = [
  "num_cpus",
  "paradoxpe",
  "pollster",
- "rayon",
  "regex",
  "resvg",
  "tl-core",

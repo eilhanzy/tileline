@@ -7,7 +7,6 @@
 use std::ops::Range;
 
 use nalgebra::{UnitQuaternion, Vector3};
-use rayon::prelude::*;
 
 use crate::body::{Aabb, BodyDesc, BodyKind, RigidBody};
 use crate::handle::{BodyHandle, ColliderHandle};
@@ -384,61 +383,18 @@ impl BodyRegistry {
             return;
         };
 
-        if rayon::current_num_threads() <= 1 || self.handles.len() < chunk_size.saturating_mul(2) {
+        // NOTE(v0.5.0/E2): shard-plan integration remains deterministic and contiguous.
+        // The previous Rayon zip-chain is intentionally removed while ParadoxPE converges on
+        // MPS-owned dispatcher execution for this phase.
+        if self.handles.len() < chunk_size.saturating_mul(2) {
             for shard in shards {
                 self.integrate_range(shard.clone(), dt, gravity);
             }
             return;
         }
-
-        let kinds = &self.kinds;
-        let awake = &self.awake;
-        let local_bounds = &self.local_bounds;
-        let inverse_masses = &self.inverse_masses;
-        let linear_dampings = &self.linear_dampings;
-
-        self.positions
-            .par_chunks_mut(chunk_size)
-            .zip(self.linear_velocities.par_chunks_mut(chunk_size))
-            .zip(self.accumulated_forces.par_chunks_mut(chunk_size))
-            .zip(self.aabbs.par_chunks_mut(chunk_size))
-            .zip(kinds.par_chunks(chunk_size))
-            .zip(awake.par_chunks(chunk_size))
-            .zip(local_bounds.par_chunks(chunk_size))
-            .zip(inverse_masses.par_chunks(chunk_size))
-            .zip(linear_dampings.par_chunks(chunk_size))
-            .for_each(
-                |(
-                    (
-                        (
-                            (
-                                (
-                                    (((positions, linear_velocities), accumulated_forces), aabbs),
-                                    kinds,
-                                ),
-                                awake,
-                            ),
-                            local_bounds,
-                        ),
-                        inverse_masses,
-                    ),
-                    linear_dampings,
-                )| {
-                    integrate_chunk(
-                        positions,
-                        linear_velocities,
-                        accumulated_forces,
-                        aabbs,
-                        kinds,
-                        awake,
-                        local_bounds,
-                        inverse_masses,
-                        linear_dampings,
-                        dt,
-                        gravity,
-                    );
-                },
-            );
+        for shard in shards {
+            self.integrate_range(shard.clone(), dt, gravity);
+        }
     }
 
     pub fn integrate(&mut self, dt: f32, gravity: Vector3<f32>) {
@@ -597,46 +553,6 @@ fn uniform_shard_chunk_size(shards: &[Range<usize>], total_len: usize) -> Option
     }
 
     Some(chunk_size)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn integrate_chunk(
-    positions: &mut [Vector3<f32>],
-    linear_velocities: &mut [Vector3<f32>],
-    accumulated_forces: &mut [Vector3<f32>],
-    aabbs: &mut [Aabb],
-    kinds: &[BodyKind],
-    awake: &[bool],
-    local_bounds: &[Aabb],
-    inverse_masses: &[f32],
-    linear_dampings: &[f32],
-    dt: f32,
-    gravity: Vector3<f32>,
-) {
-    for dense in 0..positions.len() {
-        match kinds[dense] {
-            BodyKind::Static => {
-                accumulated_forces[dense] = Vector3::zeros();
-                aabbs[dense] = local_bounds[dense].translated(positions[dense]);
-            }
-            BodyKind::Kinematic => {
-                positions[dense] += linear_velocities[dense] * dt;
-                aabbs[dense] = local_bounds[dense].translated(positions[dense]);
-            }
-            BodyKind::Dynamic => {
-                if !awake[dense] {
-                    accumulated_forces[dense] = Vector3::zeros();
-                    continue;
-                }
-                let acceleration = gravity + accumulated_forces[dense] * inverse_masses[dense];
-                linear_velocities[dense] += acceleration * dt;
-                linear_velocities[dense] *= 1.0 - linear_dampings[dense].clamp(0.0, 0.95);
-                positions[dense] += linear_velocities[dense] * dt;
-                accumulated_forces[dense] = Vector3::zeros();
-                aabbs[dense] = local_bounds[dense].translated(positions[dense]);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

@@ -245,7 +245,7 @@ impl TlAppRuntime {
             key_q_down: self.keyboard_camera.key_q,
             key_e_down: self.keyboard_camera.key_e,
             key_c_down: self.keyboard_camera.key_c,
-            key_g_down: self.script_key_g_keyboard || self.gamepad.action_f_down(),
+            key_g_down: self.script_key_g_keyboard || self.gamepad.action_g_down(),
             key_r_down: self.keyboard_camera.key_r,
             key_l_down: self.keyboard_camera.key_l,
             key_alt_down: self.keyboard_camera.key_alt,

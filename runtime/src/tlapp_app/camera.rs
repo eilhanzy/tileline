@@ -228,6 +228,7 @@ pub struct GamepadRawState {
     pub dpad_left: bool,
     pub dpad_right: bool,
     pub south: bool,
+    pub east: bool,
     pub sprint_left_trigger: bool,
     pub sprint_left_thumb: bool,
 }
@@ -303,6 +304,10 @@ impl GamepadManager {
         self.raw.south
     }
 
+    pub fn action_g_down(&self) -> bool {
+        self.raw.east
+    }
+
     pub fn camera_state(&self) -> GamepadCameraState {
         let dpad_x = (self.raw.dpad_right as i8 - self.raw.dpad_left as i8) as f32;
         let dpad_y = (self.raw.dpad_up as i8 - self.raw.dpad_down as i8) as f32;
@@ -341,6 +346,7 @@ impl GamepadManager {
     fn set_button(&mut self, button: Button, pressed: bool) {
         match button {
             Button::South => self.raw.south = pressed,
+            Button::East => self.raw.east = pressed,
             Button::LeftTrigger => self.raw.sprint_left_trigger = pressed,
             Button::LeftThumb => self.raw.sprint_left_thumb = pressed,
             Button::LeftTrigger2 => self.raw.left_trigger_2 = if pressed { 1.0 } else { 0.0 },
@@ -367,6 +373,10 @@ impl GamepadManager {
     pub fn poll(&mut self) {}
 
     pub fn action_f_down(&self) -> bool {
+        false
+    }
+
+    pub fn action_g_down(&self) -> bool {
         false
     }
 

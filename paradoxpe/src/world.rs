@@ -11,7 +11,6 @@ use mps::{
     TransformSample,
 };
 use nalgebra::{UnitQuaternion, Vector3};
-use rayon::prelude::*;
 
 use crate::abi::ParadoxScriptHostAbi;
 use crate::body::{
@@ -882,32 +881,16 @@ impl PhysicsWorld {
     pub fn capture_snapshot(&self) -> PhysicsSnapshot {
         let read = self.bodies.read_domain();
         let body_len = read.handles.len();
-        let bodies_out = if body_len >= 1_024 && rayon::current_num_threads() > 1 {
-            // Parallel snapshot capture is read-only over SoA slices and scales cleanly on MPS.
-            read.handles
-                .par_iter()
-                .enumerate()
-                .map(|(index, handle)| BodyStateFrame {
-                    handle: *handle,
-                    position: read.positions[index],
-                    rotation: read.rotations[index],
-                    linear_velocity: read.linear_velocities[index],
-                    awake: read.awake[index],
-                })
-                .collect::<Vec<_>>()
-        } else {
-            let mut out = Vec::with_capacity(body_len);
-            for index in 0..body_len {
-                out.push(BodyStateFrame {
-                    handle: read.handles[index],
-                    position: read.positions[index],
-                    rotation: read.rotations[index],
-                    linear_velocity: read.linear_velocities[index],
-                    awake: read.awake[index],
-                });
-            }
-            out
-        };
+        let mut bodies_out = Vec::with_capacity(body_len);
+        for index in 0..body_len {
+            bodies_out.push(BodyStateFrame {
+                handle: read.handles[index],
+                position: read.positions[index],
+                rotation: read.rotations[index],
+                linear_velocity: read.linear_velocities[index],
+                awake: read.awake[index],
+            });
+        }
         PhysicsSnapshot {
             tick: self.clock.tick(),
             bodies: bodies_out,

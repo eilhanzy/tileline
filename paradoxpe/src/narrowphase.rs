@@ -6,13 +6,13 @@
 use std::collections::HashMap;
 
 use nalgebra::Vector3;
-use rayon::prelude::*;
 
 use crate::body::{
     Aabb, ColliderMaterial, ColliderShape, ContactId, ContactManifold, MaterialCombineRule,
 };
 use crate::handle::BodyHandle;
 use crate::handle::ColliderHandle;
+use crate::parallel::collect_filter_map;
 use crate::storage::BodyRegistry;
 
 /// Narrowphase configuration.
@@ -69,7 +69,7 @@ pub struct NarrowphasePipeline {
     config: NarrowphaseConfig,
     predictive_dt: f32,
     manifolds: Vec<ContactManifold>,
-    // Scratch buffer reused across frames to avoid per-substep allocation from par_extend.
+    // Scratch buffer reused across frames to avoid per-substep allocation in contact production.
     produced_buffer: Vec<ContactManifold>,
     previous_states: Vec<PersistentManifoldState>,
     next_states: Vec<PersistentManifoldState>,
@@ -178,67 +178,65 @@ impl NarrowphasePipeline {
         }
         let persisted_lookup = &self.persisted_lookup;
 
-        self.produced_buffer.clear();
-        self.produced_buffer
-            .par_extend(candidate_pairs.par_iter().filter_map(|&(body_a, body_b)| {
-                let (collider_a, shape_a, material_a, filter_a) = collider_lookup(body_a)?;
-                let (collider_b, shape_b, material_b, filter_b) = collider_lookup(body_b)?;
-                if !collision_filter_allows(filter_a, filter_b) {
-                    return None;
-                }
-                let center_a = bodies.position_for(body_a)?;
-                let center_b = bodies.position_for(body_b)?;
-                let aabb_a = bodies.aabb_for(body_a)?;
-                let aabb_b = bodies.aabb_for(body_b)?;
-                let relative_velocity = bodies.relative_velocity(body_a, body_b);
-                let (mut point, mut normal, penetration) = collide_shapes_speculative(
-                    center_a,
-                    &shape_a,
-                    aabb_a,
-                    center_b,
-                    &shape_b,
-                    aabb_b,
-                    relative_velocity,
-                    self.predictive_dt,
-                    self.config.speculative_contacts,
-                    self.config.speculative_contact_distance,
-                    self.config.speculative_max_prediction_distance,
-                )?;
+        self.produced_buffer = collect_filter_map(candidate_pairs, 512, |&(body_a, body_b)| {
+            let (collider_a, shape_a, material_a, filter_a) = collider_lookup(body_a)?;
+            let (collider_b, shape_b, material_b, filter_b) = collider_lookup(body_b)?;
+            if !collision_filter_allows(filter_a, filter_b) {
+                return None;
+            }
+            let center_a = bodies.position_for(body_a)?;
+            let center_b = bodies.position_for(body_b)?;
+            let aabb_a = bodies.aabb_for(body_a)?;
+            let aabb_b = bodies.aabb_for(body_b)?;
+            let relative_velocity = bodies.relative_velocity(body_a, body_b);
+            let (mut point, mut normal, penetration) = collide_shapes_speculative(
+                center_a,
+                &shape_a,
+                aabb_a,
+                center_b,
+                &shape_b,
+                aabb_b,
+                relative_velocity,
+                self.predictive_dt,
+                self.config.speculative_contacts,
+                self.config.speculative_contact_distance,
+                self.config.speculative_max_prediction_distance,
+            )?;
 
-                let feature_tag = feature_tag_for_contact(&shape_a, &shape_b, normal);
-                let contact_id = build_contact_id(collider_a, collider_b, feature_tag);
-                let previous = persisted_lookup.get(&contact_id).copied();
-                let persisted_frames = previous
-                    .map(|state| state.persisted_frames)
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                if let Some(state) = previous {
-                    normal = stabilize_contact_normal(normal, state.normal, persisted_frames);
-                    point = stabilize_contact_point(point, state.point, persisted_frames);
-                }
-                let restitution = self
-                    .config
-                    .restitution_combine_rule
-                    .combine(material_a.restitution, material_b.restitution);
-                let friction = self
-                    .config
-                    .friction_combine_rule
-                    .combine(material_a.friction, material_b.friction);
+            let feature_tag = feature_tag_for_contact(&shape_a, &shape_b, normal);
+            let contact_id = build_contact_id(collider_a, collider_b, feature_tag);
+            let previous = persisted_lookup.get(&contact_id).copied();
+            let persisted_frames = previous
+                .map(|state| state.persisted_frames)
+                .unwrap_or(0)
+                .saturating_add(1);
+            if let Some(state) = previous {
+                normal = stabilize_contact_normal(normal, state.normal, persisted_frames);
+                point = stabilize_contact_point(point, state.point, persisted_frames);
+            }
+            let restitution = self
+                .config
+                .restitution_combine_rule
+                .combine(material_a.restitution, material_b.restitution);
+            let friction = self
+                .config
+                .friction_combine_rule
+                .combine(material_a.friction, material_b.friction);
 
-                Some(ContactManifold {
-                    contact_id,
-                    collider_a,
-                    collider_b,
-                    body_a,
-                    body_b,
-                    point,
-                    normal,
-                    penetration,
-                    persisted_frames,
-                    restitution,
-                    friction,
-                })
-            }));
+            Some(ContactManifold {
+                contact_id,
+                collider_a,
+                collider_b,
+                body_a,
+                body_b,
+                point,
+                normal,
+                penetration,
+                persisted_frames,
+                restitution,
+                friction,
+            })
+        });
 
         let produced_count = self.produced_buffer.len();
         let capacity = self.manifolds.capacity();

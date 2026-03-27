@@ -1,15 +1,14 @@
 //! Parallel broadphase candidate generation for ParadoxPE.
 //!
 //! The current implementation uses a cache-friendly sweep-and-prune pass over body AABBs. It is
-//! designed to run inside Tileline's CPU tasking environment and uses Rayon-style parallel shard
+//! designed to run inside Tileline's CPU tasking environment and uses deterministic chunked worker
 //! scans without allocating in the hot `rebuild_pairs_parallel` loop.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use rayon::prelude::*;
-
 use crate::body::{Aabb, BodyKind};
 use crate::handle::BodyHandle;
+use crate::parallel::{for_each_mut_indexed, worker_count};
 use crate::storage::BodyRegistry;
 
 /// Broadphase configuration tuned for shard-parallel sweep-and-prune.
@@ -104,7 +103,7 @@ impl BroadphasePipeline {
     #[inline]
     fn effective_chunk_size(&self, body_count: usize) -> usize {
         let base = self.config.chunk_size.max(16);
-        let workers = rayon::current_num_threads().max(1);
+        let workers = worker_count().max(1);
         // Keep enough shards for work-stealing, but avoid tiny shard overhead on high-core CPUs.
         let desired_shards = if body_count >= 4_096 {
             workers.saturating_mul(3)
@@ -179,22 +178,19 @@ impl BroadphasePipeline {
         if self.config.speculative_sweep && self.predictive_dt > 1e-6 {
             let predictive_dt = self.predictive_dt;
             let speculative_max_distance = self.config.speculative_max_distance;
-            self.swept_aabbs
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(dense, swept)| {
-                    if matches!(kinds[dense], BodyKind::Dynamic | BodyKind::Kinematic) {
-                        *swept = swept_aabb(
-                            aabbs[dense],
-                            velocities[dense],
-                            predictive_dt,
-                            speculative_max_distance,
-                        );
-                    }
-                });
+            for_each_mut_indexed(&mut self.swept_aabbs, 512, |dense, swept| {
+                if matches!(kinds[dense], BodyKind::Dynamic | BodyKind::Kinematic) {
+                    *swept = swept_aabb(
+                        aabbs[dense],
+                        velocities[dense],
+                        predictive_dt,
+                        speculative_max_distance,
+                    );
+                }
+            });
         }
         let swept_aabbs = &self.swept_aabbs;
-        self.sorted_dense.par_sort_unstable_by(|left, right| {
+        self.sorted_dense.sort_unstable_by(|left, right| {
             swept_aabbs[*left]
                 .min
                 .x
@@ -208,10 +204,10 @@ impl BroadphasePipeline {
         let overflowed = AtomicBool::new(false);
         let sorted_dense = &self.sorted_dense;
 
-        self.shard_pairs[..shard_count]
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(shard_index, local_pairs)| {
+        for_each_mut_indexed(
+            &mut self.shard_pairs[..shard_count],
+            1,
+            |shard_index, local_pairs| {
                 local_pairs.clear();
                 // Cyclic scheduling balances SAP work better than contiguous chunks because
                 // lower sorted indices usually have longer overlap scans.
@@ -236,7 +232,8 @@ impl BroadphasePipeline {
                         }
                     }
                 }
-            });
+            },
+        );
 
         let mut remaining_capacity = self.merged_pairs.capacity();
         for local_pairs in &self.shard_pairs[..shard_count] {

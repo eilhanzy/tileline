@@ -636,14 +636,9 @@ fn configure_parallel_runtime() {
             .map(|n| n.get())
             .unwrap_or(1)
             .max(1);
-        match rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|idx| format!("tileline-mps-{idx}"))
-            .build_global()
-        {
-            Ok(()) => eprintln!("[mps] rayon global thread pool configured: {threads} threads"),
-            Err(err) => eprintln!("[mps] rayon global thread pool unchanged: {err}"),
-        }
+        eprintln!(
+            "[mps] runtime bootstrap ready: logical_threads={threads} (rayon pool ownership moved out of runtime)"
+        );
     });
 }
 

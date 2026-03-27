@@ -315,6 +315,45 @@ Acceptance gates:
 
 This is a hard release theme, not a stretch goal.
 
+### Workstream E Progress Snapshot (2026-03-27)
+
+Current status from dependency + codepath audit:
+
+- `E1` Bevy independence: strong progress.
+- `E2` Rayon independence: active migration.
+- `E3` WGPU independence: partial; dual-path period still ongoing.
+
+Measured findings:
+
+- Bevy:
+  - no shipping runtime codepath usage of `bevy` scheduler/tasks was found
+  - workspace-level `bevy_ecs` dependency was removed in this pass
+- Rayon:
+  - direct `rayon` usage was removed from `runtime` crate in this pass (`runtime/src/scene.rs`
+    + TLApp runtime bootstrap)
+  - ParadoxPE broadphase + narrowphase hot loops now run through
+    `paradoxpe/src/parallel.rs` (deterministic chunked workers, no `rayon` in those phases)
+  - `PhysicsWorld::capture_snapshot` and `BodyRegistry::integrate_with_shards` were moved off
+    `rayon` as part of E2 staging
+  - active hot-path `rayon` usage in ParadoxPE currently remains in `solver`
+  - remaining major migration target is ParadoxPE/MGS `rayon` hot paths
+- WGPU:
+  - shipping/runtime-adjacent path still includes `wgpu` ownership in `runtime/src/tlapp_app/mod.rs`
+    plus `runtime` render loop glue and `tl-core` bridge/sync `wgpu` handles
+  - `runtime` still depends on `egui-wgpu` for GUI surfaces
+
+Immediate execution order (Workstream E Sprint-1):
+
+- `E2-S1`: replace `rayon` in ParadoxPE hot phases with MPS dispatcher jobs + deterministic join
+  points (`broadphase -> narrowphase -> solver -> integration`)
+- `E2-S2`: done in this pass; runtime `rayon` global pool bootstrap removed
+- `E3-S1`: keep dual renderer during migration, but mark Vulkan as primary shipping path and gate
+  all new render features behind Vulkan backend ownership
+- `E3-S2`: move bridge/sync public surfaces from `wgpu` submission handles to backend-neutral frame
+  tickets everywhere
+- `E3-S3`: final audited dependency cleanup patch removing `wgpu` + `egui-wgpu` from shipping
+  runtime crates once Vulkan path passes release validation gates
+
 ### E1. Bevy Independence
 
 Target work:
@@ -329,6 +368,11 @@ Acceptance gate:
 
 - shipping runtime path has zero Bevy scheduler/task dependence
 
+Status:
+
+- in progress and close to done; no runtime scheduler/task usage remains in active shipping path
+- keep this item open until release-prep audit confirms no reintroduction in runtime crates
+
 ### E2. Rayon Independence
 
 Target work:
@@ -340,6 +384,13 @@ Target work:
 Acceptance gate:
 
 - shipping runtime/physics hot paths are no longer backed by `rayon`
+
+Status:
+
+- active; not complete
+- blocker list currently includes:
+  - `paradoxpe/src/solver.rs`
+  - `mgs/src/zram.rs`
 
 ### E3. WGPU Independence
 
@@ -356,6 +407,12 @@ Acceptance gate:
 
 - shipping runtime render path is no longer backed by `wgpu`
 - `cargo tree` for shipping runtime crates does not include `wgpu` or `egui-wgpu`
+
+Status:
+
+- active; partial migration complete
+- Vulkan backend path exists and is integrated, but shipping runtime still has `wgpu` ownership in
+  several hot/runtime-adjacent layers
 
 Note:
 

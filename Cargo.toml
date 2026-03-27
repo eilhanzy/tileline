@@ -7,7 +7,6 @@ version = "0.4.5"
 edition = "2021"
 
 [workspace.dependencies]
-bevy_ecs = "0.18.0"
 crossbeam = "0.8.4"
 egui = "0.33.3"
 egui-wgpu = "0.33.3"

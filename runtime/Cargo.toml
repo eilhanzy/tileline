@@ -24,7 +24,6 @@ nps = { path = "../nps" }
 paradoxpe = { path = "../paradoxpe" }
 tokio = { workspace = true, features = ["net", "time", "rt", "macros"] }
 nalgebra.workspace = true
-rayon.workspace = true
 num_cpus.workspace = true
 crossbeam.workspace = true
 notify = "6.1.1"

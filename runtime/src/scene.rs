@@ -15,7 +15,6 @@ use paradoxpe::{
     Aabb, BodyDesc, BodyHandle, BodyKind, ColliderDesc, ColliderMaterial, ColliderShape,
     PhysicsSimulationMode, PhysicsWorld,
 };
-use rayon::prelude::*;
 
 use crate::tlsprite::{TlspriteFrameContext, TlspriteProgram};
 
@@ -1438,7 +1437,7 @@ impl BounceTankSceneController {
             .unwrap_or(ScenePrimitive3d::Sphere);
         let mut ball_instances = self
             .balls
-            .par_iter()
+            .iter()
             .enumerate()
             .filter_map(|(index, ball)| {
                 if stride > 1 && (index % stride != 0) {
@@ -1812,8 +1811,11 @@ impl BounceTankSceneController {
         if strength <= 0.01 {
             return 0;
         }
+        // Keep high-strength scatter responsive earlier so burst mode does not look "stuck"
+        // while still preserving a small warm-up window for spawn stabilization.
+        let min_live_fraction = (0.30 - strength * 0.22).clamp(0.08, 0.30);
         let min_live =
-            ((self.config.target_ball_count as f32) * (0.18 + strength * 0.25)).round() as usize;
+            ((self.config.target_ball_count as f32) * min_live_fraction).round() as usize;
         if self.balls.len() < min_live.max(SCATTER_MIN_LIVE_BALLS_BASE) {
             return 0;
         }
