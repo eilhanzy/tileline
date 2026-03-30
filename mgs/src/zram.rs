@@ -7,14 +7,14 @@
 //!
 //! Design goals:
 //! - avoid blocking locks on the hot path (single-owner pool)
-//! - use parallel chunk compression/decompression (Rayon) for MPS-like scaling
+//! - use parallel chunk compression/decompression (scoped threads) for MPS-like scaling
 //! - expose deterministic telemetry for fallback tuning and diagnostics
 
 use std::collections::{HashMap, VecDeque};
+use std::thread;
 
 use miniz_oxide::deflate::compress_to_vec_zlib;
 use miniz_oxide::inflate::decompress_to_vec_zlib;
-use rayon::prelude::*;
 
 use crate::hardware::{MobileGpuProfile, TbdrArchitecture};
 
@@ -322,40 +322,37 @@ impl MpsZramSpillPool {
         let chunk_bytes = self.config.chunk_bytes.max(4 * 1024);
         let chunks: Vec<&[u8]> = payload.chunks(chunk_bytes).collect();
         let level = self.config.deflate_level.min(10);
-
-        if self.config.compression_shards > 1 && chunks.len() > 1 {
-            chunks
-                .into_par_iter()
-                .map(|chunk| compress_to_vec_zlib(chunk, level))
-                .collect()
-        } else {
-            chunks
-                .into_iter()
-                .map(|chunk| compress_to_vec_zlib(chunk, level))
-                .collect()
-        }
+        let workers = self.compression_worker_count(chunks.len());
+        parallel_chunk_map(&chunks, workers, 2, |chunk| {
+            compress_to_vec_zlib(chunk, level)
+        })
     }
 
     fn decompress_chunks(&mut self, chunks: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, MpsZramError> {
-        let result: Result<Vec<Vec<u8>>, MpsZramError> = if self.config.compression_shards > 1
-            && chunks.len() > 1
-        {
-            chunks
-                .par_iter()
-                .map(|chunk| decompress_to_vec_zlib(chunk).map_err(|_| MpsZramError::InflateFailed))
-                .collect()
-        } else {
-            chunks
-                .iter()
-                .map(|chunk| decompress_to_vec_zlib(chunk).map_err(|_| MpsZramError::InflateFailed))
-                .collect()
-        };
+        let workers = self.compression_worker_count(chunks.len());
+        let decoded = parallel_chunk_map(&chunks, workers, 2, |chunk| {
+            decompress_to_vec_zlib(chunk).map_err(|_| MpsZramError::InflateFailed)
+        });
+        let result = decoded.into_iter().collect::<Result<Vec<_>, _>>();
 
         if result.is_err() {
             self.stats.failed_restores = self.stats.failed_restores.saturating_add(1);
         }
 
         result
+    }
+
+    #[inline]
+    fn compression_worker_count(&self, chunk_count: usize) -> usize {
+        let available = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        self.config
+            .compression_shards
+            .max(1)
+            .min(available)
+            .min(chunk_count.max(1))
     }
 
     fn enforce_budget(&mut self) -> usize {
@@ -454,6 +451,53 @@ impl MpsZramSpillPool {
         self.stats.stored_pages = self.pages.len();
         true
     }
+}
+
+fn parallel_chunk_map<T, R, F>(
+    items: &[T],
+    workers: usize,
+    min_items_per_worker: usize,
+    map: F,
+) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let worker_count = workers.max(1);
+    if worker_count <= 1 || items.len() <= 1 || items.len() < min_items_per_worker.max(1) * 2 {
+        return items.iter().map(map).collect();
+    }
+
+    let chunk_len = items
+        .len()
+        .div_ceil(worker_count)
+        .max(min_items_per_worker.max(1));
+    let mut shard_outputs: Vec<Vec<R>> = Vec::new();
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for shard in items.chunks(chunk_len) {
+            let map_ref = &map;
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::with_capacity(shard.len());
+                for item in shard {
+                    local.push(map_ref(item));
+                }
+                local
+            }));
+        }
+        shard_outputs.reserve(handles.len());
+        for handle in handles {
+            shard_outputs.push(handle.join().expect("MGS zram worker panicked"));
+        }
+    });
+
+    let total = shard_outputs.iter().map(Vec::len).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    for mut shard in shard_outputs {
+        out.append(&mut shard);
+    }
+    out
 }
 
 #[cfg(test)]

@@ -32,24 +32,24 @@ pub use self::fps::{FpsReport, FpsTracker, RenderDistanceStats};
 
 use crate::physics_mps_runner::{PhysicsMpsRunner, PhysicsStepToken};
 use crate::{
-    app_runner, apply_scene_light_overrides, choose_scheduler_path_for_platform,
+    app_runner, apply_scene_light_overrides, choose_scheduler_path_for_platform_from_adapter,
     clamp_scene_lights_for_camera, compile_tljoint_scene_from_path,
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, resolve_tileline_version_query,
     tileline_version_entries, unpack_pak, BounceTankRuntimePatch, BounceTankSceneConfig,
     BounceTankSceneController, BounceTankTickMetrics, ChunkedTileWorld2d, DrawPathCompiler,
     FsrConfig, FsrDynamoConfig, FsrMode, FsrQualityPreset, FsrStatus, GraphicsSchedulerPath,
-    RayTracingMode, RenderSyncMode, RuntimeBridgeConfig, RuntimeBridgeMetrics,
+    RayTracingMode, RenderSyncMode, RuntimeAdapterInfo, RuntimeBridgeConfig, RuntimeBridgeMetrics,
     RuntimeBridgeOrchestrator, RuntimeBridgePath, RuntimeBridgeTick, RuntimeFramePlan,
-    RuntimePlatform, RuntimeSceneMode, SceneFrameInstances, ScenePrimitive3d, SpriteInstance,
-    SpriteKind, TelemetryHudComposer, TelemetryHudSample, TickRatePolicy, TileCoord2d,
-    TileMutation2d, TileView2d, TileWorld2dConfig, TileWorldFrameTelemetry, TljointDiagnosticLevel,
-    TljointSceneBundle, TlpfileDiagnosticLevel, TlpfileGraphicsScheduler, TlpfileSceneDimension,
-    TlscriptOverlayTileLookup, TlscriptPerformancePreset, TlscriptShowcaseConfig,
-    TlscriptShowcaseContactSnapshot, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
-    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlscriptTileLookup, TlscriptToggleMode,
-    TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader,
-    VulkanSceneRenderer, VulkanSceneRendererConfig, WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION,
-    MAX_SCENE_LIGHTS,
+    RuntimeGpuBackend, RuntimeGpuDeviceType, RuntimePlatform, RuntimeSceneMode,
+    SceneFrameInstances, ScenePrimitive3d, SpriteInstance, SpriteKind, TelemetryHudComposer,
+    TelemetryHudSample, TickRatePolicy, TileCoord2d, TileMutation2d, TileView2d, TileWorld2dConfig,
+    TileWorldFrameTelemetry, TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel,
+    TlpfileGraphicsScheduler, TlpfileSceneDimension, TlscriptOverlayTileLookup,
+    TlscriptPerformancePreset, TlscriptShowcaseConfig, TlscriptShowcaseContactSnapshot,
+    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
+    TlscriptShowcaseProgram, TlscriptTileLookup, TlscriptToggleMode, TlspriteHotReloadEvent,
+    TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader, VulkanSceneRenderer,
+    VulkanSceneRendererConfig, WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION, MAX_SCENE_LIGHTS,
 };
 use gms::safe_default_required_limits_for_adapter;
 use mgs::MobileGpuProfile;
@@ -658,11 +658,11 @@ fn prefer_vulkan_runtime_renderer() -> bool {
     }
 }
 
-fn gms_supported_on_platform(platform: RuntimePlatform, adapter_info: &wgpu::AdapterInfo) -> bool {
+fn gms_supported_on_platform(platform: RuntimePlatform, adapter_info: &RuntimeAdapterInfo) -> bool {
     match platform {
         RuntimePlatform::Android => {
-            matches!(adapter_info.backend, wgpu::Backend::Vulkan)
-                && !matches!(adapter_info.device_type, wgpu::DeviceType::Cpu)
+            matches!(adapter_info.backend, RuntimeGpuBackend::Vulkan)
+                && !matches!(adapter_info.device_type, RuntimeGpuDeviceType::Cpu)
         }
         RuntimePlatform::Desktop => true,
     }
@@ -671,7 +671,7 @@ fn gms_supported_on_platform(platform: RuntimePlatform, adapter_info: &wgpu::Ada
 fn resolve_project_scheduler(
     manifest: TlpfileGraphicsScheduler,
     platform: RuntimePlatform,
-    adapter_info: &wgpu::AdapterInfo,
+    adapter_info: &RuntimeAdapterInfo,
 ) -> Result<SchedulerResolution, String> {
     match manifest {
         TlpfileGraphicsScheduler::Mgs => Ok(SchedulerResolution {
@@ -694,7 +694,7 @@ fn resolve_project_scheduler(
             }
         }
         TlpfileGraphicsScheduler::Auto => {
-            let decision = choose_scheduler_path_for_platform(adapter_info, platform);
+            let decision = choose_scheduler_path_for_platform_from_adapter(adapter_info, platform);
             Ok(SchedulerResolution {
                 selected: decision.path,
                 fallback_applied: false,

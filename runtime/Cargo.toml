@@ -2,6 +2,7 @@
 name = "runtime"
 version = "0.4.5"
 edition = "2021"
+license.workspace = true
 
 [package.metadata.android]
 package = "dev.tileline.runtime"

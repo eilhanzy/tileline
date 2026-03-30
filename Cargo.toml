@@ -5,6 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.4.5"
 edition = "2021"
+license = "MPL-2.0"
 
 [workspace.dependencies]
 crossbeam = "0.8.4"
@@ -15,7 +16,6 @@ hecs = "0.11.0"
 nalgebra = "0.34.1"
 num_cpus = "1.17.0"
 raw-cpuid = "11.6.0"
-rayon = "1.11.0"
 tokio = "1.49.0"
 wasmer = "7.0.1"
 wgpu = "28.0.0"

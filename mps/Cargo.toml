@@ -2,6 +2,7 @@
 name = "mps"
 version = "0.4.5"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 aes = "0.8.4"

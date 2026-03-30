@@ -2,8 +2,8 @@
 name = "paradoxpe"
 version = "0.4.5"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 mps = { path = "../mps" }
 nalgebra.workspace = true
-rayon.workspace = true

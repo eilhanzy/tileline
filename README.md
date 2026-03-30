@@ -240,8 +240,8 @@ Next pipeline steps:
 
 ## License
 
-This repository is structured to be MIT-license ready (code comments and docs use FOSS-friendly
-terminology and style). Add/update the root `LICENSE` file as the project license source of truth.
+This repository is licensed under the Mozilla Public License 2.0 (`MPL-2.0`).
+The root `LICENSE` file is the source of truth.
 
 ## Release v0.2.0
 

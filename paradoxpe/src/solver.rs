@@ -5,15 +5,15 @@
 //! - tangent/friction impulse accumulation
 //! - reusable warm-start cache keyed by collider pairs
 //! - allocation-aware scratch buffers sized ahead of the hot loop
-//! - Jacobi parallel solve path: distributes the impulse loop across all Rayon worker threads
+//! - Jacobi parallel solve path: distributes the impulse loop across Tileline worker threads
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use nalgebra::Vector3;
-use rayon::prelude::*;
 
 use crate::body::{BodyKind, ContactId, ContactManifold};
+use crate::parallel::{for_each_index, worker_count};
 use crate::storage::BodyRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -220,8 +220,8 @@ impl ContactSolver {
         // Use the full iteration budget in parallel mode (the push pre-pass is integrated into
         // each Jacobi iteration). In sequential mode subtract one iteration when the separate
         // push pass activates so total work stays comparable.
-        let use_parallel = rayon::current_num_threads() > 1
-            && manifolds.len() >= self.config.parallel_contact_push_threshold;
+        let use_parallel =
+            worker_count() > 1 && manifolds.len() >= self.config.parallel_contact_push_threshold;
         let iterations = if use_parallel {
             self.config.iterations.max(1)
         } else {
@@ -439,115 +439,113 @@ impl ContactSolver {
         let tangent_impulses = &self.tangent_impulses;
         let config = &self.config;
 
-        manifolds
-            .par_iter()
-            .enumerate()
-            .for_each(|(index, manifold)| {
-                let Some(dense_a) = bodies.dense_index_of(manifold.body_a) else {
-                    return;
-                };
-                let Some(dense_b) = bodies.dense_index_of(manifold.body_b) else {
-                    return;
-                };
-                let inv_mass_a = bodies.inverse_masses[dense_a];
-                let inv_mass_b = bodies.inverse_masses[dense_b];
-                let total_inv_mass = inv_mass_a + inv_mass_b;
-                if total_inv_mass <= f32::EPSILON {
-                    return;
-                }
-                let dynamic_a = inv_mass_a > 0.0 && bodies.kinds[dense_a] == BodyKind::Dynamic;
-                let dynamic_b = inv_mass_b > 0.0 && bodies.kinds[dense_b] == BodyKind::Dynamic;
+        for_each_index(manifolds.len(), 64, |index| {
+            let manifold = &manifolds[index];
+            let Some(dense_a) = bodies.dense_index_of(manifold.body_a) else {
+                return;
+            };
+            let Some(dense_b) = bodies.dense_index_of(manifold.body_b) else {
+                return;
+            };
+            let inv_mass_a = bodies.inverse_masses[dense_a];
+            let inv_mass_b = bodies.inverse_masses[dense_b];
+            let total_inv_mass = inv_mass_a + inv_mass_b;
+            if total_inv_mass <= f32::EPSILON {
+                return;
+            }
+            let dynamic_a = inv_mass_a > 0.0 && bodies.kinds[dense_a] == BodyKind::Dynamic;
+            let dynamic_b = inv_mass_b > 0.0 && bodies.kinds[dense_b] == BodyKind::Dynamic;
 
-                let normal = safe_normal(manifold.normal);
-                let persistence = manifold.persisted_frames.saturating_sub(1).min(8) as f32;
-                let correction_boost = 1.0 + persistence * (config.persistent_contact_boost * 0.08);
-                let correction_mag = (((manifold.penetration - config.penetration_slop).max(0.0)
-                    * config.baumgarte)
-                    / total_inv_mass)
-                    * correction_boost;
-                let correction_mag =
-                    correction_mag.min(config.max_position_correction_per_iteration.max(0.001));
+            let normal = safe_normal(manifold.normal);
+            let persistence = manifold.persisted_frames.saturating_sub(1).min(8) as f32;
+            let correction_boost = 1.0 + persistence * (config.persistent_contact_boost * 0.08);
+            let correction_mag = (((manifold.penetration - config.penetration_slop).max(0.0)
+                * config.baumgarte)
+                / total_inv_mass)
+                * correction_boost;
+            let correction_mag =
+                correction_mag.min(config.max_position_correction_per_iteration.max(0.001));
 
-                if correction_mag > 0.0 {
-                    let correction = normal * correction_mag;
-                    if dynamic_a {
-                        let delta = -correction * inv_mass_a;
-                        atomic_add_f32(&pos_delta_x[dense_a], delta.x);
-                        atomic_add_f32(&pos_delta_y[dense_a], delta.y);
-                        atomic_add_f32(&pos_delta_z[dense_a], delta.z);
-                    }
-                    if dynamic_b {
-                        let delta = correction * inv_mass_b;
-                        atomic_add_f32(&pos_delta_x[dense_b], delta.x);
-                        atomic_add_f32(&pos_delta_y[dense_b], delta.y);
-                        atomic_add_f32(&pos_delta_z[dense_b], delta.z);
-                    }
+            if correction_mag > 0.0 {
+                let correction = normal * correction_mag;
+                if dynamic_a {
+                    let delta = -correction * inv_mass_a;
+                    atomic_add_f32(&pos_delta_x[dense_a], delta.x);
+                    atomic_add_f32(&pos_delta_y[dense_a], delta.y);
+                    atomic_add_f32(&pos_delta_z[dense_a], delta.z);
                 }
+                if dynamic_b {
+                    let delta = correction * inv_mass_b;
+                    atomic_add_f32(&pos_delta_x[dense_b], delta.x);
+                    atomic_add_f32(&pos_delta_y[dense_b], delta.y);
+                    atomic_add_f32(&pos_delta_z[dense_b], delta.z);
+                }
+            }
 
-                // Normal impulse — reads current velocities as Jacobi shared snapshot.
-                // No other thread writes linear_velocities during this parallel pass.
-                let relative_velocity =
-                    bodies.linear_velocities[dense_b] - bodies.linear_velocities[dense_a];
-                let contact_velocity = relative_velocity.dot(&normal);
-                let restitution = if contact_velocity < -config.restitution_velocity_threshold {
-                    manifold.restitution.max(0.0)
-                } else {
-                    0.0
-                };
-                let raw_normal_impulse = -(1.0 + restitution) * contact_velocity / total_inv_mass;
-                // Safe: `index` is unique per manifold — no other thread accesses this slot.
-                let prev_normal = f32::from_bits(normal_impulses[index].load(Ordering::Relaxed));
-                let next_normal = (prev_normal + raw_normal_impulse).max(0.0);
-                let delta_normal = next_normal - prev_normal;
-                if delta_normal > f32::EPSILON {
-                    let impulse = normal * delta_normal;
-                    if dynamic_a {
-                        let delta = -impulse * inv_mass_a;
-                        atomic_add_f32(&push_delta_x[dense_a], delta.x);
-                        atomic_add_f32(&push_delta_y[dense_a], delta.y);
-                        atomic_add_f32(&push_delta_z[dense_a], delta.z);
-                    }
-                    if dynamic_b {
-                        let delta = impulse * inv_mass_b;
-                        atomic_add_f32(&push_delta_x[dense_b], delta.x);
-                        atomic_add_f32(&push_delta_y[dense_b], delta.y);
-                        atomic_add_f32(&push_delta_z[dense_b], delta.z);
-                    }
-                    normal_impulses[index].store(next_normal.to_bits(), Ordering::Relaxed);
+            // Normal impulse — reads current velocities as Jacobi shared snapshot.
+            // No other thread writes linear_velocities during this parallel pass.
+            let relative_velocity =
+                bodies.linear_velocities[dense_b] - bodies.linear_velocities[dense_a];
+            let contact_velocity = relative_velocity.dot(&normal);
+            let restitution = if contact_velocity < -config.restitution_velocity_threshold {
+                manifold.restitution.max(0.0)
+            } else {
+                0.0
+            };
+            let raw_normal_impulse = -(1.0 + restitution) * contact_velocity / total_inv_mass;
+            // Safe: `index` is unique per manifold — no other thread accesses this slot.
+            let prev_normal = f32::from_bits(normal_impulses[index].load(Ordering::Relaxed));
+            let next_normal = (prev_normal + raw_normal_impulse).max(0.0);
+            let delta_normal = next_normal - prev_normal;
+            if delta_normal > f32::EPSILON {
+                let impulse = normal * delta_normal;
+                if dynamic_a {
+                    let delta = -impulse * inv_mass_a;
+                    atomic_add_f32(&push_delta_x[dense_a], delta.x);
+                    atomic_add_f32(&push_delta_y[dense_a], delta.y);
+                    atomic_add_f32(&push_delta_z[dense_a], delta.z);
                 }
+                if dynamic_b {
+                    let delta = impulse * inv_mass_b;
+                    atomic_add_f32(&push_delta_x[dense_b], delta.x);
+                    atomic_add_f32(&push_delta_y[dense_b], delta.y);
+                    atomic_add_f32(&push_delta_z[dense_b], delta.z);
+                }
+                normal_impulses[index].store(next_normal.to_bits(), Ordering::Relaxed);
+            }
 
-                // Tangent (friction) impulse.
-                let tangent = tangent_basis(relative_velocity, normal);
-                if tangent.norm_squared() <= 1e-6 {
-                    return;
+            // Tangent (friction) impulse.
+            let tangent = tangent_basis(relative_velocity, normal);
+            if tangent.norm_squared() <= 1e-6 {
+                return;
+            }
+            let tangent_speed = relative_velocity.dot(&tangent);
+            let raw_tangent_impulse = -tangent_speed / total_inv_mass;
+            let current_normal = f32::from_bits(normal_impulses[index].load(Ordering::Relaxed));
+            let max_friction =
+                effective_friction_fn(config, manifold.friction, tangent_speed.abs())
+                    * current_normal;
+            let prev_tangent = f32::from_bits(tangent_impulses[index].load(Ordering::Relaxed));
+            let next_tangent =
+                (prev_tangent + raw_tangent_impulse).clamp(-max_friction, max_friction);
+            let delta_tangent = next_tangent - prev_tangent;
+            if delta_tangent.abs() > f32::EPSILON {
+                let impulse = tangent * delta_tangent;
+                if dynamic_a {
+                    let delta = -impulse * inv_mass_a;
+                    atomic_add_f32(&push_delta_x[dense_a], delta.x);
+                    atomic_add_f32(&push_delta_y[dense_a], delta.y);
+                    atomic_add_f32(&push_delta_z[dense_a], delta.z);
                 }
-                let tangent_speed = relative_velocity.dot(&tangent);
-                let raw_tangent_impulse = -tangent_speed / total_inv_mass;
-                let current_normal = f32::from_bits(normal_impulses[index].load(Ordering::Relaxed));
-                let max_friction =
-                    effective_friction_fn(config, manifold.friction, tangent_speed.abs())
-                        * current_normal;
-                let prev_tangent = f32::from_bits(tangent_impulses[index].load(Ordering::Relaxed));
-                let next_tangent =
-                    (prev_tangent + raw_tangent_impulse).clamp(-max_friction, max_friction);
-                let delta_tangent = next_tangent - prev_tangent;
-                if delta_tangent.abs() > f32::EPSILON {
-                    let impulse = tangent * delta_tangent;
-                    if dynamic_a {
-                        let delta = -impulse * inv_mass_a;
-                        atomic_add_f32(&push_delta_x[dense_a], delta.x);
-                        atomic_add_f32(&push_delta_y[dense_a], delta.y);
-                        atomic_add_f32(&push_delta_z[dense_a], delta.z);
-                    }
-                    if dynamic_b {
-                        let delta = impulse * inv_mass_b;
-                        atomic_add_f32(&push_delta_x[dense_b], delta.x);
-                        atomic_add_f32(&push_delta_y[dense_b], delta.y);
-                        atomic_add_f32(&push_delta_z[dense_b], delta.z);
-                    }
-                    tangent_impulses[index].store(next_tangent.to_bits(), Ordering::Relaxed);
+                if dynamic_b {
+                    let delta = impulse * inv_mass_b;
+                    atomic_add_f32(&push_delta_x[dense_b], delta.x);
+                    atomic_add_f32(&push_delta_y[dense_b], delta.y);
+                    atomic_add_f32(&push_delta_z[dense_b], delta.z);
                 }
-            });
+                tangent_impulses[index].store(next_tangent.to_bits(), Ordering::Relaxed);
+            }
+        });
     }
 
     fn apply_parallel_contact_push(
@@ -557,7 +555,7 @@ impl ContactSolver {
     ) {
         if self.config.parallel_contact_push_strength <= 0.0
             || manifolds.len() < self.config.parallel_contact_push_threshold
-            || rayon::current_num_threads() <= 1
+            || worker_count() <= 1
         {
             return;
         }
@@ -593,7 +591,8 @@ impl ContactSolver {
         let push_delta_y = &self.push_delta_y;
         let push_delta_z = &self.push_delta_z;
 
-        manifolds.par_iter().for_each(|manifold| {
+        for_each_index(manifolds.len(), 64, |index| {
+            let manifold = &manifolds[index];
             let Some(dense_a) = bodies_ref.dense_index_of(manifold.body_a) else {
                 return;
             };
@@ -684,11 +683,12 @@ impl ContactSolver {
         let push_delta_x = &self.push_delta_x;
         let push_delta_y = &self.push_delta_y;
         let push_delta_z = &self.push_delta_z;
-        let use_parallel = manifolds.len() >= self.config.hard_position_projection_threshold
-            && rayon::current_num_threads() > 1;
+        let use_parallel =
+            manifolds.len() >= self.config.hard_position_projection_threshold && worker_count() > 1;
 
         if use_parallel {
-            manifolds.par_iter().for_each(|manifold| {
+            for_each_index(manifolds.len(), 64, |index| {
+                let manifold = &manifolds[index];
                 accumulate_projection_delta(
                     bodies_ref,
                     manifold,

@@ -335,22 +335,32 @@ Measured findings:
     `paradoxpe/src/parallel.rs` (deterministic chunked workers, no `rayon` in those phases)
   - `PhysicsWorld::capture_snapshot` and `BodyRegistry::integrate_with_shards` were moved off
     `rayon` as part of E2 staging
-  - active hot-path `rayon` usage in ParadoxPE currently remains in `solver`
-  - remaining major migration target is ParadoxPE/MGS `rayon` hot paths
+  - ParadoxPE solver was migrated off `rayon` in this pass (Jacobi/contact push/projection loops
+    now use `paradoxpe/src/parallel.rs` helpers)
+  - `paradoxpe/Cargo.toml` no longer depends on `rayon`
+  - MGS zram path was migrated off `rayon` in this pass (`mgs/src/zram.rs` now uses scoped
+    deterministic shard workers)
+  - workspace-level `rayon` dependency was removed after crate-level migration completed
 - WGPU:
   - shipping/runtime-adjacent path still includes `wgpu` ownership in `runtime/src/tlapp_app/mod.rs`
     plus `runtime` render loop glue and `tl-core` bridge/sync `wgpu` handles
   - `runtime` still depends on `egui-wgpu` for GUI surfaces
+  - scheduler auto-policy path was decoupled from direct `wgpu::AdapterInfo` dependence:
+    `runtime::scheduler_path` now uses backend-neutral `RuntimeAdapterInfo` for core decisions,
+    with `wgpu` conversion wrappers kept for migration compatibility
 
 Immediate execution order (Workstream E Sprint-1):
 
-- `E2-S1`: replace `rayon` in ParadoxPE hot phases with MPS dispatcher jobs + deterministic join
-  points (`broadphase -> narrowphase -> solver -> integration`)
+- `E2-S1`: done in this pass for ParadoxPE (`broadphase`, `narrowphase`, `solver`,
+  `capture_snapshot`, `integrate_with_shards`)
 - `E2-S2`: done in this pass; runtime `rayon` global pool bootstrap removed
+- `E2-S3`: done in this pass; MGS zram migrated and workspace-level `rayon` dependency removed
 - `E3-S1`: keep dual renderer during migration, but mark Vulkan as primary shipping path and gate
   all new render features behind Vulkan backend ownership
 - `E3-S2`: move bridge/sync public surfaces from `wgpu` submission handles to backend-neutral frame
   tickets everywhere
+- `E3-S2`: partial in this pass; scheduler-path policy and project scheduler resolution now consume
+  backend-neutral adapter metadata (`RuntimeAdapterInfo`) instead of raw `wgpu::AdapterInfo`
 - `E3-S3`: final audited dependency cleanup patch removing `wgpu` + `egui-wgpu` from shipping
   runtime crates once Vulkan path passes release validation gates
 
@@ -387,10 +397,8 @@ Acceptance gate:
 
 Status:
 
-- active; not complete
-- blocker list currently includes:
-  - `paradoxpe/src/solver.rs`
-  - `mgs/src/zram.rs`
+- done for current shipping hot paths (runtime + ParadoxPE + MGS zram)
+- keep regression validation open during Vulkan cutover and next perf pass
 
 ### E3. WGPU Independence
 

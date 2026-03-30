@@ -2,6 +2,7 @@
 name = "tl-core"
 version = "0.4.5"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 ash = "0.38.0"

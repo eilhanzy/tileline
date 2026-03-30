@@ -58,6 +58,7 @@ impl TlAppRuntime {
         let mut surface = adapter_bootstrap.surface;
         let adapter = adapter_bootstrap.adapter;
         let adapter_info = adapter.get_info();
+        let runtime_adapter_info = RuntimeAdapterInfo::from_wgpu(&adapter_info);
         eprintln!(
             "[runtime bootstrap] platform={:?} adapter='{}' backend={:?} note={}",
             platform, adapter_info.name, adapter_info.backend, adapter_bootstrap.bootstrap_note
@@ -299,7 +300,7 @@ impl TlAppRuntime {
         }
 
         let scheduler_resolution = if let Some(manifest_scheduler) = project_scheduler_manifest {
-            resolve_project_scheduler(manifest_scheduler, platform, &adapter_info).map_err(
+            resolve_project_scheduler(manifest_scheduler, platform, &runtime_adapter_info).map_err(
                 |reason| {
                     format!(
                         "project scheduler rejected on '{}': {}",
@@ -308,7 +309,8 @@ impl TlAppRuntime {
                 },
             )?
         } else {
-            let decision = choose_scheduler_path_for_platform(&adapter_info, platform);
+            let decision =
+                choose_scheduler_path_for_platform_from_adapter(&runtime_adapter_info, platform);
             SchedulerResolution {
                 selected: decision.path,
                 fallback_applied: false,

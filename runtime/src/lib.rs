@@ -123,8 +123,10 @@ pub use scene_workload::{
     build_scene_workload_snapshot, estimate_scene_workload_requests, SceneWorkloadBridgeConfig,
 };
 pub use scheduler_path::{
-    choose_scheduler_path, choose_scheduler_path_for_platform, GraphicsSchedulerDecision,
-    GraphicsSchedulerPath, RuntimePlatform,
+    choose_scheduler_path, choose_scheduler_path_for_platform,
+    choose_scheduler_path_for_platform_from_adapter, choose_scheduler_path_from_adapter,
+    GraphicsSchedulerDecision, GraphicsSchedulerPath, RuntimeAdapterInfo, RuntimeGpuBackend,
+    RuntimeGpuDeviceType, RuntimePlatform,
 };
 pub use telemetry_hud::{
     TelemetryHudComposer, TelemetryHudConfig, TelemetryHudMetrics, TelemetryHudSample,

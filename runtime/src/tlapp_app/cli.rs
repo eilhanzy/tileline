@@ -719,24 +719,17 @@ mod tests {
     use std::path::Path;
 
     use super::{apply_ini_overrides, scan_ini_path_from_args, CliOptions};
+    use crate::{RuntimeAdapterInfo, RuntimeGpuBackend, RuntimeGpuDeviceType};
 
     fn make_adapter_info(
         name: &str,
-        backend: wgpu::Backend,
-        device_type: wgpu::DeviceType,
-    ) -> wgpu::AdapterInfo {
-        wgpu::AdapterInfo {
+        backend: RuntimeGpuBackend,
+        device_type: RuntimeGpuDeviceType,
+    ) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
             name: name.to_string(),
-            vendor: 0,
-            device: 0,
             device_type,
-            device_pci_bus_id: String::new(),
-            driver: String::new(),
-            driver_info: String::new(),
             backend,
-            subgroup_min_size: 1,
-            subgroup_max_size: 1,
-            transient_saves_memory: false,
         }
     }
 
@@ -746,8 +739,8 @@ mod tests {
         use crate::{GraphicsSchedulerPath, RuntimePlatform, TlpfileGraphicsScheduler};
         let info = make_adapter_info(
             "NVIDIA GeForce RTX 5060 Ti",
-            wgpu::Backend::Vulkan,
-            wgpu::DeviceType::DiscreteGpu,
+            RuntimeGpuBackend::Vulkan,
+            RuntimeGpuDeviceType::DiscreteGpu,
         );
         let resolved = resolve_project_scheduler(
             TlpfileGraphicsScheduler::Auto,
@@ -764,8 +757,8 @@ mod tests {
         use crate::{RuntimePlatform, TlpfileGraphicsScheduler};
         let info = make_adapter_info(
             "Mali-G610",
-            wgpu::Backend::Gl,
-            wgpu::DeviceType::IntegratedGpu,
+            RuntimeGpuBackend::Gl,
+            RuntimeGpuDeviceType::IntegratedGpu,
         );
         let err = resolve_project_scheduler(
             TlpfileGraphicsScheduler::Gms,
@@ -782,8 +775,8 @@ mod tests {
         use crate::{GraphicsSchedulerPath, RuntimePlatform, TlpfileGraphicsScheduler};
         let info = make_adapter_info(
             "Adreno 740",
-            wgpu::Backend::Vulkan,
-            wgpu::DeviceType::IntegratedGpu,
+            RuntimeGpuBackend::Vulkan,
+            RuntimeGpuDeviceType::IntegratedGpu,
         );
         let resolved = resolve_project_scheduler(
             TlpfileGraphicsScheduler::Mgs,

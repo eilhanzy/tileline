@@ -33,6 +33,73 @@ pub enum GraphicsSchedulerPath {
     Mgs,
 }
 
+/// Backend-agnostic GPU backend classification used by runtime policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeGpuBackend {
+    Vulkan,
+    Metal,
+    Dx12,
+    Gl,
+    BrowserWebGpu,
+    Other,
+}
+
+/// Backend-agnostic GPU device-class classification used by runtime policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeGpuDeviceType {
+    IntegratedGpu,
+    DiscreteGpu,
+    VirtualGpu,
+    Cpu,
+    Other,
+}
+
+/// Runtime-owned adapter identity used by scheduler policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeAdapterInfo {
+    pub name: String,
+    pub backend: RuntimeGpuBackend,
+    pub device_type: RuntimeGpuDeviceType,
+}
+
+impl RuntimeAdapterInfo {
+    /// Build runtime-owned adapter info from a `wgpu` adapter descriptor.
+    pub fn from_wgpu(adapter_info: &wgpu::AdapterInfo) -> Self {
+        Self {
+            name: adapter_info.name.clone(),
+            backend: RuntimeGpuBackend::from_wgpu(adapter_info.backend),
+            device_type: RuntimeGpuDeviceType::from_wgpu(adapter_info.device_type),
+        }
+    }
+}
+
+impl RuntimeGpuBackend {
+    /// Convert from `wgpu::Backend` to runtime-owned backend classification.
+    pub fn from_wgpu(backend: wgpu::Backend) -> Self {
+        match backend {
+            wgpu::Backend::Vulkan => Self::Vulkan,
+            wgpu::Backend::Metal => Self::Metal,
+            wgpu::Backend::Dx12 => Self::Dx12,
+            wgpu::Backend::Gl => Self::Gl,
+            wgpu::Backend::BrowserWebGpu => Self::BrowserWebGpu,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl RuntimeGpuDeviceType {
+    /// Convert from `wgpu::DeviceType` to runtime-owned device classification.
+    pub fn from_wgpu(device_type: wgpu::DeviceType) -> Self {
+        match device_type {
+            wgpu::DeviceType::IntegratedGpu => Self::IntegratedGpu,
+            wgpu::DeviceType::DiscreteGpu => Self::DiscreteGpu,
+            wgpu::DeviceType::VirtualGpu => Self::VirtualGpu,
+            wgpu::DeviceType::Cpu => Self::Cpu,
+            wgpu::DeviceType::Other => Self::Other,
+        }
+    }
+}
+
 /// Runtime scheduler-path decision with explainable metadata.
 #[derive(Debug, Clone)]
 pub struct GraphicsSchedulerDecision {
@@ -41,9 +108,9 @@ pub struct GraphicsSchedulerDecision {
     /// Adapter name used for the decision.
     pub adapter_name: String,
     /// Adapter backend used for the decision.
-    pub backend: wgpu::Backend,
+    pub backend: RuntimeGpuBackend,
     /// Adapter device type used for the decision.
-    pub device_type: wgpu::DeviceType,
+    pub device_type: RuntimeGpuDeviceType,
     /// Mobile profile inferred from adapter name.
     pub mobile_profile: MobileGpuProfile,
     /// Human-readable policy explanation.
@@ -70,7 +137,7 @@ fn env_scheduler_override() -> Option<GraphicsSchedulerPath> {
 ///
 /// Respects the `TILELINE_SCHEDULER` env-var override when set.
 pub fn choose_scheduler_path(adapter_info: &wgpu::AdapterInfo) -> GraphicsSchedulerDecision {
-    choose_scheduler_path_for_platform(adapter_info, RuntimePlatform::current())
+    choose_scheduler_path_from_adapter(&RuntimeAdapterInfo::from_wgpu(adapter_info))
 }
 
 /// Select a scheduler path from `wgpu::AdapterInfo` with explicit platform policy.
@@ -78,6 +145,28 @@ pub fn choose_scheduler_path(adapter_info: &wgpu::AdapterInfo) -> GraphicsSchedu
 /// `TILELINE_SCHEDULER` overrides platform policy when set.
 pub fn choose_scheduler_path_for_platform(
     adapter_info: &wgpu::AdapterInfo,
+    platform: RuntimePlatform,
+) -> GraphicsSchedulerDecision {
+    choose_scheduler_path_for_platform_from_adapter(
+        &RuntimeAdapterInfo::from_wgpu(adapter_info),
+        platform,
+    )
+}
+
+/// Select a scheduler path from backend-neutral runtime adapter info.
+///
+/// Respects the `TILELINE_SCHEDULER` env-var override when set.
+pub fn choose_scheduler_path_from_adapter(
+    adapter_info: &RuntimeAdapterInfo,
+) -> GraphicsSchedulerDecision {
+    choose_scheduler_path_for_platform_from_adapter(adapter_info, RuntimePlatform::current())
+}
+
+/// Select a scheduler path from backend-neutral runtime adapter info with explicit platform policy.
+///
+/// `TILELINE_SCHEDULER` overrides platform policy when set.
+pub fn choose_scheduler_path_for_platform_from_adapter(
+    adapter_info: &RuntimeAdapterInfo,
     platform: RuntimePlatform,
 ) -> GraphicsSchedulerDecision {
     // Temporary — remove this block and env_scheduler_override() once MGS testing is done.
@@ -101,7 +190,7 @@ pub fn choose_scheduler_path_for_platform(
     let is_mobile_tbdr = profile.is_mobile_tbdr();
     let is_integrated_or_mobile = matches!(
         adapter_info.device_type,
-        wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Other
+        RuntimeGpuDeviceType::IntegratedGpu | RuntimeGpuDeviceType::Other
     );
 
     let (path, reason) = if platform == RuntimePlatform::Android {
@@ -131,7 +220,7 @@ pub fn choose_scheduler_path_for_platform(
                 profile.family, profile.architecture
             ),
         )
-    } else if is_mobile_tbdr && matches!(adapter_info.backend, wgpu::Backend::Metal) {
+    } else if is_mobile_tbdr && matches!(adapter_info.backend, RuntimeGpuBackend::Metal) {
         (
             GraphicsSchedulerPath::Mgs,
             format!(
@@ -163,48 +252,49 @@ pub fn choose_scheduler_path_for_platform(
 mod tests {
     use super::*;
 
-    fn make_adapter_info(name: &str, device_type: wgpu::DeviceType) -> wgpu::AdapterInfo {
-        wgpu::AdapterInfo {
+    fn make_adapter_info(name: &str, device_type: RuntimeGpuDeviceType) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
             name: name.to_string(),
-            vendor: 0,
-            device: 0,
             device_type,
-            device_pci_bus_id: String::new(),
-            driver: String::new(),
-            driver_info: String::new(),
-            backend: wgpu::Backend::Vulkan,
-            subgroup_min_size: 1,
-            subgroup_max_size: 1,
-            transient_saves_memory: false,
+            backend: RuntimeGpuBackend::Vulkan,
         }
     }
 
     #[test]
     fn chooses_mgs_for_mobile_tbdr_profile() {
-        let info = make_adapter_info("Mali-G78 MC24", wgpu::DeviceType::IntegratedGpu);
-        let decision = choose_scheduler_path(&info);
+        let info = make_adapter_info("Mali-G78 MC24", RuntimeGpuDeviceType::IntegratedGpu);
+        let decision = choose_scheduler_path_from_adapter(&info);
         assert_eq!(decision.path, GraphicsSchedulerPath::Mgs);
     }
 
     #[test]
     fn chooses_gms_for_discrete_desktop_profile() {
-        let info = make_adapter_info("NVIDIA GeForce RTX 5060 Ti", wgpu::DeviceType::DiscreteGpu);
-        let decision = choose_scheduler_path_for_platform(&info, RuntimePlatform::Desktop);
+        let info = make_adapter_info(
+            "NVIDIA GeForce RTX 5060 Ti",
+            RuntimeGpuDeviceType::DiscreteGpu,
+        );
+        let decision =
+            choose_scheduler_path_for_platform_from_adapter(&info, RuntimePlatform::Desktop);
         assert_eq!(decision.path, GraphicsSchedulerPath::Gms);
     }
 
     #[test]
     fn chooses_mgs_for_android_even_on_discrete_label() {
-        let info = make_adapter_info("NVIDIA GeForce RTX 5060 Ti", wgpu::DeviceType::DiscreteGpu);
-        let decision = choose_scheduler_path_for_platform(&info, RuntimePlatform::Android);
+        let info = make_adapter_info(
+            "NVIDIA GeForce RTX 5060 Ti",
+            RuntimeGpuDeviceType::DiscreteGpu,
+        );
+        let decision =
+            choose_scheduler_path_for_platform_from_adapter(&info, RuntimePlatform::Android);
         assert_eq!(decision.path, GraphicsSchedulerPath::Mgs);
     }
 
     #[test]
     fn chooses_gms_for_apple_m_series_desktop_class() {
-        let mut info = make_adapter_info("Apple M4 Max", wgpu::DeviceType::IntegratedGpu);
-        info.backend = wgpu::Backend::Metal;
-        let decision = choose_scheduler_path_for_platform(&info, RuntimePlatform::Desktop);
+        let mut info = make_adapter_info("Apple M4 Max", RuntimeGpuDeviceType::IntegratedGpu);
+        info.backend = RuntimeGpuBackend::Metal;
+        let decision =
+            choose_scheduler_path_for_platform_from_adapter(&info, RuntimePlatform::Desktop);
         assert_eq!(decision.path, GraphicsSchedulerPath::Gms);
     }
 }
