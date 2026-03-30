@@ -23,6 +23,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::runtime_bridge::{GmsGuardrailProfile, GmsScalerConfig, GmsScalerMode};
 use crate::tljoint::{compile_tljoint_scene_from_path, TljointDiagnosticLevel, TljointSceneBundle};
 use crate::tlscript_showcase::{
     compile_tlscript_showcase, TlscriptShowcaseConfig, TlscriptShowcaseProgram,
@@ -128,6 +129,7 @@ pub struct TlpfileSceneBinding {
 pub struct TlpfileProject {
     pub name: String,
     pub scheduler: TlpfileGraphicsScheduler,
+    pub gms_scaler: GmsScalerConfig,
     pub default_dimension: TlpfileSceneDimension,
     pub default_scene: String,
     pub scenes: Vec<TlpfileSceneBinding>,
@@ -160,6 +162,7 @@ pub struct TlpfileSceneBundle {
     pub project_path: PathBuf,
     pub project_name: String,
     pub scheduler: TlpfileGraphicsScheduler,
+    pub gms_scaler: GmsScalerConfig,
     pub scene_dimension: TlpfileSceneDimension,
     pub scene_name: String,
     pub selected_joint_path: Option<PathBuf>,
@@ -201,10 +204,12 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
     let mut saw_header = false;
     let mut project_name: Option<String> = None;
     let mut project_scheduler: Option<TlpfileGraphicsScheduler> = None;
+    let mut project_gms_scaler = GmsScalerConfig::default();
     let mut project_default_dimension: Option<TlpfileSceneDimension> = None;
     let mut project_default_scene: Option<String> = None;
     let mut current_scene: Option<TlpfileSceneBinding> = None;
     let mut in_project_section = false;
+    let mut in_gms_scaler_section = false;
 
     for (line_index, raw_line) in source.lines().enumerate() {
         let line_no = line_index + 1;
@@ -230,9 +235,14 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
                 scenes.push(scene);
             }
             in_project_section = false;
+            in_gms_scaler_section = false;
             let section = line[1..line.len() - 1].trim();
             if section.eq_ignore_ascii_case("project") {
                 in_project_section = true;
+                continue;
+            }
+            if section.eq_ignore_ascii_case("gms_scaler") {
+                in_gms_scaler_section = true;
                 continue;
             }
             if let Some(name) = section.strip_prefix("scene.") {
@@ -256,7 +266,7 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
                 level: TlpfileDiagnosticLevel::Warning,
                 line: line_no,
                 message: format!(
-                    "unknown section '{section}' ignored (expected [project] or [scene.<name>])"
+                    "unknown section '{section}' ignored (expected [project], [gms_scaler], or [scene.<name>])"
                 ),
             });
             continue;
@@ -337,6 +347,148 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
                     level: TlpfileDiagnosticLevel::Warning,
                     line: line_no,
                     message: format!("unknown project key '{other}' ignored"),
+                }),
+            }
+            continue;
+        }
+
+        if in_gms_scaler_section {
+            match key {
+                "mode" => {
+                    if value.is_empty() {
+                        diagnostics.push(TlpfileDiagnostic {
+                            level: TlpfileDiagnosticLevel::Warning,
+                            line: line_no,
+                            message: "empty gms_scaler.mode ignored (expected adaptive|fixed)"
+                                .to_string(),
+                        });
+                    } else if let Some(parsed) = GmsScalerMode::parse(value) {
+                        project_gms_scaler.mode = parsed;
+                    } else {
+                        diagnostics.push(TlpfileDiagnostic {
+                            level: TlpfileDiagnosticLevel::Error,
+                            line: line_no,
+                            message: format!(
+                                "invalid gms_scaler.mode '{value}' (expected adaptive|fixed)"
+                            ),
+                        });
+                    }
+                }
+                "target_fps" => match value.parse::<u32>() {
+                    Ok(v) if (24..=480).contains(&v) => project_gms_scaler.target_fps = v,
+                    Ok(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: "gms_scaler.target_fps must be in 24..=480".to_string(),
+                    }),
+                    Err(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: format!("invalid gms_scaler.target_fps '{value}'"),
+                    }),
+                },
+                "min_physics_budget_pct" => match value.parse::<u8>() {
+                    Ok(v) if v <= 100 => project_gms_scaler.min_physics_budget_pct = v,
+                    Ok(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: "gms_scaler.min_physics_budget_pct must be in 0..=100"
+                            .to_string(),
+                    }),
+                    Err(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: format!("invalid gms_scaler.min_physics_budget_pct '{value}'"),
+                    }),
+                },
+                "render_budget_pct" => match value.parse::<u8>() {
+                    Ok(v) if v <= 100 => project_gms_scaler.budgets.render_budget_pct = v,
+                    Ok(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: "gms_scaler.render_budget_pct must be in 0..=100".to_string(),
+                    }),
+                    Err(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: format!("invalid gms_scaler.render_budget_pct '{value}'"),
+                    }),
+                },
+                "physics_budget_pct" => match value.parse::<u8>() {
+                    Ok(v) if v <= 100 => project_gms_scaler.budgets.physics_budget_pct = v,
+                    Ok(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: "gms_scaler.physics_budget_pct must be in 0..=100".to_string(),
+                    }),
+                    Err(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: format!("invalid gms_scaler.physics_budget_pct '{value}'"),
+                    }),
+                },
+                "ai_ml_budget_pct" => match value.parse::<u8>() {
+                    Ok(v) if v <= 100 => project_gms_scaler.budgets.ai_ml_budget_pct = v,
+                    Ok(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: "gms_scaler.ai_ml_budget_pct must be in 0..=100".to_string(),
+                    }),
+                    Err(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: format!("invalid gms_scaler.ai_ml_budget_pct '{value}'"),
+                    }),
+                },
+                "postfx_budget_pct" => match value.parse::<u8>() {
+                    Ok(v) if v <= 100 => project_gms_scaler.budgets.postfx_budget_pct = v,
+                    Ok(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: "gms_scaler.postfx_budget_pct must be in 0..=100".to_string(),
+                    }),
+                    Err(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: format!("invalid gms_scaler.postfx_budget_pct '{value}'"),
+                    }),
+                },
+                "ui_budget_pct" => match value.parse::<u8>() {
+                    Ok(v) if v <= 100 => project_gms_scaler.budgets.ui_budget_pct = v,
+                    Ok(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: "gms_scaler.ui_budget_pct must be in 0..=100".to_string(),
+                    }),
+                    Err(_) => diagnostics.push(TlpfileDiagnostic {
+                        level: TlpfileDiagnosticLevel::Error,
+                        line: line_no,
+                        message: format!("invalid gms_scaler.ui_budget_pct '{value}'"),
+                    }),
+                },
+                "guardrail" => {
+                    if value.is_empty() {
+                        diagnostics.push(TlpfileDiagnostic {
+                            level: TlpfileDiagnosticLevel::Warning,
+                            line: line_no,
+                            message: "empty gms_scaler.guardrail ignored".to_string(),
+                        });
+                    } else if let Some(profile) = GmsGuardrailProfile::parse(value) {
+                        project_gms_scaler.guardrail = profile;
+                    } else {
+                        diagnostics.push(TlpfileDiagnostic {
+                            level: TlpfileDiagnosticLevel::Error,
+                            line: line_no,
+                            message: format!(
+                                "invalid gms_scaler.guardrail '{value}' (expected balanced|aggressive|relaxed)"
+                            ),
+                        });
+                    }
+                }
+                other => diagnostics.push(TlpfileDiagnostic {
+                    level: TlpfileDiagnosticLevel::Warning,
+                    line: line_no,
+                    message: format!("unknown gms_scaler key '{other}' ignored"),
                 }),
             }
             continue;
@@ -486,6 +638,7 @@ pub fn parse_tlpfile(source: &str) -> TlpfileParseOutcome {
         Some(TlpfileProject {
             name: project_name.unwrap_or_else(|| "Tileline Project".to_string()),
             scheduler: project_scheduler.unwrap_or_default(),
+            gms_scaler: project_gms_scaler,
             default_dimension: project_default_dimension.unwrap_or_default(),
             default_scene,
             scenes,
@@ -717,6 +870,7 @@ pub fn compile_tlpfile_scene_from_path(
             project_path: project_path.to_path_buf(),
             project_name: project.name,
             scheduler: project.scheduler,
+            gms_scaler: project.gms_scaler,
             scene_dimension,
             scene_name: resolved_scene_name.to_string(),
             selected_joint_path,
@@ -825,6 +979,14 @@ mod tests {
             "[project]\n",
             "name = Demo Project\n",
             "scheduler = gms\n",
+            "[gms_scaler]\n",
+            "mode = adaptive\n",
+            "target_fps = 75\n",
+            "min_physics_budget_pct = 40\n",
+            "render_budget_pct = 30\n",
+            "physics_budget_pct = 40\n",
+            "ai_ml_budget_pct = 20\n",
+            "postfx_budget_pct = 10\n",
             "default_dimension = 3d\n",
             "default_scene = main\n",
             "[scene.main]\n",
@@ -839,6 +1001,13 @@ mod tests {
         let project = out.project.expect("project");
         assert_eq!(project.name, "Demo Project");
         assert_eq!(project.scheduler, TlpfileGraphicsScheduler::Gms);
+        assert_eq!(project.gms_scaler.mode, GmsScalerMode::Adaptive);
+        assert_eq!(project.gms_scaler.target_fps, 75);
+        assert_eq!(project.gms_scaler.min_physics_budget_pct, 40);
+        assert_eq!(project.gms_scaler.budgets.render_budget_pct, 30);
+        assert_eq!(project.gms_scaler.budgets.physics_budget_pct, 40);
+        assert_eq!(project.gms_scaler.budgets.ai_ml_budget_pct, 20);
+        assert_eq!(project.gms_scaler.budgets.postfx_budget_pct, 10);
         assert_eq!(project.default_dimension, TlpfileSceneDimension::ThreeD);
         assert_eq!(project.default_scene, "main");
         assert_eq!(project.scenes.len(), 1);
@@ -1010,6 +1179,7 @@ mod tests {
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
         let bundle = out.bundle.expect("bundle");
         assert_eq!(bundle.scene_dimension, TlpfileSceneDimension::TwoD);
+        assert_eq!(bundle.gms_scaler.mode, GmsScalerMode::Adaptive);
     }
 
     #[test]

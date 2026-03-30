@@ -153,6 +153,7 @@ impl TlAppRuntime {
         let mut bundle_sprite_root: Option<PathBuf> = None;
         let mut project_scheduler_manifest: Option<TlpfileGraphicsScheduler> = None;
         let mut project_scene_dimension_manifest: Option<TlpfileSceneDimension> = None;
+        let mut project_gms_scaler_manifest: Option<GmsScalerConfig> = None;
         if let Some(project_path) = &options.project_path {
             let project_compile = compile_tlpfile_scene_from_path(
                 project_path,
@@ -188,6 +189,7 @@ impl TlAppRuntime {
 
             project_scheduler_manifest = Some(bundle.scheduler);
             project_scene_dimension_manifest = Some(bundle.scene_dimension);
+            project_gms_scaler_manifest = Some(bundle.gms_scaler);
 
             if bundle.scene_name == "main" {
                 let main_joint_ok = bundle
@@ -338,10 +340,14 @@ impl TlAppRuntime {
             GraphicsSchedulerPath::Mgs => RuntimeBridgePath::MgsPath,
         };
         let runtime_bridge = if matches!(pipeline_mode, PipelineMode::Parallel) {
+            let mut bridge_config = RuntimeBridgeConfig::default();
+            if let Some(gms_scaler) = project_gms_scaler_manifest {
+                bridge_config.gms_scaler = gms_scaler;
+            }
             Some(RuntimeBridgeOrchestrator::new_for_scheduler(
                 scheduler_resolution.selected,
                 &adapter_info.name,
-                RuntimeBridgeConfig::default(),
+                bridge_config,
                 size.width.max(1),
                 size.height.max(1),
             ))
@@ -357,6 +363,12 @@ impl TlAppRuntime {
                 bridge_tick_published_frames: 0,
                 bridge_tick_drained_plans: 0,
                 frame_plans_popped: 0,
+                gms_mode: None,
+                domain_budgets: None,
+                sm_cu_utilization: 0.0,
+                lane_queue_depth: 0,
+                ai_ml_drop_rate: 0.0,
+                fallback_reason: None,
             });
         let runtime_bridge_telemetry =
             RuntimeBridgeTelemetry::new(runtime_bridge_metrics.bridge_path);
@@ -835,6 +847,14 @@ impl TlAppRuntime {
             pipeline_mode,
             runtime_bridge,
             runtime_bridge_metrics,
+            gms_cli_override_mode: None,
+            gms_cli_override_target_fps: None,
+            gms_cli_override_guardrail: None,
+            gms_cli_override_render_budget_pct: None,
+            gms_cli_override_physics_budget_pct: None,
+            gms_cli_override_ai_ml_budget_pct: None,
+            gms_cli_override_postfx_budget_pct: None,
+            gms_cli_override_ui_budget_pct: None,
             runtime_bridge_telemetry,
             bridge_frame_counter: 1,
             adapter_backend: adapter_info.backend,

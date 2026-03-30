@@ -19,6 +19,9 @@ use tl_core::{
     SemanticType, Stmt, TypedIrLoweringConfig, TypedIrModule, UnaryOp,
 };
 
+use crate::runtime_bridge::{
+    GmsDomainBudgets, GmsGuardrailProfile, GmsScalerDomain, GmsScalerMode,
+};
 use crate::scene::{BounceTankRuntimePatch, RayTracingMode, RuntimeSceneMode, SceneLightOverride};
 use crate::tile_world_2d::{TileCoord2d, TileMutation2d, TILE_ID_EMPTY};
 
@@ -99,6 +102,11 @@ const SHOWCASE_BUILTIN_CALLS: &[&str] = &[
     "set_adaptive_distance",
     "set_distance_blur",
     "set_msaa",
+    "gms_set_mode",
+    "gms_set_target_fps",
+    "gms_set_budget",
+    "gms_get_metric",
+    "gms_set_guardrail",
     "set_camera_move_speed",
     "set_camera_look_sensitivity",
     "set_camera_pose",
@@ -136,6 +144,11 @@ const CONTACT_MANIFOLDS_BUILTIN_NAME: &str = "contact_manifolds";
 const TOUCH_ANY_BUILTIN_NAME: &str = "touch_any";
 const TOUCH_PAIRS_BUILTIN_NAME: &str = "touch_pairs";
 const TOUCH_MANIFOLDS_BUILTIN_NAME: &str = "touch_manifolds";
+const GMS_SET_MODE_BUILTIN_NAME: &str = "gms_set_mode";
+const GMS_SET_TARGET_FPS_BUILTIN_NAME: &str = "gms_set_target_fps";
+const GMS_SET_BUDGET_BUILTIN_NAME: &str = "gms_set_budget";
+const GMS_GET_METRIC_BUILTIN_NAME: &str = "gms_get_metric";
+const GMS_SET_GUARDRAIL_BUILTIN_NAME: &str = "gms_set_guardrail";
 
 /// Runtime tile query surface used by `.tlscript` built-ins (for example `tile_get`).
 ///
@@ -350,6 +363,30 @@ impl TlscriptShowcaseContactSnapshot {
     }
 }
 
+/// Runtime-provided GMS scaler metrics exposed to `.tlscript` (`gms_get_metric`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TlscriptGmsMetricSnapshot {
+    pub mode: Option<GmsScalerMode>,
+    pub target_fps: Option<u32>,
+    pub domain_budgets: Option<GmsDomainBudgets>,
+    pub sm_cu_utilization: f32,
+    pub lane_queue_depth: usize,
+    pub ai_ml_drop_rate: f32,
+}
+
+impl Default for TlscriptGmsMetricSnapshot {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            target_fps: None,
+            domain_budgets: None,
+            sm_cu_utilization: 0.0,
+            lane_queue_depth: 0,
+            ai_ml_drop_rate: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlscriptToggleMode {
     Auto,
@@ -372,6 +409,31 @@ impl TlscriptToggleMode {
             Self::Auto => auto_default,
             Self::On => true,
             Self::Off => false,
+        }
+    }
+}
+
+/// Script-emitted GMS scaler overrides (`gms_set_*` built-ins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TlscriptGmsScalerOverride {
+    pub mode: Option<GmsScalerMode>,
+    pub target_fps: Option<u32>,
+    pub guardrail: Option<GmsGuardrailProfile>,
+    pub render_budget_pct: Option<u8>,
+    pub physics_budget_pct: Option<u8>,
+    pub ai_ml_budget_pct: Option<u8>,
+    pub postfx_budget_pct: Option<u8>,
+    pub ui_budget_pct: Option<u8>,
+}
+
+impl TlscriptGmsScalerOverride {
+    fn set_budget(&mut self, domain: GmsScalerDomain, value: u8) {
+        match domain {
+            GmsScalerDomain::Render => self.render_budget_pct = Some(value.min(100)),
+            GmsScalerDomain::Physics => self.physics_budget_pct = Some(value.min(100)),
+            GmsScalerDomain::AiMl => self.ai_ml_budget_pct = Some(value.min(100)),
+            GmsScalerDomain::PostFx => self.postfx_budget_pct = Some(value.min(100)),
+            GmsScalerDomain::Ui => self.ui_budget_pct = Some(value.min(100)),
         }
     }
 }
@@ -482,6 +544,7 @@ pub struct TlscriptShowcaseFrameOutput {
     pub adaptive_distance_mode: Option<TlscriptToggleMode>,
     pub distance_blur_mode: Option<TlscriptToggleMode>,
     pub msaa_samples: Option<u32>,
+    pub gms_scaler: TlscriptGmsScalerOverride,
     pub force_full_fbx_sphere: Option<bool>,
     pub camera_move_speed: Option<f32>,
     pub camera_look_sensitivity: Option<f32>,
@@ -564,6 +627,7 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             controls,
             tile_lookup,
             TlscriptShowcaseContactSnapshot::default(),
+            TlscriptGmsMetricSnapshot::default(),
         )
     }
 
@@ -574,10 +638,12 @@ impl<'src> TlscriptShowcaseProgram<'src> {
         controls: TlscriptShowcaseControlInput,
         tile_lookup: Option<&dyn TlscriptTileLookup>,
         contact_snapshot: TlscriptShowcaseContactSnapshot,
+        gms_metrics: TlscriptGmsMetricSnapshot,
     ) -> TlscriptShowcaseFrameOutput {
         let mut state = EvalState::new(self.max_eval_steps, self.max_loop_iterations, tile_lookup);
         state.contact_pairs = contact_snapshot.contact_pairs;
         state.contact_manifolds = contact_snapshot.contact_manifolds;
+        state.gms_metrics = gms_metrics;
         state.vars.insert(
             "frame".to_string(),
             DemoValue::Int(input.frame_index as i64),
@@ -771,6 +837,29 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             "touch_any".to_string(),
             DemoValue::Bool(contact_snapshot.contact_any()),
         );
+        state.vars.insert(
+            "gms_sm_cu_utilization".to_string(),
+            DemoValue::Float(gms_metrics.sm_cu_utilization as f64),
+        );
+        state.vars.insert(
+            "gms_lane_queue_depth".to_string(),
+            DemoValue::Int(gms_metrics.lane_queue_depth as i64),
+        );
+        state.vars.insert(
+            "gms_ai_ml_drop_rate".to_string(),
+            DemoValue::Float(gms_metrics.ai_ml_drop_rate as f64),
+        );
+        if let Some(mode) = gms_metrics.mode {
+            state
+                .vars
+                .insert("gms_mode".to_string(), DemoValue::Str(mode.as_str().to_string()));
+        }
+        if let Some(target_fps) = gms_metrics.target_fps {
+            state.vars.insert(
+                "gms_target_fps".to_string(),
+                DemoValue::Int(target_fps as i64),
+            );
+        }
 
         let Item::Function(entry_fn) = &self.module.items[self.entry_item_index];
         self.exec_block(&entry_fn.body, &mut state);
@@ -798,6 +887,7 @@ impl<'src> TlscriptShowcaseProgram<'src> {
             adaptive_distance_mode: state.adaptive_distance_mode,
             distance_blur_mode: state.distance_blur_mode,
             msaa_samples: state.msaa_samples,
+            gms_scaler: state.gms_scaler,
             force_full_fbx_sphere: state.force_full_fbx_sphere,
             camera_move_speed: state.camera_move_speed,
             camera_look_sensitivity: state.camera_look_sensitivity,
@@ -1037,6 +1127,8 @@ struct EvalState<'lookup> {
     adaptive_distance_mode: Option<TlscriptToggleMode>,
     distance_blur_mode: Option<TlscriptToggleMode>,
     msaa_samples: Option<u32>,
+    gms_scaler: TlscriptGmsScalerOverride,
+    gms_metrics: TlscriptGmsMetricSnapshot,
     force_full_fbx_sphere: Option<bool>,
     camera_move_speed: Option<f32>,
     camera_look_sensitivity: Option<f32>,
@@ -1084,6 +1176,8 @@ impl<'lookup> EvalState<'lookup> {
             adaptive_distance_mode: None,
             distance_blur_mode: None,
             msaa_samples: None,
+            gms_scaler: TlscriptGmsScalerOverride::default(),
+            gms_metrics: TlscriptGmsMetricSnapshot::default(),
             force_full_fbx_sphere: None,
             camera_move_speed: None,
             camera_look_sensitivity: None,
@@ -1383,6 +1477,27 @@ fn parse_msaa_samples_from_value(value: &DemoValue) -> Option<u32> {
     }
 }
 
+fn parse_gms_scaler_mode_from_value(value: &DemoValue) -> Option<GmsScalerMode> {
+    match value {
+        DemoValue::Str(raw) => GmsScalerMode::parse(raw),
+        _ => None,
+    }
+}
+
+fn parse_gms_guardrail_from_value(value: &DemoValue) -> Option<GmsGuardrailProfile> {
+    match value {
+        DemoValue::Str(raw) => GmsGuardrailProfile::parse(raw),
+        _ => None,
+    }
+}
+
+fn parse_gms_domain_from_value(value: &DemoValue) -> Option<GmsScalerDomain> {
+    match value {
+        DemoValue::Str(raw) => GmsScalerDomain::parse(raw),
+        _ => None,
+    }
+}
+
 fn apply_builtin_patch_call(
     name: &str,
     args: &[DemoValue],
@@ -1400,6 +1515,91 @@ fn apply_builtin_patch_call(
         CONTACT_MANIFOLDS_BUILTIN_NAME | TOUCH_MANIFOLDS_BUILTIN_NAME => match args {
             [] => return DemoValue::Int(state.contact_manifolds as i64),
             _ => state.warn(format!("{name} expects 0 args")),
+        },
+        GMS_SET_MODE_BUILTIN_NAME => match args {
+            [value] => match parse_gms_scaler_mode_from_value(value) {
+                Some(mode) => state.gms_scaler.mode = Some(mode),
+                None => state.warn("gms_set_mode expects 'adaptive' or 'fixed'"),
+            },
+            _ => state.warn("gms_set_mode expects 1 arg"),
+        },
+        GMS_SET_TARGET_FPS_BUILTIN_NAME => match args {
+            [value] => {
+                let target = value.to_i64();
+                if !(24..=480).contains(&target) {
+                    state.warn("gms_set_target_fps expects value in 24..=480");
+                } else {
+                    state.gms_scaler.target_fps = Some(target as u32);
+                }
+            }
+            _ => state.warn("gms_set_target_fps expects 1 arg"),
+        },
+        GMS_SET_BUDGET_BUILTIN_NAME => match args {
+            [domain_value, pct_value] => {
+                let Some(domain) = parse_gms_domain_from_value(domain_value) else {
+                    state.warn("gms_set_budget expects domain in {render|physics|ai_ml|postfx|ui}");
+                    return DemoValue::Int(0);
+                };
+                let pct = pct_value.to_i64();
+                if !(0..=100).contains(&pct) {
+                    state.warn("gms_set_budget expects pct in 0..=100");
+                    return DemoValue::Int(0);
+                }
+                state.gms_scaler.set_budget(domain, pct as u8);
+            }
+            _ => state.warn("gms_set_budget expects 2 args (domain, pct)"),
+        },
+        GMS_GET_METRIC_BUILTIN_NAME => match args {
+            [DemoValue::Str(metric)] => {
+                let key = metric.trim().to_ascii_lowercase();
+                let value = match key.as_str() {
+                    "sm_cu_utilization" | "utilization" => state.gms_metrics.sm_cu_utilization as f64,
+                    "lane_queue_depth" | "queue_depth" => state.gms_metrics.lane_queue_depth as f64,
+                    "ai_ml_drop_rate" | "aiml_drop_rate" => state.gms_metrics.ai_ml_drop_rate as f64,
+                    "target_fps" => state.gms_metrics.target_fps.unwrap_or(0) as f64,
+                    "render_budget_pct" => state
+                        .gms_metrics
+                        .domain_budgets
+                        .map(|b| b.render_budget_pct)
+                        .unwrap_or(0) as f64,
+                    "physics_budget_pct" => state
+                        .gms_metrics
+                        .domain_budgets
+                        .map(|b| b.physics_budget_pct)
+                        .unwrap_or(0) as f64,
+                    "ai_ml_budget_pct" | "aiml_budget_pct" => state
+                        .gms_metrics
+                        .domain_budgets
+                        .map(|b| b.ai_ml_budget_pct)
+                        .unwrap_or(0) as f64,
+                    "postfx_budget_pct" => state
+                        .gms_metrics
+                        .domain_budgets
+                        .map(|b| b.postfx_budget_pct)
+                        .unwrap_or(0) as f64,
+                    "ui_budget_pct" => state
+                        .gms_metrics
+                        .domain_budgets
+                        .map(|b| b.ui_budget_pct)
+                        .unwrap_or(0) as f64,
+                    _ => {
+                        state.warn(format!(
+                            "gms_get_metric unknown key '{metric}' (expected utilization/queue_depth/ai_ml_drop_rate/target_fps/*_budget_pct)"
+                        ));
+                        0.0
+                    }
+                };
+                return DemoValue::Float(value);
+            }
+            [_] => state.warn("gms_get_metric expects a string metric key"),
+            _ => state.warn("gms_get_metric expects 1 arg"),
+        },
+        GMS_SET_GUARDRAIL_BUILTIN_NAME => match args {
+            [value] => match parse_gms_guardrail_from_value(value) {
+                Some(profile) => state.gms_scaler.guardrail = Some(profile),
+                None => state.warn("gms_set_guardrail expects 'balanced'|'aggressive'|'relaxed'"),
+            },
+            _ => state.warn("gms_set_guardrail expects 1 arg"),
         },
         "set_gfx_profile" => match args {
             [value] => apply_gfx_profile_from_value(state, value),
@@ -2149,6 +2349,12 @@ pub fn compile_tlscript_showcase<'src>(
             name: TOUCH_MANIFOLDS_BUILTIN_NAME.to_string(),
             result: SemanticType::Int,
         });
+    semantic_config
+        .external_call_return_hints
+        .push(ExternalCallReturnHint {
+            name: GMS_GET_METRIC_BUILTIN_NAME.to_string(),
+            result: SemanticType::Float,
+        });
     semantic_config.external_call_return_hints.sort_by(|a, b| {
         a.name
             .cmp(&b.name)
@@ -2278,6 +2484,12 @@ pub fn compile_tlscript_showcase<'src>(
         .push(LoweringExternalSignature {
             name: TOUCH_MANIFOLDS_BUILTIN_NAME.to_string(),
             result: SemanticType::Int,
+        });
+    lowering_config
+        .external_function_signatures
+        .push(LoweringExternalSignature {
+            name: GMS_GET_METRIC_BUILTIN_NAME.to_string(),
+            result: SemanticType::Float,
         });
     lowering_config
         .external_function_signatures
@@ -2921,6 +3133,7 @@ mod tests {
                 contact_pairs: 28,
                 contact_manifolds: 7,
             },
+            TlscriptGmsMetricSnapshot::default(),
         );
         assert_eq!(out.patch.spawn_per_tick, Some(35));
     }
@@ -2994,6 +3207,49 @@ mod tests {
             .iter()
             .any(|w| w.contains("set_adaptive_distance")));
         assert!(out.warnings.iter().any(|w| w.contains("set_msaa")));
+    }
+
+    #[test]
+    fn supports_gms_scaler_builtins_and_metric_queries() {
+        let src = concat!(
+            "@export\n",
+            "def showcase_tick(frame: int, live_balls: int, spawned_this_tick: int):\n",
+            "    gms_set_mode(\"fixed\")\n",
+            "    gms_set_target_fps(72)\n",
+            "    gms_set_budget(\"physics\", 45)\n",
+            "    gms_set_budget(\"ai_ml\", 12)\n",
+            "    gms_set_guardrail(\"aggressive\")\n",
+            "    if gms_get_metric(\"sm_cu_utilization\") >= 0.5:\n",
+            "        set_spawn_per_tick(99)\n",
+        );
+        let outcome = compile_tlscript_showcase(src, Default::default());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let program = outcome.program.as_ref().expect("program");
+        let out = program.evaluate_frame_with_controls_and_tile_lookup_and_contacts(
+            TlscriptShowcaseFrameInput {
+                frame_index: 0,
+                live_balls: 0,
+                spawned_this_tick: 0,
+                key_f_down: false,
+            },
+            TlscriptShowcaseControlInput::default(),
+            None,
+            TlscriptShowcaseContactSnapshot::default(),
+            TlscriptGmsMetricSnapshot {
+                mode: Some(GmsScalerMode::Adaptive),
+                target_fps: Some(60),
+                domain_budgets: Some(GmsDomainBudgets::default()),
+                sm_cu_utilization: 0.72,
+                lane_queue_depth: 2,
+                ai_ml_drop_rate: 0.18,
+            },
+        );
+        assert_eq!(out.patch.spawn_per_tick, Some(99));
+        assert_eq!(out.gms_scaler.mode, Some(GmsScalerMode::Fixed));
+        assert_eq!(out.gms_scaler.target_fps, Some(72));
+        assert_eq!(out.gms_scaler.physics_budget_pct, Some(45));
+        assert_eq!(out.gms_scaler.ai_ml_budget_pct, Some(12));
+        assert_eq!(out.gms_scaler.guardrail, Some(GmsGuardrailProfile::Aggressive));
     }
 
     #[test]

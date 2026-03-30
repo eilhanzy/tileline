@@ -107,6 +107,8 @@ pub enum TaskClass {
     ObjectUpdate,
     /// Physics/particle or simulation compute.
     Physics,
+    /// AI/ML inference or agent-domain compute.
+    AiMl,
     /// UI composition and widgets, usually latency-sensitive and lighter.
     Ui,
     /// Post-processing or final compositing passes.
@@ -146,6 +148,7 @@ pub struct MultiGpuLaneAssignment {
     pub sampled_processing_jobs: u32,
     pub object_updates: u32,
     pub physics_jobs: u32,
+    pub ai_ml_jobs: u32,
     pub ui_jobs: u32,
     pub post_fx_jobs: u32,
     pub total_jobs: u32,
@@ -226,6 +229,8 @@ pub struct MultiGpuWorkloadRequest {
     pub object_updates: u32,
     /// Physics jobs.
     pub physics_jobs: u32,
+    /// AI/ML jobs.
+    pub ai_ml_jobs: u32,
     /// UI jobs.
     pub ui_jobs: u32,
     /// Post-processing jobs.
@@ -236,6 +241,8 @@ pub struct MultiGpuWorkloadRequest {
     pub bytes_per_object: u64,
     /// Bytes per physics job.
     pub bytes_per_physics_job: u64,
+    /// Bytes per AI/ML job.
+    pub bytes_per_ai_ml_job: u64,
     /// Bytes per UI job.
     pub bytes_per_ui_job: u64,
     /// Bytes per post-FX job.
@@ -254,11 +261,13 @@ impl Default for MultiGpuWorkloadRequest {
             sampled_processing_jobs: 0,
             object_updates: 0,
             physics_jobs: 0,
+            ai_ml_jobs: 0,
             ui_jobs: 0,
             post_fx_jobs: 0,
             bytes_per_sampled_job: 4096,
             bytes_per_object: 256,
             bytes_per_physics_job: 1024,
+            bytes_per_ai_ml_job: 2048,
             bytes_per_ui_job: 512,
             bytes_per_post_fx_job: 1024,
             processed_texture_bytes_per_frame: 8 * 1024 * 1024,
@@ -375,6 +384,10 @@ impl MultiGpuDispatcher {
             .iter()
             .map(|gpu| heavy_weight_for(gpu, TaskClass::Physics))
             .collect::<Vec<_>>();
+        let ai_ml_weights = usable
+            .iter()
+            .map(|gpu| heavy_weight_for(gpu, TaskClass::AiMl))
+            .collect::<Vec<_>>();
 
         let mut sampled_distribution =
             allocate_weighted_counts(request.sampled_processing_jobs, &sampled_weights);
@@ -382,6 +395,7 @@ impl MultiGpuDispatcher {
             allocate_weighted_counts(request.object_updates, &object_weights);
         let mut physics_distribution =
             allocate_weighted_counts(request.physics_jobs, &physics_weights);
+        let mut ai_ml_distribution = allocate_weighted_counts(request.ai_ml_jobs, &ai_ml_weights);
 
         let mut ui_distribution = vec![0u32; usable.len()];
         let mut post_fx_distribution = vec![0u32; usable.len()];
@@ -401,7 +415,7 @@ impl MultiGpuDispatcher {
 
             let secondary_budget_ms = secondary_latency_budget_ms(request.target_frame_budget_ms);
             let estimated_secondary_ms =
-                estimate_lane_ms(sec_gpu, sec_ui, sec_post_fx, 0, 0, 0, request);
+                estimate_lane_ms(sec_gpu, 0, 0, 0, 0, sec_ui, sec_post_fx, request);
 
             if estimated_secondary_ms > secondary_budget_ms {
                 let ratio = (secondary_budget_ms / estimated_secondary_ms).clamp(0.0, 1.0);
@@ -432,6 +446,7 @@ impl MultiGpuDispatcher {
                 &mut sampled_distribution,
                 &mut object_distribution,
                 &mut physics_distribution,
+                &mut ai_ml_distribution,
                 &ui_distribution,
                 &post_fx_distribution,
             );
@@ -454,11 +469,13 @@ impl MultiGpuDispatcher {
             let sampled_processing_jobs = sampled_distribution[slot];
             let object_updates = object_distribution[slot];
             let physics_jobs = physics_distribution[slot];
+            let ai_ml_jobs = ai_ml_distribution[slot];
             let ui_jobs = ui_distribution[slot];
             let post_fx_jobs = post_fx_distribution[slot];
             let total_jobs = sampled_processing_jobs
                 .saturating_add(object_updates)
                 .saturating_add(physics_jobs)
+                .saturating_add(ai_ml_jobs)
                 .saturating_add(ui_jobs)
                 .saturating_add(post_fx_jobs);
 
@@ -472,6 +489,7 @@ impl MultiGpuDispatcher {
                 sampled_processing_jobs,
                 object_updates,
                 physics_jobs,
+                ai_ml_jobs,
                 ui_jobs,
                 post_fx_jobs,
             );
@@ -481,6 +499,7 @@ impl MultiGpuDispatcher {
                 sampled_processing_jobs,
                 object_updates,
                 physics_jobs,
+                ai_ml_jobs,
                 ui_jobs,
                 post_fx_jobs,
                 request,
@@ -498,6 +517,7 @@ impl MultiGpuDispatcher {
                 sampled_processing_jobs,
                 object_updates,
                 physics_jobs,
+                ai_ml_jobs,
                 ui_jobs,
                 post_fx_jobs,
                 total_jobs,
@@ -540,6 +560,7 @@ impl MultiGpuDispatcher {
             request.sampled_processing_jobs,
             request.object_updates,
             request.physics_jobs,
+            request.ai_ml_jobs,
             request.ui_jobs,
             request.post_fx_jobs,
             request,
@@ -698,12 +719,14 @@ fn heavy_weight_for(gpu: &GpuAdapterProfile, class: TaskClass) -> f64 {
         MemoryTopology::DiscreteVram => match class {
             TaskClass::SampledProcessing => 1.20,
             TaskClass::Physics => 1.15,
+            TaskClass::AiMl => 1.18,
             TaskClass::ObjectUpdate => 1.05,
             TaskClass::Ui | TaskClass::PostFx => 0.95,
         },
         MemoryTopology::Unified => match class {
             TaskClass::SampledProcessing => 0.95,
             TaskClass::Physics => 0.92,
+            TaskClass::AiMl => 0.96,
             TaskClass::ObjectUpdate => 1.05,
             TaskClass::Ui | TaskClass::PostFx => 1.15,
         },
@@ -714,6 +737,7 @@ fn heavy_weight_for(gpu: &GpuAdapterProfile, class: TaskClass) -> f64 {
     let exponent = match class {
         TaskClass::SampledProcessing => 1.18,
         TaskClass::Physics => 1.15,
+        TaskClass::AiMl => 1.16,
         TaskClass::ObjectUpdate => 1.05,
         TaskClass::Ui | TaskClass::PostFx => 1.0,
     };
@@ -740,6 +764,7 @@ fn enforce_secondary_minimum_job_share(
     sampled_distribution: &mut [u32],
     object_distribution: &mut [u32],
     physics_distribution: &mut [u32],
+    ai_ml_distribution: &mut [u32],
     ui_distribution: &[u32],
     post_fx_distribution: &[u32],
 ) {
@@ -747,6 +772,7 @@ fn enforce_secondary_minimum_job_share(
         .sampled_processing_jobs
         .saturating_add(request.object_updates)
         .saturating_add(request.physics_jobs)
+        .saturating_add(request.ai_ml_jobs)
         .saturating_add(request.ui_jobs)
         .saturating_add(request.post_fx_jobs);
     if total_jobs_requested == 0 {
@@ -769,6 +795,7 @@ fn enforce_secondary_minimum_job_share(
                 .copied()
                 .unwrap_or(0),
         )
+        .saturating_add(ai_ml_distribution.get(secondary_slot).copied().unwrap_or(0))
         .saturating_add(ui_distribution.get(secondary_slot).copied().unwrap_or(0))
         .saturating_add(
             post_fx_distribution
@@ -793,17 +820,20 @@ fn enforce_secondary_minimum_job_share(
     match secondary_gpu.memory_topology {
         MemoryTopology::DiscreteVram => {
             needed = move_lane_jobs(sampled_distribution, primary_slot, secondary_slot, needed);
+            needed = move_lane_jobs(ai_ml_distribution, primary_slot, secondary_slot, needed);
             needed = move_lane_jobs(physics_distribution, primary_slot, secondary_slot, needed);
             let _ = move_lane_jobs(object_distribution, primary_slot, secondary_slot, needed);
         }
         MemoryTopology::Unified => {
             needed = move_lane_jobs(object_distribution, primary_slot, secondary_slot, needed);
+            needed = move_lane_jobs(ai_ml_distribution, primary_slot, secondary_slot, needed);
             needed = move_lane_jobs(physics_distribution, primary_slot, secondary_slot, needed);
             let _ = move_lane_jobs(sampled_distribution, primary_slot, secondary_slot, needed);
         }
         MemoryTopology::Virtualized | MemoryTopology::System | MemoryTopology::Unknown => {
             needed = move_lane_jobs(object_distribution, primary_slot, secondary_slot, needed);
-            let _ = move_lane_jobs(physics_distribution, primary_slot, secondary_slot, needed);
+            needed = move_lane_jobs(physics_distribution, primary_slot, secondary_slot, needed);
+            let _ = move_lane_jobs(ai_ml_distribution, primary_slot, secondary_slot, needed);
         }
     }
 }
@@ -869,6 +899,7 @@ fn estimate_lane_ms(
     sampled_processing_jobs: u32,
     object_updates: u32,
     physics_jobs: u32,
+    ai_ml_jobs: u32,
     ui_jobs: u32,
     post_fx_jobs: u32,
     request: MultiGpuWorkloadRequest,
@@ -880,6 +911,7 @@ fn estimate_lane_ms(
     let weighted_job_units = (sampled_processing_jobs as f64) * 24.0
         + (object_updates as f64) * 4.0
         + (physics_jobs as f64) * 10.0
+        + (ai_ml_jobs as f64) * 11.5
         + (ui_jobs as f64) * 3.0
         + (post_fx_jobs as f64) * 5.0;
 
@@ -889,6 +921,7 @@ fn estimate_lane_ms(
         sampled_processing_jobs,
         object_updates,
         physics_jobs,
+        ai_ml_jobs,
         ui_jobs,
         post_fx_jobs,
     ) as f64;
@@ -917,6 +950,7 @@ fn estimate_multi_gpu_assigned_bytes(
     sampled_processing_jobs: u32,
     object_updates: u32,
     physics_jobs: u32,
+    ai_ml_jobs: u32,
     ui_jobs: u32,
     post_fx_jobs: u32,
 ) -> u64 {
@@ -925,6 +959,7 @@ fn estimate_multi_gpu_assigned_bytes(
         .saturating_mul(request.bytes_per_sampled_job)
         .saturating_add((object_updates as u64).saturating_mul(request.bytes_per_object))
         .saturating_add((physics_jobs as u64).saturating_mul(request.bytes_per_physics_job))
+        .saturating_add((ai_ml_jobs as u64).saturating_mul(request.bytes_per_ai_ml_job))
         .saturating_add((ui_jobs as u64).saturating_mul(request.bytes_per_ui_job))
         .saturating_add((post_fx_jobs as u64).saturating_mul(request.bytes_per_post_fx_job));
     round_up_u64(total, 256)
@@ -1275,8 +1310,9 @@ fn clamp_pow2(value: u32, min_value: u32, max_value: u32) -> u32 {
 fn average_unit_parallelism_factor(gpu: &GpuAdapterProfile) -> f64 {
     (unit_parallelism_factor(gpu, TaskClass::SampledProcessing)
         + unit_parallelism_factor(gpu, TaskClass::ObjectUpdate)
-        + unit_parallelism_factor(gpu, TaskClass::Physics))
-        / 3.0
+        + unit_parallelism_factor(gpu, TaskClass::Physics)
+        + unit_parallelism_factor(gpu, TaskClass::AiMl))
+        / 4.0
 }
 
 fn unit_parallelism_factor(gpu: &GpuAdapterProfile, class: TaskClass) -> f64 {
@@ -1291,6 +1327,7 @@ fn unit_parallelism_factor(gpu: &GpuAdapterProfile, class: TaskClass) -> f64 {
     let class_exponent = match class {
         TaskClass::SampledProcessing => 0.60,
         TaskClass::Physics => 0.55,
+        TaskClass::AiMl => 0.58,
         TaskClass::ObjectUpdate => 0.35,
         TaskClass::Ui | TaskClass::PostFx => 0.20,
     };
@@ -1299,17 +1336,19 @@ fn unit_parallelism_factor(gpu: &GpuAdapterProfile, class: TaskClass) -> f64 {
         ComputeUnitKind::Sm => match class {
             TaskClass::SampledProcessing => 1.08,
             TaskClass::Physics => 1.03,
+            TaskClass::AiMl => 1.10,
             TaskClass::ObjectUpdate => 1.00,
             TaskClass::Ui | TaskClass::PostFx => 0.98,
         },
         ComputeUnitKind::Cu => match class {
             TaskClass::SampledProcessing => 1.02,
             TaskClass::Physics => 1.08,
+            TaskClass::AiMl => 1.06,
             TaskClass::ObjectUpdate => 1.00,
             TaskClass::Ui | TaskClass::PostFx => 0.98,
         },
         ComputeUnitKind::CoreCluster => match class {
-            TaskClass::SampledProcessing | TaskClass::Physics => 0.97,
+            TaskClass::SampledProcessing | TaskClass::Physics | TaskClass::AiMl => 0.97,
             TaskClass::ObjectUpdate | TaskClass::Ui | TaskClass::PostFx => 1.03,
         },
         ComputeUnitKind::Unknown => 1.0,

@@ -200,6 +200,12 @@ pub struct GpuAdapterProfile {
     pub memory_topology: MemoryTopology,
     pub compute_unit_kind: ComputeUnitKind,
     pub estimated_compute_units: u32,
+    /// Suggested planner grouping size (logical units grouped per scheduling shard).
+    pub unit_grouping: u32,
+    /// Per-unit normalized performance score used by SM/CU scaler heuristics.
+    pub unit_perf_score: f64,
+    /// Estimated thermal headroom in range `0.0..=1.0` used by adaptive guardrails.
+    pub thermal_headroom: f32,
     pub compute_unit_source: ComputeUnitEstimateSource,
     /// Optional note describing native-probe success/failure and fallback reason.
     pub compute_unit_probe_note: Option<String>,
@@ -313,6 +319,7 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
         None
     };
     let compute_unit_kind = estimate_compute_unit_kind(vendor_family);
+    let unit_grouping = estimate_unit_grouping(compute_unit_kind);
     let estimated_vram_mb = estimate_vram_mb(&info, &limits, &name_lower, memory_topology);
     let estimated_bandwidth_gbps = estimate_bandwidth_gbps(
         &info,
@@ -334,6 +341,8 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
         &limits,
         supports_mappable_primary_buffers,
     );
+    let unit_perf_score = score_breakdown.final_score as f64 / estimated_compute_units.max(1) as f64;
+    let thermal_headroom = estimate_thermal_headroom(vendor_family, memory_topology, &name_lower);
 
     GpuAdapterProfile {
         index,
@@ -345,6 +354,9 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
         memory_topology,
         compute_unit_kind,
         estimated_compute_units,
+        unit_grouping,
+        unit_perf_score,
+        thermal_headroom,
         compute_unit_source,
         compute_unit_probe_note,
         arm_shader_core_count,
@@ -355,6 +367,45 @@ fn build_profile(index: usize, adapter: &Adapter) -> GpuAdapterProfile {
         score: score_breakdown.final_score,
         score_breakdown,
     }
+}
+
+fn estimate_unit_grouping(kind: ComputeUnitKind) -> u32 {
+    match kind {
+        ComputeUnitKind::Sm => 8,
+        ComputeUnitKind::Cu => 4,
+        ComputeUnitKind::CoreCluster => 2,
+        ComputeUnitKind::Unknown => 1,
+    }
+}
+
+fn estimate_thermal_headroom(
+    vendor: VendorFamily,
+    memory_topology: MemoryTopology,
+    name_lower: &str,
+) -> f32 {
+    let topology_base: f32 = match memory_topology {
+        MemoryTopology::DiscreteVram => 0.82,
+        MemoryTopology::Unified => 0.68,
+        MemoryTopology::Virtualized => 0.46,
+        MemoryTopology::System => 0.32,
+        MemoryTopology::Unknown => 0.58,
+    };
+    let vendor_bias: f32 = match vendor {
+        VendorFamily::Arm => 0.80,
+        VendorFamily::Apple => 0.86,
+        VendorFamily::Intel => 0.92,
+        VendorFamily::Amd | VendorFamily::Nvidia => 1.0,
+        VendorFamily::Other => 0.90,
+    };
+    let mobile_bias: f32 = if name_lower.contains("mali")
+        || name_lower.contains("adreno")
+        || name_lower.contains("powervr")
+    {
+        0.78
+    } else {
+        1.0
+    };
+    (topology_base * vendor_bias * mobile_bias).clamp(0.15, 1.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

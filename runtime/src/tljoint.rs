@@ -22,6 +22,7 @@ use crate::tlscript_showcase::{
     compile_tlscript_showcase, TlscriptOverlayTileLookup, TlscriptShowcaseConfig,
     TlscriptShowcaseContactSnapshot, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
     TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlscriptTileLookup,
+    TlscriptGmsMetricSnapshot,
 };
 use crate::tlsprite::{compile_tlsprite, TlspriteDiagnosticLevel, TlspriteProgram};
 
@@ -99,6 +100,7 @@ impl TljointSceneBundle {
             controls,
             None,
             TlscriptShowcaseContactSnapshot::default(),
+            TlscriptGmsMetricSnapshot::default(),
         )
     }
 
@@ -114,6 +116,7 @@ impl TljointSceneBundle {
             controls,
             tile_lookup,
             TlscriptShowcaseContactSnapshot::default(),
+            TlscriptGmsMetricSnapshot::default(),
         )
     }
 
@@ -124,6 +127,7 @@ impl TljointSceneBundle {
         controls: TlscriptShowcaseControlInput,
         tile_lookup: Option<&dyn TlscriptTileLookup>,
         contact_snapshot: TlscriptShowcaseContactSnapshot,
+        gms_metrics: TlscriptGmsMetricSnapshot,
     ) -> TlscriptShowcaseFrameOutput {
         let mut merged = empty_frame_output();
         for (index, script) in self.scripts.iter().enumerate() {
@@ -137,6 +141,7 @@ impl TljointSceneBundle {
                 controls,
                 Some(&overlay_lookup),
                 contact_snapshot,
+                gms_metrics,
             );
             merge_frame_output(&mut merged, out, index);
         }
@@ -544,6 +549,7 @@ fn empty_frame_output() -> TlscriptShowcaseFrameOutput {
         adaptive_distance_mode: None,
         distance_blur_mode: None,
         msaa_samples: None,
+        gms_scaler: Default::default(),
         force_full_fbx_sphere: None,
         camera_move_speed: None,
         camera_look_sensitivity: None,
@@ -607,6 +613,30 @@ fn merge_frame_output(
     }
     if next.msaa_samples.is_some() {
         merged.msaa_samples = next.msaa_samples;
+    }
+    if next.gms_scaler.mode.is_some() {
+        merged.gms_scaler.mode = next.gms_scaler.mode;
+    }
+    if next.gms_scaler.target_fps.is_some() {
+        merged.gms_scaler.target_fps = next.gms_scaler.target_fps;
+    }
+    if next.gms_scaler.guardrail.is_some() {
+        merged.gms_scaler.guardrail = next.gms_scaler.guardrail;
+    }
+    if next.gms_scaler.render_budget_pct.is_some() {
+        merged.gms_scaler.render_budget_pct = next.gms_scaler.render_budget_pct;
+    }
+    if next.gms_scaler.physics_budget_pct.is_some() {
+        merged.gms_scaler.physics_budget_pct = next.gms_scaler.physics_budget_pct;
+    }
+    if next.gms_scaler.ai_ml_budget_pct.is_some() {
+        merged.gms_scaler.ai_ml_budget_pct = next.gms_scaler.ai_ml_budget_pct;
+    }
+    if next.gms_scaler.postfx_budget_pct.is_some() {
+        merged.gms_scaler.postfx_budget_pct = next.gms_scaler.postfx_budget_pct;
+    }
+    if next.gms_scaler.ui_budget_pct.is_some() {
+        merged.gms_scaler.ui_budget_pct = next.gms_scaler.ui_budget_pct;
     }
     if next.force_full_fbx_sphere.is_some() {
         merged.force_full_fbx_sphere = next.force_full_fbx_sphere;

@@ -103,7 +103,8 @@ pub use pre_alpha_loop::{
     PRE_ALPHA_PHASE_ORDER,
 };
 pub use runtime_bridge::{
-    runtime_bridge_path_from_scheduler, RuntimeBridgeConfig, RuntimeBridgeMetrics,
+    runtime_bridge_path_from_scheduler, GmsDomainBudgets, GmsGuardrailProfile, GmsScalerConfig,
+    GmsScalerDomain, GmsScalerMode, RuntimeBridgeConfig, RuntimeBridgeMetrics,
     RuntimeBridgeOrchestrator, RuntimeBridgePath, RuntimeBridgeSubmission, RuntimeBridgeTick,
     RuntimeFramePlan,
 };
@@ -158,10 +159,11 @@ pub use tlscript_parallel::{
 };
 pub use tlscript_showcase::{
     compile_tlscript_showcase, TlscriptCoordinateSpace, TlscriptGfxProfile,
-    TlscriptOverlayTileLookup, TlscriptPerformancePreset, TlscriptShowcaseCompileOutcome,
-    TlscriptShowcaseConfig, TlscriptShowcaseContactSnapshot, TlscriptShowcaseControlInput,
-    TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram,
-    TlscriptTileFill, TlscriptTileLookup, TlscriptToggleMode,
+    TlscriptGmsMetricSnapshot, TlscriptGmsScalerOverride, TlscriptOverlayTileLookup,
+    TlscriptPerformancePreset, TlscriptShowcaseCompileOutcome, TlscriptShowcaseConfig,
+    TlscriptShowcaseContactSnapshot, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
+    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlscriptTileFill, TlscriptTileLookup,
+    TlscriptToggleMode,
 };
 pub use tlsprite::{
     compile_tlsprite, compile_tlsprite_pack, compile_tlsprite_with_extra_roots, load_tlsprite_pack,

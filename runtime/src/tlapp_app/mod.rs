@@ -38,14 +38,16 @@ use crate::{
     tileline_version_entries, unpack_pak, BounceTankRuntimePatch, BounceTankSceneConfig,
     BounceTankSceneController, BounceTankTickMetrics, ChunkedTileWorld2d, DrawPathCompiler,
     FsrConfig, FsrDynamoConfig, FsrMode, FsrQualityPreset, FsrStatus, GraphicsSchedulerPath,
-    RayTracingMode, RenderSyncMode, RuntimeAdapterInfo, RuntimeBridgeConfig, RuntimeBridgeMetrics,
+    GmsGuardrailProfile, GmsScalerConfig, GmsScalerDomain, GmsScalerMode, RayTracingMode,
+    RenderSyncMode, RuntimeAdapterInfo, RuntimeBridgeConfig, RuntimeBridgeMetrics,
     RuntimeBridgeOrchestrator, RuntimeBridgePath, RuntimeBridgeTick, RuntimeFramePlan,
     RuntimeGpuBackend, RuntimeGpuDeviceType, RuntimePlatform, RuntimeSceneMode,
     SceneFrameInstances, ScenePrimitive3d, SpriteInstance, SpriteKind, TelemetryHudComposer,
     TelemetryHudSample, TickRatePolicy, TileCoord2d, TileMutation2d, TileView2d, TileWorld2dConfig,
     TileWorldFrameTelemetry, TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel,
-    TlpfileGraphicsScheduler, TlpfileSceneDimension, TlscriptOverlayTileLookup,
-    TlscriptPerformancePreset, TlscriptShowcaseConfig, TlscriptShowcaseContactSnapshot,
+    TlpfileGraphicsScheduler, TlpfileSceneDimension, TlscriptGmsMetricSnapshot,
+    TlscriptOverlayTileLookup, TlscriptPerformancePreset, TlscriptShowcaseConfig,
+    TlscriptShowcaseContactSnapshot,
     TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
     TlscriptShowcaseProgram, TlscriptTileLookup, TlscriptToggleMode, TlspriteHotReloadEvent,
     TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader, VulkanSceneRenderer,
@@ -102,6 +104,9 @@ const CONSOLE_HELP_COMMANDS: &[&str] = &[
     "help <file|gfx|sim|script|cam|log>",
     "version [module|all]",
     "status | gfx.status",
+    "gms.status | gms.mode <adaptive|fixed> | gms.target_fps <n>",
+    "gms.budget <render|physics|ai_ml|postfx|ui> <pct>",
+    "gms.guardrail <balanced|aggressive|relaxed>",
     "sim.status | sim.pause | sim.resume | sim.step <n> | sim.reset",
     "scene.mode <3d|2d>",
     "tile.status | tile.set <x y id> | tile.dig <x y> | tile.fill <x0 y0 x1 y1 id>",
@@ -603,6 +608,7 @@ mod script_runtime_tile_lookup_tests {
             TlscriptShowcaseControlInput::default(),
             Some(&runtime_lookup),
             TlscriptShowcaseContactSnapshot::default(),
+            TlscriptGmsMetricSnapshot::default(),
         );
         assert_eq!(out.patch.spawn_per_tick, Some(271));
     }
@@ -1185,6 +1191,14 @@ struct TlAppRuntime {
     pipeline_mode: PipelineMode,
     runtime_bridge: Option<RuntimeBridgeOrchestrator>,
     runtime_bridge_metrics: RuntimeBridgeMetrics,
+    gms_cli_override_mode: Option<GmsScalerMode>,
+    gms_cli_override_target_fps: Option<u32>,
+    gms_cli_override_guardrail: Option<GmsGuardrailProfile>,
+    gms_cli_override_render_budget_pct: Option<u8>,
+    gms_cli_override_physics_budget_pct: Option<u8>,
+    gms_cli_override_ai_ml_budget_pct: Option<u8>,
+    gms_cli_override_postfx_budget_pct: Option<u8>,
+    gms_cli_override_ui_budget_pct: Option<u8>,
     runtime_bridge_telemetry: RuntimeBridgeTelemetry,
     bridge_frame_counter: u64,
     adapter_backend: wgpu::Backend,
@@ -1442,6 +1456,7 @@ impl<'src> ScriptRuntime<'src> {
         controls: TlscriptShowcaseControlInput,
         tile_lookup: Option<&dyn TlscriptTileLookup>,
         contact_snapshot: TlscriptShowcaseContactSnapshot,
+        gms_metrics: TlscriptGmsMetricSnapshot,
     ) -> TlscriptShowcaseFrameOutput {
         match self {
             Self::Single(program) => program
@@ -1450,12 +1465,14 @@ impl<'src> ScriptRuntime<'src> {
                     controls,
                     tile_lookup,
                     contact_snapshot,
+                    gms_metrics,
                 ),
             Self::Joint(bundle) => bundle.evaluate_frame_with_tile_lookup_and_contacts(
                 input,
                 controls,
                 tile_lookup,
                 contact_snapshot,
+                gms_metrics,
             ),
             Self::MultiScripts(programs) => {
                 let mut merged = empty_showcase_output();
@@ -1470,6 +1487,7 @@ impl<'src> ScriptRuntime<'src> {
                         controls,
                         Some(&overlay_lookup),
                         contact_snapshot,
+                        gms_metrics,
                     );
                     merge_showcase_output(&mut merged, output, index);
                 }
@@ -1524,6 +1542,30 @@ fn merge_showcase_output(
     }
     if next.msaa_samples.is_some() {
         merged.msaa_samples = next.msaa_samples;
+    }
+    if next.gms_scaler.mode.is_some() {
+        merged.gms_scaler.mode = next.gms_scaler.mode;
+    }
+    if next.gms_scaler.target_fps.is_some() {
+        merged.gms_scaler.target_fps = next.gms_scaler.target_fps;
+    }
+    if next.gms_scaler.guardrail.is_some() {
+        merged.gms_scaler.guardrail = next.gms_scaler.guardrail;
+    }
+    if next.gms_scaler.render_budget_pct.is_some() {
+        merged.gms_scaler.render_budget_pct = next.gms_scaler.render_budget_pct;
+    }
+    if next.gms_scaler.physics_budget_pct.is_some() {
+        merged.gms_scaler.physics_budget_pct = next.gms_scaler.physics_budget_pct;
+    }
+    if next.gms_scaler.ai_ml_budget_pct.is_some() {
+        merged.gms_scaler.ai_ml_budget_pct = next.gms_scaler.ai_ml_budget_pct;
+    }
+    if next.gms_scaler.postfx_budget_pct.is_some() {
+        merged.gms_scaler.postfx_budget_pct = next.gms_scaler.postfx_budget_pct;
+    }
+    if next.gms_scaler.ui_budget_pct.is_some() {
+        merged.gms_scaler.ui_budget_pct = next.gms_scaler.ui_budget_pct;
     }
     if next.force_full_fbx_sphere.is_some() {
         merged.force_full_fbx_sphere = next.force_full_fbx_sphere;

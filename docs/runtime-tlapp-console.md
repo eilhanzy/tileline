@@ -119,6 +119,23 @@ Safety rules:
 
 These commands update live runtime state (no restart required).
 
+### GMS Scaler (`gms.*`)
+
+- `gms.status`
+- `gms.mode <adaptive|fixed>`
+- `gms.target_fps <24..480>`
+- `gms.budget <render|physics|ai_ml|postfx|ui> <pct>`
+- `gms.guardrail <balanced|aggressive|relaxed>`
+
+Runtime status output includes live scaler telemetry:
+
+- `gms_mode`
+- `gms_budgets`
+- `gms_util`
+- `gms_q`
+- `gms_ai_ml_drop`
+- `gms_reason`
+
 ### Versioning
 
 - `version` or `version all`: engine + all module versions
@@ -146,6 +163,22 @@ Useful script-side runtime queries and controls:
 - aliases: `touch_any()`, `touch_pairs()`, `touch_manifolds()`
 - `set_render_distance(v)`, `set_adaptive_distance(mode)`, `set_distance_blur(mode)`,
   `set_msaa(samples)`
+- `gms_set_mode(mode)` (`adaptive|fixed`)
+- `gms_set_target_fps(v)` (`24..480`)
+- `gms_set_budget(domain,pct)` (`render|physics|ai_ml|postfx|ui`, `0..100`)
+- `gms_set_guardrail(profile)` (`balanced|aggressive|relaxed`)
+- `gms_get_metric(name)`:
+  - `sm_cu_utilization`
+  - `lane_queue_depth`
+  - `ai_ml_drop_rate`
+  - `target_fps`
+  - `render_budget_pct|physics_budget_pct|ai_ml_budget_pct|postfx_budget_pct|ui_budget_pct`
+
+Override precedence is fixed:
+
+1. CLI override (`gms.*`)
+2. `.tlscript` runtime override (`gms_set_*`)
+3. `.tlpfile` defaults (`[gms_scaler]`)
 
 ## Examples
 
@@ -220,10 +253,30 @@ script.call set_msaa(2)
 script.exec if contact_any(): set_spawn_per_tick(contact_pairs())
 ```
 
+```text
+gms.status
+gms.mode adaptive
+gms.target_fps 60
+gms.budget physics 40
+gms.budget ai_ml 15
+gms.guardrail balanced
+```
+
+```text
+script.call gms_set_mode("fixed")
+script.call gms_set_target_fps(72)
+script.call gms_set_budget("physics", 45)
+script.call gms_set_budget("ai_ml", 12)
+script.call gms_set_guardrail("aggressive")
+script.exec if gms_get_metric("sm_cu_utilization") > 0.85: gms_set_budget("postfx", 4)
+```
+
 ## Notes
 
 - CLI script overlay strips transient camera-delta commands from persistence to avoid accidental
   continuous drift.
 - Demo scripts keep audio disabled by default; `set_audio_*` calls enable scene-side audio state.
+- `.tlpfile` project defaults can define GMS scaler baseline under `[gms_scaler]`, including
+  `mode`, `target_fps`, `min_physics_budget_pct`, and per-domain budget percentages.
 - Any statement compile/eval warnings are reported in the console output (`[tlapp console] ...`).
 - Unknown variables in `$var` expansion are fail-soft errors for that command, not hard panics.

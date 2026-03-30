@@ -23,6 +23,8 @@ pub struct SceneDispatchBridgeConfig {
     pub object_chunk_jobs: u32,
     /// Max physics jobs per submitted task descriptor.
     pub physics_chunk_jobs: u32,
+    /// Max AI/ML jobs per submitted task descriptor.
+    pub ai_ml_chunk_jobs: u32,
     /// Max UI jobs per submitted task descriptor.
     pub ui_chunk_jobs: u32,
     /// Max post-FX jobs per submitted task descriptor.
@@ -37,6 +39,7 @@ impl Default for SceneDispatchBridgeConfig {
             sampled_chunk_jobs: 256,
             object_chunk_jobs: 512,
             physics_chunk_jobs: 256,
+            ai_ml_chunk_jobs: 192,
             ui_chunk_jobs: 128,
             post_fx_chunk_jobs: 128,
             collect_receipts: false,
@@ -77,7 +80,7 @@ pub fn submit_scene_estimate_to_bridge(
 ) -> SceneDispatchSubmission {
     let mut total_submitted_tasks = 0u32;
     let mut total_jobs = 0u32;
-    let mut lanes = Vec::with_capacity(5);
+    let mut lanes = Vec::with_capacity(6);
     let mut receipts = Vec::new();
 
     let base_workgroup = Some(estimate.multi_gpu.base_workgroup_size.max(32));
@@ -133,6 +136,27 @@ pub fn submit_scene_estimate_to_bridge(
             total_jobs: estimate.multi_gpu.physics_jobs,
             chunk_jobs: config.physics_chunk_jobs,
             bytes_per_job: estimate.multi_gpu.bytes_per_physics_job,
+            cpu_priority: TaskPriority::High,
+            cpu_preference: CorePreference::Performance,
+            base_workgroup,
+            processed_texture_total: 0,
+            collect_receipts: config.collect_receipts,
+        },
+        &mut total_submitted_tasks,
+        &mut total_jobs,
+        &mut lanes,
+        &mut receipts,
+    );
+
+    submit_lane(
+        frame_loop,
+        frame_id,
+        LaneSubmitRequest {
+            kind: BridgeGpuTaskKind::AiMl,
+            routing: BridgeTaskRouting::ForcePrimaryHeavy,
+            total_jobs: estimate.multi_gpu.ai_ml_jobs,
+            chunk_jobs: config.ai_ml_chunk_jobs,
+            bytes_per_job: estimate.multi_gpu.bytes_per_ai_ml_job,
             cpu_priority: TaskPriority::High,
             cpu_preference: CorePreference::Performance,
             base_workgroup,
@@ -333,11 +357,13 @@ mod tests {
                 sampled_processing_jobs: 512,
                 object_updates: 768,
                 physics_jobs: 384,
+                ai_ml_jobs: 128,
                 ui_jobs: 64,
                 post_fx_jobs: 96,
                 bytes_per_sampled_job: 2048,
                 bytes_per_object: 256,
                 bytes_per_physics_job: 1024,
+                bytes_per_ai_ml_job: 2048,
                 bytes_per_ui_job: 512,
                 bytes_per_post_fx_job: 1024,
                 processed_texture_bytes_per_frame: 4 * 1024 * 1024,

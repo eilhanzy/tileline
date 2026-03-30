@@ -418,6 +418,161 @@ impl TlAppRuntime {
         ))
     }
 
+    pub(super) fn apply_script_gms_scaler_overrides(
+        &mut self,
+        overrides: crate::TlscriptGmsScalerOverride,
+    ) {
+        let Some(bridge) = self.runtime_bridge.as_mut() else {
+            return;
+        };
+        if bridge.path() != RuntimeBridgePath::GmsPath {
+            return;
+        }
+
+        if self.gms_cli_override_mode.is_none() {
+            if let Some(mode) = overrides.mode {
+                bridge.set_gms_mode(mode);
+            }
+        }
+        if self.gms_cli_override_target_fps.is_none() {
+            if let Some(target_fps) = overrides.target_fps {
+                bridge.set_gms_target_fps(target_fps);
+            }
+        }
+        if self.gms_cli_override_guardrail.is_none() {
+            if let Some(profile) = overrides.guardrail {
+                bridge.set_gms_guardrail(profile);
+            }
+        }
+        if self.gms_cli_override_render_budget_pct.is_none() {
+            if let Some(pct) = overrides.render_budget_pct {
+                bridge.set_gms_budget(GmsScalerDomain::Render, pct);
+            }
+        }
+        if self.gms_cli_override_physics_budget_pct.is_none() {
+            if let Some(pct) = overrides.physics_budget_pct {
+                bridge.set_gms_budget(GmsScalerDomain::Physics, pct);
+            }
+        }
+        if self.gms_cli_override_ai_ml_budget_pct.is_none() {
+            if let Some(pct) = overrides.ai_ml_budget_pct {
+                bridge.set_gms_budget(GmsScalerDomain::AiMl, pct);
+            }
+        }
+        if self.gms_cli_override_postfx_budget_pct.is_none() {
+            if let Some(pct) = overrides.postfx_budget_pct {
+                bridge.set_gms_budget(GmsScalerDomain::PostFx, pct);
+            }
+        }
+        if self.gms_cli_override_ui_budget_pct.is_none() {
+            if let Some(pct) = overrides.ui_budget_pct {
+                bridge.set_gms_budget(GmsScalerDomain::Ui, pct);
+            }
+        }
+        self.runtime_bridge_metrics = bridge.metrics();
+    }
+
+    pub(super) fn gms_status_line(&self) -> Result<String, String> {
+        let Some(bridge) = self.runtime_bridge.as_ref() else {
+            return Err("gms.status unavailable: parallel bridge is disabled (pipeline=legacy)".to_string());
+        };
+        bridge
+            .gms_status_line()
+            .ok_or_else(|| "gms.status unavailable: active bridge path is not GMS".to_string())
+    }
+
+    pub(super) fn set_gms_mode_cli_override(
+        &mut self,
+        mode: GmsScalerMode,
+    ) -> Result<String, String> {
+        let Some(bridge) = self.runtime_bridge.as_mut() else {
+            return Err("gms.mode unavailable: parallel bridge is disabled (pipeline=legacy)".to_string());
+        };
+        if bridge.path() != RuntimeBridgePath::GmsPath {
+            return Err("gms.mode unavailable: active bridge path is not GMS".to_string());
+        }
+        self.gms_cli_override_mode = Some(mode);
+        bridge.set_gms_mode(mode);
+        self.runtime_bridge_metrics = bridge.metrics();
+        Ok(format!(
+            "gms mode override set to '{}' (CLI precedence active)",
+            mode.as_str()
+        ))
+    }
+
+    pub(super) fn set_gms_target_fps_cli_override(
+        &mut self,
+        target_fps: u32,
+    ) -> Result<String, String> {
+        let Some(bridge) = self.runtime_bridge.as_mut() else {
+            return Err(
+                "gms.target_fps unavailable: parallel bridge is disabled (pipeline=legacy)"
+                    .to_string(),
+            );
+        };
+        if bridge.path() != RuntimeBridgePath::GmsPath {
+            return Err("gms.target_fps unavailable: active bridge path is not GMS".to_string());
+        }
+        let clamped = target_fps.clamp(24, 480);
+        self.gms_cli_override_target_fps = Some(clamped);
+        bridge.set_gms_target_fps(clamped);
+        self.runtime_bridge_metrics = bridge.metrics();
+        Ok(format!(
+            "gms target_fps override set to {} (CLI precedence active)",
+            clamped
+        ))
+    }
+
+    pub(super) fn set_gms_budget_cli_override(
+        &mut self,
+        domain: GmsScalerDomain,
+        pct: u8,
+    ) -> Result<String, String> {
+        let Some(bridge) = self.runtime_bridge.as_mut() else {
+            return Err("gms.budget unavailable: parallel bridge is disabled (pipeline=legacy)".to_string());
+        };
+        if bridge.path() != RuntimeBridgePath::GmsPath {
+            return Err("gms.budget unavailable: active bridge path is not GMS".to_string());
+        }
+        let clamped = pct.min(100);
+        match domain {
+            GmsScalerDomain::Render => self.gms_cli_override_render_budget_pct = Some(clamped),
+            GmsScalerDomain::Physics => self.gms_cli_override_physics_budget_pct = Some(clamped),
+            GmsScalerDomain::AiMl => self.gms_cli_override_ai_ml_budget_pct = Some(clamped),
+            GmsScalerDomain::PostFx => self.gms_cli_override_postfx_budget_pct = Some(clamped),
+            GmsScalerDomain::Ui => self.gms_cli_override_ui_budget_pct = Some(clamped),
+        }
+        bridge.set_gms_budget(domain, clamped);
+        self.runtime_bridge_metrics = bridge.metrics();
+        Ok(format!(
+            "gms budget override: {}={} (CLI precedence active)",
+            domain.as_str(),
+            clamped
+        ))
+    }
+
+    pub(super) fn set_gms_guardrail_cli_override(
+        &mut self,
+        profile: GmsGuardrailProfile,
+    ) -> Result<String, String> {
+        let Some(bridge) = self.runtime_bridge.as_mut() else {
+            return Err(
+                "gms.guardrail unavailable: parallel bridge is disabled (pipeline=legacy)"
+                    .to_string(),
+            );
+        };
+        if bridge.path() != RuntimeBridgePath::GmsPath {
+            return Err("gms.guardrail unavailable: active bridge path is not GMS".to_string());
+        }
+        self.gms_cli_override_guardrail = Some(profile);
+        bridge.set_gms_guardrail(profile);
+        self.runtime_bridge_metrics = bridge.metrics();
+        Ok(format!(
+            "gms guardrail override set to '{}' (CLI precedence active)",
+            profile.as_str()
+        ))
+    }
+
     pub(super) fn apply_performance_contract_preset(
         &mut self,
         scenario: PerformanceContractScenario,

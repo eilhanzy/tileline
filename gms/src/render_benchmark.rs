@@ -681,11 +681,13 @@ fn build_multi_gpu_workload_request(
         sampled_processing_jobs: (pixels / 2048).clamp(128, 8192) as u32,
         object_updates: (pixels / 1024).clamp(256, 16384) as u32,
         physics_jobs: (pixels / 3072).clamp(64, 4096) as u32,
+        ai_ml_jobs: (pixels / 4096).clamp(32, 3072) as u32,
         ui_jobs: (pixels / 8192).clamp(16, 1024) as u32,
         post_fx_jobs: (pixels / 6144).clamp(32, 2048) as u32,
         bytes_per_sampled_job: 4096,
         bytes_per_object: 256,
         bytes_per_physics_job: 1024,
+        bytes_per_ai_ml_job: 2048,
         bytes_per_ui_job: 512,
         bytes_per_post_fx_job: 1024,
         processed_texture_bytes_per_frame: pixels

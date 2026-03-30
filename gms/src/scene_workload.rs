@@ -45,6 +45,8 @@ pub struct SceneWorkloadTuning {
     pub physics_jobs_per_dynamic_body: f64,
     /// Physics jobs per estimated contact.
     pub physics_jobs_per_contact: f64,
+    /// AI/ML jobs per dynamic body.
+    pub ai_ml_jobs_per_dynamic_body: f64,
     /// UI jobs per sprite.
     pub ui_jobs_per_sprite: f64,
     /// Post-FX jobs per transparent instance.
@@ -64,6 +66,7 @@ impl Default for SceneWorkloadTuning {
             object_jobs_per_dynamic_body: 1.75,
             physics_jobs_per_dynamic_body: 2.10,
             physics_jobs_per_contact: 1.20,
+            ai_ml_jobs_per_dynamic_body: 0.85,
             ui_jobs_per_sprite: 0.25,
             post_fx_jobs_per_transparent: 1.10,
             base_workgroup_size: 64,
@@ -129,6 +132,11 @@ pub fn estimate_scene_workload(
         32,
         65_535,
     );
+    let ai_ml_jobs = clamp_u32(
+        dynamic_bodies * tuning.ai_ml_jobs_per_dynamic_body + contacts * 0.18 + 8.0,
+        8,
+        32_768,
+    );
     let ui_jobs = clamp_u32(sprites * tuning.ui_jobs_per_sprite + 8.0, 8, 8_192);
     let post_fx_jobs = clamp_u32(
         transparent * tuning.post_fx_jobs_per_transparent + (pixels as f64 / 10_240.0),
@@ -153,6 +161,10 @@ pub fn estimate_scene_workload(
         (estimated_frame_bytes / ui_jobs.max(1) as u64).clamp(256, 2_048),
         256,
     );
+    let ai_ml_bytes = round_up_u64(
+        (estimated_frame_bytes / ai_ml_jobs.max(1) as u64).clamp(512, 12_288),
+        256,
+    );
     let post_fx_bytes = round_up_u64(
         (estimated_frame_bytes / post_fx_jobs.max(1) as u64).clamp(512, 6_144),
         256,
@@ -165,8 +177,12 @@ pub fn estimate_scene_workload(
     );
 
     let single_gpu = WorkloadRequest {
-        object_updates: object_updates.saturating_add(ui_jobs / 2),
-        physics_jobs: physics_jobs.saturating_add(post_fx_jobs / 3),
+        object_updates: object_updates
+            .saturating_add(ui_jobs / 2)
+            .saturating_add(ai_ml_jobs / 3),
+        physics_jobs: physics_jobs
+            .saturating_add(post_fx_jobs / 3)
+            .saturating_add(ai_ml_jobs / 2),
         bytes_per_object: object_bytes,
         bytes_per_physics_job: physics_bytes,
         base_workgroup_size,
@@ -176,11 +192,13 @@ pub fn estimate_scene_workload(
         sampled_processing_jobs,
         object_updates,
         physics_jobs,
+        ai_ml_jobs,
         ui_jobs,
         post_fx_jobs,
         bytes_per_sampled_job: sampled_bytes,
         bytes_per_object: object_bytes,
         bytes_per_physics_job: physics_bytes,
+        bytes_per_ai_ml_job: ai_ml_bytes,
         bytes_per_ui_job: ui_bytes,
         bytes_per_post_fx_job: post_fx_bytes,
         processed_texture_bytes_per_frame: round_up_u64(
@@ -288,6 +306,7 @@ mod tests {
         assert!(high.complexity_score > low.complexity_score);
         assert!(high.multi_gpu.sampled_processing_jobs > low.multi_gpu.sampled_processing_jobs);
         assert!(high.multi_gpu.physics_jobs > low.multi_gpu.physics_jobs);
+        assert!(high.multi_gpu.ai_ml_jobs > low.multi_gpu.ai_ml_jobs);
         assert!(high.single_gpu.object_updates >= low.single_gpu.object_updates);
     }
 

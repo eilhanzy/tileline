@@ -230,6 +230,15 @@ impl TlAppRuntime {
                 contact_manifolds: narrowphase.manifolds,
             }
         };
+        let gms_config = self.runtime_bridge.as_ref().map(|bridge| bridge.gms_scaler_config());
+        let gms_metrics = TlscriptGmsMetricSnapshot {
+            mode: self.runtime_bridge_metrics.gms_mode,
+            target_fps: gms_config.map(|cfg| cfg.target_fps),
+            domain_budgets: self.runtime_bridge_metrics.domain_budgets,
+            sm_cu_utilization: self.runtime_bridge_metrics.sm_cu_utilization,
+            lane_queue_depth: self.runtime_bridge_metrics.lane_queue_depth,
+            ai_ml_drop_rate: self.runtime_bridge_metrics.ai_ml_drop_rate,
+        };
         let tile_lookup = |x: i32, y: i32| self.tile_world_2d.tile(TileCoord2d::new(x, y));
         let mut frame_eval = self.script_runtime.evaluate_frame(
             TlscriptShowcaseFrameInput {
@@ -241,6 +250,7 @@ impl TlAppRuntime {
             script_camera_input,
             Some(&tile_lookup),
             contact_snapshot,
+            gms_metrics,
         );
         if !self.console.script_statements.is_empty() {
             merge_showcase_output(
@@ -280,6 +290,7 @@ impl TlAppRuntime {
                 "off".to_string()
             };
         }
+        self.apply_script_gms_scaler_overrides(frame_eval.gms_scaler);
 
         if let Some(preset) = frame_eval.performance_preset {
             let scenario = match preset {
@@ -1167,8 +1178,32 @@ impl TlAppRuntime {
                 self.frame_time_jitter_ema_ms,
                 self.runtime_bridge_telemetry.physics_lag_frames,
             );
+            let gms_mode_label = self
+                .runtime_bridge_metrics
+                .gms_mode
+                .map(|mode| mode.as_str())
+                .unwrap_or("n/a");
+            let gms_budget_label = self
+                .runtime_bridge_metrics
+                .domain_budgets
+                .map(|budgets| {
+                    format!(
+                        "r{}-p{}-a{}-x{}-u{}",
+                        budgets.render_budget_pct,
+                        budgets.physics_budget_pct,
+                        budgets.ai_ml_budget_pct,
+                        budgets.postfx_budget_pct,
+                        budgets.ui_budget_pct
+                    )
+                })
+                .unwrap_or_else(|| "n/a".to_string());
+            let gms_reason_label = self
+                .runtime_bridge_metrics
+                .fallback_reason
+                .as_deref()
+                .unwrap_or("none");
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | scene_mode: {} | balls: {:>5} | draw: {:>5} | tiles_draw: {:>5} | tiles_vis: {:>5} | tiles_culled: {:>5} | tile_chunks: {:>4} | tile_dirty: {:>4} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | contract: {}:{} stable={} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | phys_workers: {} | phys_queue: {} | phys_inflight: {} | phys_frame: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | render_backend: {} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {} | pipeline: {} | bridge_path: {} | queued_plan_depth: {} | bridge_pump_published: {} | bridge_pump_drained: {} | physics_lag_frames: {} | bridge_fallback: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | scene_mode: {} | balls: {:>5} | draw: {:>5} | tiles_draw: {:>5} | tiles_vis: {:>5} | tiles_culled: {:>5} | tile_chunks: {:>4} | tile_dirty: {:>4} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | contract: {}:{} stable={} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | phys_workers: {} | phys_queue: {} | phys_inflight: {} | phys_frame: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | render_backend: {} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {} | pipeline: {} | bridge_path: {} | queued_plan_depth: {} | bridge_pump_published: {} | bridge_pump_drained: {} | physics_lag_frames: {} | bridge_fallback: {} | gms_mode: {} | gms_budget: {} | gms_util: {:>4.2} | gms_q: {} | gms_ai_ml_drop: {:>4.3} | gms_reason: {}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
@@ -1243,6 +1278,12 @@ impl TlAppRuntime {
                 self.runtime_bridge_telemetry.bridge_pump_drained,
                 self.runtime_bridge_telemetry.physics_lag_frames,
                 self.runtime_bridge_telemetry.used_fallback_plan,
+                gms_mode_label,
+                gms_budget_label,
+                self.runtime_bridge_metrics.sm_cu_utilization,
+                self.runtime_bridge_metrics.lane_queue_depth,
+                self.runtime_bridge_metrics.ai_ml_drop_rate,
+                gms_reason_label,
             );
         }
 

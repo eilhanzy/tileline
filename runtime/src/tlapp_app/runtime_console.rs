@@ -755,8 +755,32 @@ impl TlAppRuntime {
             .as_ref()
             .map(|w| w.path.display().to_string())
             .unwrap_or_else(|| "off".to_string());
+        let gms_mode = self
+            .runtime_bridge_metrics
+            .gms_mode
+            .map(|mode| mode.as_str().to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        let gms_budgets = self
+            .runtime_bridge_metrics
+            .domain_budgets
+            .map(|budgets| {
+                format!(
+                    "r{} p{} a{} x{} u{}",
+                    budgets.render_budget_pct,
+                    budgets.physics_budget_pct,
+                    budgets.ai_ml_budget_pct,
+                    budgets.postfx_budget_pct,
+                    budgets.ui_budget_pct
+                )
+            })
+            .unwrap_or_else(|| "n/a".to_string());
+        let gms_reason = self
+            .runtime_bridge_metrics
+            .fallback_reason
+            .as_deref()
+            .unwrap_or("none");
         format!(
-            "scene_mode={} tile[chunks={} dirty={} vis={} draw={} cull={}] pipeline={} bridge_path={} queued_plan_depth={} bridge_pump_published={} bridge_pump_drained={} physics_lag_frames={} bridge_fallback={} fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={} {}",
+            "scene_mode={} tile[chunks={} dirty={} vis={} draw={} cull={}] pipeline={} bridge_path={} queued_plan_depth={} bridge_pump_published={} bridge_pump_drained={} physics_lag_frames={} bridge_fallback={} gms_mode={} gms_budgets={} gms_util={:.2} gms_q={} gms_ai_ml_drop={:.3} gms_reason={} fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={} {}",
             self.scene_mode().as_str(),
             self.tile_world_frame.loaded_chunks,
             self.tile_world_frame.dirty_chunks,
@@ -770,6 +794,12 @@ impl TlAppRuntime {
             self.runtime_bridge_telemetry.bridge_pump_drained,
             self.runtime_bridge_telemetry.physics_lag_frames,
             self.runtime_bridge_telemetry.used_fallback_plan,
+            gms_mode,
+            gms_budgets,
+            self.runtime_bridge_metrics.sm_cu_utilization,
+            self.runtime_bridge_metrics.lane_queue_depth,
+            self.runtime_bridge_metrics.ai_ml_drop_rate,
+            gms_reason,
             self.present_mode,
             self.rt_mode,
             if rt.active { "on" } else { "off" },
@@ -888,6 +918,15 @@ impl TlAppRuntime {
                 contact_manifolds: narrowphase.manifolds,
             }
         };
+        let gms_config = self.runtime_bridge.as_ref().map(|bridge| bridge.gms_scaler_config());
+        let gms_metrics = TlscriptGmsMetricSnapshot {
+            mode: self.runtime_bridge_metrics.gms_mode,
+            target_fps: gms_config.map(|cfg| cfg.target_fps),
+            domain_budgets: self.runtime_bridge_metrics.domain_budgets,
+            sm_cu_utilization: self.runtime_bridge_metrics.sm_cu_utilization,
+            lane_queue_depth: self.runtime_bridge_metrics.lane_queue_depth,
+            ai_ml_drop_rate: self.runtime_bridge_metrics.ai_ml_drop_rate,
+        };
         let mut output = if let Some(tile_lookup) = tile_lookup {
             program.evaluate_frame_with_controls_and_tile_lookup_and_contacts(
                 TlscriptShowcaseFrameInput {
@@ -899,6 +938,7 @@ impl TlAppRuntime {
                 TlscriptShowcaseControlInput::default(),
                 Some(tile_lookup),
                 contact_snapshot,
+                gms_metrics,
             )
         } else {
             let runtime_tile_lookup =
@@ -913,6 +953,7 @@ impl TlAppRuntime {
                 TlscriptShowcaseControlInput::default(),
                 Some(&runtime_tile_lookup),
                 contact_snapshot,
+                gms_metrics,
             )
         };
         if !compile.warnings.is_empty() {
@@ -1041,6 +1082,13 @@ impl TlAppRuntime {
                             "gfx.adaptive_distance <auto|on|off>",
                             "gfx.distance_blur <auto|on|off>",
                         ]),
+                        "gms" => Some(vec![
+                            "gms.status",
+                            "gms.mode <adaptive|fixed>",
+                            "gms.target_fps <n>",
+                            "gms.budget <render|physics|ai_ml|postfx|ui> <pct>",
+                            "gms.guardrail <balanced|aggressive|relaxed>",
+                        ]),
                         "sim" => Some(vec![
                             "sim.status",
                             "sim.pause",
@@ -1087,7 +1135,7 @@ impl TlAppRuntime {
                         }
                     } else {
                         self.console_feedback(
-                            "unknown help topic (use: file|gfx|sim|script|cam|log)",
+                            "unknown help topic (use: file|gfx|gms|sim|script|cam|log)",
                         );
                     }
                 } else {
@@ -1114,6 +1162,91 @@ impl TlAppRuntime {
             }
             "status" | "gfx.status" => {
                 self.console_feedback(self.console_status_line());
+            }
+            "gms.status" => match self.gms_status_line() {
+                Ok(line) => self.console_feedback(line),
+                Err(err) => self.console_feedback(err),
+            },
+            "gms.mode" => {
+                let Some(raw_mode) = parts.next() else {
+                    self.console_feedback("usage: gms.mode <adaptive|fixed>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(mode) = GmsScalerMode::parse(raw_mode) else {
+                    self.console_feedback("usage: gms.mode <adaptive|fixed>");
+                    return RuntimeCommand::Consumed;
+                };
+                match self.set_gms_mode_cli_override(mode) {
+                    Ok(note) => self.console_feedback(note),
+                    Err(err) => self.console_feedback(err),
+                }
+            }
+            "gms.target_fps" => {
+                let Some(raw_target) = parts.next() else {
+                    self.console_feedback("usage: gms.target_fps <24..480>");
+                    return RuntimeCommand::Consumed;
+                };
+                let target = match parse_console_u32_in_range(
+                    raw_target,
+                    "gms.target_fps",
+                    24,
+                    480,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                match self.set_gms_target_fps_cli_override(target) {
+                    Ok(note) => self.console_feedback(note),
+                    Err(err) => self.console_feedback(err),
+                }
+            }
+            "gms.budget" => {
+                let Some(raw_domain) = parts.next() else {
+                    self.console_feedback(
+                        "usage: gms.budget <render|physics|ai_ml|postfx|ui> <pct>",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(raw_pct) = parts.next() else {
+                    self.console_feedback(
+                        "usage: gms.budget <render|physics|ai_ml|postfx|ui> <pct>",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(domain) = GmsScalerDomain::parse(raw_domain) else {
+                    self.console_feedback(
+                        "invalid domain (expected render|physics|ai_ml|postfx|ui)",
+                    );
+                    return RuntimeCommand::Consumed;
+                };
+                let pct = match parse_console_u32_in_range(raw_pct, "gms.budget", 0, 100) {
+                    Ok(value) => value as u8,
+                    Err(err) => {
+                        self.console_feedback(err);
+                        return RuntimeCommand::Consumed;
+                    }
+                };
+                match self.set_gms_budget_cli_override(domain, pct) {
+                    Ok(note) => self.console_feedback(note),
+                    Err(err) => self.console_feedback(err),
+                }
+            }
+            "gms.guardrail" => {
+                let Some(raw_profile) = parts.next() else {
+                    self.console_feedback("usage: gms.guardrail <balanced|aggressive|relaxed>");
+                    return RuntimeCommand::Consumed;
+                };
+                let Some(profile) = GmsGuardrailProfile::parse(raw_profile) else {
+                    self.console_feedback("usage: gms.guardrail <balanced|aggressive|relaxed>");
+                    return RuntimeCommand::Consumed;
+                };
+                match self.set_gms_guardrail_cli_override(profile) {
+                    Ok(note) => self.console_feedback(note),
+                    Err(err) => self.console_feedback(err),
+                }
             }
             "sim.status" => {
                 self.console_feedback(format!(

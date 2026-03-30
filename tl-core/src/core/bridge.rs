@@ -46,6 +46,8 @@ pub enum BridgeGpuTaskKind {
     SampledMesh,
     /// 3D object updates (transforms, culling metadata, skinning metadata packing).
     ObjectUpdate,
+    /// AI/ML lane (inference, gameplay model evaluation, utility kernels).
+    AiMl,
     /// Latency-sensitive UI composition work.
     Ui,
     /// Latency-sensitive post-processing/composition work.
@@ -219,11 +221,13 @@ struct FrameAccumulator {
     sampled_processing_jobs: u32,
     object_updates: u32,
     physics_jobs: u32,
+    ai_ml_jobs: u32,
     ui_jobs: u32,
     post_fx_jobs: u32,
     sampled_bytes: u64,
     object_bytes: u64,
     physics_bytes: u64,
+    ai_ml_bytes: u64,
     ui_bytes: u64,
     post_fx_bytes: u64,
     processed_texture_bytes_per_frame: u64,
@@ -240,11 +244,13 @@ impl FrameAccumulator {
             sampled_processing_jobs: 0,
             object_updates: 0,
             physics_jobs: 0,
+            ai_ml_jobs: 0,
             ui_jobs: 0,
             post_fx_jobs: 0,
             sampled_bytes: 0,
             object_bytes: 0,
             physics_bytes: 0,
+            ai_ml_bytes: 0,
             ui_bytes: 0,
             post_fx_bytes: 0,
             processed_texture_bytes_per_frame: 0,
@@ -280,6 +286,10 @@ impl FrameAccumulator {
                 self.physics_jobs = self.physics_jobs.saturating_add(jobs);
                 self.physics_bytes = self.physics_bytes.saturating_add(bytes);
             }
+            TaskClass::AiMl => {
+                self.ai_ml_jobs = self.ai_ml_jobs.saturating_add(jobs);
+                self.ai_ml_bytes = self.ai_ml_bytes.saturating_add(bytes);
+            }
             TaskClass::Ui => {
                 self.ui_jobs = self.ui_jobs.saturating_add(jobs);
                 self.ui_bytes = self.ui_bytes.saturating_add(bytes);
@@ -295,18 +305,25 @@ impl FrameAccumulator {
         self.sampled_processing_jobs == 0
             && self.object_updates == 0
             && self.physics_jobs == 0
+            && self.ai_ml_jobs == 0
             && self.ui_jobs == 0
             && self.post_fx_jobs == 0
     }
 
     fn to_single_gpu_request(&self) -> WorkloadRequest {
+        let object_jobs = self.object_updates.saturating_add(self.ai_ml_jobs / 2);
+        let physics_jobs = self.physics_jobs.saturating_add(self.ai_ml_jobs / 2);
         WorkloadRequest {
-            object_updates: self.object_updates,
-            physics_jobs: self.physics_jobs,
-            bytes_per_object: average_bytes_per_job(self.object_bytes, self.object_updates, 256),
+            object_updates: object_jobs,
+            physics_jobs,
+            bytes_per_object: average_bytes_per_job(
+                self.object_bytes.saturating_add(self.ai_ml_bytes / 2),
+                object_jobs,
+                256,
+            ),
             bytes_per_physics_job: average_bytes_per_job(
-                self.physics_bytes,
-                self.physics_jobs,
+                self.physics_bytes.saturating_add(self.ai_ml_bytes / 2),
+                physics_jobs,
                 1024,
             ),
             base_workgroup_size: self.base_workgroup_size,
@@ -318,6 +335,7 @@ impl FrameAccumulator {
             sampled_processing_jobs: self.sampled_processing_jobs,
             object_updates: self.object_updates,
             physics_jobs: self.physics_jobs,
+            ai_ml_jobs: self.ai_ml_jobs,
             ui_jobs: self.ui_jobs,
             post_fx_jobs: self.post_fx_jobs,
             bytes_per_sampled_job: average_bytes_per_job(
@@ -331,6 +349,7 @@ impl FrameAccumulator {
                 self.physics_jobs,
                 1024,
             ),
+            bytes_per_ai_ml_job: average_bytes_per_job(self.ai_ml_bytes, self.ai_ml_jobs, 2048),
             bytes_per_ui_job: average_bytes_per_job(self.ui_bytes, self.ui_jobs, 512),
             bytes_per_post_fx_job: average_bytes_per_job(
                 self.post_fx_bytes,
@@ -770,6 +789,7 @@ fn effective_task_class(descriptor: BridgeTaskDescriptor) -> TaskClass {
         }
         BridgeGpuTaskKind::SampledMesh => TaskClass::SampledProcessing,
         BridgeGpuTaskKind::ObjectUpdate => TaskClass::ObjectUpdate,
+        BridgeGpuTaskKind::AiMl => TaskClass::AiMl,
         BridgeGpuTaskKind::Ui => TaskClass::Ui,
         BridgeGpuTaskKind::PostFx => TaskClass::PostFx,
         BridgeGpuTaskKind::Custom(class) => class,
@@ -782,12 +802,13 @@ fn effective_task_class(descriptor: BridgeTaskDescriptor) -> TaskClass {
             // them in the planner's asymmetry pass.
             TaskClass::Ui => TaskClass::ObjectUpdate,
             TaskClass::PostFx => TaskClass::SampledProcessing,
+            TaskClass::AiMl => TaskClass::SampledProcessing,
             other => other,
         },
         BridgeTaskRouting::ForceSecondaryLatency => match base {
             // Reclassify heavy tasks into latency lanes when the caller explicitly wants helper-GPU
             // overlap. UI vs Post-FX split is chosen by data size (texture-heavy -> Post-FX).
-            TaskClass::SampledProcessing | TaskClass::Physics => {
+            TaskClass::SampledProcessing | TaskClass::Physics | TaskClass::AiMl => {
                 if descriptor.processed_texture_bytes > 0 {
                     TaskClass::PostFx
                 } else {

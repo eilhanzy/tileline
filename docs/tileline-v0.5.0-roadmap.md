@@ -40,6 +40,8 @@ features**, not on inventing entirely new subsystems.
 - a more aggressively parallel ParadoxPE execution model
 - a runtime MAS path (`runtime/src/mas.rs`) aligned with MPS scheduling ownership
 - a stricter MPS-driven runtime execution path with fewer serial bottlenecks
+- a full-stack `GMS Native SM/CU Scaler` path (`gms -> tl-core -> runtime -> tlapp`) with
+  `render|physics|ai_ml|postfx|ui` domains and adaptive guardrails
 - a Linux-first raw Vulkan backend inside `tl-core`
 - no shipping runtime dependence on `Bevy` scheduling/tasks
 - no hot-path runtime/physics dependence on `rayon`
@@ -65,6 +67,11 @@ These are intentionally out of scope for `v0.5.0`:
 - the Vulkan backend migration path inside `tl-core` is real and no longer speculative
 - ParadoxPE no longer depends on coarse serial stepping in its main hot path
 - MPS is the primary CPU execution path for physics/runtime jobs
+- GMS Native SM/CU scaler is active in shipping path with deterministic budget clamps and guardrails
+- GMS control surface works end-to-end with precedence:
+  - CLI override
+  - `.tlscript` runtime override
+  - `.tlpfile` defaults
 - MAS is integrated as a runtime-owned audio path without destabilizing physics/render pacing
 - no `Bevy App/System/bevy_tasks` dependence exists in shipping runtime execution
 - no `rayon` dependence remains in shipping hot paths for physics/runtime scheduling
@@ -311,7 +318,7 @@ Acceptance gates:
 - runtime performance no longer depends on general-purpose task stealing behavior
 - overlap path is not just present but measurably useful
 
-## Workstream E: Rayon / Bevy / WGPU Independence
+## Workstream E: GMS Native SM/CU Scaler + Rayon / Bevy / WGPU Independence
 
 This is a hard release theme, not a stretch goal.
 
@@ -321,7 +328,8 @@ Current status from dependency + codepath audit:
 
 - `E1` Bevy independence: strong progress.
 - `E2` Rayon independence: active migration.
-- `E3` WGPU independence: partial; dual-path period still ongoing.
+- `E3` GMS Native SM/CU scaler: baseline integration active, calibration and validation ongoing.
+- `E4` WGPU independence: partial; dual-path period still ongoing.
 
 Measured findings:
 
@@ -355,13 +363,16 @@ Immediate execution order (Workstream E Sprint-1):
   `capture_snapshot`, `integrate_with_shards`)
 - `E2-S2`: done in this pass; runtime `rayon` global pool bootstrap removed
 - `E2-S3`: done in this pass; MGS zram migrated and workspace-level `rayon` dependency removed
-- `E3-S1`: keep dual renderer during migration, but mark Vulkan as primary shipping path and gate
+- `E3-S1`: baseline GMS scaler lane controls (`render|physics|ai_ml|postfx|ui`) + guardrail
+  policy + telemetry wiring
+- `E3-S2`: full precedence contract (`CLI > .tlscript > .tlpfile`) and soak/benchmark tuning
+- `E4-S1`: keep dual renderer during migration, but mark Vulkan as primary shipping path and gate
   all new render features behind Vulkan backend ownership
-- `E3-S2`: move bridge/sync public surfaces from `wgpu` submission handles to backend-neutral frame
+- `E4-S2`: move bridge/sync public surfaces from `wgpu` submission handles to backend-neutral frame
   tickets everywhere
-- `E3-S2`: partial in this pass; scheduler-path policy and project scheduler resolution now consume
+- `E4-S2`: partial in this pass; scheduler-path policy and project scheduler resolution now consume
   backend-neutral adapter metadata (`RuntimeAdapterInfo`) instead of raw `wgpu::AdapterInfo`
-- `E3-S3`: final audited dependency cleanup patch removing `wgpu` + `egui-wgpu` from shipping
+- `E4-S3`: final audited dependency cleanup patch removing `wgpu` + `egui-wgpu` from shipping
   runtime crates once Vulkan path passes release validation gates
 
 ### E1. Bevy Independence
@@ -400,7 +411,61 @@ Status:
 - done for current shipping hot paths (runtime + ParadoxPE + MGS zram)
 - keep regression validation open during Vulkan cutover and next perf pass
 
-### E3. WGPU Independence
+### E3. GMS Native SM/CU Scaler + Independence Cutover
+
+Target work:
+
+- expand GMS device profiling to SM/CU-level metadata:
+  - `unit_count`
+  - `unit_kind`
+  - `unit_grouping`
+  - `unit_perf_score`
+  - `thermal_headroom`
+- lock lane/domain model:
+  - `render`
+  - `physics`
+  - `ai_ml`
+  - `postfx`
+  - `ui`
+- keep N/N+1 overlap intact:
+  - Render `N`
+  - Physics + AI/ML planning `N+1`
+  - atomic frame-ticket publish
+- enforce adaptive guardrails:
+  - minimum physics budget preserved
+  - on frame spike: trim `postfx` first, then `ai_ml`
+  - prefer quality reduction before determinism loss
+- support primary-present + secondary-work lane normalization on MultiGPU;
+  fail-soft to single-GPU with `fallback_reason` when required capabilities are absent
+- expose controls in all three canonical surfaces:
+  - `.tlpfile` `[gms_scaler]`
+  - runtime CLI (`gms.*`)
+  - `.tlscript` built-ins (`gms_set_*`, `gms_get_metric`)
+
+Required telemetry:
+
+- `gms_mode`
+- `domain_budgets`
+- `sm_cu_utilization`
+- `lane_queue_depth`
+- `physics_lag_frames`
+- `ai_ml_drop_rate`
+- `fallback_reason`
+
+Acceptance gate:
+
+- SM/CU budget distribution remains deterministic under fixed inputs
+- no domain starvation under sustained load
+- overlap path remains race-safe and diagnosable
+- control-surface precedence is enforced:
+  - `CLI > .tlscript > .tlpfile`
+- strict gate proves no shipping path dependence on `wgpu` / `bevy` / `rayon`
+
+Status:
+
+- in progress (baseline wiring is active; calibration + gate validation pending)
+
+### E4. WGPU Independence
 
 Target work:
 
@@ -449,6 +514,7 @@ Exit criteria:
 Target contents:
 
 - stronger MPS dispatch ownership in runtime
+- GMS Native SM/CU scaler stabilization and guardrail tuning
 - MAS (`runtime/src/mas.rs`) promoted as Multi Audio Synthesizer runtime path with MPS-aligned scheduling
 - ParadoxPE phase refactor and lower serial world-step fraction
 - `rayon` hot-path exit
