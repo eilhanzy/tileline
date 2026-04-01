@@ -4621,6 +4621,7 @@ dependencies = [
  "gms",
  "mgs",
  "mps",
+ "nalgebra",
  "paradoxpe",
  "wasm-encoder 0.224.1",
  "wgpu 28.0.0",

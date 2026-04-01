@@ -1,5 +1,7 @@
 # Tileline v0.5.0 Roadmap
 
+Codename: `Heimdall Update`
+
 This document defines the target scope for `v0.5.0`.
 
 `v0.5.0` is not intended to be a cosmetic release. It is the release where Tileline should stop
@@ -35,11 +37,16 @@ features**, not on inventing entirely new subsystems.
 
 - an optimized forward + hybrid RT render path that is stable in the runtime
 - a usable effects layer on top of the current shader/light stack
+- a bounded reflection path with clear fallback behavior
 - first-class texture support in the runtime scene/material path
+- texture-pack aware asset loading for canonical runtime content
 - a first-class SPIR-V shader path for the raw Vulkan backend
+- a `Tilecraft` development starter path built on canonical runtime content loading
 - a more aggressively parallel ParadoxPE execution model
+- a ParadoxPE GPU compute foundation with fail-soft CPU fallback
 - a runtime MAS path (`runtime/src/mas.rs`) aligned with MPS scheduling ownership
 - a stricter MPS-driven runtime execution path with fewer serial bottlenecks
+- an optional `Heimdall` ultra-aggressive performance profile for MPS/GMS/MGS tuning
 - a full-stack `GMS Native SM/CU Scaler` path (`gms -> tl-core -> runtime -> tlapp`) with
   `render|physics|ai_ml|postfx|ui` domains and adaptive guardrails
 - a Linux-first raw Vulkan backend inside `tl-core`
@@ -63,10 +70,17 @@ These are intentionally out of scope for `v0.5.0`:
 
 - RT can be enabled without destabilizing the main runtime path
 - lights, shaders, textures, and effects all work together in the same scene path
+- reflection can be enabled on supported paths and degrades cleanly when budgets are exceeded
+- texture pack selection/loading works through the canonical runtime asset path
 - SPIR-V is a supported, documented shader/runtime artifact path for Vulkan scene rendering
 - the Vulkan backend migration path inside `tl-core` is real and no longer speculative
+- `Tilecraft` development can start on top of supported engine/runtime content paths instead of
+  bespoke example glue
 - ParadoxPE no longer depends on coarse serial stepping in its main hot path
+- ParadoxPE can route supported phases through an engine-owned GPU compute backend without
+  destabilizing CPU fallback behavior
 - MPS is the primary CPU execution path for physics/runtime jobs
+- `Heimdall` profile exists as an explicit opt-in tuning mode with thermal/power caveats documented
 - GMS Native SM/CU scaler is active in shipping path with deterministic budget clamps and guardrails
 - GMS control surface works end-to-end with precedence:
   - CLI override
@@ -85,6 +99,31 @@ These are intentionally out of scope for `v0.5.0`:
 - canonical document: `docs/tileline-v0.4.5-roadmap.md`
 - `v0.5.0` now focuses on render optimization, effects/textures, ParadoxPE + MPS revision, and
   dependency independence (`rayon` / `bevy` / `wgpu`)
+
+## Heimdall Checklist Alignment
+
+The `Heimdall Update` checklist for `v0.5.0` maps to this roadmap as follows:
+
+- `Tilecraft development starter`:
+  - `Workstream B4`
+- `Effect support`:
+  - `Workstream B1`
+- `Reflection`:
+  - `Workstream A5`
+- `Texture pack support`:
+  - `Workstream B3`
+- `Heimdall` ultra-aggressive performance mode:
+  - `Workstream D3`
+- `Rayon` / `Bevy` exit:
+  - `Workstream E1` + `Workstream E2`
+- `WGPU` exit:
+  - `Workstream E4`
+- `FX / graphics improvement`:
+  - `Workstream A3` + `Workstream A5` + `Workstream B1`
+- `SPIR-V support`:
+  - `Workstream A2` + `Workstream A4`
+- `CU / SM parallelism (MPS-derived system)`:
+  - `Workstream E3`
 
 ## Workstream A: Render Stack Optimization
 
@@ -201,6 +240,23 @@ Acceptance gates:
 - secondary GPU planning remains a first-class migration concern instead of being deferred away
 - the migration path away from `wgpu` is documented, incremental, and testable
 
+### A5. Reflection And Graphics Polish
+
+Target work:
+
+- stabilize reflection quality/cost across forward + hybrid RT paths
+- keep reflection as an optional effect with explicit fallback to non-reflective lighting/material
+  behavior
+- improve general scene polish:
+  - better material readability
+  - tighter post-FX defaults
+  - fewer visually noisy transitions under load
+
+Acceptance gates:
+
+- reflections do not destabilize the main runtime path
+- graphics polish changes remain budget-aware and diagnosable from telemetry
+
 ## Workstream B: Effects And Texture Support
 
 This is the main content-facing feature gap for `v0.5.0`.
@@ -243,6 +299,38 @@ Acceptance gates:
 
 - textured scene objects render through the canonical runtime path
 - missing textures fall back safely and visibly
+
+### B3. Texture Pack Support
+
+Target scope:
+
+- define a runtime-owned texture-pack mounting/selection path
+- allow scene/material content to resolve through a chosen texture pack without example-only glue
+- keep asset fallback rules explicit when a pack is incomplete or incompatible
+
+Rules:
+
+- texture-pack selection must remain deterministic
+- missing pack entries must fail soft to default textures/materials
+
+Acceptance gates:
+
+- a selected texture pack changes runtime-visible scene content through supported APIs
+- incomplete packs do not crash or corrupt the scene path
+
+### B4. Tilecraft Development Starter
+
+Target scope:
+
+- establish a canonical starter path for building `Tilecraft` content on top of Tileline runtime
+- ensure starter scenes/assets use `.tlpfile` / `.tljoint` / `.tlscript` / `.tlsprite`
+  composition instead of bespoke example glue
+- keep this scoped to development bootstrap, not a full gameplay release
+
+Acceptance gates:
+
+- `Tilecraft` starter content can boot through the canonical runtime path
+- asset/loading expectations are documented clearly enough to begin game-side development
 
 ## Workstream C: ParadoxPE Revision
 
@@ -291,6 +379,29 @@ Acceptance gates:
 - heavy physics load is diagnosable from logs/telemetry
 - no hidden serial bottleneck dominates the entire simulation
 
+### C4. GPU Compute Foundation
+
+Target work:
+
+- add a ParadoxPE-owned compute backend contract for physics hot phases
+- start with integration-stage offload wiring, then expand to broadphase/narrowphase/solver in
+  later slices
+- keep dispatch fail-soft:
+  - no backend -> CPU fallback
+  - unsupported stage -> CPU fallback
+  - backend decline/error -> CPU fallback
+- export step-local compute telemetry so runtime can reason about:
+  - attempted dispatches
+  - executed dispatches
+  - fallback reasons
+  - reported GPU time
+
+Acceptance gates:
+
+- compute path can be enabled without breaking deterministic fixed-step execution
+- CPU fallback remains authoritative when compute dispatch is unavailable
+- runtime can inspect compute usage through ParadoxPE telemetry instead of guessing
+
 ## Workstream D: MPS Revision
 
 This workstream makes MPS the real scheduler of the engine instead of a partial helper.
@@ -317,6 +428,28 @@ Acceptance gates:
 
 - runtime performance no longer depends on general-purpose task stealing behavior
 - overlap path is not just present but measurably useful
+
+### D3. Heimdall Ultra-Aggressive Profile
+
+Target work:
+
+- define an explicit opt-in `Heimdall` profile for MPS/GMS/MGS
+- allow more aggressive queue depth, work sharding, and budget behavior where hardware headroom
+  permits it
+- document the tradeoff clearly:
+  - more power draw
+  - more heat
+  - potentially louder cooling behavior
+
+Rules:
+
+- `Heimdall` is never the silent default
+- deterministic-first physics authority still wins over reckless throughput chasing
+
+Acceptance gates:
+
+- `Heimdall` mode is controllable and observable
+- enabling it changes aggressiveness without making the runtime opaque or unstable
 
 ## Workstream E: GMS Native SM/CU Scaler + Rayon / Bevy / WGPU Independence
 
@@ -460,6 +593,7 @@ Acceptance gate:
 - control-surface precedence is enforced:
   - `CLI > .tlscript > .tlpfile`
 - strict gate proves no shipping path dependence on `wgpu` / `bevy` / `rayon`
+- this workstream is the formal `CU / SM parallelism` item in the `Heimdall Update` checklist
 
 Status:
 
@@ -500,9 +634,12 @@ Target contents:
 
 - RT optimization pass 1
 - shader/light cleanup
+- reflection and general graphics polish pass 1
 - SPIR-V shader artifact path and pipeline-cache groundwork
 - first stable effect hooks
 - initial texture pipeline
+- texture-pack support baseline
+- `Tilecraft` starter bootstrap path
 - raw Vulkan backend backbone in `tl-core`
 
 Exit criteria:
@@ -514,6 +651,7 @@ Exit criteria:
 Target contents:
 
 - stronger MPS dispatch ownership in runtime
+- opt-in `Heimdall` ultra-aggressive performance profile
 - GMS Native SM/CU scaler stabilization and guardrail tuning
 - MAS (`runtime/src/mas.rs`) promoted as Multi Audio Synthesizer runtime path with MPS-aligned scheduling
 - ParadoxPE phase refactor and lower serial world-step fraction

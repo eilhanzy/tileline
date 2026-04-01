@@ -15,4 +15,5 @@ mps = { path = "../mps" }
 gms = { path = "../gms" }
 mgs = { path = "../mgs" }
 paradoxpe = { path = "../paradoxpe" }
+nalgebra.workspace = true
 wasm-encoder = "0.224.0"

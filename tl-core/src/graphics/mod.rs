@@ -7,3 +7,4 @@
 
 pub mod multigpu;
 pub mod vulkan_backend;
+pub mod vulkan_physics_compute;

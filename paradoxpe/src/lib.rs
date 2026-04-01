@@ -15,6 +15,7 @@ pub const MODULE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod abi;
 pub mod body;
 pub mod broadphase;
+pub mod compute;
 pub mod handle;
 pub mod joint;
 pub mod narrowphase;
@@ -38,6 +39,11 @@ pub use body::{
     ContactId, ContactManifold, ContactPair, ContactSnapshot, MaterialCombineRule, RigidBody,
 };
 pub use broadphase::{BroadphaseConfig, BroadphasePipeline, BroadphaseStats};
+pub use compute::{
+    PhysicsComputeBackend, PhysicsComputeBackendKind, PhysicsComputeConfig,
+    PhysicsComputeDispatchRequest, PhysicsComputeDispatchResult, PhysicsComputeMode,
+    PhysicsComputeStage, PhysicsComputeStats,
+};
 pub use handle::{
     BodyHandle, ColliderHandle, ContactHandle, HandleKind, JointHandle, PhysicsHandle,
 };

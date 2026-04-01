@@ -43,6 +43,10 @@ pub use graphics::vulkan_backend::{
     VulkanMultiGpuFramePlan, VulkanNativeMultiGpuSupport, VulkanPhysicalDeviceProfile,
     VulkanQueueSelection, VulkanSnapshotSlotState,
 };
+pub use graphics::vulkan_physics_compute::{
+    VulkanPhysicsComputeBackend, VulkanPhysicsComputeCapabilities, VulkanPhysicsComputeConfig,
+    VulkanPhysicsDispatchPlan,
+};
 pub use tlscript::{
     annotate_typed_ir_with_parallel_hooks, lower_to_typed_ir, lower_to_typed_ir_with_config,
     AssignStmt, BinaryOp, Block, BoundsCheckEnforcement, BoundsCheckPolicy, CodegenExportEntry,

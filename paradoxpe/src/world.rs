@@ -18,6 +18,11 @@ use crate::body::{
     ContactPair, ContactSnapshot, RigidBody,
 };
 use crate::broadphase::{BroadphaseConfig, BroadphasePipeline};
+use crate::compute::{
+    PhysicsComputeBackend, PhysicsComputeBackendKind, PhysicsComputeConfig,
+    PhysicsComputeDispatchRequest, PhysicsComputeDispatchResult, PhysicsComputeMode,
+    PhysicsComputeStage, PhysicsComputeStats,
+};
 use crate::handle::{
     BodyHandle, ColliderHandle, ContactHandle, HandleKind, JointHandle, PhysicsHandle,
 };
@@ -138,6 +143,7 @@ pub struct PhysicsWorldConfig {
     pub gravity: Vector3<f32>,
     pub fixed_dt: f32,
     pub max_substeps: u32,
+    pub compute: PhysicsComputeConfig,
     pub max_contact_snapshots: usize,
     pub broadphase: BroadphaseConfig,
     pub narrowphase: NarrowphaseConfig,
@@ -153,6 +159,7 @@ impl Default for PhysicsWorldConfig {
             gravity: Vector3::new(0.0, -9.81, 0.0),
             fixed_dt: 1.0 / 120.0,
             max_substeps: 8,
+            compute: PhysicsComputeConfig::default(),
             max_contact_snapshots: 256,
             broadphase: BroadphaseConfig::default(),
             narrowphase: NarrowphaseConfig::default(),
@@ -168,6 +175,7 @@ impl Default for PhysicsWorldConfig {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PhysicsStepTimings {
     pub substeps: u32,
+    pub compute_us: u64,
     pub integrate_us: u64,
     pub broadphase_us: u64,
     pub narrowphase_us: u64,
@@ -178,7 +186,8 @@ pub struct PhysicsStepTimings {
 
 impl PhysicsStepTimings {
     pub fn total_us(&self) -> u64 {
-        self.integrate_us
+        self.compute_us
+            + self.integrate_us
             + self.broadphase_us
             + self.narrowphase_us
             + self.solver_us
@@ -222,6 +231,8 @@ pub struct PhysicsWorld {
     contacts: Vec<ContactPair>,
     integration_shards: Vec<std::ops::Range<usize>>,
     interpolation: PhysicsInterpolationBuffer,
+    compute_backend: Option<Box<dyn PhysicsComputeBackend>>,
+    pub last_compute_stats: PhysicsComputeStats,
     pub last_step_timings: PhysicsStepTimings,
 }
 
@@ -230,6 +241,7 @@ impl PhysicsWorld {
         if config.simulation_mode.is_flat_2d() {
             config.gravity = flatten_xy_vector(config.gravity);
         }
+        let initial_compute_mode = config.compute.mode;
         let mut broadphase = BroadphasePipeline::new(config.broadphase.clone());
         broadphase.sync_for_body_count(0);
         let mut narrowphase = NarrowphasePipeline::new(config.narrowphase.clone());
@@ -257,6 +269,12 @@ impl PhysicsWorld {
             contacts: Vec::new(),
             integration_shards: Vec::new(),
             interpolation: PhysicsInterpolationBuffer::default(),
+            compute_backend: None,
+            last_compute_stats: PhysicsComputeStats::new(
+                initial_compute_mode,
+                None,
+                PhysicsComputeBackendKind::Unknown,
+            ),
             last_step_timings: PhysicsStepTimings::default(),
         }
     }
@@ -267,6 +285,30 @@ impl PhysicsWorld {
 
     pub fn fixed_step_clock(&self) -> &FixedStepClock {
         &self.clock
+    }
+
+    pub fn compute_config(&self) -> &PhysicsComputeConfig {
+        &self.config.compute
+    }
+
+    pub fn set_compute_config(&mut self, compute: PhysicsComputeConfig) {
+        self.config.compute = compute;
+    }
+
+    pub fn set_compute_mode(&mut self, mode: PhysicsComputeMode) {
+        self.config.compute.mode = mode;
+    }
+
+    pub fn set_compute_backend(&mut self, backend: Option<Box<dyn PhysicsComputeBackend>>) {
+        self.compute_backend = backend;
+    }
+
+    pub fn compute_backend_name(&self) -> Option<&str> {
+        self.compute_backend.as_ref().map(|backend| backend.backend_name())
+    }
+
+    pub fn last_compute_stats(&self) -> &PhysicsComputeStats {
+        &self.last_compute_stats
     }
 
     /// Current dense body count in the world.
@@ -777,6 +819,18 @@ impl PhysicsWorld {
             return 0;
         }
 
+        let backend_name = self
+            .compute_backend
+            .as_ref()
+            .map(|backend| backend.backend_name().to_string());
+        let backend_kind = self
+            .compute_backend
+            .as_ref()
+            .map(|backend| backend.backend_kind())
+            .unwrap_or(PhysicsComputeBackendKind::Unknown);
+        self.last_compute_stats =
+            PhysicsComputeStats::new(self.config.compute.mode, backend_name, backend_kind);
+
         let mut timings = PhysicsStepTimings {
             substeps: plan.substeps,
             ..PhysicsStepTimings::default()
@@ -821,13 +875,16 @@ impl PhysicsWorld {
         step_index: u32,
         timings: &mut PhysicsStepTimings,
     ) {
-        let t = Instant::now();
-        self.bodies.integrate_with_shards(
-            plan.fixed_dt,
-            self.config.gravity,
-            &self.integration_shards,
-        );
-        timings.integrate_us += duration_us(t.elapsed());
+        let integrate_started = Instant::now();
+        let integrate_offloaded = self.try_dispatch_integrate_stage(plan, step_index, timings);
+        if !integrate_offloaded {
+            self.bodies.integrate_with_shards(
+                plan.fixed_dt,
+                self.config.gravity,
+                &self.integration_shards,
+            );
+            timings.integrate_us += duration_us(integrate_started.elapsed());
+        }
 
         let t = Instant::now();
         self.broadphase.set_predictive_dt(plan.fixed_dt);
@@ -875,6 +932,84 @@ impl PhysicsWorld {
             let t = Instant::now();
             let _ = self.enforce_flat_2d_constraints();
             timings.sleep_us += duration_us(t.elapsed());
+        }
+    }
+
+    fn try_dispatch_integrate_stage(
+        &mut self,
+        plan: &PhysicsStepExecutionPlan,
+        step_index: u32,
+        timings: &mut PhysicsStepTimings,
+    ) -> bool {
+        let stage = PhysicsComputeStage::Integrate;
+        let compute = &self.config.compute;
+        if matches!(compute.mode, PhysicsComputeMode::Disabled) {
+            self.last_compute_stats
+                .note_skip(stage, "compute mode is disabled");
+            return false;
+        }
+        if !compute.stage_enabled(stage) {
+            self.last_compute_stats
+                .note_skip(stage, "integrate stage is not compute-enabled");
+            return false;
+        }
+
+        let body_count = self.bodies.len();
+        if body_count < compute.min_body_count {
+            self.last_compute_stats.note_skip(
+                stage,
+                format!(
+                    "body threshold not reached ({body_count} < {})",
+                    compute.min_body_count
+                ),
+            );
+            return false;
+        }
+
+        let Some(backend) = self.compute_backend.as_deref() else {
+            self.last_compute_stats
+                .note_fallback(stage, "no compute backend configured");
+            return false;
+        };
+        if !backend.supports_stage(stage) {
+            self.last_compute_stats.note_fallback(
+                stage,
+                format!("backend '{}' does not support integrate", backend.backend_name()),
+            );
+            return false;
+        }
+
+        let request = PhysicsComputeDispatchRequest {
+            stage,
+            substep_index: step_index,
+            total_substeps: plan.substeps,
+            fixed_dt: plan.fixed_dt,
+            body_count,
+            candidate_pair_count: self.broadphase.candidate_pairs().len(),
+            manifold_count: self.narrowphase.manifolds().len(),
+        };
+
+        match backend.dispatch_integrate(
+            request,
+            &mut self.bodies,
+            &self.integration_shards,
+            self.config.gravity,
+            plan.fixed_dt,
+        ) {
+            PhysicsComputeDispatchResult::Executed {
+                gpu_time_us,
+                workgroups,
+            } => {
+                self.last_compute_stats
+                    .note_executed(stage, gpu_time_us, workgroups);
+                timings.compute_us += gpu_time_us;
+                true
+            }
+            PhysicsComputeDispatchResult::Fallback { reason } => {
+                self.last_compute_stats
+                    .note_fallback(stage, reason.into_owned());
+                false
+            }
         }
     }
 
@@ -1278,7 +1413,56 @@ fn free_slot<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::compute::{
+        PhysicsComputeBackend, PhysicsComputeBackendKind, PhysicsComputeConfig,
+        PhysicsComputeDispatchRequest, PhysicsComputeDispatchResult, PhysicsComputeMode,
+        PhysicsComputeStage,
+    };
     use crate::joint::FixedJointDesc;
+
+    struct MockIntegrateComputeBackend {
+        dispatches: Arc<AtomicUsize>,
+    }
+
+    impl MockIntegrateComputeBackend {
+        fn new(dispatches: Arc<AtomicUsize>) -> Self {
+            Self { dispatches }
+        }
+    }
+
+    impl PhysicsComputeBackend for MockIntegrateComputeBackend {
+        fn backend_name(&self) -> &str {
+            "mock-integrate"
+        }
+
+        fn backend_kind(&self) -> PhysicsComputeBackendKind {
+            PhysicsComputeBackendKind::Custom
+        }
+
+        fn supports_stage(&self, stage: PhysicsComputeStage) -> bool {
+            matches!(stage, PhysicsComputeStage::Integrate)
+        }
+
+        fn dispatch_integrate(
+            &self,
+            _request: PhysicsComputeDispatchRequest,
+            bodies: &mut BodyRegistry,
+            shards: &[Range<usize>],
+            gravity: Vector3<f32>,
+            fixed_dt: f32,
+        ) -> PhysicsComputeDispatchResult {
+            self.dispatches.fetch_add(1, Ordering::Relaxed);
+            bodies.integrate_with_shards(fixed_dt, gravity, shards);
+            PhysicsComputeDispatchResult::Executed {
+                gpu_time_us: 42,
+                workgroups: shards.len().max(1) as u32,
+            }
+        }
+    }
 
     #[test]
     fn dynamic_body_integrates_with_force() {
@@ -1289,6 +1473,68 @@ mod tests {
         assert!(steps > 0);
         let body = world.body(body).unwrap();
         assert!(body.position.x > 0.0);
+    }
+
+    #[test]
+    fn compute_backend_can_own_integrate_stage_with_cpu_fallback_preserved() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            compute: PhysicsComputeConfig {
+                mode: PhysicsComputeMode::PreferGpu,
+                min_body_count: 1,
+                integrate_enabled: true,
+                broadphase_enabled: false,
+                narrowphase_enabled: false,
+                solver_enabled: false,
+            },
+            gravity: Vector3::new(0.0, -9.81, 0.0),
+            ..PhysicsWorldConfig::default()
+        });
+        world.set_compute_backend(Some(Box::new(MockIntegrateComputeBackend::new(
+            dispatches.clone(),
+        ))));
+
+        let body = world.spawn_body(BodyDesc::default());
+        let steps = world.step(1.0 / 60.0);
+        assert_eq!(steps, 2);
+        assert_eq!(dispatches.load(Ordering::Relaxed), steps as usize);
+        assert_eq!(world.last_compute_stats().executed_dispatches, steps);
+        assert_eq!(
+            world.last_compute_stats().backend_name.as_deref(),
+            Some("mock-integrate")
+        );
+        assert_eq!(
+            world.last_compute_stats().last_stage,
+            Some(PhysicsComputeStage::Integrate)
+        );
+        assert!(world.last_step_timings.compute_us >= 42 * steps as u64);
+        assert!(world.body(body).expect("body").position.y < 0.0);
+    }
+
+    #[test]
+    fn compute_mode_falls_soft_when_no_backend_is_configured() {
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            compute: PhysicsComputeConfig {
+                mode: PhysicsComputeMode::PreferGpu,
+                min_body_count: 1,
+                integrate_enabled: true,
+                broadphase_enabled: false,
+                narrowphase_enabled: false,
+                solver_enabled: false,
+            },
+            gravity: Vector3::new(0.0, -9.81, 0.0),
+            ..PhysicsWorldConfig::default()
+        });
+
+        let body = world.spawn_body(BodyDesc::default());
+        let steps = world.step(1.0 / 60.0);
+        assert_eq!(steps, 2);
+        assert_eq!(world.last_compute_stats().fallback_dispatches, steps);
+        assert_eq!(
+            world.last_compute_stats().last_reason.as_deref(),
+            Some("no compute backend configured")
+        );
+        assert!(world.body(body).expect("body").position.y < 0.0);
     }
 
     #[test]
