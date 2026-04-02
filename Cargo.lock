@@ -2732,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "mps"
-version = "0.4.5"
+version = "0.5.5"
 dependencies = [
  "aes",
  "aes-gcm",

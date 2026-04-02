@@ -120,6 +120,8 @@ impl PhysicsMpsRunner {
             completed_frames: metrics.published_frames,
             latest_completed_frame: metrics.latest_published_frame,
             active_frame_id: metrics.active_frame_id,
+            simd_backend: metrics.simd_backend,
+            simd_lanes: metrics.simd_lanes,
         }
     }
 
