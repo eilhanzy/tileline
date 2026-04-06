@@ -230,7 +230,10 @@ impl TlAppRuntime {
                 contact_manifolds: narrowphase.manifolds,
             }
         };
-        let gms_config = self.runtime_bridge.as_ref().map(|bridge| bridge.gms_scaler_config());
+        let gms_config = self
+            .runtime_bridge
+            .as_ref()
+            .map(|bridge| bridge.gms_scaler_config());
         let gms_metrics = TlscriptGmsMetricSnapshot {
             mode: self.runtime_bridge_metrics.gms_mode,
             target_fps: gms_config.map(|cfg| cfg.target_fps),
@@ -933,6 +936,7 @@ impl TlAppRuntime {
         );
         let t_compile_begin = Instant::now();
         let scene_us = (t_compile_begin - t_scene_begin).as_micros() as u64;
+        #[allow(unused_mut)]
         let mut draw = self.draw_compiler.compile(&frame);
         let t_upload_begin = Instant::now();
         let compile_us = (t_upload_begin - t_compile_begin).as_micros() as u64;
@@ -1046,6 +1050,71 @@ impl TlAppRuntime {
                 let fsr_status = renderer.fsr_status();
                 let upload_us = (Instant::now() - t_upload_begin).as_micros() as u64;
                 (upload, rt_status, fsr_status, upload_us, 0)
+            }
+            #[cfg(target_os = "macos")]
+            TlAppRenderer::Metal { metal, present } => {
+                let _frame_result = metal.render_draw_frame(self.script_frame_index, &draw)?;
+
+                let upload = present.upload_draw_frame(&self.device, &self.queue, &draw);
+                present.upload_overlay_sprites(
+                    &self.device,
+                    &self.queue,
+                    self.console_overlay_sprites.as_slice(),
+                );
+                let rt_status = present.ray_tracing_status();
+                let fsr_status = present.fsr_status();
+
+                let surface = self
+                    .surface
+                    .as_ref()
+                    .ok_or("metal renderer selected without a configured surface")?;
+                let config = self
+                    .config
+                    .as_ref()
+                    .ok_or("metal renderer selected without a configured surface config")?;
+                let output = match surface.get_current_texture() {
+                    Ok(frame) => frame,
+                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                        surface.configure(&self.device, config);
+                        return Ok(());
+                    }
+                    Err(wgpu::SurfaceError::OutOfMemory) => {
+                        return Err("wgpu surface out of memory".into());
+                    }
+                    Err(wgpu::SurfaceError::Timeout) => {
+                        return Ok(());
+                    }
+                    Err(wgpu::SurfaceError::Other) => {
+                        return Ok(());
+                    }
+                };
+
+                let view = output
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("tlapp-metal-present-encoder"),
+                        });
+                present.build_rt_acceleration_structures(&mut encoder);
+                present.encode(
+                    &mut encoder,
+                    &view,
+                    wgpu::Color {
+                        r: 0.07,
+                        g: 0.09,
+                        b: 0.12,
+                        a: 1.0,
+                    },
+                );
+                present.encode_overlay_sprites(&mut encoder, &view);
+                self.queue.submit(Some(encoder.finish()));
+                let t_present_begin = Instant::now();
+                let upload_us = (t_present_begin - t_upload_begin).as_micros() as u64;
+                output.present();
+                let present_us = (Instant::now() - t_present_begin).as_micros() as u64;
+                (upload, rt_status, fsr_status, upload_us, present_us)
             }
         };
 

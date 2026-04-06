@@ -572,7 +572,7 @@ impl TlAppRuntime {
             sharpness: options.fsr_sharpness,
             render_scale_override: options.fsr_scale_override,
         };
-        let mut renderer = if prefer_vulkan_runtime_renderer() {
+        let mut renderer = if prefer_native_runtime_renderer() {
             #[cfg(target_os = "linux")]
             {
                 let present_mode = match options.vsync {
@@ -611,7 +611,51 @@ impl TlAppRuntime {
                     }
                 }
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            {
+                let metal_config = MetalSceneRendererConfig {
+                    backend: tl_core::MetalBackendConfig {
+                        max_instances: 65_536,
+                        ..Default::default()
+                    },
+                };
+                match MetalSceneRenderer::new(window.clone(), metal_config) {
+                    Ok(metal_renderer) => {
+                        let format = ensure_wgpu_surface()?;
+                        let present_renderer = WgpuSceneRenderer::new(
+                            &device,
+                            &queue,
+                            format,
+                            size.width,
+                            size.height,
+                            adapter_info.backend,
+                            options.msaa,
+                        );
+                        eprintln!("[renderer] using raw Metal runtime adapter + wgpu present path");
+                        TlAppRenderer::Metal {
+                            metal: metal_renderer,
+                            present: present_renderer,
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[renderer] raw Metal runtime adapter failed ({}), falling back to wgpu",
+                            err
+                        );
+                        let format = ensure_wgpu_surface()?;
+                        TlAppRenderer::Wgpu(WgpuSceneRenderer::new(
+                            &device,
+                            &queue,
+                            format,
+                            size.width,
+                            size.height,
+                            adapter_info.backend,
+                            options.msaa,
+                        ))
+                    }
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 let format = ensure_wgpu_surface()?;
                 TlAppRenderer::Wgpu(WgpuSceneRenderer::new(

@@ -1426,21 +1426,35 @@ mod tests {
 
     struct MockIntegrateComputeBackend {
         dispatches: Arc<AtomicUsize>,
+        backend_kind: PhysicsComputeBackendKind,
+        backend_name: &'static str,
     }
 
     impl MockIntegrateComputeBackend {
-        fn new(dispatches: Arc<AtomicUsize>) -> Self {
-            Self { dispatches }
+        fn custom(dispatches: Arc<AtomicUsize>) -> Self {
+            Self {
+                dispatches,
+                backend_kind: PhysicsComputeBackendKind::Custom,
+                backend_name: "mock-integrate",
+            }
+        }
+
+        fn metal(dispatches: Arc<AtomicUsize>) -> Self {
+            Self {
+                dispatches,
+                backend_kind: PhysicsComputeBackendKind::Metal,
+                backend_name: "mock-metal-integrate",
+            }
         }
     }
 
     impl PhysicsComputeBackend for MockIntegrateComputeBackend {
         fn backend_name(&self) -> &str {
-            "mock-integrate"
+            self.backend_name
         }
 
         fn backend_kind(&self) -> PhysicsComputeBackendKind {
-            PhysicsComputeBackendKind::Custom
+            self.backend_kind
         }
 
         fn supports_stage(&self, stage: PhysicsComputeStage) -> bool {
@@ -1490,7 +1504,7 @@ mod tests {
             gravity: Vector3::new(0.0, -9.81, 0.0),
             ..PhysicsWorldConfig::default()
         });
-        world.set_compute_backend(Some(Box::new(MockIntegrateComputeBackend::new(
+        world.set_compute_backend(Some(Box::new(MockIntegrateComputeBackend::custom(
             dispatches.clone(),
         ))));
 
@@ -1509,6 +1523,39 @@ mod tests {
         );
         assert!(world.last_step_timings.compute_us >= 42 * steps as u64);
         assert!(world.body(body).expect("body").position.y < 0.0);
+    }
+
+    #[test]
+    fn compute_backend_metal_kind_is_reported_in_telemetry() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let mut world = PhysicsWorld::new(PhysicsWorldConfig {
+            compute: PhysicsComputeConfig {
+                mode: PhysicsComputeMode::PreferGpu,
+                min_body_count: 1,
+                integrate_enabled: true,
+                broadphase_enabled: false,
+                narrowphase_enabled: false,
+                solver_enabled: false,
+            },
+            gravity: Vector3::new(0.0, -9.81, 0.0),
+            ..PhysicsWorldConfig::default()
+        });
+        world.set_compute_backend(Some(Box::new(MockIntegrateComputeBackend::metal(
+            dispatches.clone(),
+        ))));
+
+        let _body = world.spawn_body(BodyDesc::default());
+        let steps = world.step(1.0 / 60.0);
+        assert_eq!(steps, 2);
+        assert_eq!(dispatches.load(Ordering::Relaxed), steps as usize);
+        assert_eq!(
+            world.last_compute_stats().backend_kind,
+            PhysicsComputeBackendKind::Metal
+        );
+        assert_eq!(
+            world.last_compute_stats().backend_name.as_deref(),
+            Some("mock-metal-integrate")
+        );
     }
 
     #[test]

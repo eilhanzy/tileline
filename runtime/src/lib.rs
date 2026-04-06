@@ -34,6 +34,8 @@ mod app_runner;
 mod draw_path;
 mod frame_loop;
 mod mas;
+#[cfg(target_os = "macos")]
+mod metal_scene_renderer;
 mod mgs_frame_loop;
 mod mobile_scene_dispatch;
 mod mobile_scene_workload;
@@ -76,6 +78,11 @@ pub use frame_loop::{
 pub use mas::{
     AudioBufferBlock, MasConfig, MasCoreAffinity, MasMetrics, MasPriority, MasSubmission,
     MasWavError, MultiAudioScheduler, WavClip, WavPlaybackCursor, WavPlaybackParams,
+};
+#[cfg(target_os = "macos")]
+pub use metal_scene_renderer::{
+    MetalSceneRenderer, MetalSceneRendererConfig, MetalSceneRendererError,
+    MetalSceneRendererFrameResult,
 };
 pub use mgs_frame_loop::{
     MgsFrameLoopRuntime, MgsFrameLoopRuntimeConfig, MgsFrameLoopRuntimeMetrics,

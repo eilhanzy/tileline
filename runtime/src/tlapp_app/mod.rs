@@ -37,8 +37,8 @@ use crate::{
     compile_tlpfile_scene_from_path, compile_tlscript_showcase, resolve_tileline_version_query,
     tileline_version_entries, unpack_pak, BounceTankRuntimePatch, BounceTankSceneConfig,
     BounceTankSceneController, BounceTankTickMetrics, ChunkedTileWorld2d, DrawPathCompiler,
-    FsrConfig, FsrDynamoConfig, FsrMode, FsrQualityPreset, FsrStatus, GraphicsSchedulerPath,
-    GmsGuardrailProfile, GmsScalerConfig, GmsScalerDomain, GmsScalerMode, RayTracingMode,
+    FsrConfig, FsrDynamoConfig, FsrMode, FsrQualityPreset, FsrStatus, GmsGuardrailProfile,
+    GmsScalerConfig, GmsScalerDomain, GmsScalerMode, GraphicsSchedulerPath, RayTracingMode,
     RenderSyncMode, RuntimeAdapterInfo, RuntimeBridgeConfig, RuntimeBridgeMetrics,
     RuntimeBridgeOrchestrator, RuntimeBridgePath, RuntimeBridgeTick, RuntimeFramePlan,
     RuntimeGpuBackend, RuntimeGpuDeviceType, RuntimePlatform, RuntimeSceneMode,
@@ -47,12 +47,15 @@ use crate::{
     TileWorldFrameTelemetry, TljointDiagnosticLevel, TljointSceneBundle, TlpfileDiagnosticLevel,
     TlpfileGraphicsScheduler, TlpfileSceneDimension, TlscriptGmsMetricSnapshot,
     TlscriptOverlayTileLookup, TlscriptPerformancePreset, TlscriptShowcaseConfig,
-    TlscriptShowcaseContactSnapshot,
-    TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput, TlscriptShowcaseFrameOutput,
-    TlscriptShowcaseProgram, TlscriptTileLookup, TlscriptToggleMode, TlspriteHotReloadEvent,
-    TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader, VulkanSceneRenderer,
-    VulkanSceneRendererConfig, WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION, MAX_SCENE_LIGHTS,
+    TlscriptShowcaseContactSnapshot, TlscriptShowcaseControlInput, TlscriptShowcaseFrameInput,
+    TlscriptShowcaseFrameOutput, TlscriptShowcaseProgram, TlscriptTileLookup, TlscriptToggleMode,
+    TlspriteHotReloadEvent, TlspriteProgram, TlspriteProgramCache, TlspriteWatchReloader,
+    WgpuSceneRenderer, ENGINE_ID, ENGINE_VERSION, MAX_SCENE_LIGHTS,
 };
+#[cfg(target_os = "macos")]
+use crate::{MetalSceneRenderer, MetalSceneRendererConfig};
+#[cfg(target_os = "linux")]
+use crate::{VulkanSceneRenderer, VulkanSceneRendererConfig};
 use gms::safe_default_required_limits_for_adapter;
 use mgs::MobileGpuProfile;
 use nalgebra::Vector3;
@@ -648,7 +651,7 @@ fn configure_parallel_runtime() {
     });
 }
 
-fn prefer_vulkan_runtime_renderer() -> bool {
+fn prefer_native_runtime_renderer() -> bool {
     #[cfg(target_os = "linux")]
     {
         matches!(
@@ -658,7 +661,16 @@ fn prefer_vulkan_runtime_renderer() -> bool {
             Some(value) if value == "vulkan" || value == "vk"
         )
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        matches!(
+            env::var("TILELINE_RENDERER")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase()),
+            Some(value) if value == "metal" || value == "mtl"
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         false
     }
@@ -773,14 +785,14 @@ fn request_adapter_with_platform_policy(
     }
 
     let instance = wgpu::Instance::default();
-    if prefer_vulkan_runtime_renderer() {
+    if prefer_native_runtime_renderer() {
         let adapter = request_adapter(&instance, None)?;
         return Ok(AdapterBootstrap {
             instance,
             surface: None,
             adapter,
             bootstrap_note:
-                "desktop adapter probe without wgpu surface (raw Vulkan renderer selected)"
+                "desktop adapter probe without wgpu surface (raw native renderer selected)"
                     .to_string(),
         });
     }
@@ -1216,6 +1228,11 @@ struct TlAppRuntime {
 
 enum TlAppRenderer {
     Wgpu(WgpuSceneRenderer),
+    #[cfg(target_os = "macos")]
+    Metal {
+        metal: MetalSceneRenderer,
+        present: WgpuSceneRenderer,
+    },
     #[cfg(target_os = "linux")]
     Vulkan(VulkanSceneRenderer),
 }
@@ -1224,6 +1241,8 @@ impl TlAppRenderer {
     fn backend_label(&self) -> &'static str {
         match self {
             Self::Wgpu(_) => "wgpu",
+            #[cfg(target_os = "macos")]
+            Self::Metal { .. } => "metal",
             #[cfg(target_os = "linux")]
             Self::Vulkan(_) => "vulkan",
         }
@@ -1232,6 +1251,13 @@ impl TlAppRenderer {
     fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
         match self {
             Self::Wgpu(renderer) => renderer.resize(device, queue, width, height),
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal, present } => {
+                if let Err(err) = metal.resize(PhysicalSize::new(width, height)) {
+                    eprintln!("[metal renderer] resize failed: {err}");
+                }
+                present.resize(device, queue, width, height);
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => {
                 if let Err(err) = renderer.resize(PhysicalSize::new(width, height)) {
@@ -1251,6 +1277,11 @@ impl TlAppRenderer {
     ) {
         match self {
             Self::Wgpu(renderer) => renderer.set_camera_view(queue, width, height, eye, target),
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal, present } => {
+                metal.set_camera_view(width, height, eye, target);
+                present.set_camera_view(queue, width, height, eye, target);
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.set_camera_view(width, height, eye, target),
         }
@@ -1259,6 +1290,11 @@ impl TlAppRenderer {
     fn set_ray_tracing_mode(&mut self, queue: &wgpu::Queue, mode: RayTracingMode) {
         match self {
             Self::Wgpu(renderer) => renderer.set_ray_tracing_mode(queue, mode),
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal, present } => {
+                metal.set_ray_tracing_mode(mode);
+                present.set_ray_tracing_mode(queue, mode);
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.set_ray_tracing_mode(mode),
         }
@@ -1267,6 +1303,11 @@ impl TlAppRenderer {
     fn set_fsr_config(&mut self, queue: &wgpu::Queue, config: FsrConfig) {
         match self {
             Self::Wgpu(renderer) => renderer.set_fsr_config(queue, config),
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal, present } => {
+                metal.set_fsr_config(config);
+                present.set_fsr_config(queue, config);
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.set_fsr_config(config),
         }
@@ -1275,6 +1316,11 @@ impl TlAppRenderer {
     fn set_msaa_sample_count(&mut self, device: &wgpu::Device, count: u32) {
         match self {
             Self::Wgpu(renderer) => renderer.set_msaa_sample_count(device, count),
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal, present } => {
+                metal.set_msaa_sample_count(count);
+                present.set_msaa_sample_count(device, count);
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.set_msaa_sample_count(count),
         }
@@ -1283,6 +1329,8 @@ impl TlAppRenderer {
     fn msaa_sample_count(&self) -> u32 {
         match self {
             Self::Wgpu(renderer) => renderer.msaa_sample_count(),
+            #[cfg(target_os = "macos")]
+            Self::Metal { present, .. } => present.msaa_sample_count(),
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.msaa_sample_count(),
         }
@@ -1291,6 +1339,11 @@ impl TlAppRenderer {
     fn set_force_full_fbx_sphere(&mut self, force: bool) {
         match self {
             Self::Wgpu(renderer) => renderer.set_force_full_fbx_sphere(force),
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal, present } => {
+                metal.set_force_full_fbx_sphere(force);
+                present.set_force_full_fbx_sphere(force);
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.set_force_full_fbx_sphere(force),
         }
@@ -1304,6 +1357,11 @@ impl TlAppRenderer {
     ) -> Result<(), String> {
         match self {
             Self::Wgpu(renderer) => renderer.bind_fbx_mesh_slot_from_path(device, slot, path),
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal, present } => {
+                metal.bind_fbx_mesh_slot_from_path(slot, path)?;
+                present.bind_fbx_mesh_slot_from_path(device, slot, path)
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.bind_fbx_mesh_slot_from_path(slot, path),
         }
@@ -1317,6 +1375,11 @@ impl TlAppRenderer {
     ) -> Result<(), String> {
         match self {
             Self::Wgpu(renderer) => renderer.bind_sprite_texture_slot_from_path(queue, slot, path),
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal, present } => {
+                metal.bind_sprite_texture_slot_from_path(slot, path)?;
+                present.bind_sprite_texture_slot_from_path(queue, slot, path)
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.bind_sprite_texture_slot_from_path(slot, path),
         }
@@ -1332,6 +1395,11 @@ impl TlAppRenderer {
             Self::Wgpu(renderer) => {
                 renderer.bind_builtin_sphere_mesh_slot(device, slot, high_quality)
             }
+            #[cfg(target_os = "macos")]
+            Self::Metal { metal, present } => {
+                metal.bind_builtin_sphere_mesh_slot(slot, high_quality);
+                present.bind_builtin_sphere_mesh_slot(device, slot, high_quality);
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.bind_builtin_sphere_mesh_slot(slot, high_quality),
         }
@@ -1340,6 +1408,8 @@ impl TlAppRenderer {
     fn ray_tracing_status(&self) -> crate::SceneRayTracingStatus {
         match self {
             Self::Wgpu(renderer) => renderer.ray_tracing_status(),
+            #[cfg(target_os = "macos")]
+            Self::Metal { present, .. } => present.ray_tracing_status(),
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.ray_tracing_status(),
         }
@@ -1348,6 +1418,8 @@ impl TlAppRenderer {
     fn fsr_status(&self) -> FsrStatus {
         match self {
             Self::Wgpu(renderer) => renderer.fsr_status(),
+            #[cfg(target_os = "macos")]
+            Self::Metal { present, .. } => present.fsr_status(),
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.fsr_status(),
         }
@@ -1356,6 +1428,8 @@ impl TlAppRenderer {
     fn world_to_ndc(&self, world_pos: [f32; 3]) -> Option<[f32; 3]> {
         match self {
             Self::Wgpu(renderer) => renderer.world_to_ndc(world_pos),
+            #[cfg(target_os = "macos")]
+            Self::Metal { present, .. } => present.world_to_ndc(world_pos),
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.world_to_ndc(world_pos),
         }
@@ -1364,6 +1438,8 @@ impl TlAppRenderer {
     fn camera_eye(&self) -> [f32; 3] {
         match self {
             Self::Wgpu(renderer) => renderer.camera_eye(),
+            #[cfg(target_os = "macos")]
+            Self::Metal { present, .. } => present.camera_eye(),
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.camera_eye(),
         }
@@ -1372,6 +1448,10 @@ impl TlAppRenderer {
     fn world_radius_to_ndc_half_size(&self, world_radius: f32, clip_w: f32) -> f32 {
         match self {
             Self::Wgpu(renderer) => renderer.world_radius_to_ndc_half_size(world_radius, clip_w),
+            #[cfg(target_os = "macos")]
+            Self::Metal { present, .. } => {
+                present.world_radius_to_ndc_half_size(world_radius, clip_w)
+            }
             #[cfg(target_os = "linux")]
             Self::Vulkan(renderer) => renderer.world_radius_to_ndc_half_size(world_radius, clip_w),
         }

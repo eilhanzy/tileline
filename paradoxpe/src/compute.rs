@@ -63,6 +63,7 @@ pub enum PhysicsComputeBackendKind {
     #[default]
     Unknown,
     Vulkan,
+    Metal,
     CpuSimd,
     Custom,
 }

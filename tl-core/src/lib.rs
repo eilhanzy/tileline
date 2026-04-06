@@ -8,7 +8,8 @@
 //! The crate exposes:
 //! - [`core::bridge`] for MPS<->GMS frame planning
 //! - [`graphics::multigpu::sync`] for portable explicit multi-GPU synchronization and UMA hooks
-//! - [`graphics::vulkan_backend`] for the Linux-first raw Vulkan backend skeleton
+//! - [`graphics::vulkan_backend`] for the Linux raw Vulkan backend skeleton
+//! - [`graphics::metal_backend`] for the macOS raw Metal backend skeleton
 //! - [`tlscript`] for the in-memory, zero-copy `.tlscript` frontend lexer/token layer
 
 /// Canonical module id used by runtime version commands.
@@ -30,19 +31,34 @@ pub use core::mgs_bridge::{
     MpsMgsBridgeMetrics,
 };
 pub use gms::{AdaptiveBufferDecision, AdaptiveFrameTelemetry};
+pub use graphics::frame_snapshot::{
+    FrameInstanceTransform, FrameLightRecord, FrameMaterialRecord, FrameTextureRecord,
+    RenderStateSnapshot,
+};
+#[cfg(target_os = "macos")]
+pub use graphics::metal_backend::{
+    MetalBackend, MetalBackendConfig, MetalBackendError, MetalFrameExecutionTelemetry,
+    MetalFrameSubmissionTelemetry, MetalSnapshotSlotState,
+};
+#[cfg(target_os = "macos")]
+pub use graphics::metal_physics_compute::{
+    MetalPhysicsComputeBackend, MetalPhysicsComputeCapabilities, MetalPhysicsComputeConfig,
+    MetalPhysicsDispatchPlan,
+};
 pub use graphics::multigpu::sync::{
     ComposeBarrierState, GpuQueueLane, GpuSubmissionHandle, GpuSubmissionWaitStatus,
     GpuSubmissionWaiter, MultiGpuFrameSyncConfig, MultiGpuFrameSynchronizer, MultiGpuSyncSnapshot,
     SharedPlacementPolicy, SyncBackendHint, WgpuSubmissionWaiter,
 };
+#[cfg(target_os = "linux")]
 pub use graphics::vulkan_backend::{
-    FrameInstanceTransform, FrameLightRecord, FrameMaterialRecord, FrameSubmissionTelemetry,
-    FrameTextureRecord, LinuxWindowSystemIntegration, PresentModePreference, RenderStateSnapshot,
-    VulkanBackend, VulkanBackendConfig, VulkanBackendError, VulkanDeviceExtensionSupport,
+    FrameSubmissionTelemetry, LinuxWindowSystemIntegration, PresentModePreference, VulkanBackend,
+    VulkanBackendConfig, VulkanBackendError, VulkanDeviceExtensionSupport,
     VulkanFrameExecutionTelemetry, VulkanMultiGpuCapabilities, VulkanMultiGpuConfig,
     VulkanMultiGpuFramePlan, VulkanNativeMultiGpuSupport, VulkanPhysicalDeviceProfile,
     VulkanQueueSelection, VulkanSnapshotSlotState,
 };
+#[cfg(target_os = "linux")]
 pub use graphics::vulkan_physics_compute::{
     VulkanPhysicsComputeBackend, VulkanPhysicsComputeCapabilities, VulkanPhysicsComputeConfig,
     VulkanPhysicsDispatchPlan,
