@@ -73,6 +73,13 @@ If you want to contribute before `v0.5.0` release stabilization:
 - follow [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 - use [SECURITY.md](SECURITY.md) for vulnerability reporting
 
+Contribution terms:
+
+- the project is currently open-source and may be commercialized in the future
+- contributions are accepted under `MPL-2.0` and may be used in future commercial distributions
+- contributions do not create employment, equity, or revenue-share rights unless separately agreed
+  in writing
+
 GitHub templates are included for issues and pull requests under `.github/`.
 
 ## Current Architecture

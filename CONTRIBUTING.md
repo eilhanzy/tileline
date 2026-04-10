@@ -6,6 +6,22 @@ Tileline is currently in a pre-alpha transition phase, and `v0.5.0` is the main 
 milestone before broad public growth. Contributions are still welcome now, especially if they are
 well-scoped and test-backed.
 
+## Contribution License and Future Commercial Use
+
+Tileline is currently maintained as an open-source project and may also be commercialized in future
+releases by project maintainers.
+
+By submitting contributions, you agree that:
+
+- your contributions are provided under the repository license (`MPL-2.0`)
+- maintainers may use, modify, and distribute those contributions in open-source and commercial
+  distributions under the project license terms
+- contributions do not create employment, partnership, equity, or revenue-share rights unless
+  separately agreed in writing
+
+If you need different legal/commercial terms for your contributions, please contact maintainers
+before opening a PR.
+
 ## Before You Start
 
 - Read [README.md](README.md) for workspace context.
