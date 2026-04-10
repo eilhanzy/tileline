@@ -16,6 +16,8 @@ in `src/` crates (not benchmark-only code).
 - `tileline-v0.4.5-roadmap.md`: v0.4.5 roadmap for first-class 2D side-view foundation (chunked tile world + dig/place + flat-2D ParadoxPE)
 - `tileline-v0.5.0-roadmap.md`: v0.5.0 roadmap for render optimization, effects/textures, ParadoxPE + MPS revision, and Rayon/Bevy/WGPU independence
 - `tileline-v0.3.0-foundation.md`: v0.3.0 foundation scope for runtime FSR policy and decentralized NPS topology
+- `engine-architecture-api-core.md`: architecture/API-core map for crate boundaries, runtime lifecycle, and integration surfaces
+- `tlscript-v0.4.5-guide.md`: strict `v0.4.5` TLScript guide used as canonical source for PDF release docs
 - `nps-protocol.md`: NPS UDP bit-packing, reliability, authority handoff, and MPS integration
 - `nps-runtime-plan.md`: canonical NPS channel, tick, snapshot, and transport runtime plan
 - `paradoxpe-foundation.md`: ParadoxPE handles, SoA storage, broadphase/solver pipeline, snapshot base, and script ABI
@@ -55,3 +57,8 @@ in `src/` crates (not benchmark-only code).
 - Prefer implementation-adjacent docs that reference real modules and public APIs.
 - Keep benchmark docs separate from engine/runtime behavior.
 - Favor explicit performance constraints (latency budgets, zero-copy paths, bounded waits).
+
+## PDF Build Utility
+
+- `scripts/build_tlscript_pdf.sh`: builds a TLScript guide PDF from markdown via `pandoc` (default
+  engine: `tectonic`) with explicit dependency checks and fail-soft diagnostics.
