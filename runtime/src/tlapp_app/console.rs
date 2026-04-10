@@ -190,7 +190,7 @@ impl Default for RuntimeConsoleState {
             script_statements: Vec::new(),
             script_overlay: empty_showcase_output(),
             edit_target: RuntimeConsoleEditTarget::Command,
-            quick_fps_cap: "60".to_string(),
+            quick_fps_cap: "off".to_string(),
             quick_render_distance: "off".to_string(),
             quick_fsr_sharpness: "0.35".to_string(),
             quick_msaa: "4".to_string(),

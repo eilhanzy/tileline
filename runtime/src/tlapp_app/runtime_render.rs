@@ -1053,7 +1053,14 @@ impl TlAppRuntime {
             }
             #[cfg(target_os = "macos")]
             TlAppRenderer::Metal { metal, present } => {
-                let _frame_result = metal.render_draw_frame(self.script_frame_index, &draw)?;
+                let shadow_submit_stride = metal_shadow_submit_stride(
+                    visible_ball_count,
+                    self.frame_time_ema_ms,
+                    self.frame_time_budget_ms,
+                );
+                if self.script_frame_index % shadow_submit_stride == 0 {
+                    let _frame_result = metal.render_draw_frame(self.script_frame_index, &draw)?;
+                }
 
                 let upload = present.upload_draw_frame(&self.device, &self.queue, &draw);
                 present.upload_overlay_sprites(
@@ -1357,5 +1364,23 @@ impl TlAppRuntime {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn metal_shadow_submit_stride(
+    visible_ball_count: usize,
+    frame_time_ema_ms: f32,
+    frame_time_budget_ms: f32,
+) -> u64 {
+    let budget = frame_time_budget_ms.max(1.0);
+    if visible_ball_count >= 9_000 || frame_time_ema_ms > budget * 1.35 {
+        8
+    } else if visible_ball_count >= 6_000 || frame_time_ema_ms > budget * 1.18 {
+        4
+    } else if visible_ball_count >= 3_000 || frame_time_ema_ms > budget * 1.06 {
+        2
+    } else {
+        1
     }
 }

@@ -39,7 +39,7 @@ impl Default for CliOptions {
         Self {
             resolution: PhysicalSize::new(1280, 720),
             vsync: VsyncMode::Auto,
-            fps_cap: Some(60.0),
+            fps_cap: None,
             pipeline_mode: PipelineMode::default_for_build(),
             tick_profile: TickProfile::Max,
             tick_cap: None,
@@ -664,7 +664,7 @@ fn print_usage() {
     println!("Options:");
     println!("  --resolution <WxH>        Window size (default: 1280x720)");
     println!("  --vsync auto|on|off       Present mode preference (default: auto)");
-    println!("  --fps-cap <N|off>         Frame cap target (default: 60)");
+    println!("  --fps-cap <N|off>         Frame cap target (default: off)");
     println!(
         "  --pipeline <mode>         Runtime frame pipeline: parallel|legacy (default: parallel)"
     );
