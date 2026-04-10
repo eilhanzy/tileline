@@ -43,6 +43,8 @@ features**, not on inventing entirely new subsystems.
 - a first-class SPIR-V shader path for the raw Vulkan backend
 - a `Tilecraft` development starter path built on canonical runtime content loading
 - a more aggressively parallel ParadoxPE execution model
+- a full-phase parallel ParadoxPE hot path (`broadphase|narrowphase|solver|integrate`) with
+  explicit serial-tail-only fallback rules
 - a ParadoxPE GPU compute foundation with fail-soft CPU fallback
 - a runtime MAS path (`runtime/src/mas.rs`) aligned with MPS scheduling ownership
 - a stricter MPS-driven runtime execution path with fewer serial bottlenecks
@@ -77,6 +79,10 @@ These are intentionally out of scope for `v0.5.0`:
 - `Tilecraft` development can start on top of supported engine/runtime content paths instead of
   bespoke example glue
 - ParadoxPE no longer depends on coarse serial stepping in its main hot path
+- ParadoxPE `broadphase|narrowphase|solver|integrate` phases are parallel by default in shipping
+  runtime presets
+- any ParadoxPE serial fallback path is explicit, telemetry-visible, and bounded (no silent
+  sequential ownership of hot phases)
 - ParadoxPE can route supported phases through an engine-owned GPU compute backend without
   destabilizing CPU fallback behavior
 - MPS is the primary CPU execution path for physics/runtime jobs
@@ -343,6 +349,34 @@ Current status:
 - still too coarse in its hot path
 - still not fully exploiting available CPU parallelism
 
+### C0. Full Parallelization Hard Gate
+
+This is a release-critical item. `v0.5.0` cannot ship with hidden sequential ownership in
+ParadoxPE hot phases.
+
+Target work:
+
+- audit all phase paths for hidden sequential loops and single-thread ownership
+- enforce parallel-first execution for:
+  - `broadphase`
+  - `narrowphase`
+  - `solver`
+  - `integrate`
+- keep serial execution only as explicit deterministic tail paths (small-N, unsupported host, or
+  safety fallback)
+- add mandatory telemetry for serial-tail visibility:
+  - `serial_fallback_reason`
+  - `serial_work_items`
+  - `serial_time_us`
+  - `phase_parallel_mode`
+
+Acceptance gates:
+
+- no silent sequential fallback exists in ParadoxPE hot phases
+- under `30k` dense-contact stress, serial-tail work remains bounded and does not dominate phase
+  time
+- runtime logs/telemetry can always explain why a phase ran serial vs parallel
+
 ### C1. Step Pipeline Refactor
 
 Target work:
@@ -372,6 +406,7 @@ Target work:
   - manifold growth
   - per-step candidate pair pressure
   - effective physics ceiling
+  - per-phase `serial_time_us` and fallback reason when serial-tail path is used
 
 Acceptance gates:
 
@@ -655,6 +690,7 @@ Target contents:
 - GMS Native SM/CU scaler stabilization and guardrail tuning
 - MAS (`runtime/src/mas.rs`) promoted as Multi Audio Synthesizer runtime path with MPS-aligned scheduling
 - ParadoxPE phase refactor and lower serial world-step fraction
+- ParadoxPE full-phase parallel hot path hardening (serial-tail-only fallback policy)
 - `rayon` hot-path exit
 - `Bevy` runtime-path exit
 - `wgpu` shipping render-path exit
@@ -665,10 +701,18 @@ Exit criteria:
 
 - `v0.5.0` can be shipped without depending on generic schedulers or `wgpu` in shipping runtime
 - MAS runtime path remains stable under the same workload validation gates
+- ParadoxPE phases (`broadphase|narrowphase|solver|integrate`) run parallel by default on shipping
+  presets, with serial-tail paths explicit + telemetry-bounded
 
 ## Validation Gates
 
 The release should be validated against real workloads, not just compile success.
+
+### ParadoxPE Parallelization Gate
+
+- `8k` and `30k` scenario runs must emit per-phase parallel/serial telemetry every sampled window
+- if any phase executes serial, logs must include `serial_fallback_reason` and `serial_time_us`
+- no phase may silently remain sequential in the main shipping preset path
 
 ## Performance Contract
 
