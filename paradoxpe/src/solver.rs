@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use nalgebra::Vector3;
 
 use crate::body::{BodyKind, ContactId, ContactManifold};
-use crate::parallel::{for_each_index, worker_count};
+use crate::parallel::{for_each_index, worker_count, ParallelExecutionMode};
 use crate::storage::BodyRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,6 +89,10 @@ pub struct ContactSolverStats {
     pub normal_impulses_applied: u32,
     pub friction_impulses_applied: u32,
     pub warmstart_hits: u32,
+    pub solve_mode: ParallelExecutionMode,
+    pub solve_serial_fallback_reason: Option<&'static str>,
+    pub projection_mode: ParallelExecutionMode,
+    pub projection_serial_fallback_reason: Option<&'static str>,
 }
 
 /// Reusable solver state holder.
@@ -222,6 +226,15 @@ impl ContactSolver {
         // push pass activates so total work stays comparable.
         let use_parallel =
             worker_count() > 1 && manifolds.len() >= self.config.parallel_contact_push_threshold;
+        let solve_mode = if use_parallel {
+            ParallelExecutionMode::Parallel
+        } else if worker_count() <= 1 {
+            ParallelExecutionMode::SerialSingleWorker
+        } else {
+            ParallelExecutionMode::SerialSmallWorkload
+        };
+        self.stats.solve_mode = solve_mode;
+        self.stats.solve_serial_fallback_reason = solve_mode.serial_fallback_reason();
         let iterations = if use_parallel {
             self.config.iterations.max(1)
         } else {
@@ -264,7 +277,11 @@ impl ContactSolver {
                     self.pos_delta_y[d].store(0.0f32.to_bits(), Ordering::Relaxed);
                     self.pos_delta_z[d].store(0.0f32.to_bits(), Ordering::Relaxed);
                 }
-                self.solve_parallel_iteration(bodies, manifolds);
+                let mode = self.solve_parallel_iteration(bodies, manifolds);
+                if mode.is_serial() {
+                    self.stats.solve_mode = mode;
+                    self.stats.solve_serial_fallback_reason = mode.serial_fallback_reason();
+                }
                 // Sparse flush: apply vel/pos deltas and track position changes.
                 for i in 0..self.jacobi_touched_bodies.len() {
                     let dense = self.jacobi_touched_bodies[i];
@@ -302,7 +319,9 @@ impl ContactSolver {
             }
         }
 
-        self.apply_hard_position_projection(bodies, manifolds);
+        let projection_mode = self.apply_hard_position_projection(bodies, manifolds);
+        self.stats.projection_mode = projection_mode;
+        self.stats.projection_serial_fallback_reason = projection_mode.serial_fallback_reason();
         self.flush_touched_positions(bodies);
 
         for (index, manifold) in manifolds.iter().enumerate() {
@@ -428,7 +447,11 @@ impl ContactSolver {
     /// atomic buffers (`push_delta_*` for velocity, `pos_delta_*` for position). No body state
     /// is mutated during this call; callers must call `flush_vel_deltas` and `flush_pos_deltas`
     /// after each iteration to apply the accumulated deltas.
-    fn solve_parallel_iteration(&self, bodies: &BodyRegistry, manifolds: &[ContactManifold]) {
+    fn solve_parallel_iteration(
+        &self,
+        bodies: &BodyRegistry,
+        manifolds: &[ContactManifold],
+    ) -> ParallelExecutionMode {
         let push_delta_x = &self.push_delta_x;
         let push_delta_y = &self.push_delta_y;
         let push_delta_z = &self.push_delta_z;
@@ -545,7 +568,7 @@ impl ContactSolver {
                 }
                 tangent_impulses[index].store(next_tangent.to_bits(), Ordering::Relaxed);
             }
-        });
+        })
     }
 
     fn apply_parallel_contact_push(
@@ -647,9 +670,9 @@ impl ContactSolver {
         &mut self,
         bodies: &mut BodyRegistry,
         manifolds: &[ContactManifold],
-    ) {
+    ) -> ParallelExecutionMode {
         if self.config.hard_position_projection_strength <= 0.0 || manifolds.is_empty() {
-            return;
+            return ParallelExecutionMode::NotRun;
         }
 
         // Build sparse set of touched dynamic bodies and clear only those slots.
@@ -686,7 +709,7 @@ impl ContactSolver {
         let use_parallel =
             manifolds.len() >= self.config.hard_position_projection_threshold && worker_count() > 1;
 
-        if use_parallel {
+        let mode = if use_parallel {
             for_each_index(manifolds.len(), 64, |index| {
                 let manifold = &manifolds[index];
                 accumulate_projection_delta(
@@ -699,7 +722,7 @@ impl ContactSolver {
                     push_delta_y,
                     push_delta_z,
                 );
-            });
+            })
         } else {
             for manifold in manifolds {
                 accumulate_projection_delta(
@@ -713,7 +736,12 @@ impl ContactSolver {
                     push_delta_z,
                 );
             }
-        }
+            if worker_count() <= 1 {
+                ParallelExecutionMode::SerialSingleWorker
+            } else {
+                ParallelExecutionMode::SerialSmallWorkload
+            }
+        };
 
         for i in 0..self.jacobi_touched_bodies.len() {
             let dense = self.jacobi_touched_bodies[i];
@@ -732,6 +760,7 @@ impl ContactSolver {
                 self.touched_body_indices.push(dense);
             }
         }
+        mode
     }
 
     fn apply_warmstart(&mut self, bodies: &mut BodyRegistry, manifolds: &[ContactManifold]) {

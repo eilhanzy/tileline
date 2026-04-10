@@ -10,6 +10,7 @@ use nalgebra::{UnitQuaternion, Vector3};
 
 use crate::body::{Aabb, BodyDesc, BodyKind, RigidBody};
 use crate::handle::{BodyHandle, ColliderHandle};
+use crate::parallel::{worker_count, ParallelExecutionMode};
 
 const INVALID_DENSE_INDEX: u32 = u32::MAX;
 
@@ -370,31 +371,38 @@ impl BodyRegistry {
         dt: f32,
         gravity: Vector3<f32>,
         shards: &[Range<usize>],
-    ) {
+    ) -> ParallelExecutionMode {
         if shards.is_empty() {
             self.integrate_range(0..self.handles.len(), dt, gravity);
-            return;
+            return ParallelExecutionMode::SerialUnsupportedPlan;
         }
 
         let Some(chunk_size) = uniform_shard_chunk_size(shards, self.handles.len()) else {
             for shard in shards {
                 self.integrate_range(shard.clone(), dt, gravity);
             }
-            return;
+            return ParallelExecutionMode::SerialUnsupportedPlan;
         };
 
         // NOTE(v0.5.0/E2): shard-plan integration remains deterministic and contiguous.
         // The previous Rayon zip-chain is intentionally removed while ParadoxPE converges on
         // MPS-owned dispatcher execution for this phase.
+        if worker_count() <= 1 {
+            for shard in shards {
+                self.integrate_range(shard.clone(), dt, gravity);
+            }
+            return ParallelExecutionMode::SerialSingleWorker;
+        }
         if self.handles.len() < chunk_size.saturating_mul(2) {
             for shard in shards {
                 self.integrate_range(shard.clone(), dt, gravity);
             }
-            return;
+            return ParallelExecutionMode::SerialSmallWorkload;
         }
         for shard in shards {
             self.integrate_range(shard.clone(), dt, gravity);
         }
+        ParallelExecutionMode::SerialUnimplemented
     }
 
     pub fn integrate(&mut self, dt: f32, gravity: Vector3<f32>) {

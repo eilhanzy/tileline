@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::body::{Aabb, BodyKind};
 use crate::handle::BodyHandle;
-use crate::parallel::{for_each_mut_indexed, worker_count};
+use crate::parallel::{for_each_mut_indexed, worker_count, ParallelExecutionMode};
 use crate::storage::BodyRegistry;
 
 /// Broadphase configuration tuned for shard-parallel sweep-and-prune.
@@ -46,6 +46,10 @@ pub struct BroadphaseStats {
     pub candidate_pairs: usize,
     pub dropped_pairs: usize,
     pub overflowed: bool,
+    pub swept_aabb_mode: ParallelExecutionMode,
+    pub swept_aabb_serial_fallback_reason: Option<&'static str>,
+    pub pair_scan_mode: ParallelExecutionMode,
+    pub pair_scan_serial_fallback_reason: Option<&'static str>,
 }
 
 /// Reusable broadphase pipeline with preallocated shard-local and merged pair buffers.
@@ -178,7 +182,7 @@ impl BroadphasePipeline {
         if self.config.speculative_sweep && self.predictive_dt > 1e-6 {
             let predictive_dt = self.predictive_dt;
             let speculative_max_distance = self.config.speculative_max_distance;
-            for_each_mut_indexed(&mut self.swept_aabbs, 512, |dense, swept| {
+            let mode = for_each_mut_indexed(&mut self.swept_aabbs, 512, |dense, swept| {
                 if matches!(kinds[dense], BodyKind::Dynamic | BodyKind::Kinematic) {
                     *swept = swept_aabb(
                         aabbs[dense],
@@ -188,6 +192,8 @@ impl BroadphasePipeline {
                     );
                 }
             });
+            self.stats.swept_aabb_mode = mode;
+            self.stats.swept_aabb_serial_fallback_reason = mode.serial_fallback_reason();
         }
         let swept_aabbs = &self.swept_aabbs;
         self.sorted_dense.sort_unstable_by(|left, right| {
@@ -204,7 +210,7 @@ impl BroadphasePipeline {
         let overflowed = AtomicBool::new(false);
         let sorted_dense = &self.sorted_dense;
 
-        for_each_mut_indexed(
+        let pair_scan_mode = for_each_mut_indexed(
             &mut self.shard_pairs[..shard_count],
             1,
             |shard_index, local_pairs| {
@@ -234,6 +240,8 @@ impl BroadphasePipeline {
                 }
             },
         );
+        self.stats.pair_scan_mode = pair_scan_mode;
+        self.stats.pair_scan_serial_fallback_reason = pair_scan_mode.serial_fallback_reason();
 
         let mut remaining_capacity = self.merged_pairs.capacity();
         for local_pairs in &self.shard_pairs[..shard_count] {

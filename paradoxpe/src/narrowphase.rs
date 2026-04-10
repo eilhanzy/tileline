@@ -12,7 +12,7 @@ use crate::body::{
 };
 use crate::handle::BodyHandle;
 use crate::handle::ColliderHandle;
-use crate::parallel::collect_filter_map;
+use crate::parallel::{collect_filter_map, ParallelExecutionMode};
 use crate::storage::BodyRegistry;
 
 /// Narrowphase configuration.
@@ -53,6 +53,8 @@ pub struct NarrowphaseStats {
     pub persistent_manifolds: usize,
     pub culled_pairs: usize,
     pub overflowed: bool,
+    pub manifold_build_mode: ParallelExecutionMode,
+    pub manifold_serial_fallback_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -178,7 +180,7 @@ impl NarrowphasePipeline {
         }
         let persisted_lookup = &self.persisted_lookup;
 
-        self.produced_buffer = collect_filter_map(candidate_pairs, 512, |&(body_a, body_b)| {
+        let (produced, mode) = collect_filter_map(candidate_pairs, 512, |&(body_a, body_b)| {
             let (collider_a, shape_a, material_a, filter_a) = collider_lookup(body_a)?;
             let (collider_b, shape_b, material_b, filter_b) = collider_lookup(body_b)?;
             if !collision_filter_allows(filter_a, filter_b) {
@@ -237,6 +239,9 @@ impl NarrowphasePipeline {
                 friction,
             })
         });
+        self.produced_buffer = produced;
+        self.stats.manifold_build_mode = mode;
+        self.stats.manifold_serial_fallback_reason = mode.serial_fallback_reason();
 
         let produced_count = self.produced_buffer.len();
         let capacity = self.manifolds.capacity();

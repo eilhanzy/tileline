@@ -7,6 +7,53 @@
 
 use std::thread;
 
+/// Execution mode snapshot returned by ParadoxPE parallel helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParallelExecutionMode {
+    /// Helper path was not executed for this phase.
+    #[default]
+    NotRun,
+    /// Work was processed in parallel chunks.
+    Parallel,
+    /// Sequential fallback because only one logical worker is available.
+    SerialSingleWorker,
+    /// Sequential fallback because workload is below parallel threshold.
+    SerialSmallWorkload,
+    /// Sequential fallback because input shards are not parallel-safe.
+    SerialUnsupportedPlan,
+    /// Sequential fallback because parallel execution is not implemented yet.
+    SerialUnimplemented,
+}
+
+impl ParallelExecutionMode {
+    #[inline]
+    pub const fn is_parallel(self) -> bool {
+        matches!(self, Self::Parallel)
+    }
+
+    #[inline]
+    pub const fn is_serial(self) -> bool {
+        matches!(
+            self,
+            Self::SerialSingleWorker
+                | Self::SerialSmallWorkload
+                | Self::SerialUnsupportedPlan
+                | Self::SerialUnimplemented
+        )
+    }
+
+    #[inline]
+    pub const fn serial_fallback_reason(self) -> Option<&'static str> {
+        match self {
+            Self::SerialSingleWorker => Some("single_worker"),
+            Self::SerialSmallWorkload => Some("small_workload"),
+            Self::SerialUnsupportedPlan => Some("unsupported_plan"),
+            Self::SerialUnimplemented => Some("parallel_not_implemented"),
+            _ => None,
+        }
+    }
+}
+
 /// Return the logical worker count available to this process.
 #[inline]
 pub fn worker_count() -> usize {
@@ -17,9 +64,18 @@ pub fn worker_count() -> usize {
 }
 
 #[inline]
-fn should_parallelize(total_items: usize, min_items_per_worker: usize) -> bool {
+fn resolve_execution_mode(
+    total_items: usize,
+    min_items_per_worker: usize,
+) -> ParallelExecutionMode {
     let workers = worker_count();
-    workers > 1 && total_items >= min_items_per_worker.max(1).saturating_mul(2)
+    if workers <= 1 {
+        return ParallelExecutionMode::SerialSingleWorker;
+    }
+    if total_items < min_items_per_worker.max(1).saturating_mul(2) {
+        return ParallelExecutionMode::SerialSmallWorkload;
+    }
+    ParallelExecutionMode::Parallel
 }
 
 #[inline]
@@ -32,16 +88,21 @@ fn chunk_len(total_items: usize, min_items_per_worker: usize) -> usize {
 }
 
 /// Parallel-for over a mutable slice with stable global index.
-pub fn for_each_mut_indexed<T, F>(slice: &mut [T], min_items_per_worker: usize, f: F)
+pub fn for_each_mut_indexed<T, F>(
+    slice: &mut [T],
+    min_items_per_worker: usize,
+    f: F,
+) -> ParallelExecutionMode
 where
     T: Send,
     F: Fn(usize, &mut T) + Sync,
 {
-    if !should_parallelize(slice.len(), min_items_per_worker) {
+    let mode = resolve_execution_mode(slice.len(), min_items_per_worker);
+    if !mode.is_parallel() {
         for (index, item) in slice.iter_mut().enumerate() {
             f(index, item);
         }
-        return;
+        return mode;
     }
 
     let chunk = chunk_len(slice.len(), min_items_per_worker);
@@ -56,18 +117,20 @@ where
             });
         }
     });
+    ParallelExecutionMode::Parallel
 }
 
 /// Parallel-for over `0..len` with deterministic chunk order.
-pub fn for_each_index<F>(len: usize, min_items_per_worker: usize, f: F)
+pub fn for_each_index<F>(len: usize, min_items_per_worker: usize, f: F) -> ParallelExecutionMode
 where
     F: Fn(usize) + Sync,
 {
-    if !should_parallelize(len, min_items_per_worker) {
+    let mode = resolve_execution_mode(len, min_items_per_worker);
+    if !mode.is_parallel() {
         for index in 0..len {
             f(index);
         }
-        return;
+        return mode;
     }
 
     let chunk = chunk_len(len, min_items_per_worker);
@@ -82,25 +145,31 @@ where
             });
         }
     });
+    ParallelExecutionMode::Parallel
 }
 
 /// Collect values with a parallel filter-map over a read-only slice.
 ///
 /// Output order is deterministic and follows input order by chunk.
-pub fn collect_filter_map<T, U, F>(input: &[T], min_items_per_worker: usize, map: F) -> Vec<U>
+pub fn collect_filter_map<T, U, F>(
+    input: &[T],
+    min_items_per_worker: usize,
+    map: F,
+) -> (Vec<U>, ParallelExecutionMode)
 where
     T: Sync,
     U: Send,
     F: Fn(&T) -> Option<U> + Sync,
 {
-    if !should_parallelize(input.len(), min_items_per_worker) {
+    let mode = resolve_execution_mode(input.len(), min_items_per_worker);
+    if !mode.is_parallel() {
         let mut out = Vec::with_capacity(input.len() / 2);
         for item in input {
             if let Some(mapped) = map(item) {
                 out.push(mapped);
             }
         }
-        return out;
+        return (out, mode);
     }
 
     let chunk = chunk_len(input.len(), min_items_per_worker);
@@ -134,7 +203,7 @@ where
     for mut local in chunk_outputs {
         out.append(&mut local);
     }
-    out
+    (out, ParallelExecutionMode::Parallel)
 }
 
 #[cfg(test)]
@@ -145,9 +214,10 @@ mod tests {
     #[test]
     fn for_each_mut_indexed_visits_every_index_once() {
         let mut data = vec![0usize; 4096];
-        for_each_mut_indexed(&mut data, 64, |index, item| {
+        let mode = for_each_mut_indexed(&mut data, 64, |index, item| {
             *item = index + 1;
         });
+        assert!(mode.is_parallel() || mode.is_serial());
         for (index, value) in data.iter().enumerate() {
             assert_eq!(*value, index + 1);
         }
@@ -156,17 +226,19 @@ mod tests {
     #[test]
     fn collect_filter_map_keeps_chunk_deterministic_order() {
         let data = (0u32..2048).collect::<Vec<_>>();
-        let out = collect_filter_map(
-            &data,
-            64,
-            |value| {
-                if value % 3 == 0 {
-                    Some(*value)
-                } else {
-                    None
-                }
-            },
-        );
+        let (out, mode) =
+            collect_filter_map(
+                &data,
+                64,
+                |value| {
+                    if value % 3 == 0 {
+                        Some(*value)
+                    } else {
+                        None
+                    }
+                },
+            );
+        assert!(mode.is_parallel() || mode.is_serial());
         let expected = data
             .iter()
             .copied()
@@ -179,10 +251,11 @@ mod tests {
     fn collect_filter_map_runs_map_on_all_items() {
         let data = (0u32..1024).collect::<Vec<_>>();
         let calls = AtomicUsize::new(0);
-        let _ = collect_filter_map(&data, 32, |value| {
+        let (_out, mode) = collect_filter_map(&data, 32, |value| {
             calls.fetch_add(1, Ordering::Relaxed);
             Some(*value)
         });
+        assert!(mode.is_parallel() || mode.is_serial());
         assert_eq!(calls.load(Ordering::Relaxed), data.len());
     }
 }

@@ -31,6 +31,7 @@ use crate::joint::{
     JointConstraintSolver, JointSolverConfig,
 };
 use crate::narrowphase::{NarrowphaseConfig, NarrowphasePipeline};
+use crate::parallel::ParallelExecutionMode;
 use crate::sleep::{SleepConfig, SleepIslandManager};
 use crate::snapshot::{BodyStateFrame, PhysicsInterpolationBuffer, PhysicsSnapshot};
 use crate::solver::{ContactSolver, ContactSolverConfig};
@@ -177,9 +178,17 @@ pub struct PhysicsStepTimings {
     pub substeps: u32,
     pub compute_us: u64,
     pub integrate_us: u64,
+    pub integrate_mode: ParallelExecutionMode,
+    pub integrate_serial_fallback_reason: Option<&'static str>,
     pub broadphase_us: u64,
+    pub broadphase_mode: ParallelExecutionMode,
+    pub broadphase_serial_fallback_reason: Option<&'static str>,
     pub narrowphase_us: u64,
+    pub narrowphase_mode: ParallelExecutionMode,
+    pub narrowphase_serial_fallback_reason: Option<&'static str>,
     pub solver_us: u64,
+    pub solver_mode: ParallelExecutionMode,
+    pub solver_serial_fallback_reason: Option<&'static str>,
     pub sleep_us: u64,
     pub snapshot_us: u64,
 }
@@ -304,7 +313,9 @@ impl PhysicsWorld {
     }
 
     pub fn compute_backend_name(&self) -> Option<&str> {
-        self.compute_backend.as_ref().map(|backend| backend.backend_name())
+        self.compute_backend
+            .as_ref()
+            .map(|backend| backend.backend_name())
     }
 
     pub fn last_compute_stats(&self) -> &PhysicsComputeStats {
@@ -878,12 +889,17 @@ impl PhysicsWorld {
         let integrate_started = Instant::now();
         let integrate_offloaded = self.try_dispatch_integrate_stage(plan, step_index, timings);
         if !integrate_offloaded {
-            self.bodies.integrate_with_shards(
+            let integrate_mode = self.bodies.integrate_with_shards(
                 plan.fixed_dt,
                 self.config.gravity,
                 &self.integration_shards,
             );
+            timings.integrate_mode = integrate_mode;
+            timings.integrate_serial_fallback_reason = integrate_mode.serial_fallback_reason();
             timings.integrate_us += duration_us(integrate_started.elapsed());
+        } else {
+            timings.integrate_mode = ParallelExecutionMode::Parallel;
+            timings.integrate_serial_fallback_reason = None;
         }
 
         let t = Instant::now();
@@ -892,6 +908,10 @@ impl PhysicsWorld {
         let bodies = &self.bodies;
         self.broadphase.rebuild_pairs_parallel(bodies);
         timings.broadphase_us += duration_us(t.elapsed());
+        let broadphase_stats = self.broadphase.stats();
+        timings.broadphase_mode = broadphase_stats.pair_scan_mode;
+        timings.broadphase_serial_fallback_reason =
+            broadphase_stats.pair_scan_serial_fallback_reason;
 
         let is_last = step_index + 1 == plan.substeps;
         let on_stride = plan.substeps as usize > plan.sleep_update_stride
@@ -926,6 +946,14 @@ impl PhysicsWorld {
                 );
                 timings.sleep_us += duration_us(t.elapsed());
             }
+
+            let narrowphase_stats = self.narrowphase.stats();
+            timings.narrowphase_mode = narrowphase_stats.manifold_build_mode;
+            timings.narrowphase_serial_fallback_reason =
+                narrowphase_stats.manifold_serial_fallback_reason;
+            let solver_stats = self.solver.stats();
+            timings.solver_mode = solver_stats.solve_mode;
+            timings.solver_serial_fallback_reason = solver_stats.solve_serial_fallback_reason;
         }
 
         if self.config.simulation_mode.is_flat_2d() {
@@ -974,7 +1002,10 @@ impl PhysicsWorld {
         if !backend.supports_stage(stage) {
             self.last_compute_stats.note_fallback(
                 stage,
-                format!("backend '{}' does not support integrate", backend.backend_name()),
+                format!(
+                    "backend '{}' does not support integrate",
+                    backend.backend_name()
+                ),
             );
             return false;
         }
@@ -1414,8 +1445,8 @@ fn free_slot<T>(
 mod tests {
     use super::*;
     use std::ops::Range;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use crate::compute::{
         PhysicsComputeBackend, PhysicsComputeBackendKind, PhysicsComputeConfig,
