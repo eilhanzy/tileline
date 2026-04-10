@@ -60,7 +60,8 @@ use gms::safe_default_required_limits_for_adapter;
 use mgs::MobileGpuProfile;
 use nalgebra::Vector3;
 use paradoxpe::{
-    BroadphaseConfig, ContactSolverConfig, NarrowphaseConfig, PhysicsWorld, PhysicsWorldConfig,
+    parallel::ParallelExecutionMode, BroadphaseConfig, ContactSolverConfig, NarrowphaseConfig,
+    PhysicsWorld, PhysicsWorldConfig,
 };
 use regex::RegexBuilder;
 use winit::application::ApplicationHandler;
@@ -1954,6 +1955,32 @@ fn scheduler_path_label(path: GraphicsSchedulerPath) -> &'static str {
     match path {
         GraphicsSchedulerPath::Gms => "gms",
         GraphicsSchedulerPath::Mgs => "mgs",
+    }
+}
+
+#[inline]
+fn phase_mode_label(mode: ParallelExecutionMode) -> &'static str {
+    match mode {
+        ParallelExecutionMode::NotRun => "not_run",
+        ParallelExecutionMode::Parallel => "parallel",
+        ParallelExecutionMode::SerialSingleWorker => "serial_single_worker",
+        ParallelExecutionMode::SerialSmallWorkload => "serial_small_workload",
+        ParallelExecutionMode::SerialUnsupportedPlan => "serial_unsupported_plan",
+        ParallelExecutionMode::SerialUnimplemented => "serial_unimplemented",
+    }
+}
+
+#[inline]
+fn phase_serial_fallback_reason_label(reason: Option<&'static str>) -> &'static str {
+    reason.unwrap_or("none")
+}
+
+#[inline]
+fn phase_serial_time_us(mode: ParallelExecutionMode, phase_time_us: u64) -> u64 {
+    if mode.is_serial() {
+        phase_time_us
+    } else {
+        0
     }
 }
 

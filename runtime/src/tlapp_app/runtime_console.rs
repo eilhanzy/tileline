@@ -779,8 +779,29 @@ impl TlAppRuntime {
             .fallback_reason
             .as_deref()
             .unwrap_or("none");
+        let step_timings = self.world.borrow().last_step_timings;
+        let integrate_mode_label = phase_mode_label(step_timings.integrate_mode);
+        let broadphase_mode_label = phase_mode_label(step_timings.broadphase_mode);
+        let narrowphase_mode_label = phase_mode_label(step_timings.narrowphase_mode);
+        let solver_mode_label = phase_mode_label(step_timings.solver_mode);
+        let integrate_reason_label =
+            phase_serial_fallback_reason_label(step_timings.integrate_serial_fallback_reason);
+        let broadphase_reason_label =
+            phase_serial_fallback_reason_label(step_timings.broadphase_serial_fallback_reason);
+        let narrowphase_reason_label =
+            phase_serial_fallback_reason_label(step_timings.narrowphase_serial_fallback_reason);
+        let solver_reason_label =
+            phase_serial_fallback_reason_label(step_timings.solver_serial_fallback_reason);
+        let integrate_serial_us =
+            phase_serial_time_us(step_timings.integrate_mode, step_timings.integrate_us);
+        let broadphase_serial_us =
+            phase_serial_time_us(step_timings.broadphase_mode, step_timings.broadphase_us);
+        let narrowphase_serial_us =
+            phase_serial_time_us(step_timings.narrowphase_mode, step_timings.narrowphase_us);
+        let solver_serial_us =
+            phase_serial_time_us(step_timings.solver_mode, step_timings.solver_us);
         format!(
-            "scene_mode={} tile[chunks={} dirty={} vis={} draw={} cull={}] pipeline={} bridge_path={} queued_plan_depth={} bridge_pump_published={} bridge_pump_drained={} physics_lag_frames={} bridge_fallback={} gms_mode={} gms_budgets={} gms_util={:.2} gms_q={} gms_ai_ml_drop={:.3} gms_reason={} fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={} {}",
+            "scene_mode={} tile[chunks={} dirty={} vis={} draw={} cull={}] pipeline={} bridge_path={} queued_plan_depth={} bridge_pump_published={} bridge_pump_drained={} physics_lag_frames={} bridge_fallback={} gms_mode={} gms_budgets={} gms_util={:.2} gms_q={} gms_ai_ml_drop={:.3} gms_reason={} fps_cap={fps_cap} vsync={:?} rt={:?}/{} fsr={:?}/{} scale={:.2} sharpness={:.2} render_distance={} adaptive_distance={:?} distance_blur={:?} sim_paused={} step_budget={} substeps={} c0_mode[i={} b={} n={} s={}] c0_reason[i={} b={} n={} s={}] c0_serial_us[i={} b={} n={} s={}] log_filter={} log_tail={} tailf={} watch={} script_vars={} script_calls={} {}",
             self.scene_mode().as_str(),
             self.tile_world_frame.loaded_chunks,
             self.tile_world_frame.dirty_chunks,
@@ -813,6 +834,18 @@ impl TlAppRuntime {
             self.simulation_paused,
             self.simulation_step_budget,
             substeps,
+            integrate_mode_label,
+            broadphase_mode_label,
+            narrowphase_mode_label,
+            solver_mode_label,
+            integrate_reason_label,
+            broadphase_reason_label,
+            narrowphase_reason_label,
+            solver_reason_label,
+            integrate_serial_us,
+            broadphase_serial_us,
+            narrowphase_serial_us,
+            solver_serial_us,
             log_filter,
             log_tail,
             tailf_state,
@@ -918,7 +951,10 @@ impl TlAppRuntime {
                 contact_manifolds: narrowphase.manifolds,
             }
         };
-        let gms_config = self.runtime_bridge.as_ref().map(|bridge| bridge.gms_scaler_config());
+        let gms_config = self
+            .runtime_bridge
+            .as_ref()
+            .map(|bridge| bridge.gms_scaler_config());
         let gms_metrics = TlscriptGmsMetricSnapshot {
             mode: self.runtime_bridge_metrics.gms_mode,
             target_fps: gms_config.map(|cfg| cfg.target_fps),
@@ -1186,12 +1222,8 @@ impl TlAppRuntime {
                     self.console_feedback("usage: gms.target_fps <24..480>");
                     return RuntimeCommand::Consumed;
                 };
-                let target = match parse_console_u32_in_range(
-                    raw_target,
-                    "gms.target_fps",
-                    24,
-                    480,
-                ) {
+                let target = match parse_console_u32_in_range(raw_target, "gms.target_fps", 24, 480)
+                {
                     Ok(value) => value,
                     Err(err) => {
                         self.console_feedback(err);
@@ -1628,6 +1660,22 @@ impl TlAppRuntime {
                     self.frame_time_jitter_ema_ms,
                     self.runtime_bridge_telemetry.physics_lag_frames,
                     self.world.borrow().last_step_timings.total_us(),
+                ));
+                let step_timings = self.world.borrow().last_step_timings;
+                self.console_feedback(format!(
+                    "  c0 phase | mode i={} b={} n={} s={} | reason i={} b={} n={} s={} | serial_us i={} b={} n={} s={}",
+                    phase_mode_label(step_timings.integrate_mode),
+                    phase_mode_label(step_timings.broadphase_mode),
+                    phase_mode_label(step_timings.narrowphase_mode),
+                    phase_mode_label(step_timings.solver_mode),
+                    phase_serial_fallback_reason_label(step_timings.integrate_serial_fallback_reason),
+                    phase_serial_fallback_reason_label(step_timings.broadphase_serial_fallback_reason),
+                    phase_serial_fallback_reason_label(step_timings.narrowphase_serial_fallback_reason),
+                    phase_serial_fallback_reason_label(step_timings.solver_serial_fallback_reason),
+                    phase_serial_time_us(step_timings.integrate_mode, step_timings.integrate_us),
+                    phase_serial_time_us(step_timings.broadphase_mode, step_timings.broadphase_us),
+                    phase_serial_time_us(step_timings.narrowphase_mode, step_timings.narrowphase_us),
+                    phase_serial_time_us(step_timings.solver_mode, step_timings.solver_us),
                 ));
                 self.console_feedback(format!(
                     "  render | backend={} scheduler={} pipeline={} render_distance={} adaptive_distance={} distance_blur={:?} fsr={:?}/{:?} scale={:.2} sharpness={:.2} rt={:?}/{} dyn={} adapter={}",

@@ -399,10 +399,81 @@ impl BodyRegistry {
             }
             return ParallelExecutionMode::SerialSmallWorkload;
         }
-        for shard in shards {
-            self.integrate_range(shard.clone(), dt, gravity);
-        }
-        ParallelExecutionMode::SerialUnimplemented
+
+        let kinds = self.kinds.as_slice();
+        let awake = self.awake.as_slice();
+        let inverse_masses = self.inverse_masses.as_slice();
+        let linear_dampings = self.linear_dampings.as_slice();
+        let local_bounds = self.local_bounds.as_slice();
+        let positions = self.positions.as_mut_slice();
+        let linear_velocities = self.linear_velocities.as_mut_slice();
+        let accumulated_forces = self.accumulated_forces.as_mut_slice();
+        let aabbs = self.aabbs.as_mut_slice();
+
+        std::thread::scope(|scope| {
+            let mut position_chunks = positions.chunks_mut(chunk_size);
+            let mut velocity_chunks = linear_velocities.chunks_mut(chunk_size);
+            let mut force_chunks = accumulated_forces.chunks_mut(chunk_size);
+            let mut aabb_chunks = aabbs.chunks_mut(chunk_size);
+
+            for (
+                (((kind_chunk, awake_chunk), inverse_mass_chunk), linear_damping_chunk),
+                local_bounds_chunk,
+            ) in kinds
+                .chunks(chunk_size)
+                .zip(awake.chunks(chunk_size))
+                .zip(inverse_masses.chunks(chunk_size))
+                .zip(linear_dampings.chunks(chunk_size))
+                .zip(local_bounds.chunks(chunk_size))
+            {
+                let position_chunk = position_chunks
+                    .next()
+                    .expect("positions chunk count should match kinds chunks");
+                let velocity_chunk = velocity_chunks
+                    .next()
+                    .expect("velocity chunk count should match kinds chunks");
+                let force_chunk = force_chunks
+                    .next()
+                    .expect("force chunk count should match kinds chunks");
+                let aabb_chunk = aabb_chunks
+                    .next()
+                    .expect("aabb chunk count should match kinds chunks");
+
+                scope.spawn(move || {
+                    for index in 0..kind_chunk.len() {
+                        match kind_chunk[index] {
+                            BodyKind::Static => {
+                                force_chunk[index] = Vector3::zeros();
+                                aabb_chunk[index] =
+                                    local_bounds_chunk[index].translated(position_chunk[index]);
+                            }
+                            BodyKind::Kinematic => {
+                                position_chunk[index] += velocity_chunk[index] * dt;
+                                aabb_chunk[index] =
+                                    local_bounds_chunk[index].translated(position_chunk[index]);
+                            }
+                            BodyKind::Dynamic => {
+                                if !awake_chunk[index] {
+                                    force_chunk[index] = Vector3::zeros();
+                                    continue;
+                                }
+                                let acceleration =
+                                    gravity + force_chunk[index] * inverse_mass_chunk[index];
+                                velocity_chunk[index] += acceleration * dt;
+                                velocity_chunk[index] *=
+                                    1.0 - linear_damping_chunk[index].clamp(0.0, 0.95);
+                                position_chunk[index] += velocity_chunk[index] * dt;
+                                force_chunk[index] = Vector3::zeros();
+                                aabb_chunk[index] =
+                                    local_bounds_chunk[index].translated(position_chunk[index]);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        ParallelExecutionMode::Parallel
     }
 
     pub fn integrate(&mut self, dt: f32, gravity: Vector3<f32>) {
@@ -628,11 +699,53 @@ mod tests {
 
         let mut shards = Vec::new();
         parallel.plan_integration_shards(8, 32, &mut shards);
-        parallel.integrate_with_shards(dt, gravity, &shards);
+        let mode = parallel.integrate_with_shards(dt, gravity, &shards);
 
         assert_eq!(serial.positions, parallel.positions);
         assert_eq!(serial.linear_velocities, parallel.linear_velocities);
         assert_eq!(serial.accumulated_forces, parallel.accumulated_forces);
         assert_eq!(serial.aabbs, parallel.aabbs);
+        assert_ne!(mode, ParallelExecutionMode::SerialUnimplemented);
+    }
+
+    #[test]
+    fn integrate_with_shards_reports_serial_small_workload_for_tiny_body_sets() {
+        let mut registry = BodyRegistry::new();
+        for _ in 0..12 {
+            registry.spawn(BodyDesc::default());
+        }
+        let mut shards = Vec::new();
+        registry.plan_integration_shards(8, 32, &mut shards);
+        let mode =
+            registry.integrate_with_shards(1.0 / 120.0, Vector3::new(0.0, -9.81, 0.0), &shards);
+        assert_eq!(mode, ParallelExecutionMode::SerialSmallWorkload);
+    }
+
+    #[test]
+    fn integrate_with_shards_reports_serial_unsupported_plan_for_non_uniform_chunks() {
+        let mut registry = BodyRegistry::new();
+        for _ in 0..257 {
+            registry.spawn(BodyDesc::default());
+        }
+        let shards = vec![0..128, 128..192, 192..257];
+        let mode =
+            registry.integrate_with_shards(1.0 / 120.0, Vector3::new(0.0, -9.81, 0.0), &shards);
+        assert_eq!(mode, ParallelExecutionMode::SerialUnsupportedPlan);
+    }
+
+    #[test]
+    fn integrate_with_shards_reports_parallel_for_shipping_scale_when_workers_available() {
+        if worker_count() <= 1 {
+            return;
+        }
+        let mut registry = BodyRegistry::new();
+        for _ in 0..8_000 {
+            registry.spawn(BodyDesc::default());
+        }
+        let mut shards = Vec::new();
+        registry.plan_integration_shards(8, 32, &mut shards);
+        let mode =
+            registry.integrate_with_shards(1.0 / 120.0, Vector3::new(0.0, -9.81, 0.0), &shards);
+        assert_eq!(mode, ParallelExecutionMode::Parallel);
     }
 }

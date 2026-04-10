@@ -1184,12 +1184,35 @@ impl TlAppRuntime {
             None => String::new(),
         };
         let step_timings = self.world.borrow().last_step_timings;
+        let integrate_mode_label = phase_mode_label(step_timings.integrate_mode);
+        let broadphase_mode_label = phase_mode_label(step_timings.broadphase_mode);
+        let narrowphase_mode_label = phase_mode_label(step_timings.narrowphase_mode);
+        let solver_mode_label = phase_mode_label(step_timings.solver_mode);
+        let integrate_reason_label =
+            phase_serial_fallback_reason_label(step_timings.integrate_serial_fallback_reason);
+        let broadphase_reason_label =
+            phase_serial_fallback_reason_label(step_timings.broadphase_serial_fallback_reason);
+        let narrowphase_reason_label =
+            phase_serial_fallback_reason_label(step_timings.narrowphase_serial_fallback_reason);
+        let solver_reason_label =
+            phase_serial_fallback_reason_label(step_timings.solver_serial_fallback_reason);
+        let integrate_serial_us =
+            phase_serial_time_us(step_timings.integrate_mode, step_timings.integrate_us);
+        let broadphase_serial_us =
+            phase_serial_time_us(step_timings.broadphase_mode, step_timings.broadphase_us);
+        let narrowphase_serial_us =
+            phase_serial_time_us(step_timings.narrowphase_mode, step_timings.narrowphase_us);
+        let solver_serial_us =
+            phase_serial_time_us(step_timings.solver_mode, step_timings.solver_us);
+        let c0_suffix = format!(
+            " | c0 i={integrate_mode_label}/{integrate_reason_label}/{integrate_serial_us}us b={broadphase_mode_label}/{broadphase_reason_label}/{broadphase_serial_us}us n={narrowphase_mode_label}/{narrowphase_reason_label}/{narrowphase_serial_us}us s={solver_mode_label}/{solver_reason_label}/{solver_serial_us}us"
+        );
         let physics_pool_metrics = self.world.thread_pool_metrics();
         let console_suffix = self.console_title_suffix();
         let render_backend_label = self.renderer.backend_label();
         let performance_contract = self.performance_contract_evaluation();
         let title = format!(
-            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Scene {} | Balls {} (draw {}) | Tiles {} (vis {} cull {} chunks {} dirty {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | Phys {}µs (int {}µs bp {}µs np {}µs sv {}µs sl {}µs) | contract {}:{} | {:?} {} {} {:?}{}{}{}{}{}{}{}",
+            "Tileline TLApp | FPS {:.1} | Frame {:.2} ms | Tick {:.0} Hz | Scene {} | Balls {} (draw {}) | Tiles {} (vis {} cull {} chunks {} dirty {}) | Lights {} | RT {:?}/{} ({}) | FSR {:?}/{} ({:.2}) | Substeps {} | Phys {}µs (int {}µs bp {}µs np {}µs sv {}µs sl {}µs) | contract {}:{} | {:?} {} {} {:?}{}{}{}{}{}{}{}{}",
             self.fps_tracker.ema_fps(),
             frame_time * 1_000.0,
             self.tick_hz,
@@ -1239,6 +1262,7 @@ impl TlAppRuntime {
             bridge_suffix,
             distance_suffix,
             pacing_suffix,
+            c0_suffix,
             console_suffix,
         );
         self.window.set_title(&title);
@@ -1279,7 +1303,7 @@ impl TlAppRuntime {
                 .as_deref()
                 .unwrap_or("none");
             println!(
-                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | scene_mode: {} | balls: {:>5} | draw: {:>5} | tiles_draw: {:>5} | tiles_vis: {:>5} | tiles_culled: {:>5} | tile_chunks: {:>4} | tile_dirty: {:>4} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | contract: {}:{} stable={} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | phys_workers: {} | phys_queue: {} | phys_inflight: {} | phys_frame: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | render_backend: {} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {} | pipeline: {} | bridge_path: {} | queued_plan_depth: {} | bridge_pump_published: {} | bridge_pump_drained: {} | physics_lag_frames: {} | bridge_fallback: {} | gms_mode: {} | gms_budget: {} | gms_util: {:>4.2} | gms_q: {} | gms_ai_ml_drop: {:>4.3} | gms_reason: {}",
+                "tlapp fps | inst: {:>6.1} | ema: {:>6.1} | avg: {:>6.1} | stddev: {:>5.2} ms | scene_mode: {} | balls: {:>5} | draw: {:>5} | tiles_draw: {:>5} | tiles_vis: {:>5} | tiles_culled: {:>5} | tile_chunks: {:>4} | tile_dirty: {:>4} | lights: {:>2} | substeps: {} | phys_us: {:>6} | int_us: {:>5} | bp_us: {:>5} | np_us: {:>5} | sv_us: {:>5} | sl_us: {:>5} | snap_us: {:>5} | pre_phys_us: {:>5} | scene_us: {:>5} | compile_us: {:>5} | upload_us: {:>5} | present_us: {:>6} | scattered: {:>4} | rd_culled: {:>4} | rd_blur: {:>4} | fill: {:>4.2} | fill_ema: {:>4.2} | contract: {}:{} stable={} | rt_mode: {:?} | rt_active: {} | rt_dynamic: {:>4} | rt_reason: {} | fsr_mode: {:?} | fsr_active: {} | fsr_scale: {:>4.2} | fsr_sharpness: {:>4.2} | fsr_reason: {} | mps_threads: {} | phys_workers: {} | phys_queue: {} | phys_inflight: {} | phys_frame: {} | shards: {} | pairs: {} | manifolds: {} | platform: {:?} | backend: {:?} | render_backend: {} | scheduler: {} | present: {:?} | fallback: {} | adapter: {} | reason: {} | pipeline: {} | bridge_path: {} | queued_plan_depth: {} | bridge_pump_published: {} | bridge_pump_drained: {} | physics_lag_frames: {} | bridge_fallback: {} | gms_mode: {} | gms_budget: {} | gms_util: {:>4.2} | gms_q: {} | gms_ai_ml_drop: {:>4.3} | gms_reason: {} | c0_mode: i={} b={} n={} s={} | c0_reason: i={} b={} n={} s={} | c0_serial_us: i={} b={} n={} s={}",
                 report.instant_fps,
                 report.ema_fps,
                 report.avg_fps,
@@ -1360,6 +1384,18 @@ impl TlAppRuntime {
                 self.runtime_bridge_metrics.lane_queue_depth,
                 self.runtime_bridge_metrics.ai_ml_drop_rate,
                 gms_reason_label,
+                integrate_mode_label,
+                broadphase_mode_label,
+                narrowphase_mode_label,
+                solver_mode_label,
+                integrate_reason_label,
+                broadphase_reason_label,
+                narrowphase_reason_label,
+                solver_reason_label,
+                integrate_serial_us,
+                broadphase_serial_us,
+                narrowphase_serial_us,
+                solver_serial_us,
             );
         }
 

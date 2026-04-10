@@ -38,12 +38,16 @@ Make `broadphase | narrowphase | solver | integrate` parallel-by-default in ship
     - narrowphase
     - solver
 
-- [ ] C0-S5: Implement true parallel shard integration for `integrate`.
-  - Replace current serial shard loop in `integrate_with_shards` with deterministic parallel shard execution.
-  - Preserve deterministic output and existing correctness tests.
+- [x] C0-S5: Implement true parallel shard integration for `integrate`.
+  - `BodyRegistry::integrate_with_shards` now runs deterministic disjoint chunk execution in parallel
+    when shard plan + workload thresholds are satisfied.
+  - Serial fallback remains explicit (`SerialUnsupportedPlan`, `SerialSingleWorker`,
+    `SerialSmallWorkload`) and no longer reports `SerialUnimplemented`.
 
-- [ ] C0-S6: Add runtime/console telemetry lines for C0 gate fields.
-  - Print phase mode + `serial_fallback_reason` + phase serial time in TLApp telemetry output.
+- [x] C0-S6: Add runtime/console telemetry lines for C0 gate fields.
+  - TLApp title + FPS log now print per-phase mode/reason/serial-us for
+    `integrate|broadphase|narrowphase|solver`.
+  - Console `status` / `perf.report` now include the same C0 gate telemetry fields.
 
 - [ ] C0-S7: Add C0 gate tests.
   - Unit tests for mode transitions (`Parallel`, `SerialSmallWorkload`, `SerialSingleWorker`, etc.).
