@@ -33,6 +33,9 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 
 - `README.md`: workspace overview and quick start
 - `CHANGELOG.md`: release history
+- `CONTRIBUTING.md`: contribution workflow and PR expectations
+- `CODE_OF_CONDUCT.md`: community behavior standards
+- `SECURITY.md`: vulnerability reporting and support policy
 - `docs/README.md`: documentation index
 - `docs/tlscript-lexer.md`: `.tlscript` zero-copy lexer/token design
 - `docs/tlscript-parser-plan.md`: `.tlscript` parser/AST roadmap and V1 grammar
@@ -61,6 +64,16 @@ This workspace is currently in pre-alpha transition phase (Foundation -> Pre-Alp
 - `docs/alpha-foss-ui-assets.md`: FOSS icon/font candidates and asset policy for Alpha editor UI
 - `docs/mgs-scene-workload.md`: runtime/mobile scene/sprite density to MGS hint and tile planning mapping
 - `docs/demos/README.md`: show/demo documentation area (`docs/demos/*`)
+
+## Contributing and Community
+
+If you want to contribute before `v0.5.0` release stabilization:
+
+- start with [CONTRIBUTING.md](CONTRIBUTING.md)
+- follow [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- use [SECURITY.md](SECURITY.md) for vulnerability reporting
+
+GitHub templates are included for issues and pull requests under `.github/`.
 
 ## Current Architecture
 
